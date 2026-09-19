@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Luna · Plugin Lab</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#tool-input">跳至工具输入</a>
+  <div class="shell">
+    <aside class="rail" aria-label="Luna 工作台">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">◒</span><strong>Luna</strong></div>
+      <div class="lab-name">Plugin Lab</div>
+      <nav aria-label="页面区域"><a href="#operate" class="nav-active">工具工作台 <span aria-hidden="true">↗</span></a><a href="#inspect">插件管理</a><a href="#lifecycle">生命周期</a></nav>
+      <div class="rail-note"><span class="small-label">本地机制实验</span><p>机制 Demo · 未接入模型</p><p class="muted">独立进程 · 手动热重载<br>不包含自动文件监听</p></div>
+    </aside>
+    <main>
+      <header class="page-header"><div><p class="eyebrow">LUNA / PLUGIN KERNEL</p><h1>插件工作台</h1></div><span id="status" class="connection" role="status" data-state="pending">正在连接后端…</span></header>
+      <p id="connection-error" class="notice error" role="alert" hidden></p>
+      <div class="workbench">
+        <section id="operate" class="operate" aria-labelledby="operate-title">
+          <div class="section-heading"><h2 id="operate-title">调用工具</h2><span class="small-label">OPERATE</span></div>
+          <p class="section-intro">一次调用，固定一个插件代次。</p>
+          <form id="invoke-form">
+            <label for="tool-input">输入文本</label>
+            <textarea id="tool-input" name="text" rows="5" maxlength="16000" placeholder="例如：  hello Luna  " required aria-describedby="input-hint"></textarea>
+            <p id="input-hint" class="hint">文本交给真实插件处理，不会发送给模型。</p>
+            <div class="invoke-controls"><div class="delay-field"><label for="delay-ms">调用延迟</label><select id="delay-ms" name="delay_ms"><option value="0">立即执行 · 0 ms</option><option value="3000">慢调用 · 3000 ms</option></select></div><button id="invoke-btn" class="primary" type="submit">调用工具</button></div>
+            <p id="invoke-feedback" class="feedback" role="status">试试慢调用：等待期间切换至另一插件，观察返回代次。</p>
+          </form>
+          <section class="output-section" aria-labelledby="output-title"><div class="section-heading"><h3 id="output-title">调用结果</h3><span class="small-label">最近 20 次 · 新 → 旧</span></div><ol id="output" class="output-list" aria-live="polite" aria-relevant="additions text"><li class="empty">还没有调用结果。输入文本，开始第一次调用。</li></ol></section>
+        </section>
+        <aside id="inspect" class="inspect" aria-labelledby="inspect-title">
+          <div class="section-heading"><h2 id="inspect-title">插件管理</h2><span class="small-label">INSPECT</span></div>
+          <div class="active-heading"><span class="active-dot" aria-hidden="true"></span><span>当前插件</span><code id="active-version">—</code><code id="generation">—</code></div>
+          <dl class="process-data"><div><dt>Host PID</dt><dd><code id="host-pid">—</code></dd></div><div><dt>Plugin PID</dt><dd><code id="plugin-pid">—</code></dd></div><div><dt>当前候选</dt><dd><code id="active-candidate">—</code></dd></div></dl>
+          <form id="reload-form"><label for="candidate">加载候选</label><select id="candidate" name="candidate" aria-describedby="reload-hint"><option value="v1">v1 · 文本工具</option><option value="v2">v2 · 文本工具</option><option value="broken">broken · 失败回滚测试</option></select><button id="reload-btn" type="submit" class="secondary">重新编译并加载</button><p id="reload-hint" class="hint">选择当前候选即可重载磁盘源码。新插件就绪后才切换；失败则保留原插件。</p><p id="reload-feedback" class="feedback" role="status"></p><p id="error" class="notice error" role="alert" hidden></p></form>
+          <section class="retiring-section" aria-labelledby="retiring-title"><h3 id="retiring-title">等待旧代退出</h3><p class="hint">进行中的调用结束后，旧插件才会退出。</p><ul id="retiring" class="retiring-list"><li class="muted">等待后端状态。</li></ul></section>
+        </aside>
+      </div>
+      <section id="lifecycle" class="lifecycle" aria-labelledby="events-title"><div class="section-heading"><h2 id="events-title">生命周期事件</h2><span class="small-label">后端记录 · 最近 80 条 · 旧 → 新</span></div><ol id="events" class="event-list" aria-label="后端生命周期事件"><li class="empty">等待后端事件。</li></ol></section>
+      <footer>手动热重载 / 进程内状态 <span>页面刷新将清空本页调用历史</span></footer>
+      <noscript><p class="notice error">此工作台需要 JavaScript 才能调用本地 API。</p></noscript>
+    </main>
+  </div>
+</body>
+</html>
