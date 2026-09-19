@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Luna Agent · Core preview</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div><p class="eyebrow">LUNA / LOCAL KERNEL</p><h1>Luna Agent · Core preview</h1></div>
+    <div class="truth"><span class="dot" aria-hidden="true"></span>真实模型 · 单会话 · 未持久化</div>
+  </header>
+  <main>
+    <section class="workspace" aria-label="Chat workbench">
+      <div id="transcript" class="transcript" aria-live="polite">
+        <article class="message assistant"><span class="role">Luna</span><p>Ready. Ask a question or explicitly request <code>luna_text_transform</code>.</p></article>
+      </div>
+      <div id="run-status" class="run-status" role="status">Idle</div>
+      <form id="chat-form" class="composer">
+        <label for="message">Message</label>
+        <textarea id="message" maxlength="16384" rows="3" placeholder="Ask Luna to transform some text…" required></textarea>
+        <button id="send" type="submit">Run agent</button>
+      </form>
+    </section>
+    <aside class="inspector" aria-label="Runtime inspector">
+      <section><p class="eyebrow">RUNTIME</p><h2>Core state</h2><dl>
+        <div><dt>Model</dt><dd id="model">—</dd></div><div><dt>Provider</dt><dd id="provider">—</dd></div>
+        <div><dt>Host PID</dt><dd id="host-pid">—</dd></div><div><dt>Run</dt><dd id="busy">—</dd></div>
+      </dl></section>
+      <section><p class="eyebrow">ACTIVE TOOL PROCESS</p><dl>
+        <div><dt>Version</dt><dd id="plugin-version">—</dd></div><div><dt>Generation</dt><dd id="plugin-generation">—</dd></div><div><dt>Plugin PID</dt><dd id="plugin-pid">—</dd></div>
+      </dl>
+      <form id="reload-form" class="reload"><label for="candidate">Candidate</label><select id="candidate"><option>v1</option><option>v2</option><option>broken</option></select><button id="reload" type="submit">Reload</button></form>
+      <p id="reload-status" class="quiet" role="status"></p></section>
+      <section><p class="eyebrow">LIFECYCLE</p><ol id="events" class="events"></ol></section>
+    </aside>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>
