@@ -2,41 +2,113 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="dark">
-  <title>Luna Agent · Core preview</title>
+  <title>Luna</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <header class="topbar">
-    <div><p class="eyebrow">LUNA / LOCAL KERNEL</p><h1>Luna Agent · Core preview</h1></div>
-    <div class="truth"><span class="dot" aria-hidden="true"></span>真实模型 · 单会话 · 未持久化</div>
-  </header>
-  <main>
-    <section class="workspace" aria-label="Chat workbench">
-      <div id="transcript" class="transcript" aria-live="polite">
-        <article class="message assistant"><span class="role">Luna</span><p>Ready. Ask a question or explicitly request <code>luna_text_transform</code>.</p></article>
+  <div class="app-shell">
+    <header class="utility-header">
+      <div class="brand" aria-label="Luna">
+        <span class="luna-mark" aria-hidden="true"></span>
+        <span class="brand-name">Luna</span>
+        <span class="session-note">本地会话 · 不保存记录</span>
       </div>
-      <div id="run-status" class="run-status" role="status">Idle</div>
-      <form id="chat-form" class="composer">
-        <label for="message">Message</label>
-        <textarea id="message" maxlength="16384" rows="3" placeholder="Ask Luna to transform some text…" required></textarea>
-        <button id="send" type="submit">Run agent</button>
-      </form>
-    </section>
-    <aside class="inspector" aria-label="Runtime inspector">
-      <section><p class="eyebrow">RUNTIME</p><h2>Core state</h2><dl>
-        <div><dt>Model</dt><dd id="model">—</dd></div><div><dt>Provider</dt><dd id="provider">—</dd></div>
-        <div><dt>Host PID</dt><dd id="host-pid">—</dd></div><div><dt>Run</dt><dd id="busy">—</dd></div>
-      </dl></section>
-      <section><p class="eyebrow">ACTIVE TOOL PROCESS</p><dl>
-        <div><dt>Version</dt><dd id="plugin-version">—</dd></div><div><dt>Generation</dt><dd id="plugin-generation">—</dd></div><div><dt>Plugin PID</dt><dd id="plugin-pid">—</dd></div>
-      </dl>
-      <form id="reload-form" class="reload"><label for="candidate">Candidate</label><select id="candidate"><option>v1</option><option>v2</option><option>broken</option></select><button id="reload" type="submit">Reload</button></form>
-      <p id="reload-status" class="quiet" role="status"></p></section>
-      <section><p class="eyebrow">LIFECYCLE</p><ol id="events" class="events"></ol></section>
-    </aside>
-  </main>
+      <div class="runtime-actions">
+        <span id="runtime-brief" class="runtime-brief"><span class="state-dot" aria-hidden="true"></span>正在确认</span>
+        <button id="runtime-toggle" class="quiet-button" type="button" aria-expanded="false" aria-controls="runtime-drawer">运行详情</button>
+      </div>
+    </header>
+
+    <main id="app-content" class="chat-pane">
+      <div id="transcript" class="transcript" tabindex="0" aria-label="对话记录">
+        <div class="transcript-content">
+          <section id="empty-state" class="empty-state" aria-labelledby="empty-title">
+            <h1 id="empty-title">有什么想一起看看？</h1>
+            <p>把问题或想处理的文字发给 Luna。内容仅用于当前本地会话，刷新后不会保留。</p>
+          </section>
+          <div id="conversation" class="conversation"></div>
+        </div>
+      </div>
+
+      <button id="latest" class="latest-button" type="button" hidden>回到最新</button>
+      <div id="run-status" class="run-status" role="status" hidden></div>
+
+      <div class="composer-shell">
+        <form id="chat-form" class="composer">
+          <label class="sr-only" for="message">消息</label>
+          <textarea id="message" maxlength="16384" rows="1" placeholder="给 Luna 发消息…" required></textarea>
+          <button id="send" class="send-button" type="submit">发送</button>
+        </form>
+        <p class="composer-hint">Enter 发送 · Shift + Enter 换行</p>
+      </div>
+    </main>
+  </div>
+
+  <div id="runtime-backdrop" class="drawer-backdrop" hidden></div>
+  <aside id="runtime-drawer" class="runtime-drawer" role="dialog" aria-modal="true" aria-labelledby="runtime-title" hidden>
+    <header class="drawer-header">
+      <div>
+        <h2 id="runtime-title">运行详情</h2>
+      </div>
+      <button id="runtime-close" class="icon-button" type="button" aria-label="关闭运行详情">关闭</button>
+    </header>
+
+    <div class="drawer-body">
+      <p id="runtime-availability" class="availability" role="status">正在读取本地运行状态…</p>
+
+      <section class="drawer-section" aria-labelledby="runtime-section-title">
+        <h3 id="runtime-section-title">运行</h3>
+        <dl class="fact-list">
+          <div><dt>模型</dt><dd id="model">—</dd></div>
+          <div><dt>提供方</dt><dd id="provider">—</dd></div>
+          <div><dt>主进程 PID</dt><dd id="host-pid">—</dd></div>
+          <div><dt>会话状态</dt><dd id="busy">—</dd></div>
+        </dl>
+      </section>
+
+      <section class="drawer-section" aria-labelledby="transformer-title">
+        <h3 id="transformer-title">文本转换器</h3>
+        <dl class="fact-list">
+          <div><dt>当前版本</dt><dd id="plugin-version">—</dd></div>
+          <div><dt>Generation</dt><dd id="plugin-generation">—</dd></div>
+          <div><dt>插件 PID</dt><dd id="plugin-pid">—</dd></div>
+        </dl>
+      </section>
+
+      <section class="drawer-section" aria-labelledby="reload-title">
+        <div class="section-heading">
+          <h3 id="reload-title">高级：重新载入</h3>
+          <span>验证后切换</span>
+        </div>
+        <form id="reload-form" class="reload-form">
+          <label for="candidate">候选版本</label>
+          <div class="reload-controls">
+            <select id="candidate">
+              <option value="v1">稳定版本 v1</option>
+              <option value="v2">候选版本 v2</option>
+              <option value="broken">故障演练 broken</option>
+            </select>
+            <button id="reload" type="submit">验证并启用</button>
+          </div>
+        </form>
+        <p id="reload-status" class="reload-status" role="status"></p>
+        <details id="reload-technical" class="technical-detail" hidden>
+          <summary>技术详情</summary>
+          <pre id="reload-error"></pre>
+        </details>
+      </section>
+
+      <section class="drawer-section lifecycle-section">
+        <details class="lifecycle-detail">
+          <summary>生命周期</summary>
+          <ol id="events" class="events"></ol>
+        </details>
+      </section>
+    </div>
+  </aside>
+
   <script src="/app.js" defer></script>
 </body>
 </html>
