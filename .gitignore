@@ -1,0 +1,7 @@
+# Generated binaries for the root app and historical spikes.
+**/.runtime/
+
+# Local-only verification evidence and captured logs.
+**/.evidence/
+**/local-evidence/
+**/*.log
