@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -45,9 +46,8 @@ func TestToolWrapperEmitsStartedThenFinishedWithActualMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var result pluginhost.Output
-	if err := json.Unmarshal([]byte(got), &result); err != nil {
-		t.Fatal(err)
+	if got != "trimmed" {
+		t.Fatalf("model-visible output must be the plain plugin result, got %q", got)
 	}
 	if len(sink.events) != 2 || sink.events[0].Type != "tool.started" || sink.events[1].Type != "tool.finished" {
 		t.Fatalf("event order: %+v", sink.events)
@@ -55,6 +55,34 @@ func TestToolWrapperEmitsStartedThenFinishedWithActualMetadata(t *testing.T) {
 	finished := sink.events[1].Data.(ToolFinished)
 	if finished.Generation != 7 || finished.Version != "v2" || finished.PluginPID != 42 || finished.Result != "trimmed" {
 		t.Fatalf("bad finished payload: %+v", finished)
+	}
+}
+
+func TestToolHandsOnlyTheTransformedTextToTheModel(t *testing.T) {
+	sink := &collectingSink{}
+	ctx := WithRun(context.Background(), "run-1", sink)
+	tool := NewTextTransformTool(fakeInvoker{out: pluginhost.Output{Result: "trimmed text", Generation: 7, Version: "v2", PluginPID: 42}})
+	got, err := tool.InvokableRun(ctx, `{"text":" hi "}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "trimmed text" {
+		t.Fatalf("model-visible tool output must be the plain plugin result, got %q", got)
+	}
+	for _, leak := range []string{"42", "v2", "Generation", "generation", "PluginPID", "plugin_pid", "PID"} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("model-visible tool output leaked plugin identity %q: %q", leak, got)
+		}
+	}
+	if len(sink.events) != 2 {
+		t.Fatalf("event count: %+v", sink.events)
+	}
+	finished, ok := sink.events[1].Data.(ToolFinished)
+	if !ok {
+		t.Fatalf("unexpected event payload: %#v", sink.events[1].Data)
+	}
+	if finished.Generation != 7 || finished.Version != "v2" || finished.PluginPID != 42 || finished.Result != "trimmed text" {
+		t.Fatalf("plugin identity must stay exact in the UI event: %+v", finished)
 	}
 }
 

@@ -131,8 +131,10 @@ func (t *TextTransformTool) InvokableRun(ctx context.Context, arguments string, 
 		return "", err
 	}
 	emit(ctx, Event{Type: "tool.finished", Data: ToolFinished{RunID: runID(ctx), Name: ToolName, Result: out.Result, Generation: out.Generation, Version: out.Version, PluginPID: out.PluginPID}})
-	b, _ := json.Marshal(out)
-	return string(b), nil
+	// Only the transformed text is model-visible. Plugin generation, version and
+	// process identity stay in the event stream for the UI, so they cannot reach
+	// a user-facing answer through the model's context.
+	return out.Result, nil
 }
 
 // toolInfo fixes the exact public schema after construction.
