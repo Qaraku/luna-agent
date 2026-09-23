@@ -232,7 +232,7 @@ func newNonStreamingTestRunner(t *testing.T, m model.ToolCallingChatModel, invok
 		Name:          "luna-test",
 		Instruction:   instruction,
 		Model:         m,
-		ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: []tool.BaseTool{NewTextTransformTool(invoker), NewReadFileTool(&recordingReader{})}}},
+		ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: []tool.BaseTool{NewTextTransformTool(invoker), NewReadFileTool(&recordingReader{}), NewRememberTool(nil)}}},
 		MaxIterations: 6,
 	})
 	if err != nil {
@@ -353,13 +353,18 @@ func TestRunnerExecutesMultipleToolCallsSequentially(t *testing.T) {
 
 type fakeModel struct{}
 
-// The core registers both allowlisted tools, and nothing else.
+// The core registers every model-visible tool itself: the two plugin-backed
+// wrappers and the host-native memory tool, and nothing else. This Eino version
+// passes the tool list to the model as a model option rather than calling this
+// method, so the live observation of the offered tool set lives in
+// TestTheModelSeesThreeToolsAndOnlyTheMemoryToolWrites; this stays as the
+// contract for a version that does call it.
 func (fakeModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
 	names := make([]string, 0, len(tools))
 	for _, t := range tools {
 		names = append(names, t.Name)
 	}
-	if len(names) != 2 || names[0] != "luna_text_transform" || names[1] != "luna_read_file" {
+	if len(names) != 3 || names[0] != "luna_text_transform" || names[1] != "luna_read_file" || names[2] != RememberToolName {
 		return nil, io.ErrUnexpectedEOF
 	}
 	return fakeModel{}, nil

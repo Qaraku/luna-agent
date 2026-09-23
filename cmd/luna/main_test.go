@@ -210,6 +210,30 @@ func TestSessionsDirPrefersExplicitValue(t *testing.T) {
 	}
 }
 
+func TestMemoryFileDefaultsUnderRoot(t *testing.T) {
+	got := memoryFile("/repo", "")
+	want := filepath.Join("/repo", ".runtime", "memory.jsonl")
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestMemoryFilePrefersExplicitValue(t *testing.T) {
+	got := memoryFile("/repo", "/elsewhere/memory.jsonl")
+	if got != "/elsewhere/memory.jsonl" {
+		t.Fatalf("got %q, want the explicit value", got)
+	}
+}
+
+// The default memory file sits next to the session directory, both under the
+// git-ignored .runtime/, so neither is a repository artifact.
+func TestMemoryAndSessionsShareTheRuntimeDirectory(t *testing.T) {
+	root := "/repo"
+	if filepath.Dir(memoryFile(root, "")) != filepath.Dir(sessionsDir(root, "")) {
+		t.Fatalf("memory %q and sessions %q do not share a directory", memoryFile(root, ""), sessionsDir(root, ""))
+	}
+}
+
 func TestWorkingDirOrEmptyWhenDirectoryIsRemoved(t *testing.T) {
 	original, err := os.Getwd()
 	if err != nil {

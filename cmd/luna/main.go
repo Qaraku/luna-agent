@@ -18,6 +18,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/agent"
 	"github.com/Qaraku/luna-agent/internal/config"
 	"github.com/Qaraku/luna-agent/internal/httpapi"
+	"github.com/Qaraku/luna-agent/internal/memory"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/Qaraku/luna-agent/internal/store"
 )
@@ -97,12 +98,23 @@ func sessionsDir(root, explicit string) string {
 	return filepath.Join(root, ".runtime", "sessions")
 }
 
+// memoryFile resolves the append-only memory file, the same way: an explicit
+// path wins, otherwise the file lives under the resolved root next to the
+// sessions.
+func memoryFile(root, explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return filepath.Join(root, ".runtime", "memory.jsonl")
+}
+
 func run() error {
 	addr := flag.String("addr", "127.0.0.1:0", "literal loopback listen address")
 	rootFlag := flag.String("root", "", "repository root holding web/ and plugins/ (default: auto-detect)")
 	readRoot := flag.String("read-root", "", "directory luna_read_file may read inside (default: the resolved root)")
 	readLimit := flag.Int("read-limit", 0, "single-read cap in bytes for luna_read_file (default: 262144)")
 	sessionsFlag := flag.String("sessions-dir", "", "directory holding the append-only session files (default: <root>/.runtime/sessions/)")
+	memoryFlag := flag.String("memory-file", "", "file holding the append-only memory facts (default: <root>/.runtime/memory.jsonl)")
 	flag.Parse()
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
@@ -120,6 +132,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("open session store: %w", err)
 	}
+	// Memory is core state, not a plugin: the tool that writes it and the
+	// injection that reads it both live in the core, backed by this file.
+	facts, err := memory.Open(memoryFile(root, *memoryFlag))
+	if err != nil {
+		return fmt.Errorf("open memory store: %w", err)
+	}
 	listener, err := httpapi.Listen(*addr)
 	if err != nil {
 		return err
@@ -134,8 +152,10 @@ func run() error {
 	}
 	defer plugins.Close()
 	// The store is both sides of the conversation: history is read from it and
-	// the transcript of every run is appended to it.
-	runner, err := agent.NewOpenAIRunner(ctx, cfg, plugins, plugins, agent.WithHistory(sessions), agent.WithTranscript(sessions))
+	// the transcript of every run is appended to it. The same pattern holds for
+	// memory, whose read side is the system prompt and whose write side is the
+	// host-native luna_remember tool.
+	runner, err := agent.NewOpenAIRunner(ctx, cfg, plugins, plugins, agent.WithHistory(sessions), agent.WithTranscript(sessions), agent.WithMemory(facts))
 	if err != nil {
 		return fmt.Errorf("construct Eino agent: %w", err)
 	}
