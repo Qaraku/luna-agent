@@ -2,46 +2,41 @@
 
 ## Destination
 
-`v0.1.0` publishes the existing kernel slice as a public repository: a Go agent kernel with a real
-out-of-process tool plugin, verified hot reload, and a local browser workbench. The release is a
-portability and presentation pass. It adds no new agent capability.
+`v1.0.0` turns the `v0.1.0` kernel slice into a local agent worth using every day: more than one real
+tool, conversations that survive a restart, an explicit context strategy, and a browser front end
+that can be extended at runtime.
 
-Feature expansion is deferred until after `v0.1.0` ships.
+`v0.1.0` shipped first as a portability and presentation pass that added no agent capability. It is
+tagged and released, so this roadmap no longer tracks it.
 
-## v0.1.0 scope
+## v1.0.0 scope
 
-### Blocking work
-
-| # | Item | Why it blocks the release | Acceptance |
+| Slice | Content | Depends on | Status |
 |---|---|---|---|
-| 1 | Module path | `module luna-agent` is not a fetchable path, so nobody can `go get` it and the repo cannot be the source of truth for its own imports | Every import reads `github.com/Qaraku/luna-agent/...` and `go build ./...` passes |
-| 2 | Start from any directory | `rootFromExecutable` assumes the binary sits at `<repo>/.runtime/luna`; `go run ./cmd/luna` resolves the root to a temporary build directory, so `plugins/` and `web/` are not found and the app cannot start | A clean clone starts with `go run ./cmd/luna`, serves `web/`, and builds plugin candidates |
-| 3 | `LICENSE` | Without a license the code is all-rights-reserved by default and nobody may legally reuse it | MIT license at the repository root |
-| 4 | Visitor-facing `README` | The current README is an internal tour of a slice; a visitor needs the problem, the design, and the quick start | Motivation, architecture diagram, quick start, verification summary |
-| 5 | CI | A clean checkout must be provably green without the author's machine | `go test -race`, `go vet`, `go build`, `node --test` run on push |
-| 6 | Host paths in documents | `README.md` and two `spikes/` documents embed `/home/j/...`, which is meaningless to a visitor and needlessly identifying | No absolute host path in tracked text files |
-| 7 | Release | There must be a version to point at | `v0.1.0` tag with release notes |
+| S1 | A second tool plugin: bounded file reading | — | on `main` |
+| S2 | Persistent sessions and run history | — | not started |
+| S3 | Context and memory strategy | S2 | not started |
+| S4 | Runtime UI plugin loading | — | not started |
 
-### Pre-publish checks
+### Slice acceptance
 
-- Every gate in `AGENTS.md` passes.
-- A clean clone into a temporary directory starts, serves the UI, and survives a plugin reload.
-- A secret scan over tracked files finds no credential material.
-- No tracked build artifact, evidence directory, or captured log.
+- **S1** — a second model-visible tool, `luna_read_file`, bounded by a read root: absolute paths,
+  traversal, escapes outside the root, and symlink escapes are rejected on the host side; there is a
+  single-read size cap; only text is returned. The allowlist holds two tools, and reload,
+  generation pinning, drain and rollback all work for both of them.
+- **S2** — conversations and run records survive a process restart and a page reload.
+- **S3** — the rules that decide what enters the model's context are explicit and unit-tested.
+- **S4** — front-end contribution points register, mount, unmount, and release their resources.
 
-### Explicitly out of scope for v0.1.0
+## How this is being built
 
-The `docs/architecture.md` non-goals still apply: multi-agent orchestration, persistent
-conversations, durable run history, long-term memory, arbitrary shell/filesystem/network tools,
-runtime UI plugins, a plugin marketplace, production authentication, and public deployment.
+One slice at a time. Each slice is verified by compilation plus focused unit tests; end-to-end
+verification against a live provider happens once, at the `v1.0.0` boundary. An unreleased
+intermediate slice that fails end to end is corrected by the slices that follow it rather than by
+stopping the line.
 
-## After v0.1.0
+## Non-goals for v1.0.0
 
-Candidates, none committed. Each needs its own spec before implementation.
-
-| Candidate | Value | Cost |
-|---|---|---|
-| Persistent sessions and run history | Turns the workbench from a demo into something usable daily | Durable store, restart semantics, migration policy |
-| A second and third tool plugin | Proves the plugin boundary is a real extension point rather than one hard-coded case | Tool schema ownership, per-tool authorization |
-| Context and memory strategy | The largest lever on answer quality | Retrieval design, privacy boundary |
-| Runtime UI plugin loading | Completes the "everything is a plugin" principle on the front end | Registration, mount, unmount, resource cleanup protocols |
+Multi-agent orchestration, arbitrary shell execution, unbounded filesystem access, a plugin
+marketplace, production authentication, tenant isolation, public deployment, cross-origin API
+access, hidden reasoning capture, and retries that could duplicate model or tool effects.

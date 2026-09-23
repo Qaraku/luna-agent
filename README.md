@@ -19,25 +19,30 @@ flowchart LR
     subgraph Host["Luna host process"]
         API["internal/httpapi<br/>loopback HTTP + SSE"]
         Agent["internal/agent<br/>Eino ChatModelAgent"]
-        PH["internal/pluginhost<br/>generation pinning"]
+        PH["internal/pluginhost<br/>per-tool generation pinning"]
     end
 
-    subgraph Plugins["Tool plugin subprocess"]
-        V1["plugins/v1"]
-        V2["plugins/v2"]
+    subgraph Plugins["Tool plugin subprocesses"]
+        T1["luna_text_transform · v1"]
+        R1["luna_read_file · v1"]
+        C["candidate build · v2 for every tool"]
     end
 
     UI <-->|"app-owned events"| API
     API --> Agent
     Agent -->|"luna_text_transform"| PH
-    PH -->|"net/rpc"| V1
-    PH -.->|"build + handshake, then publish"| V2
+    Agent -->|"luna_read_file"| PH
+    PH -->|"net/rpc"| T1
+    PH -->|"net/rpc"| R1
+    PH -.->|"build + handshake, then publish"| C
 ```
+
+Plugin sources live at `plugins/<tool>/<candidate>/`, so both the tool and the candidate are part of the path the core compiles.
 
 Each layer has one owner and an explicit contract:
 
 1. **The Go core** owns runs, cancellation, budgets, plugin lifecycle, and the event stream. Eino types never cross the HTTP boundary.
-2. **The plugin process** owns one tool implementation. It receives only the environment it needs, never the model credentials.
+2. **Each plugin process** owns one tool implementation. It receives only the environment it needs, never the model credentials.
 3. **The browser UI** observes and controls the core through a small app-owned HTTP/SSE contract. Model output, tool arguments, and tool results reach the DOM only through `createElement` / `textContent`.
 
 See [docs/architecture.md](docs/architecture.md) for ownership and reload semantics, and [docs/roadmap.md](docs/roadmap.md) for scope.
@@ -46,15 +51,18 @@ See [docs/architecture.md](docs/architecture.md) for ownership and reload semant
 
 - An Eino `ChatModelAgent` named `luna` with automatic tool choice, a six-iteration ceiling, and sequential execution when one model turn contains multiple tool calls.
 - OpenAI-compatible configuration read only from the process environment.
-- One model-visible tool, `luna_text_transform`, backed by an allowlisted subprocess candidate:
+- Two model-visible tools, each backed by an allowlisted subprocess candidate. Every tool uses the same `v1` / `v2` / `broken` vocabulary, so a replacement has one shape whatever the tool does:
 
-  | Candidate | `Invoke` returns |
-  |---|---|
-  | `v1` | the input with surrounding whitespace trimmed |
-  | `v2` | trimmed, uppercased, prefixed with `Luna · ` |
-  | `broken` | refuses the plugin handshake, so rollback is observable |
+  | Tool | `v1` returns | `v2` returns |
+  |---|---|---|
+  | `luna_text_transform` | the input with surrounding whitespace trimmed | trimmed, uppercased, prefixed with `Luna · ` |
+  | `luna_read_file` | the text of a host-validated file inside the read root | the same text with `CRLF` and lone `CR` normalized to `LF` |
 
-- Validated hot reload: build, start, handshake, and metadata checks all complete before a new generation is published. In-flight calls stay pinned to their original generation until it drains.
+  `broken` refuses the plugin handshake for every tool, so a failed replacement stays observable on all of them.
+
+- `luna_read_file` is the only filesystem capability, and it is bounded: the host normalizes the requested path, rejects absolute paths and `..` escapes, resolves symbolic links, and refuses anything that is not still inside the read root; a single read above the 256 KiB cap is refused with an explicit error instead of being truncated, and content with a NUL byte is refused as binary. The plugin receives an already-validated absolute path plus the cap and never interprets a path itself. The read root defaults to the resolved repository root and can be pointed elsewhere with `-read-root`.
+
+- Validated hot reload: build, start, handshake, and metadata checks all complete for every allowlisted tool before the new generations are published together. In-flight calls stay pinned to their original generation until it drains.
 - A loopback-only HTTP service with guarded mutation origins, bounded request bodies, and a default 60-second whole-run context deadline.
 - Public, app-owned SSE events instead of Eino or plugin RPC structs, with exactly one terminal event per writable stream.
 
@@ -106,18 +114,18 @@ Startup errors name the missing variable but never print its value.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/healthz` | Configuration and plugin readiness; implies no provider call |
-| `GET` | `/api/state` | Bounded runtime state: model name, provider host, host and plugin PIDs, generations, busy flag, lifecycle events. No API key |
-| `POST` | `/api/reload` | `{"candidate":"v1\|v2\|broken"}` — validated replacement, or a rollback-preserving error |
+| `GET` | `/healthz` | Configuration readiness plus an active generation for every allowlisted tool; implies no provider call |
+| `GET` | `/api/state` | Bounded runtime state: model name, provider host, host PID, one plugin record per tool (tool name, candidate, version, generation, plugin PID, status, in-flight calls), busy flag, lifecycle events. No API key |
+| `POST` | `/api/reload` | `{"candidate":"v1\|v2\|broken"}` — builds and validates the candidate for every allowlisted tool, then publishes them as one generation, or fails leaving every tool on its previous generation |
 | `POST` | `/api/runs` | `{"message":"..."}` — `text/event-stream` response using the event types in [docs/architecture.md](docs/architecture.md) |
 
 Mutation requests must come from the exact bound browser origin. There is no CORS support and no public-network mode.
 
 ## Observing a hot reload
 
-1. Send a message and confirm the tool result comes back as `moon light`.
-2. `POST /api/reload` with `{"candidate":"v2"}`. The next run returns `Luna · MOON LIGHT` from a new generation and a new plugin PID.
-3. `POST /api/reload` with `{"candidate":"broken"}`. The reload fails and `v2` keeps serving.
+1. Ask Luna to transform text and confirm the tool result comes back as `moon light`; ask it to read a file inside the read root and confirm the file text comes back. The runtime drawer lists one row per tool, each with its own version, generation and plugin PID.
+2. `POST /api/reload` with `{"candidate":"v2"}`. Both tools move to a new generation with new plugin PIDs: the next transform returns `Luna · MOON LIGHT`, and a file whose lines end in `CRLF` comes back with `LF`.
+3. `POST /api/reload` with `{"candidate":"broken"}`. The reload fails and both tools keep serving `v2`, because a candidate is published for every tool or for none.
 
 Assert on the tool result rather than on model prose: the tool result identifies the serving generation deterministically.
 
@@ -133,7 +141,7 @@ node --check web/app.js
 node --test web/app.test.cjs
 ```
 
-The Node suite reports 8 passing tests. Go unit and integration coverage includes configuration alias handling, real subprocess replacement and draining, broken-candidate rollback, RPC timeout termination, strict tool schema and trailing-JSON rejection, sequential tool execution, suppression of assistant text from tool-call turns, deterministic fake-model Eino event mapping, whole-run timeout and cancellation cleanup, exactly-one SSE terminal semantics, and HTTP guards. A focused post-disconnect race regression also passed 50 repeated race-detector runs.
+The Node suite reports 13 passing tests. Go unit and integration coverage includes configuration alias handling, one process per allowlisted tool, real subprocess replacement and draining, broken-candidate rollback with the active generation kept serving, RPC timeout termination, host-side file-read path validation (absolute paths, `..` escapes, symlink escape, non-regular files, the size cap and binary content), strict tool schemas and trailing-JSON rejection, sequential tool execution, suppression of assistant text from tool-call turns, deterministic fake-model Eino event mapping, whole-run timeout and cancellation cleanup, exactly-one SSE terminal semantics, and HTTP guards. A focused post-disconnect race regression also passed 50 repeated race-detector runs.
 
 Separate end-to-end validation completed the checks that deterministic tests cannot provide:
 
@@ -142,6 +150,8 @@ Separate end-to-end validation completed the checks that deterministic tests can
 - Desktop Preview independently opened the running loopback application and read visible model, provider, host, and plugin metadata.
 - A clean copy of the tree started with `go run ./cmd/luna` from a temporary directory, served the UI, and published plugin generation 1.
 - A final independent review found no security concerns or logic errors.
+
+The live-provider, headless-Chromium, Desktop Preview and clean-checkout checks above were captured for the one-tool kernel. The two-tool change re-ran the Go race, vet, root-build, Go-format, Node syntax and Node test gates listed at the top of this section; it did not re-run a live provider or a real browser.
 
 No API key appeared in the retained verification evidence. These results are point-in-time evidence for the tested provider and headless Chromium path, not a production-readiness claim, a compatibility guarantee for every OpenAI-compatible provider, or a complete accessibility/cross-browser audit.
 
@@ -153,7 +163,7 @@ The spike is a separate Go module and historical evidence. The root application 
 
 ## Boundaries
 
-The slice deliberately excludes multi-agent orchestration, persistent conversations, durable run history, long-term memory, arbitrary shell/filesystem/network tools, browser-supplied plugin code or paths, runtime UI plugins, a plugin marketplace, production authentication, tenant isolation, public deployment, cross-origin API access, hidden reasoning capture, retries that could duplicate model or tool effects, and a public cancellation API.
+The slice deliberately excludes multi-agent orchestration, persistent conversations, durable run history, long-term memory, arbitrary shell or network tools, filesystem access beyond the bounded read-only `luna_read_file`, browser-supplied plugin code or paths, runtime UI plugins, a plugin marketplace, production authentication, tenant isolation, public deployment, cross-origin API access, hidden reasoning capture, retries that could duplicate model or tool effects, and a public cancellation API.
 
 ## License
 
