@@ -74,6 +74,187 @@ function reloadCopy(state, candidate, technical = '') {
   return { summary: `无法启用 ${candidate}，当前版本保持不变。`, technical };
 }
 
+// --- Sessions -------------------------------------------------------------
+
+// The current session lives in the URL hash and never in browser storage: a
+// refresh restores it, a second tab starts a session of its own, and the link
+// can be copied. A fragment is accepted only when it looks like a session id —
+// the store's charset is lowercase alphanumeric, 8 to 64 characters — so a
+// hand-edited or stale link is ignored instead of being sent as a request that
+// could only come back 400.
+function isSessionID(value) {
+  return typeof value === 'string' && /^[0-9a-z]{8,64}$/.test(value);
+}
+
+function parseSessionHash(hash) {
+  for (const part of String(hash ?? '').replace(/^#/, '').split('&')) {
+    const separator = part.indexOf('=');
+    if (separator < 0 || part.slice(0, separator) !== 'session') continue;
+    const value = part.slice(separator + 1);
+    return isSessionID(value) ? value : '';
+  }
+  return '';
+}
+
+function sessionHash(id) {
+  return isSessionID(id) ? `#session=${id}` : '';
+}
+
+// A stored title is the first message of the session, cut to 80 runes by the
+// store. An absent or blank one is labelled rather than rendered as a blank
+// row.
+function sessionTitle(value) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  return text || '未命名会话';
+}
+
+// Timestamps are rendered exactly as the server wrote them (RFC 3339 carrying
+// its own offset) instead of through the browser's timezone, so a stored time
+// is never silently rewritten. A value that cannot be read is shown as missing.
+function sessionTime(value) {
+  const match = typeof value === 'string' ? value.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/) : null;
+  return match ? `${match[1]} ${match[2]}` : '—';
+}
+
+function runCountLabel(value) {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) return '运行次数未知';
+  return value === 0 ? '尚无运行' : `${value} 次运行`;
+}
+
+function runStatusLabel(status) {
+  return {
+    ok: '这次运行已完成',
+    error: '这次运行失败了',
+    cancelled: '这次运行被取消',
+    interrupted: '这次运行中断了'
+  }[status] || '这次运行的结果未知';
+}
+
+// sessionRows turns GET /api/sessions into display rows, in the order the
+// server returned them (newest first; nothing is re-sorted here). A record
+// without a usable id cannot be switched to, so it is dropped rather than
+// rendered as a dead row, while a record with an id but missing fields is
+// still listed and labelled honestly.
+function sessionRows(payload, currentID) {
+  const list = payload && typeof payload === 'object' && Array.isArray(payload.sessions) ? payload.sessions : [];
+  const rows = [];
+  for (const entry of list) {
+    const record = entry && typeof entry === 'object' ? entry : {};
+    if (!isSessionID(record.id)) continue;
+    rows.push({
+      id: record.id,
+      shortId: record.id.slice(0, 8),
+      title: sessionTitle(record.title),
+      time: sessionTime(record.updated_at),
+      runs: runCountLabel(record.run_count),
+      current: record.id === currentID
+    });
+  }
+  return rows;
+}
+
+// Replay shows the frozen record facts and nothing else. The store has no field
+// for plugin generation, version or process id, so a replayed tool call cannot
+// show an execution identity and must not invent one.
+function argumentsText(raw) {
+  const text = typeof raw === 'string' ? raw : '';
+  if (!text.trim()) return '—';
+  try {
+    return JSON.stringify(JSON.parse(text), null, 2);
+  } catch (_) {
+    return text;
+  }
+}
+
+function toolCallFacts(record) {
+  const item = record && typeof record === 'object' ? record : {};
+  const error = typeof item.error === 'string' ? item.error : '';
+  const facts = [
+    { label: '工具', value: valueOrDash(item.name) },
+    { label: '参数', value: argumentsText(item.arguments) }
+  ];
+  if (error) facts.push({ label: '错误', value: error });
+  else facts.push({ label: '结果', value: typeof item.result === 'string' ? item.result : valueOrDash(item.result) });
+  return facts;
+}
+
+// replaySession turns GET /api/sessions/{id} into an ordered draw list. Records
+// are replayed in file order, so the area shows what is on disk: a user message
+// opens a turn, tool calls attach to the assistant turn that answers it, and
+// the run record closes it. The `session` record is the file's own header and
+// carries no conversation. Nothing is guessed: a record type, a role or a run
+// that is not part of the frozen vocabulary is counted and reported, and a run
+// that ended without leaving a turn still says so in its own words.
+function replaySession(detail) {
+  const payload = detail && typeof detail === 'object' ? detail : {};
+  const records = Array.isArray(payload.records) ? payload.records : [];
+  const turns = [];
+  const notices = [];
+  let open = null;
+  let unknown = 0;
+  const openAssistant = () => {
+    open = { role: 'assistant', answer: '', tools: [], status: '', failed: false };
+    turns.push(open);
+    return open;
+  };
+  for (const entry of records) {
+    const record = entry && typeof entry === 'object' ? entry : null;
+    if (!record) {
+      unknown += 1;
+      continue;
+    }
+    if (record.type === 'session') continue;
+    if (record.type === 'message') {
+      const text = typeof record.text === 'string' ? record.text : '';
+      if (record.role === 'user') {
+        turns.push({ role: 'user', text });
+        open = null;
+      } else if (record.role === 'assistant') {
+        (open || openAssistant()).answer += text;
+      } else {
+        unknown += 1;
+      }
+      continue;
+    }
+    if (record.type === 'tool_call') {
+      const error = typeof record.error === 'string' ? record.error : '';
+      (open || openAssistant()).tools.push({
+        name: record.name,
+        arguments: record.arguments,
+        result: record.result,
+        error,
+        failed: error !== ''
+      });
+      continue;
+    }
+    if (record.type === 'run') {
+      const status = typeof record.status === 'string' ? record.status : '';
+      const failed = status !== '' && status !== 'ok';
+      if (open) {
+        open.status = status;
+        open.failed = failed;
+        open = null;
+      } else if (failed) {
+        turns.push({ role: 'note', text: runStatusLabel(status) });
+      }
+      continue;
+    }
+    unknown += 1;
+  }
+  if (payload.truncated === true) notices.push('这个会话的最后一行没有写完，已按可读的部分回放。');
+  if (unknown > 0) notices.push(`有 ${unknown} 条记录无法识别，未回放。`);
+  return { title: sessionTitle(payload.title), truncated: payload.truncated === true, turns, notices };
+}
+
+// The run body carries the current session when there is one, so the turn
+// continues that session's history; a session that does not exist yet sends no
+// session_id at all and lets the server create it and name it on run.started.
+function runPayload(message, sessionID) {
+  const payload = { message };
+  if (isSessionID(sessionID)) payload.session_id = sessionID;
+  return payload;
+}
+
 function parseInline(text) {
   const source = String(text ?? '');
   const runs = [];
@@ -169,7 +350,7 @@ function parseMarkdownBlocks(markdown) {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { parseEventBlock, toolSummary, toolLabel, toolActivityLabel, candidateLabel, reloadCopy, valueOrDash, pluginStatusLabel, pluginRows, parseInline, parseMarkdownBlocks };
+  module.exports = { parseEventBlock, toolSummary, toolLabel, toolActivityLabel, candidateLabel, reloadCopy, valueOrDash, pluginStatusLabel, pluginRows, parseInline, parseMarkdownBlocks, isSessionID, parseSessionHash, sessionHash, sessionTitle, sessionTime, runCountLabel, runStatusLabel, sessionRows, argumentsText, toolCallFacts, replaySession, runPayload };
 }
 
 if (typeof document !== 'undefined') {
@@ -194,6 +375,10 @@ if (typeof document !== 'undefined') {
   const reloadStatus = $('reload-status');
   const reloadTechnical = $('reload-technical');
   const reloadError = $('reload-error');
+  const sessionList = $('session-list');
+  const sessionNew = $('session-new');
+  const sessionStatus = $('session-status');
+  const sessionNotices = $('session-notices');
 
   let running = false;
   let reloading = false;
@@ -201,6 +386,11 @@ if (typeof document !== 'undefined') {
   let openTools = [];
   let lastFocused = null;
   let drawerTimer = null;
+  // switching guards a session replay in flight; sessionsPayload is the last
+  // good list, so a busy flag can re-render the rows without a second request.
+  let switching = false;
+  let sessionsPayload = null;
+  let currentSessionID = '';
 
   function make(tag, className, text) {
     const node = document.createElement(tag);
@@ -261,28 +451,39 @@ if (typeof document !== 'undefined') {
     emptyState.hidden = true;
   }
 
-  function addUserTurn(text) {
-    const stick = nearBottom();
-    hideEmptyState();
+  function userTurnNode(text) {
     const turn = make('article', 'turn user');
     turn.setAttribute('aria-label', '你');
     turn.append(make('div', 'turn-content', text));
-    conversation.append(turn);
+    return turn;
+  }
+
+  function addUserTurn(text) {
+    const stick = nearBottom();
+    hideEmptyState();
+    conversation.append(userTurnNode(text));
     contentChanged(stick);
+  }
+
+  // The three parts of an assistant turn are built in one place so a live turn
+  // and a replayed one are the same DOM shape.
+  function assistantTurnNode() {
+    const turn = make('article', 'turn assistant');
+    turn.setAttribute('aria-label', 'Luna');
+    turn.append(make('span', 'assistant-label', 'Luna'));
+    const tools = make('div', 'tool-list');
+    const body = make('div', 'assistant-body placeholder', 'Luna 正在回应…');
+    turn.append(tools, body);
+    return { turn, tools, body };
   }
 
   function addAssistantTurn(message) {
     const stick = nearBottom();
     hideEmptyState();
-    const turn = make('article', 'turn assistant');
-    turn.setAttribute('aria-label', 'Luna');
-    const label = make('span', 'assistant-label', 'Luna');
-    const tools = make('div', 'tool-list');
-    const body = make('div', 'assistant-body placeholder', 'Luna 正在回应…');
-    turn.append(label, tools, body);
-    conversation.append(turn);
+    const node = assistantTurnNode();
+    conversation.append(node.turn);
     contentChanged(stick);
-    return { turn, tools, body, message, answer: '', hasAnswer: false, failed: false, terminal: false };
+    return { turn: node.turn, tools: node.tools, body: node.body, message, answer: '', hasAnswer: false, failed: false, terminal: false };
   }
 
   function appendDefinition(list, label, value) {
@@ -388,6 +589,10 @@ if (typeof document !== 'undefined') {
     const data = event.data || {};
     if (event.type === 'run.started') {
       setRunStatus('Luna 正在回应…');
+      // A session that did not exist before this run is created by the server;
+      // its id arrives here and goes into the hash, so the address bar names the
+      // session the answer is being written into, and a refresh returns to it.
+      adoptSession(data.session_id);
     } else if (event.type === 'assistant.delta') {
       appendAnswer(data.text);
     } else if (event.type === 'tool.started') {
@@ -422,7 +627,7 @@ if (typeof document !== 'undefined') {
     const response = await fetch('/api/runs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message })
+      body: JSON.stringify(runPayload(message, currentSessionID))
     });
     if (!response.ok) throw new Error(await errorMessage(response));
     if (!response.body) throw new Error('Streaming response unavailable');
@@ -448,7 +653,7 @@ if (typeof document !== 'undefined') {
   }
 
   async function submitMessage(rawMessage) {
-    if (running) return;
+    if (running || switching) return;
     const message = rawMessage.trim();
     if (!message) return;
     let admitted = false;
@@ -458,7 +663,7 @@ if (typeof document !== 'undefined') {
     input.value = '';
     resizeInput();
     running = true;
-    send.disabled = true;
+    setSessionControls();
     setRunStatus('正在连接…');
     try {
       await streamRun(message, () => { admitted = true; });
@@ -473,9 +678,11 @@ if (typeof document !== 'undefined') {
       }
       setRunStatus('');
       running = false;
-      send.disabled = false;
+      setSessionControls();
       input.focus();
       updateState();
+      // The run changed the session's title, time and run count.
+      updateSessions();
     }
   }
 
@@ -516,6 +723,9 @@ if (typeof document !== 'undefined') {
     runtimeBackdrop.hidden = false;
     runtimeToggle.setAttribute('aria-expanded', 'true');
     setBackgroundInert(true);
+    // Reading every session file has a cost, so the list is refreshed when the
+    // drawer that shows it is opened and while it stays open.
+    updateSessions();
     requestAnimationFrame(() => {
       runtimeDrawer.classList.add('is-open');
       runtimeBackdrop.classList.add('is-open');
@@ -581,6 +791,7 @@ if (typeof document !== 'undefined') {
     $('provider').textContent = valueOrDash(state.provider_host);
     $('host-pid').textContent = valueOrDash(state.host_pid);
     $('busy').textContent = state.busy ? `运行中 · ${valueOrDash(state.current_run_id)}` : '可用';
+    $('current-session').textContent = valueOrDash(state.current_session_id);
 
     // Each allowlisted tool gets its own row, and a tool mid-replacement can
     // report a retiring generation next to its active one. Nothing here is
@@ -619,8 +830,219 @@ if (typeof document !== 'undefined') {
       runtimeBrief.lastChild.textContent = '状态暂不可用';
       runtimeBrief.className = 'runtime-brief unavailable';
     }
+    // The list is only visible in the drawer, so it is only polled while that
+    // drawer is open; the store reads every session file to answer it.
+    if (!runtimeDrawer.hidden) updateSessions();
   }
 
+  // --- Sessions in the drawer and the address bar -------------------------
+
+  function setSessionStatus(text, className = '') {
+    sessionStatus.textContent = text;
+    sessionStatus.className = `session-status${className ? ` ${className}` : ''}`;
+  }
+
+  function sessionRowNode(row) {
+    const item = make('li');
+    const button = make('button', `session-row${row.current ? ' is-current' : ''}`);
+    button.type = 'button';
+    if (row.current) button.setAttribute('aria-current', 'true');
+    button.append(make('span', 'session-title', row.title));
+    const meta = make('span', 'session-meta', `${row.time} · ${row.runs} · #${row.shortId}`);
+    // A title is the session's first message, so two sessions can share one.
+    // The id prefix is what tells them apart, and the current one is said in
+    // words rather than only in colour.
+    if (row.current) meta.append(make('span', 'session-current', '当前'));
+    button.append(meta);
+    button.disabled = running || switching;
+    button.addEventListener('click', () => switchSession(row.id));
+    item.append(button);
+    return item;
+  }
+
+  function renderSessions(payload) {
+    sessionsPayload = payload;
+    const rows = sessionRows(payload, currentSessionID);
+    sessionList.replaceChildren();
+    for (const row of rows) sessionList.append(sessionRowNode(row));
+    $('sessions-empty').hidden = rows.length > 0;
+  }
+
+  function rerenderSessions() {
+    if (sessionsPayload === null) return;
+    renderSessions(sessionsPayload);
+  }
+
+  async function updateSessions() {
+    try {
+      const response = await fetch('/api/sessions', { cache: 'no-store' });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      renderSessions(await response.json());
+    } catch (error) {
+      setSessionStatus(`无法读取会话列表：${error.message}`, 'failure');
+    }
+  }
+
+  // A single place decides whether the composer and the session controls accept
+  // input: a run and a replay in flight both block the controls that would mix
+  // two states.
+  function setSessionControls() {
+    send.disabled = running || switching;
+    sessionNew.disabled = running || switching;
+    rerenderSessions();
+  }
+
+  function resetConversation() {
+    conversation.replaceChildren();
+    sessionNotices.replaceChildren();
+    sessionNotices.hidden = true;
+    emptyState.hidden = false;
+    latest.hidden = true;
+    currentTurn = null;
+    openTools = [];
+    setRunStatus('');
+  }
+
+  function toolRowNode(tool) {
+    const details = make('details', `tool-row${tool.failed ? ' failed' : ''}`);
+    const summary = make('summary', '', toolActivityLabel(tool.name, tool.failed ? 'failed' : 'finished'));
+    const detail = make('div', 'tool-detail');
+    const list = make('dl');
+    for (const fact of toolCallFacts(tool)) appendDefinition(list, fact.label, fact.value);
+    detail.append(list);
+    details.append(summary, detail);
+    return details;
+  }
+
+  function assistantReplayNode(record) {
+    const node = assistantTurnNode();
+    for (const tool of record.tools) node.tools.append(toolRowNode(tool));
+    if (!record.tools.length) node.tools.remove();
+    node.body.classList.remove('placeholder');
+    if (record.answer) {
+      renderMarkdown(node.body, record.answer);
+    } else if (record.failed) {
+      // A run that ended without an answer still has to be visible as such.
+      node.body.classList.add('failed');
+      node.body.textContent = runStatusLabel(record.status);
+    } else if (!record.tools.length) {
+      node.body.textContent = '这条记录没有内容。';
+    } else {
+      node.body.remove();
+    }
+    return node.turn;
+  }
+
+  function renderReplayedSession(detail) {
+    const replay = replaySession(detail);
+    conversation.replaceChildren();
+    sessionNotices.replaceChildren();
+    for (const notice of replay.notices) sessionNotices.append(make('p', 'session-notice', notice));
+    if (!replay.turns.length && !replay.notices.length) {
+      sessionNotices.append(make('p', 'session-notice', '这个会话还没有可回放的记录。'));
+    }
+    sessionNotices.hidden = sessionNotices.childElementCount === 0;
+    for (const turn of replay.turns) {
+      if (turn.role === 'user') conversation.append(userTurnNode(turn.text));
+      else if (turn.role === 'note') conversation.append(make('p', 'turn-note', turn.text));
+      else conversation.append(assistantReplayNode(turn));
+    }
+    currentTurn = null;
+    openTools = [];
+    // The empty state is shown only when there is genuinely nothing to read.
+    emptyState.hidden = sessionNotices.childElementCount > 0 || replay.turns.length > 0;
+    latest.hidden = true;
+    transcript.scrollTop = transcript.scrollHeight;
+  }
+
+  // loadSession replays one session into the conversation area. Until the read
+  // returns, no session is claimed: the id only becomes current when the server
+  // has confirmed it, and a failure states itself instead of showing an empty
+  // conversation as if the session were empty.
+  async function loadSession(id) {
+    currentSessionID = id;
+    rerenderSessions();
+    switching = true;
+    setSessionControls();
+    setSessionStatus('正在恢复会话…');
+    try {
+      const response = await fetch(`/api/sessions/${id}`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      renderReplayedSession(await response.json());
+      setSessionStatus(`已恢复会话 #${id.slice(0, 8)}。`);
+    } catch (error) {
+      dropSession();
+      setSessionStatus(`无法读取这个会话：${error.message}`, 'failure');
+    } finally {
+      switching = false;
+      setSessionControls();
+    }
+  }
+
+  // dropSession leaves the URL with no session in it and the area empty, which
+  // is the truth after a new session is started or a stored one is gone.
+  function dropSession() {
+    currentSessionID = '';
+    history.replaceState(null, '', `${location.pathname}${location.search}`);
+    resetConversation();
+    rerenderSessions();
+  }
+
+  function newSession() {
+    if (running || switching) return;
+    dropSession();
+    setSessionStatus('新会话：发送第一条消息后开始记录。');
+  }
+
+  function switchSession(id) {
+    if (running || switching || !isSessionID(id) || id === currentSessionID) return;
+    // The hash is what carries the session, so a switch is a URL change; the
+    // hashchange handler is what performs the replay.
+    location.hash = sessionHash(id);
+  }
+
+  // adoptSession records the id a fresh session was given. It arrives on
+  // run.started, so the hash names the session the answer belongs to.
+  function adoptSession(id) {
+    if (!isSessionID(id) || id === currentSessionID) return;
+    currentSessionID = id;
+    location.hash = sessionHash(id);
+    rerenderSessions();
+    setSessionStatus(`已开始新会话 #${id.slice(0, 8)}。`);
+  }
+
+  async function applySessionHash() {
+    const id = parseSessionHash(location.hash);
+    if (id === currentSessionID) {
+      // A fragment that cannot be a session id is not left in the address bar
+      // to be copied or refreshed into a request that would be rejected.
+      if (!id && location.hash.startsWith('#session')) {
+        history.replaceState(null, '', `${location.pathname}${location.search}`);
+        setSessionStatus('链接里的会话 id 无法识别，已按新会话开始。', 'failure');
+      }
+      return;
+    }
+    if (running || switching) {
+      // A run is streaming into the current session; honouring the fragment now
+      // would draw two sessions into one area. The hash is put back instead.
+      const restored = sessionHash(currentSessionID);
+      history.replaceState(null, '', restored ? `${location.pathname}${location.search}${restored}` : `${location.pathname}${location.search}`);
+      setSessionStatus('运行中无法切换会话。', 'failure');
+      return;
+    }
+    if (!id) {
+      dropSession();
+      setSessionStatus('新会话：发送第一条消息后开始记录。');
+      return;
+    }
+    await loadSession(id);
+  }
+
+  sessionNew.addEventListener('click', newSession);
+  window.addEventListener('hashchange', applySessionHash);
+
+  applySessionHash();
+  updateSessions();
   updateState();
   setInterval(updateState, 2000);
 }

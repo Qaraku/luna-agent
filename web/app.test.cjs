@@ -236,3 +236,278 @@ test('frontend uses safe DOM APIs and includes interaction contracts', () => {
   assert.match(js, /'工具'/);
   assert.match(js, /\$\('plugins-empty'\)\.hidden = rows\.length > 0/);
 });
+
+test('the current session travels in the URL hash and only a well formed id is used', () => {
+  const { parseSessionHash, sessionHash, isSessionID } = require('./app.js');
+  assert.equal(parseSessionHash('#session=8f2a1c4d9e0b'), '8f2a1c4d9e0b');
+  assert.equal(parseSessionHash('session=8f2a1c4d9e0b'), '8f2a1c4d9e0b');
+  assert.equal(parseSessionHash('#session=8f2a1c4d9e0b&other=1'), '8f2a1c4d9e0b');
+  assert.equal(parseSessionHash('#session='), '');
+  assert.equal(parseSessionHash('#session=../../etc/passwd'), '');
+  assert.equal(parseSessionHash('#session=8F2A1C4D'), '', 'uppercase is outside the store charset');
+  assert.equal(parseSessionHash('#session=short'), '', 'below the length bound');
+  assert.equal(parseSessionHash('#other=1'), '');
+  assert.equal(parseSessionHash(''), '');
+  assert.equal(parseSessionHash(undefined), '');
+
+  assert.equal(sessionHash('8f2a1c4d9e0b'), '#session=8f2a1c4d9e0b');
+  assert.equal(sessionHash('bad id'), '', 'a fragment is only written for a usable id');
+  assert.equal(isSessionID('0123456789abcdef'), true);
+  assert.equal(isSessionID('a'.repeat(64)), true);
+  assert.equal(isSessionID('a'.repeat(65)), false);
+  assert.equal(isSessionID('01234567'), true);
+  assert.equal(isSessionID('0123456'), false);
+  assert.equal(isSessionID(undefined), false);
+});
+
+test('session rows carry title, time and run count while the current one is marked', () => {
+  const { sessionRows } = require('./app.js');
+  assert.deepEqual(sessionRows({
+    sessions: [
+      { id: '8f2a1c4d9e0b', title: '把这段文字改短', updated_at: '2026-09-23T17:14:16.123456789+08:00', run_count: 3 },
+      { id: 'a1b2c3d4e5f6', title: '', updated_at: '', run_count: 0 }
+    ]
+  }, '8f2a1c4d9e0b'), [
+    { id: '8f2a1c4d9e0b', shortId: '8f2a1c4d', title: '把这段文字改短', time: '2026-09-23 17:14', runs: '3 次运行', current: true },
+    { id: 'a1b2c3d4e5f6', shortId: 'a1b2c3d4', title: '未命名会话', time: '—', runs: '尚无运行', current: false }
+  ]);
+
+  // No list, an unreadable list or entries without an id: nothing is invented.
+  assert.deepEqual(sessionRows({ sessions: [] }, ''), []);
+  assert.deepEqual(sessionRows({ sessions: [] }), []);
+  assert.deepEqual(sessionRows({}), []);
+  assert.deepEqual(sessionRows(undefined), []);
+  assert.deepEqual(sessionRows({ sessions: 'nope' }), []);
+  assert.deepEqual(sessionRows({ sessions: [null, 'x', { id: '../../etc' }, { id: '8f2a1c4d9e0b' }] }, ''), [
+    { id: '8f2a1c4d9e0b', shortId: '8f2a1c4d', title: '未命名会话', time: '—', runs: '运行次数未知', current: false }
+  ], 'a row without a usable id cannot be switched to');
+
+  // The server order (newest first) is kept; the browser does not re-sort it.
+  const rows = sessionRows({
+    sessions: [
+      { id: 'aaaaaaaaaaaa', title: '先', updated_at: '2026-09-23T09:00:00+08:00', run_count: 2 },
+      { id: 'bbbbbbbbbbbb', title: '后', updated_at: '2026-09-23T10:00:00+08:00', run_count: 1 }
+    ]
+  }, 'aaaaaaaaaaaa');
+  assert.deepEqual(rows.map((row) => row.id), ['aaaaaaaaaaaa', 'bbbbbbbbbbbb']);
+  assert.deepEqual(rows.map((row) => row.current), [true, false]);
+});
+
+test('a session replays in record order and tool calls attach to their answer', () => {
+  const { replaySession } = require('./app.js');
+  const replay = replaySession({
+    id: '8f2a1c4d9e0b',
+    title: '把这段文字改短',
+    truncated: false,
+    records: [
+      { type: 'session', id: '8f2a1c4d9e0b', created_at: '2026-09-23T17:00:00+08:00', title: '把这段文字改短' },
+      { type: 'message', run_id: 'r1', role: 'user', text: '把  moon  改短', at: '2026-09-23T17:00:01+08:00' },
+      { type: 'tool_call', run_id: 'r1', name: 'luna_text_transform', arguments: '{"text":"  moon  "}', result: 'moon', error: '', at: '2026-09-23T17:00:02+08:00' },
+      { type: 'message', run_id: 'r1', role: 'assistant', text: '结果如下：\n\n- `moon`', at: '2026-09-23T17:00:03+08:00' },
+      { type: 'run', run_id: 'r1', started_at: '2026-09-23T17:00:00+08:00', ended_at: '2026-09-23T17:00:03+08:00', status: 'ok' }
+    ]
+  });
+  assert.equal(replay.title, '把这段文字改短');
+  assert.deepEqual(replay.notices, []);
+  assert.deepEqual(replay.turns, [
+    { role: 'user', text: '把  moon  改短' },
+    {
+      role: 'assistant',
+      answer: '结果如下：\n\n- `moon`',
+      tools: [{ name: 'luna_text_transform', arguments: '{"text":"  moon  "}', result: 'moon', error: '', failed: false }],
+      status: 'ok',
+      failed: false
+    }
+  ], 'the session header record carries no conversation');
+});
+
+test('replay stays honest for empty, partial, unknown and truncated sessions', () => {
+  const { replaySession } = require('./app.js');
+  assert.deepEqual(replaySession({ records: [] }), { title: '未命名会话', truncated: false, turns: [], notices: [] });
+  assert.deepEqual(replaySession({}), { title: '未命名会话', truncated: false, turns: [], notices: [] });
+  assert.deepEqual(replaySession(undefined), { title: '未命名会话', truncated: false, turns: [], notices: [] });
+  assert.deepEqual(replaySession({ records: 'nope', title: 'x' }), { title: 'x', truncated: false, turns: [], notices: [] });
+
+  // A torn tail is reported as such, never silently repaired.
+  const truncated = replaySession({ records: [{ type: 'message', role: 'user', text: '好' }], truncated: true });
+  assert.equal(truncated.truncated, true);
+  assert.deepEqual(truncated.notices, ['这个会话的最后一行没有写完，已按可读的部分回放。']);
+  assert.equal(truncated.turns.length, 1);
+  assert.equal(replaySession({ records: [{ type: 'message', role: 'user', text: '好' }], truncated: false }).notices.length, 0);
+
+  // An unknown type, an unknown role and an unreadable entry are counted, never guessed at.
+  const unknown = replaySession({
+    records: [
+      { type: 'message', role: 'user', text: '好' },
+      { type: 'message', role: 'system', text: 'x' },
+      { type: 'tool_result' },
+      null,
+      'nope',
+      {}
+    ]
+  });
+  assert.deepEqual(unknown.notices, ['有 5 条记录无法识别，未回放。']);
+  assert.deepEqual(unknown.turns, [{ role: 'user', text: '好' }]);
+
+  // Missing fields are replayed as they are, not filled in.
+  const partial = replaySession({
+    records: [
+      { type: 'message', role: 'user' },
+      { type: 'tool_call' },
+      { type: 'run', status: 'error' }
+    ]
+  });
+  assert.deepEqual(partial.turns, [
+    { role: 'user', text: '' },
+    {
+      role: 'assistant',
+      answer: '',
+      tools: [{ name: undefined, arguments: undefined, result: undefined, error: '', failed: false }],
+      status: 'error',
+      failed: true
+    }
+  ]);
+
+  // A run that ended without leaving a turn still says so; an ok one stays metadata.
+  assert.deepEqual(replaySession({
+    records: [
+      { type: 'message', role: 'user', text: '好' },
+      { type: 'run', status: 'cancelled' },
+      { type: 'run', status: 'ok' }
+    ]
+  }).turns, [
+    { role: 'user', text: '好' },
+    { role: 'note', text: '这次运行被取消' }
+  ]);
+});
+
+test('a replayed tool call shows the frozen facts and no invented identity', () => {
+  const { toolCallFacts, argumentsText, runStatusLabel, sessionTitle, sessionTime, runCountLabel } = require('./app.js');
+
+  // The model's argument text is JSON; it is pretty printed for reading and
+  // shown verbatim when it is not JSON at all.
+  assert.equal(argumentsText('{"text":"  moon  "}'), '{\n  "text": "  moon  "\n}');
+  assert.equal(argumentsText('not json'), 'not json');
+  assert.equal(argumentsText(''), '—');
+  assert.equal(argumentsText(undefined), '—');
+  assert.equal(argumentsText({ text: 'moon' }), '—');
+
+  assert.deepEqual(toolCallFacts({ name: 'luna_read_file', arguments: '{"path":"a.txt"}', result: 'raw <tag>', error: '' }), [
+    { label: '工具', value: 'luna_read_file' },
+    { label: '参数', value: '{\n  "path": "a.txt"\n}' },
+    { label: '结果', value: 'raw <tag>' }
+  ]);
+  assert.deepEqual(toolCallFacts({ name: 'luna_text_transform', arguments: '{}', result: 'ignored', error: '工具执行失败' }), [
+    { label: '工具', value: 'luna_text_transform' },
+    { label: '参数', value: '{}' },
+    { label: '错误', value: '工具执行失败' }
+  ], 'a failed call reports the error instead of a result');
+  assert.deepEqual(toolCallFacts({}), [
+    { label: '工具', value: '—' },
+    { label: '参数', value: '—' },
+    { label: '结果', value: '—' }
+  ]);
+  assert.deepEqual(toolCallFacts(undefined), [
+    { label: '工具', value: '—' },
+    { label: '参数', value: '—' },
+    { label: '结果', value: '—' }
+  ]);
+
+  // A record has no plugin identity field, so replay cannot show one.
+  const labels = toolCallFacts({ name: 'luna_read_file', arguments: '{}', result: 'ok' }).map((fact) => fact.label);
+  assert.equal(labels.includes('执行身份'), false);
+  assert.equal(JSON.stringify(toolCallFacts({ name: 'luna_read_file', result: 'ok' })).includes('generation'), false);
+
+  assert.equal(runStatusLabel('ok'), '这次运行已完成');
+  assert.equal(runStatusLabel('error'), '这次运行失败了');
+  assert.equal(runStatusLabel('cancelled'), '这次运行被取消');
+  assert.equal(runStatusLabel('interrupted'), '这次运行中断了');
+  assert.equal(runStatusLabel('something-else'), '这次运行的结果未知');
+  assert.equal(runStatusLabel(undefined), '这次运行的结果未知');
+
+  assert.equal(sessionTitle('  把文字改短  '), '把文字改短');
+  assert.equal(sessionTitle(''), '未命名会话');
+  assert.equal(sessionTitle(7), '未命名会话');
+
+  assert.equal(sessionTime('2026-09-23T17:14:16Z'), '2026-09-23 17:14');
+  assert.equal(sessionTime('2026-09-23 17:14'), '—');
+  assert.equal(sessionTime(undefined), '—');
+
+  assert.equal(runCountLabel(0), '尚无运行');
+  assert.equal(runCountLabel(3), '3 次运行');
+  assert.equal(runCountLabel('3'), '运行次数未知');
+  assert.equal(runCountLabel(-1), '运行次数未知');
+  assert.equal(runCountLabel(undefined), '运行次数未知');
+});
+
+test('a run carries the current session only when there is one', () => {
+  const { runPayload } = require('./app.js');
+  assert.deepEqual(runPayload('你好', ''), { message: '你好' });
+  assert.equal('session_id' in runPayload('你好', ''), false, 'a new session sends no session_id at all');
+  assert.deepEqual(runPayload('你好', '8f2a1c4d9e0b'), { message: '你好', session_id: '8f2a1c4d9e0b' });
+  assert.equal('session_id' in runPayload('你好', 'not a session id'), false, 'a malformed id never reaches the server');
+  assert.equal(runPayload('你好', undefined).message, '你好');
+});
+
+test('the drawer carries a 会话 section and the replay area without widening the transcript contract', () => {
+  const html = source('index.html');
+  assert.match(html, /<section class="drawer-section" aria-labelledby="sessions-title">/);
+  assert.match(html, /<h3 id="sessions-title">会话<\/h3>/);
+  assert.match(html, /id="session-new"[^>]*>新建会话<\/button>/);
+  assert.match(html, /<ul id="session-list" class="session-list"><\/ul>/, 'the list is filled from the server, not from markup');
+  assert.match(html, /id="sessions-empty"[^>]*hidden[^>]*>还没有历史会话。/);
+  assert.match(html, /id="session-notices" class="session-notices" hidden/);
+  assert.match(html, /id="current-session"/);
+  assert.match(html, /id="session-status"[^>]*role="status"/);
+
+  // The transcript keeps its own contract: labelled, keyboard scrollable and
+  // never aria-live, because a replay must not be announced record by record.
+  assert.match(html, /id="transcript"[^>]*tabindex="0"[^>]*aria-label="对话记录"/);
+  assert.equal(/id="transcript"[^>]*aria-live/.test(html), false, 'the replay area must not announce every record');
+  assert.match(html, /id="runtime-drawer"[^>]*role="dialog"[^>]*aria-modal="true"[^>]*hidden/);
+  assert.match(html, /id="runtime-toggle"[^>]*aria-expanded="false"[^>]*aria-controls="runtime-drawer"/);
+
+  assert.equal(/data-session-id/.test(html), false, 'no session is fabricated in markup');
+  assert.equal(/\b(?:src|href)=["']https?:\/\//.test(html), false);
+});
+
+test('the front end keeps the session in the hash and reaches the DOM only through safe APIs', () => {
+  const js = source('app.js');
+  assert.equal(js.includes('localStorage'), false, 'the current session must not be kept in browser storage');
+  assert.match(js, /location\.hash/);
+  assert.match(js, /addEventListener\('hashchange'/);
+  assert.match(js, /history\.replaceState/);
+  assert.match(js, /runPayload\(message, currentSessionID\)/, 'a message carries the current session id');
+  assert.match(js, /adoptSession\(data\.session_id\)/, 'a new session id arrives on run.started');
+  assert.match(js, /\/api\/sessions\/\$\{id\}/);
+  assert.match(js, /fetch\('\/api\/sessions'/);
+  assert.match(js, /replaySession\(detail\)/);
+  assert.match(js, /emptyState\.hidden = sessionNotices\.childElementCount > 0 \|\| replay\.turns\.length > 0/);
+  assert.match(js, /sessionRowNode/);
+  assert.match(js, /assistantReplayNode/);
+  assert.match(js, /valueOrDash\(state\.current_session_id\)/);
+  assert.equal(js.includes('innerHTML'), false);
+  assert.equal(/\beval\s*\(/.test(js), false);
+  assert.equal(js.includes('new Function'), false);
+});
+
+test('every session style the script builds a class for exists in the stylesheet', () => {
+  const css = source('style.css');
+  const selectors = ['.session-new', '.session-list', '.session-row', '.session-row.is-current', '.session-title', '.session-meta', '.session-current', '.session-empty', '.session-status', '.session-notice', '.turn-note', '.assistant-body.failed'];
+  for (const selector of selectors) {
+    assert.ok(
+      [`${selector} {`, `${selector}:`, `${selector},`, `${selector}.`].some((form) => css.includes(form)),
+      `missing style ${selector}`
+    );
+  }
+  // The new rules are inside the same budget the existing stylesheet test
+  // measures: no shadow, no gradient, and only the four allowed radii.
+  const added = css.slice(css.indexOf('/* Session list, replay notices'));
+  assert.equal(/box-shadow\s*:/i.test(added), false);
+  assert.equal(/gradient\s*\(/i.test(added), false);
+  for (const match of added.matchAll(/border-radius:\s*([^;}]+)/gi)) {
+    for (const radius of match[1].trim().split(/\s+/)) {
+      assert.ok(['0', '4px', '8px', '12px'].includes(radius), `unsupported radius ${radius}`);
+    }
+  }
+});

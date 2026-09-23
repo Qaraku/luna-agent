@@ -28,6 +28,7 @@
             <h1 id="empty-title">有什么想一起看看？</h1>
             <p>把问题或想处理的文字发给 Luna。内容仅用于当前本地会话，刷新后不会保留。</p>
           </section>
+          <div id="session-notices" class="session-notices" hidden></div>
           <div id="conversation" class="conversation"></div>
         </div>
       </div>
@@ -65,7 +66,19 @@
           <div><dt>提供方</dt><dd id="provider">—</dd></div>
           <div><dt>主进程 PID</dt><dd id="host-pid">—</dd></div>
           <div><dt>会话状态</dt><dd id="busy">—</dd></div>
+          <div><dt>运行中的会话</dt><dd id="current-session">—</dd></div>
         </dl>
+      </section>
+
+      <section class="drawer-section" aria-labelledby="sessions-title">
+        <div class="section-heading">
+          <h3 id="sessions-title">会话</h3>
+          <span>保存在本机</span>
+        </div>
+        <button id="session-new" class="session-new" type="button">新建会话</button>
+        <ul id="session-list" class="session-list"></ul>
+        <p id="sessions-empty" class="session-empty" hidden>还没有历史会话。</p>
+        <p id="session-status" class="session-status" role="status"></p>
       </section>
 
       <section class="drawer-section" aria-labelledby="plugins-title">

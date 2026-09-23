@@ -430,6 +430,51 @@ button:focus-visible, textarea:focus-visible, select:focus-visible, summary:focu
 .plugin-empty { margin: 10px 0 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.6; }
 .reload-status.failure { color: var(--danger); }
 .reload-status.success { color: var(--positive); }
+
+/* Session list, replay notices and the state line of the 会话 section. */
+.session-new {
+  width: 100%;
+  padding: 0 13px;
+  border: 1px solid var(--moon);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--moon);
+  font-weight: 600;
+}
+.session-new:hover { border-color: var(--moon-hover); color: var(--moon-hover); }
+.session-list { margin: 12px 0 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+.session-row {
+  width: 100%;
+  padding: 9px 12px;
+  display: grid;
+  gap: 4px;
+  text-align: left;
+  border: 1px solid var(--line-subtle);
+  border-radius: 8px;
+  background: var(--surface-1);
+  color: var(--text-secondary);
+}
+.session-row:hover { border-color: var(--line-strong); color: var(--text-primary); }
+.session-row.is-current { border-color: var(--line-strong); background: var(--surface-2); color: var(--text-primary); }
+.session-title { font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
+.session-meta { color: var(--text-tertiary); font: 11px/1.6 "Iosevka Fixed", monospace; }
+.session-current { margin-left: 6px; color: var(--warning); }
+.session-empty { margin: 10px 0 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.6; }
+.session-status { min-height: 19px; margin: 10px 0 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.6; }
+.session-status.failure { color: var(--danger); }
+.session-notices { margin: 0 0 18px; }
+.session-notice {
+  margin: 0 0 8px;
+  padding: 9px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.turn-note { margin: 0; color: var(--danger); font: 13px/1.7 "Noto Sans SC", "Noto Sans CJK SC", sans-serif; }
+.assistant-body.failed { color: var(--danger); font: 15px/1.7 "Noto Sans SC", "Noto Sans CJK SC", sans-serif; }
 .technical-detail, .lifecycle-detail { color: var(--text-tertiary); font-size: 12px; }
 .technical-detail { margin-top: 8px; }
 .technical-detail summary, .lifecycle-detail > summary {
