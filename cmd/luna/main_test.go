@@ -234,6 +234,15 @@ func TestMemoryAndSessionsShareTheRuntimeDirectory(t *testing.T) {
 	}
 }
 
+// UI plugins are discovered under the fixed plugins/ui convention, derived from
+// the resolved root and never from a request.
+func TestUIPluginsDirIsUnderTheResolvedRoot(t *testing.T) {
+	got := uiPluginsDir("/repo")
+	if want := filepath.Join("/repo", "plugins", "ui"); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
 func TestWorkingDirOrEmptyWhenDirectoryIsRemoved(t *testing.T) {
 	original, err := os.Getwd()
 	if err != nil {

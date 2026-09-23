@@ -1,0 +1,6 @@
+{
+  "name": "hello",
+  "title": "Hello",
+  "description": "The smallest UI plugin: it renders one line of text and holds no state.",
+  "entry": "plugin.js"
+}

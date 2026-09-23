@@ -1,0 +1,6 @@
+{
+  "name": "counter",
+  "title": "Counter",
+  "description": "A counter whose button listener and timer are both removed by unmount.",
+  "entry": "plugin.js"
+}

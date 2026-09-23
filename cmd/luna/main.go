@@ -21,6 +21,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/memory"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/Qaraku/luna-agent/internal/store"
+	"github.com/Qaraku/luna-agent/internal/uiplugin"
 )
 
 // rootFromExecutable assumes the conventional layout where the built binary
@@ -108,6 +109,13 @@ func memoryFile(root, explicit string) string {
 	return filepath.Join(root, ".runtime", "memory.jsonl")
 }
 
+// uiPluginsDir resolves the runtime UI plugin directory. It always lives under
+// the resolved root and has no flag: a browser is only ever served plugins from
+// the checkout that is running, never from a path a request asked for.
+func uiPluginsDir(root string) string {
+	return filepath.Join(root, "plugins", uiplugin.Dir)
+}
+
 func run() error {
 	addr := flag.String("addr", "127.0.0.1:0", "literal loopback listen address")
 	rootFlag := flag.String("root", "", "repository root holding web/ and plugins/ (default: auto-detect)")
@@ -160,7 +168,7 @@ func run() error {
 		return fmt.Errorf("construct Eino agent: %w", err)
 	}
 	bound := listener.Addr().String()
-	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, WebDir: filepath.Join(root, "web")})
+	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)})
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: 70 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() {

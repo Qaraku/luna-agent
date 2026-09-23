@@ -19,8 +19,10 @@ import (
 	"time"
 
 	"github.com/Qaraku/luna-agent/internal/agent"
+	"github.com/Qaraku/luna-agent/internal/fileread"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/Qaraku/luna-agent/internal/store"
+	"github.com/Qaraku/luna-agent/internal/uiplugin"
 )
 
 type PluginManager interface {
@@ -45,6 +47,10 @@ type Info struct {
 	Model        string
 	ProviderHost string
 	WebDir       string
+	// UIPluginsDir is the plugins/ui directory holding runtime UI plugins. It
+	// is added by S4a and changes no existing field's meaning. An unset value
+	// lists no plugins and serves no file rather than failing a request.
+	UIPluginsDir string
 }
 type LifecycleEvent struct {
 	Time    time.Time `json:"time"`
@@ -231,6 +237,12 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.listSessions(w)
+	case "/api/ui-plugins":
+		if r.Method != http.MethodGet {
+			method(w, http.MethodGet)
+			return
+		}
+		s.listUIPlugins(w)
 	case "/api/runs":
 		if r.Method != http.MethodPost {
 			method(w, http.MethodPost)
@@ -250,6 +262,14 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.readSession(w, id)
+			return
+		}
+		if name, file, ok := uiPluginPathID(r.URL.Path); ok {
+			if r.Method != http.MethodGet {
+				method(w, http.MethodGet)
+				return
+			}
+			s.serveUIPluginFile(w, name, file)
 			return
 		}
 		http.NotFound(w, r)
@@ -309,6 +329,94 @@ func (s *Server) readSession(w http.ResponseWriter, id string) {
 	}
 	send(w, 200, sessionDetail{ID: session.ID, Title: session.Title, CreatedAt: session.CreatedAt, UpdatedAt: session.UpdatedAt, RunCount: session.RunCount, Truncated: session.Truncated, Records: records})
 }
+
+// uiPluginRef is the frozen list shape of GET /api/ui-plugins.
+type uiPluginRef struct {
+	Name        string `json:"name"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Entry       string `json:"entry"`
+}
+
+// uiPluginSkip names a directory the listing did not return as a plugin, and
+// why. The reason is a fixed phrase from uiplugin: it names no host path.
+type uiPluginSkip struct {
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
+}
+
+// listUIPlugins answers with every discoverable runtime UI plugin in name order
+// and with the directories that were skipped. A skipped directory is reported,
+// never fatal: one broken plugin cannot turn this into a 500.
+func (s *Server) listUIPlugins(w http.ResponseWriter) {
+	manifests, skipped, err := uiplugin.List(s.info.UIPluginsDir)
+	if err != nil {
+		fail(w, 500, err)
+		return
+	}
+	plugins := make([]uiPluginRef, 0, len(manifests))
+	for _, manifest := range manifests {
+		plugins = append(plugins, uiPluginRef{Name: manifest.Name, Title: manifest.Title, Description: manifest.Description, Entry: manifest.Entry})
+	}
+	refused := make([]uiPluginSkip, 0, len(skipped))
+	for _, skip := range skipped {
+		refused = append(refused, uiPluginSkip{Name: skip.Name, Reason: skip.Reason})
+	}
+	send(w, 200, map[string]any{"plugins": plugins, "skipped": refused})
+}
+
+// serveUIPluginFile serves one file from inside one plugin's directory with the
+// Content-Type its extension declares. No other header is added: this API sets
+// no CORS header, exactly like the rest of it.
+func (s *Server) serveUIPluginFile(w http.ResponseWriter, name, file string) {
+	content, contentType, err := uiplugin.File(s.info.UIPluginsDir, name, file)
+	if err != nil {
+		fail(w, uiPluginStatus(err), err)
+		return
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.WriteHeader(200)
+	_, _ = io.WriteString(w, content)
+}
+
+// uiPluginPathID splits /api/ui-plugins/<name>/<file>. The name is one path
+// segment; everything after it is the file, handed on unread so the plugin name
+// and the file check remain the only validators.
+func uiPluginPathID(path string) (string, string, bool) {
+	const prefix = "/api/ui-plugins/"
+	if !strings.HasPrefix(path, prefix) {
+		return "", "", false
+	}
+	name, file, found := strings.Cut(strings.TrimPrefix(path, prefix), "/")
+	if !found || name == "" || file == "" {
+		return "", "", false
+	}
+	return name, file, true
+}
+
+// uiPluginStatus maps a UI plugin refusal onto the HTTP status. A file that is
+// not there is a 404; a request for something this host does not serve is a
+// 4xx and never a guess.
+func uiPluginStatus(err error) int {
+	switch {
+	case errors.Is(err, uiplugin.ErrNameInvalid),
+		errors.Is(err, fileread.ErrPathInvalid),
+		errors.Is(err, fileread.ErrPathAbsolute),
+		errors.Is(err, fileread.ErrPathEscape),
+		errors.Is(err, fileread.ErrPathOutside),
+		errors.Is(err, fileread.ErrSymlinkEscape):
+		return 400
+	case errors.Is(err, uiplugin.ErrFileType), errors.Is(err, fileread.ErrBinary):
+		return 415
+	case errors.Is(err, fileread.ErrTooLarge):
+		return 413
+	case errors.Is(err, fileread.ErrNotFound), errors.Is(err, fileread.ErrNotRegular):
+		return 404
+	default:
+		return 500
+	}
+}
+
 func method(w http.ResponseWriter, allow string) {
 	w.Header().Set("Allow", allow)
 	fail(w, 405, fmt.Errorf("method must be %s", allow))
