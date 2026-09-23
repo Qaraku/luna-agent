@@ -511,3 +511,255 @@ test('every session style the script builds a class for exists in the stylesheet
     }
   }
 });
+
+test('the UI plugin listing shows every plugin and never hides a skipped one', () => {
+  const { uiPluginRows, UI_PLUGIN_ENTRY_REASON } = require('./app.js');
+  assert.deepEqual(uiPluginRows({
+    plugins: [
+      { name: 'counter', title: 'Counter', description: 'A counter whose timer unmount clears.', entry: 'plugin.js' },
+      { name: 'hello', title: 'Hello', description: '', entry: 'plugin.js' }
+    ],
+    skipped: [
+      { name: 'bare', reason: 'plugin.json is not valid JSON' },
+      { name: 'mismatched', reason: '' }
+    ]
+  }), [
+    { name: 'counter', title: 'Counter', description: 'A counter whose timer unmount clears.', entry: 'plugin.js', url: '/api/ui-plugins/counter/plugin.js', skipped: false, reason: '' },
+    { name: 'hello', title: 'Hello', description: '', entry: 'plugin.js', url: '/api/ui-plugins/hello/plugin.js', skipped: false, reason: '' },
+    { name: 'bare', title: 'bare', description: '', entry: '', url: '', skipped: true, reason: 'plugin.json is not valid JSON' },
+    { name: 'mismatched', title: 'mismatched', description: '', entry: '', url: '', skipped: true, reason: '未说明原因' }
+  ]);
+
+  // A listed plugin this front end cannot import stays visible as a skip with a
+  // reason of its own, rather than disappearing from the section.
+  assert.deepEqual(uiPluginRows({ plugins: [{ name: 'escape', title: 'Escape', description: '', entry: '../../secret.js' }] }), [
+    { name: 'escape', title: 'escape', description: '', entry: '', url: '', skipped: true, reason: UI_PLUGIN_ENTRY_REASON }
+  ]);
+
+  // A title-less but usable plugin is named by its directory.
+  assert.equal(uiPluginRows({ plugins: [{ name: 'hello', entry: 'plugin.js' }] })[0].title, 'hello');
+
+  // Nothing read, nothing invented.
+  assert.deepEqual(uiPluginRows(undefined), []);
+  assert.deepEqual(uiPluginRows({}), []);
+  assert.deepEqual(uiPluginRows({ plugins: 'nope', skipped: null }), []);
+  assert.deepEqual(uiPluginRows({ plugins: [null, 'nope', {}] }).map((row) => row.skipped), [true, true, true]);
+  assert.deepEqual(uiPluginRows({ skipped: ['nope'] }), [
+    { name: '—', title: '—', description: '', entry: '', url: '', skipped: true, reason: '未说明原因' }
+  ]);
+});
+
+test('a plugin entry becomes an import path only while it stays inside the plugin', () => {
+  const { uiPluginEntryURL, uiPluginEntrySafe, uiPluginNameValid } = require('./app.js');
+  assert.equal(uiPluginEntryURL('hello', 'plugin.js'), '/api/ui-plugins/hello/plugin.js');
+  assert.equal(uiPluginEntryURL('hello', ' dist/main.js '), '/api/ui-plugins/hello/dist/main.js');
+  assert.equal(uiPluginEntryURL('hello', 'sub/dir/plugin.js'), '/api/ui-plugins/hello/sub/dir/plugin.js');
+
+  const refused = ['', '   ', './plugin.js', '../plugin.js', 'sub/../../plugin.js', 'sub//plugin.js', 'a/b/', '/etc/passwd', 'C:\\plugin.js', 'https://evil.test/p.js', 'plugin.js?x=1', 'plugin.js#x', 'a%2fb.js', 'a\\b.js', 'plugin\u0000.js'];
+  for (const entry of refused) {
+    assert.equal(uiPluginEntrySafe(entry), false, `entry ${JSON.stringify(entry)} must not be accepted`);
+    assert.equal(uiPluginEntryURL('hello', entry), '', `entry ${JSON.stringify(entry)} must not become an import path`);
+  }
+  assert.equal(uiPluginEntrySafe(undefined), false);
+  assert.equal(uiPluginEntryURL('Hello', 'plugin.js'), '', 'a plugin name is one lowercase directory name');
+  assert.equal(uiPluginEntryURL('../hello', 'plugin.js'), '');
+  assert.equal(uiPluginEntryURL('', 'plugin.js'), '');
+  assert.equal(uiPluginNameValid('hello-world'), true);
+  assert.equal(uiPluginNameValid('hello.world'), false);
+  assert.equal(uiPluginNameValid('a'.repeat(32)), true);
+  assert.equal(uiPluginNameValid('a'.repeat(33)), false);
+});
+
+test('a plugin module must export both mount and unmount to be usable', () => {
+  const { uiPluginMissingExports, UI_PLUGIN_REQUIRED_EXPORTS } = require('./app.js');
+  assert.deepEqual(UI_PLUGIN_REQUIRED_EXPORTS, ['mount', 'unmount']);
+  assert.deepEqual(uiPluginMissingExports({ mount() {}, unmount() {} }), []);
+  assert.deepEqual(uiPluginMissingExports({ mount() {} }), ['unmount']);
+  assert.deepEqual(uiPluginMissingExports({ unmount() {} }), ['mount']);
+  assert.deepEqual(uiPluginMissingExports({}), ['mount', 'unmount']);
+  assert.deepEqual(uiPluginMissingExports({ mount: 'not a function', unmount: null }), ['mount', 'unmount']);
+  assert.deepEqual(uiPluginMissingExports(undefined), ['mount', 'unmount']);
+  assert.deepEqual(uiPluginMissingExports(null), ['mount', 'unmount']);
+  assert.deepEqual(uiPluginMissingExports('nope'), ['mount', 'unmount']);
+});
+
+test('every UI plugin failure carries its own message', () => {
+  const { uiPluginErrorDetail, uiPluginImportError, uiPluginMissingExportError, uiPluginMountError, uiPluginUnmountError } = require('./app.js');
+  assert.equal(uiPluginImportError('hello', 'Failed to fetch dynamically imported module'), '无法加载界面插件 hello 的入口文件：Failed to fetch dynamically imported module');
+  assert.equal(uiPluginMissingExportError('hello', ['mount']), '界面插件 hello 缺少必需的导出 mount。');
+  assert.equal(uiPluginMissingExportError('hello', ['mount', 'unmount']), '界面插件 hello 缺少必需的导出 mount、unmount。');
+  assert.equal(uiPluginMountError('counter', 'boom'), '界面插件 counter 挂载失败，容器已移除：boom');
+  assert.equal(uiPluginUnmountError('counter', 'boom'), '界面插件 counter 停用时清理失败，容器已移除：boom');
+
+  assert.equal(uiPluginErrorDetail(new Error('boom')), 'boom');
+  assert.equal(uiPluginErrorDetail({ message: 'boom' }), 'boom');
+  assert.equal(uiPluginErrorDetail('boom'), 'boom');
+  assert.equal(uiPluginErrorDetail(404), '404');
+  assert.equal(uiPluginErrorDetail(undefined), '未知错误');
+  assert.equal(uiPluginErrorDetail(null), '未知错误');
+  assert.equal(uiPluginErrorDetail(''), '未知错误');
+  assert.equal(uiPluginErrorDetail('   '), '未知错误');
+  // A thrown value that cannot even be stringified still produces one line of text.
+  assert.equal(uiPluginErrorDetail({ toString() { throw new Error('no'); } }), '未知错误');
+});
+
+test('the UI plugin enable and disable transitions are one pure machine', () => {
+  const { uiPluginInitialState, uiPluginTransition, uiPluginToggleAction, uiPluginToggleLabel, uiPluginStatusText, uiPluginEnableFailureEvent, uiPluginDisableEvent } = require('./app.js');
+  const initial = uiPluginInitialState();
+  assert.deepEqual(initial, { status: 'disabled', error: '' }, 'a page load starts disabled, with nothing persisted');
+  assert.equal(uiPluginToggleAction(initial.status), 'enable');
+  assert.equal(uiPluginToggleLabel('disabled'), '启用');
+  assert.equal(uiPluginStatusText(initial), '');
+
+  const loading = uiPluginTransition(initial, 'enable');
+  assert.deepEqual(loading, { status: 'loading', error: '' });
+  assert.equal(uiPluginToggleAction('loading'), '', 'there is no second transition while one is in flight');
+  assert.equal(uiPluginToggleLabel('loading'), '处理中…');
+  assert.equal(uiPluginTransition(loading, 'enable'), loading, 'a second enable does not restart the load');
+
+  const enabled = uiPluginTransition(loading, 'enabled');
+  assert.deepEqual(enabled, { status: 'enabled', error: '' });
+  assert.equal(uiPluginToggleAction('enabled'), 'disable');
+  assert.equal(uiPluginToggleLabel('enabled'), '停用');
+  assert.equal(uiPluginStatusText(enabled), '已启用 · 停用时会调用 unmount');
+
+  const failed = uiPluginTransition(loading, { type: 'enable-failed', error: 'boom' });
+  assert.deepEqual(failed, { status: 'failed', error: 'boom' });
+  assert.equal(uiPluginStatusText(failed), 'boom', 'the row says what failed');
+  assert.equal(uiPluginToggleAction('failed'), 'enable', 'a failed plugin can be tried again');
+  assert.deepEqual(uiPluginTransition(failed, 'enable'), { status: 'loading', error: '' }, 'the last failure is cleared on the next try');
+
+  const disabling = uiPluginTransition(enabled, 'disable');
+  assert.deepEqual(disabling, { status: 'loading', error: '' });
+  assert.deepEqual(uiPluginTransition(disabling, 'disabled'), { status: 'disabled', error: '' });
+
+  // A throwing unmount still leaves the plugin off — the host removed the
+  // container — and the error is carried on the disabled state.
+  const unmountFailed = uiPluginTransition(disabling, { type: 'disable-failed', error: '清理失败' });
+  assert.deepEqual(unmountFailed, { status: 'disabled', error: '清理失败' });
+  assert.equal(uiPluginStatusText(unmountFailed), '清理失败');
+  assert.equal(uiPluginToggleAction(unmountFailed.status), 'enable');
+
+  assert.deepEqual(uiPluginTransition(enabled, 'nonsense'), enabled, 'an unknown event changes nothing');
+  assert.deepEqual(uiPluginTransition(undefined, 'enable'), { status: 'loading', error: '' });
+  assert.deepEqual(uiPluginTransition('nope', 'nonsense'), { status: 'disabled', error: '' });
+  assert.deepEqual(uiPluginStatusText(undefined), '');
+
+  // The two events the loader itself builds are decided here, not in the DOM
+  // glue: a failed enable is a failure, and a throwing unmount is still a
+  // disabled plugin with its error kept.
+  assert.deepEqual(uiPluginEnableFailureEvent('boom'), { type: 'enable-failed', error: 'boom' });
+  assert.deepEqual(uiPluginTransition(loading, uiPluginEnableFailureEvent('boom')), { status: 'failed', error: 'boom' });
+  assert.deepEqual(uiPluginDisableEvent('counter', ''), { type: 'disabled' });
+  assert.deepEqual(uiPluginDisableEvent('counter', '   '), { type: 'disabled' });
+  assert.deepEqual(uiPluginDisableEvent('counter', 'boom'), { type: 'disable-failed', error: '界面插件 counter 停用时清理失败，容器已移除：boom' });
+  assert.deepEqual(uiPluginTransition(disabling, uiPluginDisableEvent('counter', 'boom')), {
+    status: 'disabled', error: '界面插件 counter 停用时清理失败，容器已移除：boom'
+  }, 'the container is gone either way, so the plugin is off and the error is shown');
+});
+
+test('the host removes the container on every failed enable and on every disable', () => {
+  const { uiPluginTeardown, uiPluginAbandonMount } = require('./app.js');
+  let removed = 0;
+  const target = { remove() { removed += 1; } };
+
+  assert.deepEqual(uiPluginTeardown({ unmount() {} }, target, 'hello'), { type: 'disabled' });
+  assert.equal(removed, 1, 'a clean unmount still leaves the host removing the container');
+
+  assert.deepEqual(uiPluginTeardown({ unmount() { throw new Error('boom'); } }, target, 'counter'), {
+    type: 'disable-failed',
+    error: '界面插件 counter 停用时清理失败，容器已移除：boom'
+  }, 'a throwing unmount is reported, and the plugin is still off');
+  assert.equal(removed, 2, 'the container is removed even when unmount threw');
+
+  // A plugin throwing something that is not an Error is reported the same way.
+  assert.deepEqual(uiPluginTeardown({ unmount() { throw 'plain string'; } }, target, 'hello'), {
+    type: 'disable-failed',
+    error: '界面插件 hello 停用时清理失败，容器已移除：plain string'
+  });
+  assert.equal(removed, 3);
+  assert.deepEqual(uiPluginTeardown({ unmount() { throw undefined; } }, target, 'hello'), {
+    type: 'disable-failed',
+    error: '界面插件 hello 停用时清理失败，容器已移除：未知错误'
+  });
+  assert.equal(removed, 4);
+
+  // An enable that never finished is cleaned up here: the container created for
+  // the attempt is removed and the stage is hidden again, so no half-mounted
+  // plugin stays on screen after a failed import, a throwing mount or a missing
+  // export.
+  const stage = { hidden: false };
+  uiPluginAbandonMount(stage, target);
+  assert.equal(removed, 5);
+  assert.equal(stage.hidden, true);
+});
+
+test('the host interface handed to a plugin is narrow and frozen', () => {
+  const { uiPluginHostAPI, UI_PLUGIN_API_VERSION } = require('./app.js');
+  const lines = [];
+  const api = uiPluginHostAPI(UI_PLUGIN_API_VERSION, (message) => lines.push(message));
+  assert.deepEqual(Object.keys(api), ['version', 'log'], 'a plugin gets the contract version and a log line, nothing else');
+  assert.equal(api.version, '1');
+  assert.equal(Object.isFrozen(api), true, 'a plugin cannot widen the interface it was handed');
+  api.log('hello');
+  api.log(7);
+  api.log(undefined);
+  assert.deepEqual(lines, ['hello', '7', ''], 'the log takes text, whatever the plugin passes');
+  for (const absent of ['fetch', 'state', 'document', 'session', 'plugins', 'goto']) {
+    assert.equal(Object.getOwnPropertyNames(api).includes(absent), false, `${absent} must not be handed out`);
+  }
+  assert.doesNotThrow(() => uiPluginHostAPI('1').log('no sink'), 'a missing sink must not throw inside the plugin call');
+  assert.equal(uiPluginHostAPI(undefined).version, '');
+});
+
+test('the drawer carries a 界面插件 section and imports a plugin only on a click', () => {
+  const html = source('index.html');
+  const js = source('app.js');
+  assert.match(html, /<section class="drawer-section" aria-labelledby="ui-plugins-title">/);
+  assert.match(html, /<h3 id="ui-plugins-title">界面插件<\/h3>/);
+  assert.match(html, /<ul id="ui-plugin-list" class="ui-plugin-list"><\/ul>/, 'the list is filled from the server, not from markup');
+  assert.match(html, /id="ui-plugins-empty"[^>]*hidden[^>]*>暂未读到界面插件。/);
+  assert.match(html, /id="ui-plugins-status"[^>]*role="status"/);
+  assert.match(html, /刷新后回到停用/);
+  assert.match(html, /id="ui-plugins-retry"[^>]*hidden[^>]*>重新读取插件列表<\/button>/);
+
+  // The dynamic import is a runtime call inside the enable path and never a
+  // top-level statement: this file is loaded by Node under node --test.
+  assert.equal(/^\s*import\s/m.test(js), false, 'no static import may sit in this file');
+  assert.match(js, /pluginModule = await import\(node\.row\.url\)/);
+  assert.match(js, /uiPluginRows\(payload\)/);
+  assert.match(js, /uiPluginHostAPI\(UI_PLUGIN_API_VERSION/);
+  assert.match(js, /uiPluginTeardown\(mounted\.pluginModule, mounted\.target, node\.row\.title\)/, 'the unmount-and-remove guarantee is the tested helper');
+  assert.match(js, /uiPluginAbandonMount\(node\.stage, target\)/, 'a failed enable cleans the container up through the tested helper');
+  assert.match(js, /uiPluginEnableFailureEvent\(message\)/, 'a failed enable is decided by the tested helper');
+  assert.match(js, /failUIPlugin\(node, target, uiPluginImportError/, 'a failed import names itself');
+  assert.match(js, /failUIPlugin\(node, target, uiPluginMissingExportError/, 'a missing export names itself');
+  assert.match(js, /failUIPlugin\(node, target, uiPluginMountError/, 'a throwing mount names itself');
+  assert.match(js, /fetch\('\/api\/ui-plugins'/);
+  assert.equal(js.includes('localStorage'), false, 'enable state is not persisted anywhere');
+  assert.equal(js.includes('sessionStorage'), false);
+  assert.equal(js.includes('innerHTML'), false);
+  assert.equal(js.includes('new Function'), false);
+});
+
+test('every UI plugin style the script builds a class for exists in the stylesheet', () => {
+  const css = source('style.css');
+  const selectors = ['.ui-plugin-hint', '.ui-plugin-list', '.ui-plugin-row', '.ui-plugin-row.skipped', '.ui-plugin-head', '.ui-plugin-title', '.ui-plugin-toggle', '.ui-plugin-toggle.is-on', '.ui-plugin-description', '.ui-plugin-reason', '.ui-plugin-reason-label', '.ui-plugin-stage', '.ui-plugin-target', '.ui-plugin-status', '.ui-plugin-status.failure', '.ui-plugin-log', '.ui-plugin-retry'];
+  for (const selector of selectors) {
+    assert.ok(
+      [`${selector} {`, `${selector}:`, `${selector},`, `${selector}.`].some((form) => css.includes(form)),
+      `missing style ${selector}`
+    );
+  }
+  // The added rules stay inside the same budget the rest of the stylesheet is
+  // measured against: no shadow, no gradient, only the four allowed radii.
+  const added = css.slice(css.indexOf('/* Runtime UI plugins'), css.indexOf('.reload-status.failure'));
+  assert.ok(added.length > 0, 'the UI plugin block must be present');
+  assert.equal(/box-shadow\s*:/i.test(added), false);
+  assert.equal(/gradient\s*\(/i.test(added), false);
+  for (const match of added.matchAll(/border-radius:\s*([^;}]+)/gi)) {
+    for (const radius of match[1].trim().split(/\s+/)) {
+      assert.ok(['0', '4px', '8px', '12px'].includes(radius), `unsupported radius ${radius}`);
+    }
+  }
+});

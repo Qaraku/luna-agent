@@ -428,6 +428,58 @@ button:focus-visible, textarea:focus-visible, select:focus-visible, summary:focu
 .reload-controls button:hover { border-color: var(--moon-hover); color: var(--moon-hover); }
 .reload-status { min-height: 19px; margin: 10px 0 0; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
 .plugin-empty { margin: 10px 0 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.6; }
+
+/* Runtime UI plugins: the host styles the list, one row per plugin, and the
+   container a plugin mounts into. A plugin's own elements are not styled here;
+   they are the plugin's business. */
+.ui-plugin-hint { margin: 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.7; }
+.ui-plugin-list { margin: 12px 0 0; padding: 0; list-style: none; display: grid; gap: 10px; }
+.ui-plugin-row {
+  padding: 12px;
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--line-subtle);
+  border-radius: 8px;
+  background: var(--surface-1);
+}
+.ui-plugin-row.skipped { border-style: dashed; background: transparent; }
+.ui-plugin-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.ui-plugin-title { color: var(--text-primary); font-size: 13px; font-weight: 650; overflow-wrap: anywhere; }
+.ui-plugin-toggle {
+  min-width: 72px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+}
+.ui-plugin-toggle:hover { border-color: var(--moon); color: var(--moon); }
+.ui-plugin-toggle.is-on { border-color: var(--positive); color: var(--positive); }
+.ui-plugin-description { margin: 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.7; }
+.ui-plugin-reason { margin: 0; color: var(--warning); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.ui-plugin-reason-label { margin-right: 2px; color: var(--danger); }
+.ui-plugin-stage {
+  padding: 10px 12px;
+  border: 1px solid var(--line-subtle);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text-secondary);
+}
+.ui-plugin-target { font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.ui-plugin-status { margin: 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.ui-plugin-status.failure { color: var(--danger); }
+.ui-plugin-log { margin: 0; padding-left: 18px; color: var(--text-tertiary); font: 11px/1.6 "Iosevka Fixed", monospace; }
+.ui-plugin-log li { padding: 3px 0; overflow-wrap: anywhere; }
+.ui-plugin-retry {
+  width: 100%;
+  margin-top: 10px;
+  padding: 0 13px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+}
+.ui-plugin-retry:hover { border-color: var(--moon); color: var(--moon); }
 .reload-status.failure { color: var(--danger); }
 .reload-status.success { color: var(--positive); }
 

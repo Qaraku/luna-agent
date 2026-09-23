@@ -87,6 +87,18 @@
         <p id="plugins-empty" class="plugin-empty" hidden>暂未读到工具插件。</p>
       </section>
 
+      <section class="drawer-section" aria-labelledby="ui-plugins-title">
+        <div class="section-heading">
+          <h3 id="ui-plugins-title">界面插件</h3>
+          <span>刷新后回到停用</span>
+        </div>
+        <p class="ui-plugin-hint">插件在浏览器里运行，只能拿到受限的宿主接口：契约版本与一个日志回调。</p>
+        <ul id="ui-plugin-list" class="ui-plugin-list"></ul>
+        <p id="ui-plugins-empty" class="plugin-empty" hidden>暂未读到界面插件。</p>
+        <p id="ui-plugins-status" class="ui-plugin-status" role="status" hidden></p>
+        <button id="ui-plugins-retry" class="ui-plugin-retry" type="button" hidden>重新读取插件列表</button>
+      </section>
+
       <section class="drawer-section" aria-labelledby="reload-title">
         <div class="section-heading">
           <h3 id="reload-title">高级：重新载入</h3>

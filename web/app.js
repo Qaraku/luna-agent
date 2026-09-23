@@ -74,6 +74,256 @@ function reloadCopy(state, candidate, technical = '') {
   return { summary: `无法启用 ${candidate}，当前版本保持不变。`, technical };
 }
 
+// --- Runtime UI plugins ---------------------------------------------------
+
+// UI_PLUGIN_API_VERSION is the version of the mount/unmount contract itself.
+// The host publishes no product version to the browser, so this names the
+// contract a plugin is written against instead of inventing a host version.
+const UI_PLUGIN_API_VERSION = '1';
+
+// The reason given to a listed plugin this front end refuses to load. It only
+// appears when the server listed something the loader cannot import, and the
+// directory stays visible with it rather than disappearing.
+const UI_PLUGIN_ENTRY_REASON = 'plugin.json 的 entry 不是插件目录内的相对路径';
+
+// The exports a plugin must provide. mount is what is called on enable and
+// unmount is the only thing that ends the plugin's own side effects, so a
+// module missing either one cannot be mounted or left after being mounted.
+const UI_PLUGIN_REQUIRED_EXPORTS = ['mount', 'unmount'];
+
+function uiPluginText(value) {
+  if (typeof value === 'string') return value;
+  if (value === undefined || value === null) return '';
+  try {
+    return String(value);
+  } catch (_) {
+    return '';
+  }
+}
+
+// uiPluginNameValid is the whole shape a plugin name may have, the same rule the
+// server enforces: one directory name, no separator, no dot.
+function uiPluginNameValid(name) {
+  return typeof name === 'string' && /^[a-z0-9-]{1,32}$/.test(name);
+}
+
+// uiPluginEntrySafe reports whether a manifest entry is a relative path inside
+// the plugin's own directory. The server refuses anything else when it lists
+// plugins; this is the client's own check on top of that, so a hand-edited
+// manifest can neither reach import() with an absolute URL nor climb out of the
+// plugin root. `%` is refused outright because an encoded separator or dot is
+// the one thing that could survive a naive segment split.
+function uiPluginEntrySafe(entry) {
+  if (typeof entry !== 'string') return false;
+  const value = entry.trim();
+  if (!value || value.length > 200) return false;
+  if (value.startsWith('/') || value.includes('\\')) return false;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(value)) return false;
+  if (/[\u0000-\u001f\u007f?#%]/.test(value)) return false;
+  return value.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
+}
+
+// uiPluginEntryURL is the only place a plugin's import specifier is built. The
+// name and the entry are validated first, so the specifier is always a path
+// under /api/ui-plugins/ on this origin, and a caller that gets '' must not
+// import at all.
+function uiPluginEntryURL(name, entry) {
+  if (!uiPluginNameValid(name) || !uiPluginEntrySafe(entry)) return '';
+  const path = entry.trim().split('/').map(encodeURIComponent).join('/');
+  return `/api/ui-plugins/${name}/${path}`;
+}
+
+// uiPluginRows turns GET /api/ui-plugins into display rows: the plugins the
+// server discovered, then the directories it skipped. A skipped directory is
+// shown with the server's own reason and is never hidden — a broken plugin
+// directory is exactly what this section exists to make visible. A listed
+// plugin whose name or entry this loader cannot use becomes a skipped row too,
+// with a reason of the client's own, rather than being silently dropped.
+function uiPluginRows(payload) {
+  const body = payload && typeof payload === 'object' ? payload : {};
+  const plugins = Array.isArray(body.plugins) ? body.plugins : [];
+  const skipped = Array.isArray(body.skipped) ? body.skipped : [];
+  const rows = [];
+  for (const entry of plugins) {
+    const record = entry && typeof entry === 'object' ? entry : {};
+    const name = typeof record.name === 'string' ? record.name : '';
+    const url = uiPluginEntryURL(name, record.entry);
+    if (!url) {
+      const label = name || '—';
+      rows.push({
+        name: label, title: label, description: '', entry: '', url: '', skipped: true, reason: UI_PLUGIN_ENTRY_REASON
+      });
+      continue;
+    }
+    rows.push({
+      name,
+      title: uiPluginText(record.title) || name,
+      description: uiPluginText(record.description),
+      entry: record.entry.trim(),
+      url,
+      skipped: false,
+      reason: ''
+    });
+  }
+  for (const entry of skipped) {
+    const record = entry && typeof entry === 'object' ? entry : {};
+    const name = uiPluginText(record.name) || '—';
+    rows.push({
+      name,
+      title: name,
+      description: '',
+      entry: '',
+      url: '',
+      skipped: true,
+      reason: uiPluginText(record.reason) || '未说明原因'
+    });
+  }
+  return rows;
+}
+
+// uiPluginMissingExports names every required export a loaded module does not
+// provide, so the message can say which one is missing instead of guessing.
+function uiPluginMissingExports(pluginModule) {
+  const loaded = pluginModule && typeof pluginModule === 'object' ? pluginModule : {};
+  return UI_PLUGIN_REQUIRED_EXPORTS.filter((name) => typeof loaded[name] !== 'function');
+}
+
+// A plugin's throw can be anything at all, so one place turns it into the single
+// line of text that goes on screen through textContent.
+function uiPluginErrorDetail(error) {
+  if (error && typeof error === 'object' && typeof error.message === 'string' && error.message) return error.message;
+  const text = uiPluginText(error).trim();
+  return text || '未知错误';
+}
+
+function uiPluginImportError(name, detail) {
+  return `无法加载界面插件 ${name} 的入口文件：${detail}`;
+}
+
+function uiPluginMissingExportError(name, missing) {
+  const list = Array.isArray(missing) ? missing.join('、') : uiPluginText(missing);
+  return `界面插件 ${name} 缺少必需的导出 ${list}。`;
+}
+
+function uiPluginMountError(name, detail) {
+  return `界面插件 ${name} 挂载失败，容器已移除：${detail}`;
+}
+
+function uiPluginUnmountError(name, detail) {
+  return `界面插件 ${name} 停用时清理失败，容器已移除：${detail}`;
+}
+
+function uiPluginState(status, error = '') {
+  return { status, error: error === '' ? '' : uiPluginErrorDetail(error) };
+}
+
+// uiPluginEnableFailureEvent is the event after a failed enable. Nothing is
+// mounted, so the plugin is a failure carrying its message and not a disabled
+// plugin, which is what the state machine is told.
+function uiPluginEnableFailureEvent(message) {
+  return { type: 'enable-failed', error: message };
+}
+
+// uiPluginDisableEvent is the event after unmount has been attempted. The host
+// removes the container on both paths, so a throwing unmount is still a
+// disabled plugin — one whose error is reported instead of swallowed.
+function uiPluginDisableEvent(title, detail) {
+  const text = uiPluginText(detail).trim();
+  return text === '' ? { type: 'disabled' } : { type: 'disable-failed', error: uiPluginUnmountError(title, text) };
+}
+
+// uiPluginTeardown runs the plugin's own unmount and then removes the container.
+// The removal happens on both paths and is not conditional on the plugin
+// behaving: it is the host's guarantee, so it lives in one place instead of
+// inside an event handler where a thrown error could skip it.
+function uiPluginTeardown(pluginModule, target, title) {
+  let detail = '';
+  try {
+    pluginModule.unmount(target);
+  } catch (error) {
+    detail = uiPluginErrorDetail(error);
+  }
+  target.remove();
+  return uiPluginDisableEvent(title, detail);
+}
+
+// uiPluginAbandonMount is the host's own cleanup after an enable that did not
+// finish: the container created for that attempt is removed and the stage that
+// held it is hidden again, so nothing that never mounted stays on screen.
+function uiPluginAbandonMount(stage, target) {
+  target.remove();
+  stage.hidden = true;
+}
+
+function uiPluginInitialState() {
+  return uiPluginState('disabled');
+}
+
+// uiPluginTransition is the whole enable/disable state machine, as a pure
+// function. The two failure events differ on purpose: a failed enable leaves
+// nothing mounted, so it is a failure; a failed disable has already had its
+// container removed by the host, so the plugin is off and the error is shown
+// beside it instead of being swallowed.
+function uiPluginTransition(state, event) {
+  const current = state && typeof state === 'object' && typeof state.status === 'string' ? state : uiPluginInitialState();
+  const type = event && typeof event === 'object' ? event.type : event;
+  const error = event && typeof event === 'object' ? event.error : undefined;
+  switch (type) {
+    case 'enable':
+      // An old failure is cleared here, because nothing is mounted yet.
+      return current.status === 'loading' ? current : uiPluginState('loading');
+    case 'enabled':
+      return uiPluginState('enabled');
+    case 'enable-failed':
+      return uiPluginState('failed', error);
+    case 'disable':
+      return current.status === 'loading' ? current : uiPluginState('loading');
+    case 'disabled':
+      return uiPluginState('disabled');
+    case 'disable-failed':
+      return uiPluginState('disabled', error);
+    default:
+      return current;
+  }
+}
+
+// uiPluginToggleAction says what a click on the control means right now, and ''
+// while a transition is in flight, which is when the button is disabled.
+function uiPluginToggleAction(status) {
+  if (status === 'loading') return '';
+  return status === 'enabled' ? 'disable' : 'enable';
+}
+
+function uiPluginToggleLabel(status) {
+  if (status === 'loading') return '处理中…';
+  return status === 'enabled' ? '停用' : '启用';
+}
+
+// uiPluginStatusText is the line under one plugin. It carries the last error
+// whatever the status, so a plugin that failed to load or failed to clean up
+// says so instead of looking idle.
+function uiPluginStatusText(state) {
+  const current = state && typeof state === 'object' ? state : uiPluginInitialState();
+  if (current.error) return current.error;
+  if (current.status === 'loading') return '正在加载插件入口…';
+  if (current.status === 'enabled') return '已启用 · 停用时会调用 unmount';
+  return '';
+}
+
+// uiPluginHostAPI is the entire host interface a plugin receives: the contract
+// version and one bounded log line. No host state, no DOM reference outside the
+// plugin's own container and no fetch wrapper, so a plugin cannot read the
+// session, the tool plugins or anything else in the drawer.
+function uiPluginHostAPI(version, log) {
+  const write = typeof log === 'function' ? log : () => {};
+  return Object.freeze({
+    version: uiPluginText(version),
+    log(message) {
+      write(uiPluginText(message));
+    }
+  });
+}
+
 // --- Sessions -------------------------------------------------------------
 
 // The current session lives in the URL hash and never in browser storage: a
@@ -350,7 +600,7 @@ function parseMarkdownBlocks(markdown) {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { parseEventBlock, toolSummary, toolLabel, toolActivityLabel, candidateLabel, reloadCopy, valueOrDash, pluginStatusLabel, pluginRows, parseInline, parseMarkdownBlocks, isSessionID, parseSessionHash, sessionHash, sessionTitle, sessionTime, runCountLabel, runStatusLabel, sessionRows, argumentsText, toolCallFacts, replaySession, runPayload };
+  module.exports = { parseEventBlock, toolSummary, toolLabel, toolActivityLabel, candidateLabel, reloadCopy, valueOrDash, pluginStatusLabel, pluginRows, parseInline, parseMarkdownBlocks, isSessionID, parseSessionHash, sessionHash, sessionTitle, sessionTime, runCountLabel, runStatusLabel, sessionRows, argumentsText, toolCallFacts, replaySession, runPayload, uiPluginText, uiPluginNameValid, uiPluginEntrySafe, uiPluginEntryURL, uiPluginRows, uiPluginMissingExports, uiPluginErrorDetail, uiPluginImportError, uiPluginMissingExportError, uiPluginMountError, uiPluginUnmountError, uiPluginState, uiPluginInitialState, uiPluginTransition, uiPluginEnableFailureEvent, uiPluginDisableEvent, uiPluginTeardown, uiPluginAbandonMount, uiPluginToggleAction, uiPluginToggleLabel, uiPluginStatusText, uiPluginHostAPI, UI_PLUGIN_API_VERSION, UI_PLUGIN_ENTRY_REASON, UI_PLUGIN_REQUIRED_EXPORTS };
 }
 
 if (typeof document !== 'undefined') {
@@ -379,6 +629,10 @@ if (typeof document !== 'undefined') {
   const sessionNew = $('session-new');
   const sessionStatus = $('session-status');
   const sessionNotices = $('session-notices');
+  const uiPluginList = $('ui-plugin-list');
+  const uiPluginsEmpty = $('ui-plugins-empty');
+  const uiPluginStatus = $('ui-plugins-status');
+  const uiPluginsRetry = $('ui-plugins-retry');
 
   let running = false;
   let reloading = false;
@@ -726,6 +980,7 @@ if (typeof document !== 'undefined') {
     // Reading every session file has a cost, so the list is refreshed when the
     // drawer that shows it is opened and while it stays open.
     updateSessions();
+    updateUIPlugins();
     requestAnimationFrame(() => {
       runtimeDrawer.classList.add('is-open');
       runtimeBackdrop.classList.add('is-open');
@@ -785,6 +1040,172 @@ if (typeof document !== 'undefined') {
       reloadButton.disabled = false;
     }
   });
+
+  // --- Runtime UI plugins ------------------------------------------------
+
+  // Enable state lives in this page and nowhere else: a refresh starts with
+  // every plugin disabled, and nothing about a running plugin is written to
+  // browser storage. The list is read once, so a plugin that is running is
+  // never torn out of the section by a later read of the same list; a listing
+  // that failed to arrive is the one case with a retry, and then nothing is
+  // mounted yet.
+  let uiPluginsPayload = null;
+  let uiPluginsReading = false;
+  const uiPluginMounts = new Map();
+
+  // A plugin's own log line, bounded, into a list that is not a live region:
+  // a chatty experimental plugin must not be announced line by line.
+  function uiPluginLogLine(node, message) {
+    const text = uiPluginText(message).trim();
+    if (!text) return;
+    node.log.append(make('li', 'ui-plugin-log-line', text));
+    while (node.log.childElementCount > 50) node.log.firstElementChild.remove();
+    node.log.hidden = false;
+  }
+
+  function applyUIPluginState(node, state) {
+    node.state = state;
+    const action = uiPluginToggleAction(state.status);
+    node.button.textContent = uiPluginToggleLabel(state.status);
+    node.button.disabled = action === '';
+    node.button.className = `ui-plugin-toggle${state.status === 'enabled' ? ' is-on' : ''}`;
+    node.button.setAttribute('aria-label', action === 'disable'
+      ? `停用界面插件 ${node.row.title}`
+      : action === 'enable' ? `启用界面插件 ${node.row.title}` : `界面插件 ${node.row.title} 正在处理`);
+    const status = uiPluginStatusText(state);
+    node.status.textContent = status;
+    node.status.className = `ui-plugin-status${state.error ? ' failure' : ''}`;
+    node.status.hidden = status === '';
+    // The plugin's container is only on screen while the plugin is mounted, so
+    // nothing that looks mounted is ever left behind.
+    node.stage.hidden = state.status !== 'enabled';
+  }
+
+  function uiPluginRowNode(row) {
+    const item = make('li', `ui-plugin-row${row.skipped ? ' skipped' : ''}`);
+    const head = make('div', 'ui-plugin-head');
+    head.append(make('span', 'ui-plugin-title', row.title));
+    if (row.skipped) {
+      // A skipped directory is shown with the server's reason and no control:
+      // there is nothing to load, and hiding it is exactly the failure this
+      // section is meant to prevent.
+      item.append(head);
+      const reason = make('p', 'ui-plugin-reason');
+      reason.append(make('span', 'ui-plugin-reason-label', '已跳过'), document.createTextNode(`：${row.reason}`));
+      item.append(reason);
+      return item;
+    }
+    const node = {};
+    const button = make('button', 'ui-plugin-toggle');
+    button.type = 'button';
+    button.addEventListener('click', () => toggleUIPlugin(node));
+    head.append(button);
+    const description = make('p', 'ui-plugin-description', row.description || '这个插件没有写描述。');
+    const stage = make('div', 'ui-plugin-stage');
+    stage.hidden = true;
+    const status = make('p', 'ui-plugin-status');
+    status.hidden = true;
+    const log = make('ul', 'ui-plugin-log');
+    log.hidden = true;
+    item.append(head, description, stage, status, log);
+    Object.assign(node, { row, button, stage, status, log, state: uiPluginInitialState() });
+    applyUIPluginState(node, node.state);
+    return item;
+  }
+
+  function renderUIPlugins(payload) {
+    const rows = uiPluginRows(payload);
+    uiPluginList.replaceChildren();
+    for (const row of rows) uiPluginList.append(uiPluginRowNode(row));
+    uiPluginsEmpty.hidden = rows.length > 0;
+  }
+
+  async function updateUIPlugins(force = false) {
+    if (uiPluginsReading || (uiPluginsPayload !== null && !force)) return;
+    uiPluginsReading = true;
+    uiPluginsRetry.hidden = true;
+    try {
+      const response = await fetch('/api/ui-plugins', { cache: 'no-store' });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      uiPluginsPayload = await response.json();
+      uiPluginStatus.textContent = '';
+      uiPluginStatus.className = 'ui-plugin-status';
+      uiPluginStatus.hidden = true;
+      renderUIPlugins(uiPluginsPayload);
+    } catch (error) {
+      // A listing that could not be read is said so plainly: an empty section
+      // would otherwise claim there are no plugins.
+      uiPluginsPayload = null;
+      uiPluginStatus.textContent = `无法读取界面插件列表：${uiPluginErrorDetail(error)}`;
+      uiPluginStatus.className = 'ui-plugin-status failure';
+      uiPluginStatus.hidden = false;
+      uiPluginsRetry.hidden = false;
+    } finally {
+      uiPluginsReading = false;
+    }
+  }
+
+  // enableUIPlugin fails closed at every step: the container is created for this
+  // attempt and removed again on any failure, so the plugin is either fully
+  // mounted or gone, never half there.
+  async function enableUIPlugin(node) {
+    applyUIPluginState(node, uiPluginTransition(node.state, 'enable'));
+    const target = make('div', 'ui-plugin-target');
+    node.stage.append(target);
+    node.stage.hidden = false;
+    const api = uiPluginHostAPI(UI_PLUGIN_API_VERSION, (message) => uiPluginLogLine(node, message));
+    let pluginModule = null;
+    try {
+      pluginModule = await import(node.row.url);
+    } catch (error) {
+      failUIPlugin(node, target, uiPluginImportError(node.row.title, uiPluginErrorDetail(error)));
+      return;
+    }
+    const missing = uiPluginMissingExports(pluginModule);
+    if (missing.length) {
+      failUIPlugin(node, target, uiPluginMissingExportError(node.row.title, missing));
+      return;
+    }
+    try {
+      pluginModule.mount(target, api);
+    } catch (error) {
+      // mount threw, so the plugin's own cleanup cannot be relied on here; what
+      // the host owns is the container it created, and it removes that.
+      failUIPlugin(node, target, uiPluginMountError(node.row.title, uiPluginErrorDetail(error)));
+      return;
+    }
+    uiPluginMounts.set(node.row.name, { target, pluginModule });
+    applyUIPluginState(node, uiPluginTransition(node.state, 'enabled'));
+  }
+
+  function failUIPlugin(node, target, message) {
+    uiPluginAbandonMount(node.stage, target);
+    applyUIPluginState(node, uiPluginTransition(node.state, uiPluginEnableFailureEvent(message)));
+  }
+
+  // disableUIPlugin calls the plugin's unmount and then removes the container
+  // whatever unmount did. A plugin whose cleanup throws is still off the screen,
+  // and the error is shown rather than swallowed.
+  async function disableUIPlugin(node) {
+    applyUIPluginState(node, uiPluginTransition(node.state, 'disable'));
+    const mounted = uiPluginMounts.get(node.row.name);
+    uiPluginMounts.delete(node.row.name);
+    if (!mounted) {
+      applyUIPluginState(node, uiPluginTransition(node.state, 'disabled'));
+      return;
+    }
+    const event = uiPluginTeardown(mounted.pluginModule, mounted.target, node.row.title);
+    node.stage.hidden = true;
+    applyUIPluginState(node, uiPluginTransition(node.state, event));
+  }
+
+  async function toggleUIPlugin(node) {
+    const action = uiPluginToggleAction(node.state.status);
+    if (action === 'enable') await enableUIPlugin(node);
+    else if (action === 'disable') await disableUIPlugin(node);
+  }
+
+  uiPluginsRetry.addEventListener('click', () => updateUIPlugins(true));
 
   function renderState(state) {
     $('model').textContent = valueOrDash(state.model);
