@@ -46,12 +46,30 @@ type State struct {
 	ProviderHost    string              `json:"provider_host"`
 	ModelConfigured bool                `json:"model_configured"`
 	ModelConnected  bool                `json:"model_connected"`
-	Active          *pluginhost.Record  `json:"active"`
 	Plugins         []pluginhost.Record `json:"plugins"`
 	Busy            bool                `json:"busy"`
 	CurrentRunID    string              `json:"current_run_id,omitempty"`
 	Events          []LifecycleEvent    `json:"events"`
 	Demo            bool                `json:"demo"`
+}
+
+// pluginsReady reports whether every allowlisted tool has a published
+// generation. A single active plugin is not enough: each tool is its own
+// process and can fail on its own.
+func pluginsReady(records []pluginhost.Record) bool {
+	for _, spec := range pluginhost.Allowlist {
+		found := false
+		for _, record := range records {
+			if record.Tool == spec.Tool && record.Status == "active" {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 var runTimeout = 60 * time.Second
@@ -127,7 +145,7 @@ func (s *Server) state() State {
 	s.eventMu.Lock()
 	events := append([]LifecycleEvent{}, s.events...)
 	s.eventMu.Unlock()
-	return State{HostPID: os.Getpid(), StartedAt: s.started, Model: s.info.Model, ProviderHost: s.info.ProviderHost, ModelConfigured: s.info.Model != "" && s.info.ProviderHost != "", ModelConnected: s.connected.Load(), Active: ps.Active, Plugins: ps.Plugins, Busy: busy, CurrentRunID: id, Events: events, Demo: true}
+	return State{HostPID: os.Getpid(), StartedAt: s.started, Model: s.info.Model, ProviderHost: s.info.ProviderHost, ModelConfigured: s.info.Model != "" && s.info.ProviderHost != "", ModelConnected: s.connected.Load(), Plugins: ps.Plugins, Busy: busy, CurrentRunID: id, Events: events, Demo: true}
 }
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -156,8 +174,8 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		st := s.state()
-		ready := st.ModelConfigured && st.Active != nil && st.Active.Status == "active"
-		send(w, 200, map[string]any{"ready": ready, "model_configured": st.ModelConfigured, "plugin_active": st.Active != nil})
+		plugins := pluginsReady(st.Plugins)
+		send(w, 200, map[string]any{"ready": st.ModelConfigured && plugins, "model_configured": st.ModelConfigured, "plugin_active": plugins})
 	case "/api/state":
 		if r.Method != http.MethodGet {
 			method(w, http.MethodGet)

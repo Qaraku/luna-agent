@@ -18,8 +18,14 @@ import (
 	jsonschema "github.com/eino-contrib/jsonschema"
 )
 
-const ToolName = "luna_text_transform"
-const instruction = "You are Luna, a truthful local demo. Use luna_text_transform whenever the user explicitly requests text transformation or explicitly asks to call it. Do not claim tools or actions that were not observed."
+const (
+	// ToolName and ReadFileToolName are the model-visible names of the two
+	// allowlisted tools. The names come from the plugin host's allowlist, so the
+	// core cannot register a tool the host cannot route or replace.
+	ToolName         = pluginhost.ToolTextTransform
+	ReadFileToolName = pluginhost.ToolReadFile
+)
+const instruction = "You are Luna, a truthful local demo. Use luna_text_transform whenever the user explicitly requests text transformation or explicitly asks to call it. Use luna_read_file when the user asks you to read a file; the path must be relative to the configured read root, which holds the local text files you may read. Do not claim tools or actions that were not observed."
 
 type Event struct {
 	Type string `json:"type"`
@@ -79,11 +85,38 @@ type RunFailed struct {
 type Invoker interface {
 	Invoke(context.Context, pluginhost.Input) (pluginhost.Output, error)
 }
+
+// FileReader is the host-side file tool. The wrapper hands it the raw path from
+// the model; validating that path against the read root is the host's job, not
+// the tool wrapper's and never the plugin's.
+type FileReader interface {
+	ReadFile(context.Context, pluginhost.ReadRequest) (pluginhost.Output, error)
+}
+
 type TextTransformTool struct{ invoker Invoker }
 
 func NewTextTransformTool(i Invoker) *TextTransformTool { return &TextTransformTool{invoker: i} }
 func (t *TextTransformTool) Info(context.Context) (*schema.ToolInfo, error) {
 	return toolInfo(), nil
+}
+
+// decodeOne accepts exactly one JSON object and rejects unknown fields and
+// trailing JSON values. Both tool wrappers share it so a malformed call is
+// refused before it can reach a plugin.
+func decodeOne(arguments string, into any) error {
+	d := json.NewDecoder(strings.NewReader(arguments))
+	d.DisallowUnknownFields()
+	if err := d.Decode(into); err != nil {
+		return err
+	}
+	var extra any
+	if extraErr := d.Decode(&extra); extraErr != io.EOF {
+		if extraErr == nil {
+			return fmt.Errorf("expected exactly one JSON object")
+		}
+		return extraErr
+	}
+	return nil
 }
 
 func strictToolSchema() *jsonschema.Schema {
@@ -106,18 +139,7 @@ func (t *TextTransformTool) InvokableRun(ctx context.Context, arguments string, 
 	var in struct {
 		Text string `json:"text"`
 	}
-	d := json.NewDecoder(strings.NewReader(arguments))
-	d.DisallowUnknownFields()
-	err := d.Decode(&in)
-	if err == nil {
-		var extra any
-		if extraErr := d.Decode(&extra); extraErr != io.EOF {
-			err = extraErr
-			if err == nil {
-				err = fmt.Errorf("expected exactly one JSON object")
-			}
-		}
-	}
+	err := decodeOne(arguments, &in)
 	if err != nil || in.Text == "" {
 		if err == nil {
 			err = fmt.Errorf("text is required")
@@ -137,30 +159,85 @@ func (t *TextTransformTool) InvokableRun(ctx context.Context, arguments string, 
 	return out.Result, nil
 }
 
+type ReadFileTool struct{ reader FileReader }
+
+func NewReadFileTool(r FileReader) *ReadFileTool { return &ReadFileTool{reader: r} }
+func (t *ReadFileTool) Info(context.Context) (*schema.ToolInfo, error) {
+	return readFileInfo(), nil
+}
+
+func readFileSchema() *jsonschema.Schema {
+	type args struct {
+		Path string `json:"path" jsonschema_description:"Path of a text file, relative to the configured read root"`
+	}
+	r := jsonschema.Reflector{DoNotReference: true, AllowAdditionalProperties: false}
+	s := r.Reflect(args{})
+	s.Required = []string{"path"}
+	return s
+}
+
+func (t *ReadFileTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.Option) (string, error) {
+	var raw any
+	if err := json.Unmarshal([]byte(arguments), &raw); err != nil {
+		raw = arguments
+	}
+	emit(ctx, Event{Type: "tool.started", Data: ToolStarted{RunID: runID(ctx), Name: ReadFileToolName, Arguments: raw}})
+	var in struct {
+		Path string `json:"path"`
+	}
+	err := decodeOne(arguments, &in)
+	if err != nil || in.Path == "" {
+		if err == nil {
+			err = fmt.Errorf("path is required")
+		}
+		emit(ctx, Event{Type: "tool.failed", Data: ToolFailed{RunID: runID(ctx), Name: ReadFileToolName, Error: err.Error()}})
+		return "", err
+	}
+	// The requested path is passed through unchanged: the host resolves and
+	// validates it against the read root before any plugin sees it.
+	out, err := t.reader.ReadFile(ctx, pluginhost.ReadRequest{Path: in.Path})
+	if err != nil {
+		emit(ctx, Event{Type: "tool.failed", Data: ToolFailed{RunID: runID(ctx), Name: ReadFileToolName, Error: err.Error(), Generation: out.Generation, Version: out.Version, PluginPID: out.PluginPID}})
+		return "", err
+	}
+	emit(ctx, Event{Type: "tool.finished", Data: ToolFinished{RunID: runID(ctx), Name: ReadFileToolName, Result: out.Result, Generation: out.Generation, Version: out.Version, PluginPID: out.PluginPID}})
+	// As with the transform tool, only the file text is model-visible; the
+	// serving generation, version and process identity stay in the event stream.
+	return out.Result, nil
+}
+
 // toolInfo fixes the exact public schema after construction.
 func toolInfo() *schema.ToolInfo {
 	return &schema.ToolInfo{Name: ToolName, Desc: "Transform text using the active local Luna subprocess plugin.", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(strictToolSchema())}
 }
 
-var _ tool.InvokableTool = (*TextTransformTool)(nil)
+// readFileInfo is the exact public schema of the file tool.
+func readFileInfo() *schema.ToolInfo {
+	return &schema.ToolInfo{Name: ReadFileToolName, Desc: "Read a text file from the configured read root using the active local Luna subprocess plugin.", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(readFileSchema())}
+}
+
+var (
+	_ tool.InvokableTool = (*TextTransformTool)(nil)
+	_ tool.InvokableTool = (*ReadFileTool)(nil)
+)
 
 type Runner struct{ runner *adk.Runner }
 
-func NewRunner(ctx context.Context, m model.ToolCallingChatModel, invoker Invoker) (*Runner, error) {
-	tt := NewTextTransformTool(invoker)
-	a, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{Name: "luna", Description: "Local Luna core preview", Instruction: instruction, Model: m, ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: []tool.BaseTool{tt}, ExecuteSequentially: true}}, MaxIterations: 6})
+func NewRunner(ctx context.Context, m model.ToolCallingChatModel, invoker Invoker, reader FileReader) (*Runner, error) {
+	tools := []tool.BaseTool{NewTextTransformTool(invoker), NewReadFileTool(reader)}
+	a, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{Name: "luna", Description: "Local Luna core preview", Instruction: instruction, Model: m, ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: tools, ExecuteSequentially: true}}, MaxIterations: 6})
 	if err != nil {
 		return nil, err
 	}
 	return &Runner{runner: adk.NewRunner(ctx, adk.RunnerConfig{Agent: a, EnableStreaming: true})}, nil
 }
 
-func NewOpenAIRunner(ctx context.Context, cfg config.Config, invoker Invoker) (*Runner, error) {
+func NewOpenAIRunner(ctx context.Context, cfg config.Config, invoker Invoker, reader FileReader) (*Runner, error) {
 	m, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL, Model: cfg.Model})
 	if err != nil {
 		return nil, err
 	}
-	return NewRunner(ctx, m, invoker)
+	return NewRunner(ctx, m, invoker, reader)
 }
 
 func (r *Runner) Run(parent context.Context, message, id string, sink Sink) (answer string, err error) {

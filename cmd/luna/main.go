@@ -89,6 +89,8 @@ func resolveRoot(explicit, executable, workingDir string) (string, error) {
 func run() error {
 	addr := flag.String("addr", "127.0.0.1:0", "literal loopback listen address")
 	rootFlag := flag.String("root", "", "repository root holding web/ and plugins/ (default: auto-detect)")
+	readRoot := flag.String("read-root", "", "directory luna_read_file may read inside (default: the resolved root)")
+	readLimit := flag.Int("read-limit", 0, "single-read cap in bytes for luna_read_file (default: 262144)")
 	flag.Parse()
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
@@ -110,12 +112,12 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	plugins, err := pluginhost.New(ctx, root, pluginhost.Options{})
+	plugins, err := pluginhost.New(ctx, root, pluginhost.Options{ReadRoot: *readRoot, ReadLimit: *readLimit})
 	if err != nil {
 		return fmt.Errorf("start plugin host: %w", err)
 	}
 	defer plugins.Close()
-	runner, err := agent.NewOpenAIRunner(ctx, cfg, plugins)
+	runner, err := agent.NewOpenAIRunner(ctx, cfg, plugins, plugins)
 	if err != nil {
 		return fmt.Errorf("construct Eino agent: %w", err)
 	}

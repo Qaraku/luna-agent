@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Qaraku/luna-agent/internal/fileread"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/model"
@@ -25,6 +27,20 @@ type fakeInvoker struct {
 
 func (f fakeInvoker) Invoke(context.Context, pluginhost.Input) (pluginhost.Output, error) {
 	return f.out, f.err
+}
+
+// recordingReader captures the read request the tool wrapper produced, so a
+// test can prove the wrapper forwards the raw model-supplied path instead of
+// validating it itself.
+type recordingReader struct {
+	requests []pluginhost.ReadRequest
+	out      pluginhost.Output
+	err      error
+}
+
+func (r *recordingReader) ReadFile(_ context.Context, req pluginhost.ReadRequest) (pluginhost.Output, error) {
+	r.requests = append(r.requests, req)
+	return r.out, r.err
 }
 
 type collectingSink struct {
@@ -168,7 +184,7 @@ func TestRunSuppressesStreamingContentBeforeToolCall(t *testing.T) {
 		},
 		final: "final answer",
 	}
-	r, err := NewRunner(context.Background(), m, fakeInvoker{out: pluginhost.Output{Result: "hello"}})
+	r, err := NewRunner(context.Background(), m, fakeInvoker{out: pluginhost.Output{Result: "hello"}}, &recordingReader{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +209,7 @@ func TestRunSuppressesStreamingContentAfterToolCall(t *testing.T) {
 		},
 		final: "final answer",
 	}
-	r, err := NewRunner(context.Background(), m, fakeInvoker{out: pluginhost.Output{Result: "hello"}})
+	r, err := NewRunner(context.Background(), m, fakeInvoker{out: pluginhost.Output{Result: "hello"}}, &recordingReader{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,12 +228,11 @@ func TestRunSuppressesStreamingContentAfterToolCall(t *testing.T) {
 
 func newNonStreamingTestRunner(t *testing.T, m model.ToolCallingChatModel, invoker Invoker) *Runner {
 	t.Helper()
-	tt := NewTextTransformTool(invoker)
 	a, err := adk.NewChatModelAgent(context.Background(), &adk.ChatModelAgentConfig{
 		Name:          "luna-test",
 		Instruction:   instruction,
 		Model:         m,
-		ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: []tool.BaseTool{tt}}},
+		ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: []tool.BaseTool{NewTextTransformTool(invoker), NewReadFileTool(&recordingReader{})}}},
 		MaxIterations: 6,
 	})
 	if err != nil {
@@ -308,7 +323,7 @@ func TestRunnerExecutesMultipleToolCallsSequentially(t *testing.T) {
 		final: "final answer",
 	}
 	invoker := newSequentialProbeInvoker()
-	r, err := NewRunner(context.Background(), m, invoker)
+	r, err := NewRunner(context.Background(), m, invoker, &recordingReader{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,8 +353,13 @@ func TestRunnerExecutesMultipleToolCallsSequentially(t *testing.T) {
 
 type fakeModel struct{}
 
+// The core registers both allowlisted tools, and nothing else.
 func (fakeModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
-	if len(tools) != 1 || tools[0].Name != "luna_text_transform" {
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		names = append(names, t.Name)
+	}
+	if len(names) != 2 || names[0] != "luna_text_transform" || names[1] != "luna_read_file" {
 		return nil, io.ErrUnexpectedEOF
 	}
 	return fakeModel{}, nil
@@ -367,7 +387,7 @@ func TestFakeModelEinoEndToEndMapsAppEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer h.Close()
-	r, err := NewRunner(context.Background(), fakeModel{}, h)
+	r, err := NewRunner(context.Background(), fakeModel{}, h, h)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,5 +415,179 @@ func TestFakeModelEinoEndToEndMapsAppEvents(t *testing.T) {
 	finished := sink.events[2].Data.(ToolFinished)
 	if finished.Result != "hello" || finished.Generation != 1 || finished.Version != "v1" || finished.PluginPID <= 0 {
 		t.Fatalf("tool event=%+v", finished)
+	}
+}
+
+func TestReadFileToolEmitsStartedThenFinishedAndHidesIdentityFromTheModel(t *testing.T) {
+	sink := &collectingSink{}
+	ctx := WithRun(context.Background(), "run-1", sink)
+	reader := &recordingReader{out: pluginhost.Output{Result: "file body", Generation: 9, Version: "v1", PluginPID: 77}}
+	tool := NewReadFileTool(reader)
+	got, err := tool.InvokableRun(ctx, `{"path":"docs/architecture.md"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "file body" {
+		t.Fatalf("model-visible tool output must be the plain file text, got %q", got)
+	}
+	// The wrapper forwards the raw requested path; resolving it is the host's
+	// job, never the wrapper's and never the plugin's.
+	if len(reader.requests) != 1 || reader.requests[0].Path != "docs/architecture.md" {
+		t.Fatalf("wrapper requests=%+v", reader.requests)
+	}
+	for _, leak := range []string{"77", "v1", "Generation", "generation", "PluginPID", "plugin_pid", "PID", "9"} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("model-visible tool output leaked plugin identity %q: %q", leak, got)
+		}
+	}
+	if len(sink.events) != 2 || sink.events[0].Type != "tool.started" || sink.events[1].Type != "tool.finished" {
+		t.Fatalf("event order: %+v", sink.events)
+	}
+	started, ok := sink.events[0].Data.(ToolStarted)
+	if !ok || started.Name != ReadFileToolName {
+		t.Fatalf("started payload: %#v", sink.events[0].Data)
+	}
+	args, ok := started.Arguments.(map[string]any)
+	if !ok || args["path"] != "docs/architecture.md" {
+		t.Fatalf("started arguments must carry the requested path: %#v", started.Arguments)
+	}
+	finished, ok := sink.events[1].Data.(ToolFinished)
+	if !ok || finished.Name != ReadFileToolName {
+		t.Fatalf("finished payload: %#v", sink.events[1].Data)
+	}
+	if finished.Result != "file body" || finished.Generation != 9 || finished.Version != "v1" || finished.PluginPID != 77 {
+		t.Fatalf("plugin identity must stay exact in the UI event: %+v", finished)
+	}
+}
+
+func TestReadFileToolRejectsMalformedArgumentsBeforeTheHost(t *testing.T) {
+	for _, arguments := range []string{`{}`, `{"path":""}`, `{"path":"a"}{"path":"b"}`, `{"path":"a","depth":2}`, `not json`, ``} {
+		sink := &collectingSink{}
+		ctx := WithRun(context.Background(), "run-1", sink)
+		reader := &recordingReader{out: pluginhost.Output{Result: "should not be reached"}}
+		if _, err := NewReadFileTool(reader).InvokableRun(ctx, arguments); err == nil {
+			t.Fatalf("arguments %q accepted", arguments)
+		}
+		if len(reader.requests) != 0 {
+			t.Fatalf("arguments %q reached the host: %+v", arguments, reader.requests)
+		}
+		if len(sink.events) != 2 || sink.events[0].Type != "tool.started" || sink.events[1].Type != "tool.failed" {
+			t.Fatalf("arguments %q events=%+v", arguments, sink.events)
+		}
+		failed := sink.events[1].Data.(ToolFailed)
+		if failed.Name != ReadFileToolName || failed.Error == "" {
+			t.Fatalf("arguments %q failed payload=%+v", arguments, failed)
+		}
+	}
+}
+
+func TestReadFileSchemaIsStrict(t *testing.T) {
+	info, err := NewReadFileTool(&recordingReader{}).Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Name != ReadFileToolName {
+		t.Fatalf("tool name = %q", info.Name)
+	}
+	s, err := info.ParamsOneOf.ToJSONSchema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(s)
+	var raw map[string]any
+	_ = json.Unmarshal(b, &raw)
+	if raw["type"] != "object" || raw["additionalProperties"] != false {
+		t.Fatalf("schema is not strict: %s", b)
+	}
+	req := raw["required"].([]any)
+	if len(req) != 1 || req[0] != "path" {
+		t.Fatalf("required mismatch: %s", b)
+	}
+}
+
+// A refusal by the host (here: an absolute path) surfaces as tool.failed with
+// the host's own message.
+func TestReadFileToolReportsAHostRefusalAsToolFailed(t *testing.T) {
+	sink := &collectingSink{}
+	ctx := WithRun(context.Background(), "run-1", sink)
+	reader := &recordingReader{err: fileread.ErrPathAbsolute}
+	_, err := NewReadFileTool(reader).InvokableRun(ctx, `{"path":"/etc/passwd"}`)
+	if err == nil || !errors.Is(err, fileread.ErrPathAbsolute) {
+		t.Fatalf("error = %v", err)
+	}
+	if len(sink.events) != 2 || sink.events[1].Type != "tool.failed" {
+		t.Fatalf("events=%+v", sink.events)
+	}
+	failed := sink.events[1].Data.(ToolFailed)
+	if failed.Name != ReadFileToolName || !strings.Contains(failed.Error, "absolute paths are not allowed") {
+		t.Fatalf("failed payload=%+v", failed)
+	}
+}
+
+type readModel struct{}
+
+func (readModel) WithTools([]*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+	return readModel{}, nil
+}
+func (readModel) Generate(_ context.Context, input []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+	for _, m := range input {
+		if m.Role == schema.Tool {
+			return schema.AssistantMessage("Observed the file.", nil), nil
+		}
+	}
+	return schema.AssistantMessage("", []schema.ToolCall{{ID: "call-1", Type: "function", Function: schema.FunctionCall{Name: ReadFileToolName, Arguments: `{"path":"docs/architecture.md"}`}}}), nil
+}
+func (m readModel) Stream(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	msg, err := m.Generate(ctx, input, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return schema.StreamReaderFromArray([]*schema.Message{msg}), nil
+}
+
+// The second tool runs through the real subprocess plugin behind Eino, and its
+// event mapping is the same app-owned shape as the transform tool.
+func TestFakeModelReadsAFileThroughEinoEndToEnd(t *testing.T) {
+	root, _ := filepath.Abs("../..")
+	h, err := pluginhost.New(context.Background(), root, pluginhost.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	r, err := NewRunner(context.Background(), readModel{}, h, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &collectingSink{}
+	answer, err := r.Run(context.Background(), "read docs/architecture.md", "run-read", sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer != "Observed the file." {
+		t.Fatalf("answer=%q", answer)
+	}
+	types := []string{}
+	for _, e := range sink.events {
+		types = append(types, e.Type)
+	}
+	want := []string{"run.started", "tool.started", "tool.finished", "assistant.delta", "run.finished"}
+	if len(types) != len(want) {
+		t.Fatalf("events=%v", types)
+	}
+	for i := range want {
+		if types[i] != want[i] {
+			t.Fatalf("events=%v", types)
+		}
+	}
+	started := sink.events[1].Data.(ToolStarted)
+	if started.Name != ReadFileToolName {
+		t.Fatalf("started=%+v", started)
+	}
+	finished := sink.events[2].Data.(ToolFinished)
+	if finished.Name != ReadFileToolName || !strings.Contains(finished.Result, "# Luna Agent architecture") {
+		t.Fatalf("finished=%+v", finished)
+	}
+	if finished.Generation != 1 || finished.Version != "v1" || finished.PluginPID <= 0 {
+		t.Fatalf("finished identity=%+v", finished)
 	}
 }

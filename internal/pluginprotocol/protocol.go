@@ -7,9 +7,15 @@ import (
 
 var Handshake = plugin.HandshakeConfig{ProtocolVersion: 1, MagicCookieKey: "LUNA_PLUGIN", MagicCookieValue: "luna-core-v1"}
 
+// Input is the plugin RPC request. Text/DelayMS serve the text-transform
+// plugin; Path/MaxBytes serve the file-read plugin, where Path is an absolute
+// path the host has already validated against the read root. A plugin never
+// receives a model- or browser-supplied path in Path.
 type Input struct {
-	Text    string `json:"text"`
-	DelayMS int    `json:"delay_ms"`
+	Text     string `json:"text"`
+	Path     string `json:"path"`
+	MaxBytes int    `json:"max_bytes"`
+	DelayMS  int    `json:"delay_ms"`
 }
 type Metadata struct {
 	Version  string

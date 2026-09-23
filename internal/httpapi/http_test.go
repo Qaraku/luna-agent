@@ -36,8 +36,19 @@ func (f fakeRunner) Run(ctx context.Context, message, id string, sink agent.Sink
 	return "hello", nil
 }
 
+// pluginState builds the plugin records for the named tools. Fixture plugin
+// PIDs differ per tool, so an assertion on one of them cannot pass by accident
+// on the other.
+func pluginState(tools ...string) pluginhost.State {
+	state := pluginhost.State{Plugins: []pluginhost.Record{}}
+	for i, tool := range tools {
+		state.Plugins = append(state.Plugins, pluginhost.Record{Tool: tool, Generation: 1, Version: "v1", Candidate: "v1", PluginPID: 123 + i, Status: "active"})
+	}
+	return state
+}
+
 func testHandler(r Runner) http.Handler {
-	p := &fakePlugins{state: pluginhost.State{Active: &pluginhost.Record{Generation: 1, Version: "v1", PluginPID: 123, Status: "active"}, Plugins: []pluginhost.Record{{Generation: 1, Version: "v1", PluginPID: 123, Status: "active"}}}}
+	p := &fakePlugins{state: pluginState(pluginhost.ToolTextTransform, pluginhost.ToolReadFile)}
 	return New(p, r, Info{BoundHost: "127.0.0.1:43210", Model: "fake-model", ProviderHost: "provider.test", WebDir: "../../web"})
 }
 
@@ -472,12 +483,60 @@ func TestStateAndHealthContainNoSecretAndHonestConnectionState(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
 		t.Fatal(err)
 	}
-	if state.ModelConnected || !state.ModelConfigured || state.Model != "fake-model" || state.Active == nil {
+	if state.ModelConnected || !state.ModelConfigured || state.Model != "fake-model" || len(state.Plugins) == 0 {
 		t.Fatalf("bad state: %+v", state)
 	}
 	w = request(t, h, http.MethodGet, "/healthz", "", false)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), `"ready":true`) {
 		t.Fatalf("health=%d %s", w.Code, w.Body.String())
+	}
+}
+
+// /api/state reports every allowlisted tool, not one active entry: a single
+// active record could not name which tool had failed.
+func TestStateReportsEveryToolAndNoSingleActiveEntry(t *testing.T) {
+	w := request(t, testHandler(fakeRunner{}), http.MethodGet, "/api/state", "", false)
+	body := w.Body.String()
+	if strings.Contains(body, `"active":{`) {
+		t.Fatalf("state still carries a single active entry: %s", body)
+	}
+	var state State
+	if err := json.Unmarshal(w.Body.Bytes(), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Plugins) != len(pluginhost.Allowlist) {
+		t.Fatalf("plugins=%+v, want one record per allowlisted tool", state.Plugins)
+	}
+	for _, spec := range pluginhost.Allowlist {
+		if !strings.Contains(body, `"tool":"`+spec.Tool+`"`) {
+			t.Fatalf("state does not name %s: %s", spec.Tool, body)
+		}
+		found := false
+		for _, record := range state.Plugins {
+			if record.Tool == spec.Tool && record.Status == "active" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("state has no active record for %s: %+v", spec.Tool, state.Plugins)
+		}
+	}
+}
+
+// Readiness covers the whole tool set: one live tool is not enough.
+func TestHealthzRequiresEveryAllowlistedTool(t *testing.T) {
+	full := request(t, testHandler(fakeRunner{}), http.MethodGet, "/healthz", "", false)
+	if !strings.Contains(full.Body.String(), `"plugin_active":true`) {
+		t.Fatalf("health with every tool active: %s", full.Body.String())
+	}
+	partial := New(&fakePlugins{state: pluginState(pluginhost.ToolTextTransform)}, fakeRunner{}, Info{BoundHost: "127.0.0.1:43210", Model: "fake-model", ProviderHost: "provider.test", WebDir: "../../web"})
+	w := request(t, partial, http.MethodGet, "/healthz", "", false)
+	body := w.Body.String()
+	if !strings.Contains(body, `"plugin_active":false`) || !strings.Contains(body, `"ready":false`) {
+		t.Fatalf("a missing tool must make the host unready: %s", body)
+	}
+	if !strings.Contains(body, `"model_configured":true`) {
+		t.Fatalf("readiness must still distinguish configuration from a live plugin: %s", body)
 	}
 }
 
