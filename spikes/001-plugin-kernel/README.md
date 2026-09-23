@@ -7,7 +7,7 @@
 要求 PATH 中有 Go（模块要求 Go 1.24+），首次允许下载依赖。必须从本 spike 目录启动，web 文件在运行时读取，没有 embed 或 Node 构建依赖。
 
 ```sh
-cd /home/j/probe/luna-agent/spikes/001-plugin-kernel
+cd spikes/001-plugin-kernel   # from the repository root
 go mod download
 go build -o .runtime/luna ./cmd/luna
 ./.runtime/luna -addr 127.0.0.1:0

@@ -29,7 +29,7 @@ git diff --check
 
 ## Secrets and evidence
 
-- Never read, print, copy, commit, or persist values from `~/.secrets/llm-dsv4f.env`.
+- Never read, print, copy, commit, or persist credential values, and never include them in evidence, logs, or lifecycle output.
 - Never log API keys, authorization headers, provider request/response bodies, prompts, tool arguments/results, or hidden reasoning in lifecycle evidence.
 - Application startup errors may identify missing environment-variable names, but must not include their values.
 - Only source a trusted secrets file when an explicitly authorized live-provider check requires it. The normal implementation and deterministic test path must use fake models or process-environment stubs.

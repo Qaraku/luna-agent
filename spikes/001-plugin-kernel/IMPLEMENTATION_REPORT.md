@@ -53,7 +53,7 @@ PLUGIN_EXIT_CONFIRMED 285336
 ## 启动命令
 
 ```sh
-cd /home/j/probe/luna-agent/spikes/001-plugin-kernel
+cd spikes/001-plugin-kernel   # from the repository root
 ./.runtime/luna -addr 127.0.0.1:0
 ```
 

@@ -149,10 +149,10 @@ The final independent review passed with no security concerns or logic errors re
 ## Exact parent launch command
 
 ```sh
-zsh -lc 'source ~/.secrets/llm-dsv4f.env && exec /home/j/probe/luna-agent/.runtime/luna -addr 127.0.0.1:0'
+zsh -lc 'source ~/.secrets/<provider>.env && exec ./.runtime/luna -addr 127.0.0.1:0'
 ```
 
-This command executes the trusted shell file `~/.secrets/llm-dsv4f.env`; it must not be used if that file is not trusted. No secret values belong in repository output or verification logs. The launched process prints the exact ephemeral `LISTEN_URL`. Any parent validation should be bounded and should terminate and wait for the server and owned plugin processes before completion.
+This command executes the trusted shell file `~/.secrets/<provider>.env`; it must not be used if that file is not trusted. No secret values belong in repository output or verification logs. The launched process prints the exact ephemeral `LISTEN_URL`. Any parent validation should be bounded and should terminate and wait for the server and owned plugin processes before completion.
 
 ## Limits
 

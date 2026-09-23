@@ -25,7 +25,7 @@ Go httpapi/kernel 测试通过，无 race 报告；Node 测试 3 项通过。最
 
 ### 真实 API 检查
 
-9 项独立 API 检查全部通过，脚本结果保存在 `/home/j/.hermes/cache/luna-demo-verification/results/api-evidence.json`。
+9 项独立 API 检查全部通过，脚本结果保存在本地验证目录 `luna-demo-verification/results/api-evidence.json`（该目录未随仓库发布）。
 
 - 宿主 PID 始终为 `272095`，启动时间保持不变。
 - v1 generation 3 / PID `281827` 返回 `moon light`。
@@ -48,7 +48,7 @@ Go httpapi/kernel 测试通过，无 race 报告；Node 测试 3 项通过。最
 - 390px 窄屏无横向溢出，页面无 JavaScript pageerror。
 - 1440px 桌面截图可读，无阻碍试用的遮挡。
 
-UI 证据：`/home/j/.hermes/cache/luna-demo-verification/results/ui-evidence.json`；截图同目录 `desktop.png`、`mobile.png`。
+UI 证据：本地验证目录 `luna-demo-verification/results/ui-evidence.json`；截图同目录 `desktop.png`、`mobile.png`。
 
 已通过 desktop_preview 打开实际应用，并读取确认：标题 `Luna · Plugin Lab`，`已连接 · 实时状态`，Host PID `272095`，工具与插件控制项存在。可见窗口只做打开和读取，未代用户点击。
 
@@ -56,7 +56,7 @@ UI 证据：`/home/j/.hermes/cache/luna-demo-verification/results/ui-evidence.js
 
 本次交付 URL：`http://127.0.0.1:36487/`。这是本次进程的端口，不是永久配置。
 
-父任务保留的示例进程：PID `272095`，命令 `./.runtime/luna-verified -addr 127.0.0.1:0`，Hermes 后台进程句柄 `proc_34233970bec8`。它仅监听 loopback，供用户试用。页面关掉不等于服务停止；以后需要关闭时仅操作这个已核实的 demo 进程，不使用泛化 pkill。
+父任务保留的示例进程：PID `272095`，命令 `./.runtime/luna-verified -addr 127.0.0.1:0`。它仅监听 loopback，供用户试用。页面关掉不等于服务停止；以后需要关闭时仅操作这个已核实的 demo 进程，不使用泛化 pkill。
 
 重新运行的方式见 README。没有提交或推送 Git。
 
