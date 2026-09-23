@@ -427,6 +427,7 @@ button:focus-visible, textarea:focus-visible, select:focus-visible, summary:focu
 }
 .reload-controls button:hover { border-color: var(--moon-hover); color: var(--moon-hover); }
 .reload-status { min-height: 19px; margin: 10px 0 0; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.plugin-empty { margin: 10px 0 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.6; }
 .reload-status.failure { color: var(--danger); }
 .reload-status.success { color: var(--positive); }
 .technical-detail, .lifecycle-detail { color: var(--text-tertiary); font-size: 12px; }

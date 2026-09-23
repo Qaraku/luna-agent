@@ -13,12 +13,51 @@ function toolSummary(data) {
   return `generation ${data.generation ?? '—'} · ${data.version ?? '—'} · PID ${data.plugin_pid ?? '—'}`;
 }
 
-function toolActivityLabel(state) {
+// Tool copy is keyed by the model-visible tool name, so a card or a status row
+// for one tool never borrows another tool's wording. An unknown name gets
+// neutral copy rather than a guess, and the fallback never names a plugin.
+const TOOL_COPY = {
+  luna_text_transform: { noun: '文本转换', running: '正在转换文本…', finished: '文本转换完成', failed: '文本转换失败' },
+  luna_read_file: { noun: '读取文件', running: '正在读取文件…', finished: '读取文件完成', failed: '读取文件失败' }
+};
+const TOOL_COPY_FALLBACK = { noun: '工具调用', running: '正在调用工具…', finished: '工具调用完成', failed: '工具调用失败' };
+
+function toolLabel(name) {
+  return TOOL_COPY[name] || TOOL_COPY_FALLBACK;
+}
+
+function toolActivityLabel(name, state) {
+  const label = toolLabel(name);
+  return label[state] || label.noun;
+}
+
+function valueOrDash(value) {
+  return value === undefined || value === null || value === '' ? '—' : String(value);
+}
+
+function pluginStatusLabel(status) {
   return {
-    running: '正在转换文本…',
-    finished: '文本转换完成',
-    failed: '文本转换失败'
-  }[state] || '文本转换';
+    active: '启用中',
+    retiring: '退役中',
+    failed: '不可用'
+  }[status] || '状态未知';
+}
+
+// pluginRows turns the state payload's `plugins` array into display rows: one
+// row per record, because a tool being replaced reports its retiring generation
+// alongside its active one. A missing array or a malformed record produces an
+// honest placeholder instead of an invented plugin.
+function pluginRows(plugins) {
+  if (!Array.isArray(plugins)) return [];
+  return plugins.map((plugin) => {
+    const record = plugin && typeof plugin === 'object' ? plugin : {};
+    return {
+      tool: valueOrDash(record.tool),
+      label: toolLabel(record.tool).noun,
+      status: pluginStatusLabel(record.status),
+      identity: toolSummary(record)
+    };
+  });
 }
 
 function candidateLabel(value) {
@@ -130,7 +169,7 @@ function parseMarkdownBlocks(markdown) {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { parseEventBlock, toolSummary, toolActivityLabel, candidateLabel, reloadCopy, parseInline, parseMarkdownBlocks };
+  module.exports = { parseEventBlock, toolSummary, toolLabel, toolActivityLabel, candidateLabel, reloadCopy, valueOrDash, pluginStatusLabel, pluginRows, parseInline, parseMarkdownBlocks };
 }
 
 if (typeof document !== 'undefined') {
@@ -262,10 +301,10 @@ if (typeof document !== 'undefined') {
     const stick = nearBottom();
     const details = make('details', 'tool-row running');
     details.open = true;
-    const summary = make('summary', '', toolActivityLabel('running'));
+    const summary = make('summary', '', toolActivityLabel(data.name, 'running'));
     const detail = make('div', 'tool-detail');
     const list = make('dl');
-    appendDefinition(list, '工具', data.name || 'luna_text_transform');
+    appendDefinition(list, '工具', valueOrDash(data.name));
     appendDefinition(list, '参数', formatValue(data.arguments));
     detail.append(list);
     details.append(summary, detail);
@@ -286,7 +325,7 @@ if (typeof document !== 'undefined') {
     tool.complete = true;
     tool.details.classList.remove('running');
     tool.details.classList.toggle('failed', failed);
-    tool.summary.textContent = toolActivityLabel(failed ? 'failed' : 'finished');
+    tool.summary.textContent = toolActivityLabel(tool.name, failed ? 'failed' : 'finished');
     appendDefinition(tool.list, failed ? '错误' : '结果', failed ? (data.error || '未知错误') : formatValue(data.result));
     appendDefinition(tool.list, '执行身份', toolSummary(data));
     tool.details.open = false;
@@ -312,7 +351,7 @@ if (typeof document !== 'undefined') {
       tool.complete = true;
       tool.details.classList.remove('running');
       tool.details.classList.add('failed');
-      tool.summary.textContent = toolActivityLabel('failed');
+      tool.summary.textContent = toolActivityLabel(tool.name, 'failed');
       appendDefinition(tool.list, '错误', '工具在完成前中断。');
       tool.details.open = false;
     }
@@ -537,19 +576,25 @@ if (typeof document !== 'undefined') {
     }
   });
 
-  function valueOrDash(value) {
-    return value === undefined || value === null || value === '' ? '—' : String(value);
-  }
-
   function renderState(state) {
     $('model').textContent = valueOrDash(state.model);
     $('provider').textContent = valueOrDash(state.provider_host);
     $('host-pid').textContent = valueOrDash(state.host_pid);
     $('busy').textContent = state.busy ? `运行中 · ${valueOrDash(state.current_run_id)}` : '可用';
-    const active = state.active || {};
-    $('plugin-version').textContent = valueOrDash(active.version);
-    $('plugin-generation').textContent = valueOrDash(active.generation);
-    $('plugin-pid').textContent = valueOrDash(active.plugin_pid);
+
+    // Each allowlisted tool gets its own row, and a tool mid-replacement can
+    // report a retiring generation next to its active one. Nothing here is
+    // invented: when the payload has no records the list stays empty and the
+    // drawer says so.
+    const plugins = $('plugins');
+    const rows = pluginRows(state.plugins);
+    plugins.replaceChildren();
+    for (const row of rows) {
+      const entry = make('div');
+      entry.append(make('dt', '', `${row.tool} · ${row.label}`), make('dd', '', `${row.status} · ${row.identity}`));
+      plugins.append(entry);
+    }
+    $('plugins-empty').hidden = rows.length > 0;
 
     runtimeAvailability.textContent = '本地运行状态可用';
     runtimeAvailability.className = 'availability ready';

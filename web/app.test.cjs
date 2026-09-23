@@ -33,11 +33,30 @@ test('tool summary preserves immutable execution identity', () => {
   assert.equal(toolSummary({}), 'generation — · — · PID —');
 });
 
-test('tool activity and reload copy are friendly while values remain exact', () => {
+test('tool copy names each tool and falls back without inventing one', () => {
+  const { toolLabel } = require('./app.js');
+  assert.deepEqual(toolLabel('luna_text_transform'), {
+    noun: '文本转换', running: '正在转换文本…', finished: '文本转换完成', failed: '文本转换失败'
+  });
+  assert.deepEqual(toolLabel('luna_read_file'), {
+    noun: '读取文件', running: '正在读取文件…', finished: '读取文件完成', failed: '读取文件失败'
+  });
+  assert.deepEqual(toolLabel(undefined), {
+    noun: '工具调用', running: '正在调用工具…', finished: '工具调用完成', failed: '工具调用失败'
+  });
+  assert.deepEqual(toolLabel('luna_unknown'), toolLabel(undefined), 'an unknown tool must not borrow a known tool name');
+});
+
+test('tool activity copy is per tool while values remain exact', () => {
   const { toolActivityLabel, candidateLabel, reloadCopy } = require('./app.js');
-  assert.equal(toolActivityLabel('running'), '正在转换文本…');
-  assert.equal(toolActivityLabel('finished'), '文本转换完成');
-  assert.equal(toolActivityLabel('failed'), '文本转换失败');
+  assert.equal(toolActivityLabel('luna_text_transform', 'running'), '正在转换文本…');
+  assert.equal(toolActivityLabel('luna_text_transform', 'finished'), '文本转换完成');
+  assert.equal(toolActivityLabel('luna_text_transform', 'failed'), '文本转换失败');
+  assert.equal(toolActivityLabel('luna_read_file', 'running'), '正在读取文件…');
+  assert.equal(toolActivityLabel('luna_read_file', 'finished'), '读取文件完成');
+  assert.equal(toolActivityLabel('luna_read_file', 'failed'), '读取文件失败');
+  assert.equal(toolActivityLabel('luna_read_file', 'unknown-state'), '读取文件');
+  assert.equal(toolActivityLabel(undefined, 'running'), '正在调用工具…');
   assert.equal(candidateLabel('v1'), '稳定版本 v1');
   assert.equal(candidateLabel('v2'), '候选版本 v2');
   assert.equal(candidateLabel('broken'), '故障演练 broken');
@@ -46,6 +65,58 @@ test('tool activity and reload copy are friendly while values remain exact', () 
   assert.deepEqual(reloadCopy('failure', 'broken', 'handshake timeout'), {
     summary: '无法启用 broken，当前版本保持不变。', technical: 'handshake timeout'
   });
+});
+
+test('valueOrDash keeps exact values and marks missing ones', () => {
+  const { valueOrDash } = require('./app.js');
+  assert.equal(valueOrDash(0), '0');
+  assert.equal(valueOrDash('v1'), 'v1');
+  assert.equal(valueOrDash(12), '12');
+  assert.equal(valueOrDash(undefined), '—');
+  assert.equal(valueOrDash(null), '—');
+  assert.equal(valueOrDash(''), '—');
+});
+
+test('plugin status copy distinguishes active, draining and failed records', () => {
+  const { pluginStatusLabel } = require('./app.js');
+  assert.equal(pluginStatusLabel('active'), '启用中');
+  assert.equal(pluginStatusLabel('retiring'), '退役中');
+  assert.equal(pluginStatusLabel('failed'), '不可用');
+  assert.equal(pluginStatusLabel(undefined), '状态未知');
+  assert.equal(pluginStatusLabel('something-else'), '状态未知');
+});
+
+test('plugin rows cover every tool and stay honest for empty and partial states', () => {
+  const { pluginRows } = require('./app.js');
+  assert.deepEqual(pluginRows([
+    { tool: 'luna_text_transform', generation: 2, version: 'v2', plugin_pid: 91, candidate: 'v2', status: 'active', inflight: 0 },
+    { tool: 'luna_read_file', generation: 2, version: 'v2', plugin_pid: 92, candidate: 'v2', status: 'active', inflight: 1 }
+  ]), [
+    { tool: 'luna_text_transform', label: '文本转换', status: '启用中', identity: 'generation 2 · v2 · PID 91' },
+    { tool: 'luna_read_file', label: '读取文件', status: '启用中', identity: 'generation 2 · v2 · PID 92' }
+  ]);
+
+  // A tool mid-replacement reports both generations; both rows are shown.
+  assert.deepEqual(pluginRows([
+    { tool: 'luna_read_file', generation: 3, version: 'v2', plugin_pid: 93, candidate: 'v2', status: 'active', inflight: 0 },
+    { tool: 'luna_read_file', generation: 2, version: 'v1', plugin_pid: 41, candidate: 'v1', status: 'retiring', inflight: 1 }
+  ]), [
+    { tool: 'luna_read_file', label: '读取文件', status: '启用中', identity: 'generation 3 · v2 · PID 93' },
+    { tool: 'luna_read_file', label: '读取文件', status: '退役中', identity: 'generation 2 · v1 · PID 41' }
+  ]);
+
+  // No records, no payload, or a record without fields: never an invented tool.
+  assert.deepEqual(pluginRows([]), []);
+  assert.deepEqual(pluginRows(undefined), []);
+  assert.deepEqual(pluginRows(null), []);
+  assert.deepEqual(pluginRows('luna_read_file'), []);
+  assert.deepEqual(pluginRows([{}]), [
+    { tool: '—', label: '工具调用', status: '状态未知', identity: 'generation — · — · PID —' }
+  ]);
+  assert.deepEqual(pluginRows([null, { tool: 'luna_read_file', version: 'v1', status: 'failed' }]), [
+    { tool: '—', label: '工具调用', status: '状态未知', identity: 'generation — · — · PID —' },
+    { tool: 'luna_read_file', label: '读取文件', status: '不可用', identity: 'generation — · v1 · PID —' }
+  ]);
 });
 
 test('Moonline markup is conversation-first with an accessible hidden runtime drawer', () => {
@@ -64,13 +135,29 @@ test('Moonline markup is conversation-first with an accessible hidden runtime dr
   assert.equal(/id="transcript"[^>]*aria-live/.test(html), false, 'streaming transcript must not announce every token');
   assert.match(html, /<summary>生命周期<\/summary>/);
   assert.match(html, /<summary>技术详情<\/summary>/);
+  assert.match(html, /<section class="drawer-section" aria-labelledby="plugins-title">/);
+  assert.match(html, /<h3 id="plugins-title">工具插件<\/h3>/);
 
-  for (const id of ['model', 'provider', 'host-pid', 'busy', 'plugin-version', 'plugin-generation', 'plugin-pid', 'candidate', 'reload', 'reload-status', 'events']) {
+  for (const id of ['model', 'provider', 'host-pid', 'busy', 'plugins', 'plugins-empty', 'candidate', 'reload', 'reload-status', 'events']) {
     assert.match(html, new RegExp(`id="${id}"`));
   }
   for (const value of ['v1', 'v2', 'broken']) {
     assert.match(html, new RegExp(`<option value="${value}"`));
   }
+});
+
+test('the plugin section is an empty list in markup and never a fixed tool', () => {
+  const html = source('index.html');
+  const js = source('app.js');
+  assert.match(html, /<dl id="plugins" class="fact-list"><\/dl>/, 'the drawer list is filled from state, not from markup');
+  assert.match(html, /id="plugins-empty"[^>]*hidden[^>]*>暂未读到工具插件。</);
+  for (const id of ['plugin-version', 'plugin-generation', 'plugin-pid']) {
+    assert.equal(html.includes(id), false, `stale single-plugin field ${id} must be gone`);
+  }
+  assert.equal(html.includes('文本转换器'), false, 'the drawer must not be titled after one tool');
+  assert.equal(js.includes('state.active'), false, 'the removed single-active field must not be read');
+  assert.equal(js.includes('plugin-version'), false, 'the removed single-plugin field must not be written');
+  assert.match(js, /pluginRows\(state\.plugins\)/, 'the drawer renders the plugins array');
 });
 
 test('the primary surface omits console-era and fabricated content', () => {
@@ -119,6 +206,8 @@ test('styles implement fixed-shell Moonline tokens, type, motion and mobile shee
 test('frontend uses safe DOM APIs and includes interaction contracts', () => {
   const js = source('app.js');
   assert.equal(js.includes('innerHTML'), false);
+  assert.equal(/\beval\s*\(/.test(js), false);
+  assert.equal(js.includes('new Function'), false);
   assert.match(js, /currentTurn\.terminal\s*=\s*true/);
   assert.match(js, /if \(!currentTurn \|\| !currentTurn\.terminal\) showRunFailure\(error\.message\)/);
   assert.match(js, /function resolveOpenTools\(\)/);
@@ -144,4 +233,6 @@ test('frontend uses safe DOM APIs and includes interaction contracts', () => {
   assert.match(js, /function renderMarkdown/);
   assert.match(js, /currentTurn\.answer \+= text/);
   assert.match(js, /renderMarkdown\(currentTurn\.body, currentTurn\.answer\)/);
+  assert.match(js, /'工具'/);
+  assert.match(js, /\$\('plugins-empty'\)\.hidden = rows\.length > 0/);
 });
