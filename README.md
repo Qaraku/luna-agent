@@ -6,7 +6,7 @@ A local, single-user agent kernel in Go built around one bet: **tools live in th
 
 Most agent frameworks load tools into the host process. Changing a tool means restarting the agent, and a crashing tool can take the whole agent down with it. Luna Agent runs each tool as a [HashiCorp `go-plugin`](https://github.com/hashicorp/go-plugin) subprocess, validates a replacement candidate before publishing it, pins in-flight calls to the generation that started them, and keeps the previous version serving if the candidate fails.
 
-This is a bounded kernel slice, not a production agent platform. Runs are single-flight and are not persisted.
+This is a bounded kernel slice, not a production agent platform. Runs are single-flight, and each run's transcript is appended to a session file on disk.
 
 ## Architecture
 
@@ -41,7 +41,7 @@ Plugin sources live at `plugins/<tool>/<candidate>/`, so both the tool and the c
 
 Each layer has one owner and an explicit contract:
 
-1. **The Go core** owns runs, cancellation, budgets, plugin lifecycle, and the event stream. Eino types never cross the HTTP boundary.
+1. **The Go core** owns runs, cancellation, budgets, plugin lifecycle, the event stream, and the session files on disk. Eino types never cross the HTTP boundary.
 2. **Each plugin process** owns one tool implementation. It receives only the environment it needs, never the model credentials.
 3. **The browser UI** observes and controls the core through a small app-owned HTTP/SSE contract. Model output, tool arguments, and tool results reach the DOM only through `createElement` / `textContent`.
 
@@ -65,6 +65,8 @@ See [docs/architecture.md](docs/architecture.md) for ownership and reload semant
 - Validated hot reload: build, start, handshake, and metadata checks all complete for every allowlisted tool before the new generations are published together. In-flight calls stay pinned to their original generation until it drains.
 - A loopback-only HTTP service with guarded mutation origins, bounded request bodies, and a default 60-second whole-run context deadline.
 - Public, app-owned SSE events instead of Eino or plugin RPC structs, with exactly one terminal event per writable stream.
+- Runs are persisted. Each session is one append-only JSONL file under `-sessions-dir` (default `<root>/.runtime/sessions/`); one line is one record, written by a single `Write` call, so a crash can lose only an unterminated tail fragment and never a completed record. A run appends the user message before the model runs, one record per tool call, the assistant answer, and one record carrying the run's status. A run whose transcript cannot be written is reported as failed instead of as a success.
+- A session's history is replayed into the model. The input for a turn is the system prompt, then the session's prior messages in order, then this turn's user message — capped at the most recent 40 messages and 64 KiB of message text, dropping the oldest first. Summarization and retrieval over that history are not implemented.
 
 ## Quick start
 
@@ -89,6 +91,8 @@ ROOT=/path/to/repo
 ```
 
 Open that URL. Roots are resolved in this order: an explicit `-root` (which must hold `web/index.html` and `plugins/`), then the executable's grandparent — the `<repo>/.runtime/luna` layout — then the working directory, which is the candidate that makes `go run ./cmd/luna` work from a fresh checkout.
+
+Sessions are written under the resolved root at `.runtime/sessions/`, which is already gitignored; `-sessions-dir` points them at another directory.
 
 The same commands work for the conventional layout, where the binary lives at `<repo>/.runtime/luna`:
 
@@ -115,9 +119,11 @@ Startup errors name the missing variable but never print its value.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/healthz` | Configuration readiness plus an active generation for every allowlisted tool; implies no provider call |
-| `GET` | `/api/state` | Bounded runtime state: model name, provider host, host PID, one plugin record per tool (tool name, candidate, version, generation, plugin PID, status, in-flight calls), busy flag, lifecycle events. No API key |
+| `GET` | `/api/state` | Bounded runtime state: model name, provider host, host PID, one plugin record per tool (tool name, candidate, version, generation, plugin PID, status, in-flight calls), busy flag, the current run and session ids (empty when idle), lifecycle events. No API key |
+| `GET` | `/api/sessions` | Session summaries, newest first: `id`, `title`, `updated_at`, `run_count` |
+| `GET` | `/api/sessions/{id}` | One session for replay: `id`, `title`, `created_at`, `updated_at`, `run_count`, `truncated`, and its `records` in file order. An unknown id is `404`, a malformed one `400` |
 | `POST` | `/api/reload` | `{"candidate":"v1\|v2\|broken"}` — builds and validates the candidate for every allowlisted tool, then publishes them as one generation, or fails leaving every tool on its previous generation |
-| `POST` | `/api/runs` | `{"message":"..."}` — `text/event-stream` response using the event types in [docs/architecture.md](docs/architecture.md) |
+| `POST` | `/api/runs` | `{"message":"...","session_id":"..."}` — `session_id` is optional and must name an existing session: an unknown id is `404` and a malformed one `400`, both before admission. When it is omitted a session is created and its id arrives on `run.started`. `text/event-stream` response using the event types in [docs/architecture.md](docs/architecture.md) |
 
 Mutation requests must come from the exact bound browser origin. There is no CORS support and no public-network mode.
 
@@ -153,6 +159,8 @@ Separate end-to-end validation completed the checks that deterministic tests can
 
 The live-provider, headless-Chromium, Desktop Preview and clean-checkout checks above were captured for the one-tool kernel. The two-tool change re-ran the Go race, vet, root-build, Go-format, Node syntax and Node test gates listed at the top of this section; it did not re-run a live provider or a real browser.
 
+The session change re-ran those same gates and nothing more. No server and no model provider were run for it, so the session endpoints, the append-only store under a real crash, the history replay and the terminal-event contract are not claimed as end-to-end verified, and no browser was exercised against them. The front end does not surface sessions yet.
+
 No API key appeared in the retained verification evidence. These results are point-in-time evidence for the tested provider and headless Chromium path, not a production-readiness claim, a compatibility guarantee for every OpenAI-compatible provider, or a complete accessibility/cross-browser audit.
 
 ## Historical spike
@@ -163,7 +171,7 @@ The spike is a separate Go module and historical evidence. The root application 
 
 ## Boundaries
 
-The slice deliberately excludes multi-agent orchestration, persistent conversations, durable run history, long-term memory, arbitrary shell or network tools, filesystem access beyond the bounded read-only `luna_read_file`, browser-supplied plugin code or paths, runtime UI plugins, a plugin marketplace, production authentication, tenant isolation, public deployment, cross-origin API access, hidden reasoning capture, retries that could duplicate model or tool effects, and a public cancellation API.
+The slice deliberately excludes multi-agent orchestration, long-term memory, arbitrary shell or network tools, filesystem access beyond the bounded read-only `luna_read_file`, browser-supplied plugin code or paths, runtime UI plugins, a session front end in `web/`, a plugin marketplace, production authentication, tenant isolation, public deployment, cross-origin API access, hidden reasoning capture, retries that could duplicate model or tool effects, and a public cancellation API.
 
 ## License
 
