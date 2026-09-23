@@ -1,5 +1,7 @@
 # Luna Agent root slice — implementation report
 
+> **Point-in-time record.** This report describes the `v0.1.0` root slice as it stood when it was written. Later slices added a second plugin tool, persistent sessions and bounded memory, so statements below about what the slice excludes describe that revision, not the current tree. `README.md` and `docs/roadmap.md` describe the current state.
+
 ## Result
 
 The root candidate contains a bounded Eino-based Agent kernel, a real replaceable subprocess tool, a guarded loopback HTTP/SSE surface, and a local chat/trajectory UI. The historical `spikes/001-plugin-kernel/` tree was preserved and is not part of the root runtime dependency graph.
