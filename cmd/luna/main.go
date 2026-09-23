@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -9,6 +10,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,10 +21,74 @@ import (
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
 )
 
+// rootFromExecutable assumes the conventional layout where the built binary
+// lives at <root>/.runtime/luna.
 func rootFromExecutable(executable string) string { return filepath.Dir(filepath.Dir(executable)) }
+
+// checkAssets reports why dir cannot serve the runtime. A usable root holds a
+// web/index.html file and a plugins directory.
+func checkAssets(dir string) error {
+	index, err := os.Stat(filepath.Join(dir, "web", "index.html"))
+	if err != nil {
+		return fmt.Errorf("web/index.html: %w", err)
+	}
+	if index.IsDir() {
+		return errors.New("web/index.html is a directory")
+	}
+	plugins, err := os.Stat(filepath.Join(dir, "plugins"))
+	if err != nil {
+		return fmt.Errorf("plugins: %w", err)
+	}
+	if !plugins.IsDir() {
+		return errors.New("plugins exists but is not a directory")
+	}
+	return nil
+}
+
+// hasAssets reports whether dir is a usable root.
+func hasAssets(dir string) bool { return dir != "" && checkAssets(dir) == nil }
+
+// workingDirOrEmpty returns the process working directory. That directory can be
+// removed or renamed out from under the process, which only costs the weakest root
+// candidate, so the failure becomes an empty candidate instead of a fatal error.
+func workingDirOrEmpty() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return dir
+}
+
+// resolveRoot locates the directory holding web/ and plugins/. An explicit -root
+// wins and must be usable. Otherwise the executable's assumed grandparent is tried
+// first, then the working directory, which is the candidate that makes
+// `go run ./cmd/luna` work from a fresh checkout.
+func resolveRoot(explicit, executable, workingDir string) (string, error) {
+	if explicit != "" {
+		if err := checkAssets(explicit); err != nil {
+			return "", fmt.Errorf("root %q is not usable: %w", explicit, err)
+		}
+		return explicit, nil
+	}
+	var tried []string
+	for _, candidate := range []string{rootFromExecutable(executable), workingDir} {
+		if candidate == "" || slices.Contains(tried, candidate) {
+			continue
+		}
+		if hasAssets(candidate) {
+			return candidate, nil
+		}
+		tried = append(tried, candidate)
+	}
+	if len(tried) == 0 {
+		return "", errors.New("cannot locate web/ and plugins/; pass -root")
+	}
+	return "", fmt.Errorf("cannot locate web/ and plugins/; tried %s; pass -root", strings.Join(tried, ", "))
+}
 
 func run() error {
 	addr := flag.String("addr", "127.0.0.1:0", "literal loopback listen address")
+	rootFlag := flag.String("root", "", "repository root holding web/ and plugins/ (default: auto-detect)")
 	flag.Parse()
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
@@ -31,7 +98,10 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("locate executable: %w", err)
 	}
-	root := rootFromExecutable(executable)
+	root, err := resolveRoot(*rootFlag, executable, workingDirOrEmpty())
+	if err != nil {
+		return err
+	}
 	listener, err := httpapi.Listen(*addr)
 	if err != nil {
 		return err
@@ -61,6 +131,7 @@ func run() error {
 		done <- err
 	}()
 	fmt.Printf("LISTEN_URL=http://%s\n", bound)
+	fmt.Printf("ROOT=%s\n", root)
 	select {
 	case err := <-done:
 		return err
