@@ -14,7 +14,7 @@ tagged and released, so this roadmap no longer tracks it.
 | Slice | Content | Depends on | Status |
 |---|---|---|---|
 | S1 | A second tool plugin: bounded file reading | — | on `main` |
-| S2 | Persistent sessions and run history | — | not started |
+| S2 | Persistent sessions and run history | — | on `main` |
 | S3 | Context and memory strategy | S2 | not started |
 | S4 | Runtime UI plugin loading | — | not started |
 
