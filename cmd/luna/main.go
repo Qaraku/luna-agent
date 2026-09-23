@@ -12,10 +12,10 @@ import (
 	"syscall"
 	"time"
 
-	"luna-agent/internal/agent"
-	"luna-agent/internal/config"
-	"luna-agent/internal/httpapi"
-	"luna-agent/internal/pluginhost"
+	"github.com/Qaraku/luna-agent/internal/agent"
+	"github.com/Qaraku/luna-agent/internal/config"
+	"github.com/Qaraku/luna-agent/internal/httpapi"
+	"github.com/Qaraku/luna-agent/internal/pluginhost"
 )
 
 func rootFromExecutable(executable string) string { return filepath.Dir(filepath.Dir(executable)) }

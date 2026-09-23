@@ -10,12 +10,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
-	"luna-agent/internal/pluginhost"
 )
 
 type fakeInvoker struct {

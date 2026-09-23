@@ -17,8 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"luna-agent/internal/agent"
-	"luna-agent/internal/pluginhost"
+	"github.com/Qaraku/luna-agent/internal/agent"
+	"github.com/Qaraku/luna-agent/internal/pluginhost"
 )
 
 type PluginManager interface {

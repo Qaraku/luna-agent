@@ -7,6 +7,8 @@ import (
 	"io"
 	"strings"
 
+	"github.com/Qaraku/luna-agent/internal/config"
+	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/model"
@@ -14,8 +16,6 @@ import (
 	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 	jsonschema "github.com/eino-contrib/jsonschema"
-	"luna-agent/internal/config"
-	"luna-agent/internal/pluginhost"
 )
 
 const ToolName = "luna_text_transform"

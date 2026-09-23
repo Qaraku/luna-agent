@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
+	"github.com/Qaraku/luna-agent/internal/pluginprotocol"
 	"github.com/hashicorp/go-plugin"
-	"luna-agent/internal/pluginprotocol"
 	"os"
 	"strings"
 	"time"

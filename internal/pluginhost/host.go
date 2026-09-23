@@ -11,9 +11,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Qaraku/luna-agent/internal/pluginprotocol"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-plugin"
-	"luna-agent/internal/pluginprotocol"
 )
 
 type Input = pluginprotocol.Input

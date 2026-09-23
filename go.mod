@@ -1,4 +1,4 @@
-module luna-agent
+module github.com/Qaraku/luna-agent
 
 go 1.24
 
