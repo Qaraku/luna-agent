@@ -13,6 +13,7 @@ import (
 
 	"github.com/Qaraku/luna-agent/internal/agent"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
+	"github.com/Qaraku/luna-agent/internal/store"
 )
 
 type fakePlugins struct {
@@ -25,14 +26,16 @@ func (f *fakePlugins) Reload(context.Context, string) error { return f.reloadErr
 
 type fakeRunner struct{ fail bool }
 
-func (f fakeRunner) Run(ctx context.Context, message, id string, sink agent.Sink) (string, error) {
-	sink.Emit(agent.Event{Type: "run.started", Data: agent.RunStarted{RunID: id}})
+// Run mirrors the real runner's session contract: the run id and, when the run
+// belongs to a session, the session id travel on the existing run.started event.
+func (f fakeRunner) Run(_ context.Context, req agent.RunRequest) (string, error) {
+	req.Sink.Emit(agent.Event{Type: "run.started", Data: agent.RunStarted{RunID: req.RunID, SessionID: req.SessionID}})
 	if f.fail {
-		sink.Emit(agent.Event{Type: "run.failed", Data: agent.RunFailed{RunID: id, Error: "model unavailable"}})
+		req.Sink.Emit(agent.Event{Type: "run.failed", Data: agent.RunFailed{RunID: req.RunID, Error: "model unavailable"}})
 		return "", errors.New("model unavailable")
 	}
-	sink.Emit(agent.Event{Type: "assistant.delta", Data: agent.AssistantDelta{Text: "hello"}})
-	sink.Emit(agent.Event{Type: "run.finished", Data: agent.RunFinished{RunID: id, Answer: "hello"}})
+	req.Sink.Emit(agent.Event{Type: "assistant.delta", Data: agent.AssistantDelta{Text: "hello"}})
+	req.Sink.Emit(agent.Event{Type: "run.finished", Data: agent.RunFinished{RunID: req.RunID, Answer: "hello"}})
 	return "hello", nil
 }
 
@@ -47,9 +50,26 @@ func pluginState(tools ...string) pluginhost.State {
 	return state
 }
 
-func testHandler(r Runner) http.Handler {
+// newTestStore is a real session store in a temporary directory, so the session
+// API is exercised through its real implementation rather than a stub.
+func newTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	s, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open session store: %v", err)
+	}
+	return s
+}
+
+func testHandler(t *testing.T, r Runner) http.Handler {
+	t.Helper()
+	return handlerWithStore(t, r, newTestStore(t))
+}
+
+func handlerWithStore(t *testing.T, r Runner, sessions Sessions) http.Handler {
+	t.Helper()
 	p := &fakePlugins{state: pluginState(pluginhost.ToolTextTransform, pluginhost.ToolReadFile)}
-	return New(p, r, Info{BoundHost: "127.0.0.1:43210", Model: "fake-model", ProviderHost: "provider.test", WebDir: "../../web"})
+	return New(p, r, sessions, Info{BoundHost: "127.0.0.1:43210", Model: "fake-model", ProviderHost: "provider.test", WebDir: "../../web"})
 }
 
 func request(t *testing.T, h http.Handler, method, path, body string, origin bool) *httptest.ResponseRecorder {
@@ -68,7 +88,7 @@ type timeoutRunner struct {
 	deadline chan time.Time
 }
 
-func (r timeoutRunner) Run(ctx context.Context, _, _ string, _ agent.Sink) (string, error) {
+func (r timeoutRunner) Run(ctx context.Context, _ agent.RunRequest) (string, error) {
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		r.deadline <- time.Time{}
@@ -86,7 +106,7 @@ func TestRunTimeoutCoversRunnerInvocation(t *testing.T) {
 
 	runner := timeoutRunner{deadline: make(chan time.Time, 1)}
 	started := time.Now()
-	w := request(t, testHandler(runner), http.MethodPost, "/api/runs", `{"message":"do it"}`, true)
+	w := request(t, testHandler(t, runner), http.MethodPost, "/api/runs", `{"message":"do it"}`, true)
 	elapsed := time.Since(started)
 	deadline := <-runner.deadline
 	if deadline.IsZero() {
@@ -106,12 +126,12 @@ type cancelAwareRunner struct {
 	release  chan struct{}
 }
 
-func (r cancelAwareRunner) Run(ctx context.Context, _, _ string, sink agent.Sink) (string, error) {
+func (r cancelAwareRunner) Run(ctx context.Context, req agent.RunRequest) (string, error) {
 	close(r.started)
 	<-ctx.Done()
 	close(r.canceled)
 	<-r.release
-	sink.Emit(agent.Event{Type: "assistant.delta", Data: agent.AssistantDelta{Text: "late"}})
+	req.Sink.Emit(agent.Event{Type: "assistant.delta", Data: agent.AssistantDelta{Text: "late"}})
 	return "", ctx.Err()
 }
 
@@ -152,10 +172,10 @@ type queuedEventRunner struct {
 	queued chan struct{}
 }
 
-func (r queuedEventRunner) Run(ctx context.Context, _, id string, sink agent.Sink) (string, error) {
-	sink.Emit(agent.Event{Type: "run.started", Data: agent.RunStarted{RunID: id}})
+func (r queuedEventRunner) Run(ctx context.Context, req agent.RunRequest) (string, error) {
+	req.Sink.Emit(agent.Event{Type: "run.started", Data: agent.RunStarted{RunID: req.RunID}})
 	<-r.queue
-	sink.Emit(agent.Event{Type: "assistant.delta", Data: agent.AssistantDelta{Text: "late"}})
+	req.Sink.Emit(agent.Event{Type: "assistant.delta", Data: agent.AssistantDelta{Text: "late"}})
 	close(r.queued)
 	<-ctx.Done()
 	return "", ctx.Err()
@@ -201,7 +221,7 @@ func TestCanceledRequestDoesNotWriteQueuedSSEEvent(t *testing.T) {
 	// deterministic even though Go deliberately randomizes ready select cases.
 	for attempt := 1; attempt <= 64; attempt++ {
 		runner := queuedEventRunner{queue: make(chan struct{}), queued: make(chan struct{})}
-		h := testHandler(runner)
+		h := testHandler(t, runner)
 		ctx, cancel := context.WithCancel(context.Background())
 		r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:43210/api/runs", strings.NewReader(`{"message":"do it"}`)).WithContext(ctx)
 		r.Host = "127.0.0.1:43210"
@@ -243,7 +263,7 @@ func TestCanceledRequestDoesNotWriteQueuedSSEEvent(t *testing.T) {
 
 func TestCanceledRunWaitsForRunnerBeforeClearingBusyAndStopsWriting(t *testing.T) {
 	runner := cancelAwareRunner{started: make(chan struct{}), canceled: make(chan struct{}), release: make(chan struct{})}
-	h := testHandler(runner)
+	h := testHandler(t, runner)
 	ctx, cancel := context.WithCancel(context.Background())
 	r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:43210/api/runs", strings.NewReader(`{"message":"do it"}`)).WithContext(ctx)
 	r.Host = "127.0.0.1:43210"
@@ -300,12 +320,12 @@ type writeFailureRunner struct {
 	release  chan struct{}
 }
 
-func (r writeFailureRunner) Run(ctx context.Context, _, id string, sink agent.Sink) (string, error) {
-	sink.Emit(agent.Event{Type: "run.started", Data: agent.RunStarted{RunID: id}})
+func (r writeFailureRunner) Run(ctx context.Context, req agent.RunRequest) (string, error) {
+	req.Sink.Emit(agent.Event{Type: "run.started", Data: agent.RunStarted{RunID: req.RunID}})
 	<-ctx.Done()
 	close(r.canceled)
 	<-r.release
-	sink.Emit(agent.Event{Type: "assistant.delta", Data: agent.AssistantDelta{Text: "late"}})
+	req.Sink.Emit(agent.Event{Type: "assistant.delta", Data: agent.AssistantDelta{Text: "late"}})
 	return "", ctx.Err()
 }
 
@@ -333,7 +353,7 @@ func (w *failingWriter) writeCount() int {
 
 func TestSSEWriteFailureCancelsAndWaitsForRunner(t *testing.T) {
 	runner := writeFailureRunner{canceled: make(chan struct{}), release: make(chan struct{})}
-	h := testHandler(runner)
+	h := testHandler(t, runner)
 	r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:43210/api/runs", strings.NewReader(`{"message":"do it"}`))
 	r.Host = "127.0.0.1:43210"
 	r.Header.Set("Origin", "http://127.0.0.1:43210")
@@ -370,7 +390,7 @@ func TestSSEWriteFailureCancelsAndWaitsForRunner(t *testing.T) {
 }
 
 func TestRunSSEHasOrderedSingleTerminalEvent(t *testing.T) {
-	w := request(t, testHandler(fakeRunner{}), http.MethodPost, "/api/runs", `{"message":"do it"}`, true)
+	w := request(t, testHandler(t, fakeRunner{}), http.MethodPost, "/api/runs", `{"message":"do it"}`, true)
 	if w.Code != 200 || w.Header().Get("Content-Type") != "text/event-stream" {
 		t.Fatalf("status=%d headers=%v body=%s", w.Code, w.Header(), w.Body.String())
 	}
@@ -389,7 +409,7 @@ func TestRunSSEHasOrderedSingleTerminalEvent(t *testing.T) {
 }
 
 func TestRunFailureHasSingleFailedTerminal(t *testing.T) {
-	w := request(t, testHandler(fakeRunner{fail: true}), http.MethodPost, "/api/runs", `{"message":"do it"}`, true)
+	w := request(t, testHandler(t, fakeRunner{fail: true}), http.MethodPost, "/api/runs", `{"message":"do it"}`, true)
 	body := w.Body.String()
 	if strings.Count(body, "event: run.failed") != 1 || strings.Contains(body, "event: run.finished") {
 		t.Fatalf("terminal semantics: %s", body)
@@ -400,20 +420,20 @@ type malformedTerminalRunner struct {
 	missing bool
 }
 
-func (r malformedTerminalRunner) Run(_ context.Context, _, id string, sink agent.Sink) (string, error) {
-	sink.Emit(agent.Event{Type: "run.started", Data: agent.RunStarted{RunID: id}})
+func (r malformedTerminalRunner) Run(_ context.Context, req agent.RunRequest) (string, error) {
+	req.Sink.Emit(agent.Event{Type: "run.started", Data: agent.RunStarted{RunID: req.RunID}})
 	if r.missing {
-		sink.Emit(agent.Event{Type: "assistant.delta", Data: agent.AssistantDelta{Text: "hello"}})
+		req.Sink.Emit(agent.Event{Type: "assistant.delta", Data: agent.AssistantDelta{Text: "hello"}})
 		return "hello", nil
 	}
-	sink.Emit(agent.Event{Type: "run.finished", Data: agent.RunFinished{RunID: id, Answer: "hello"}})
-	sink.Emit(agent.Event{Type: "run.finished", Data: agent.RunFinished{RunID: id, Answer: "duplicate"}})
-	sink.Emit(agent.Event{Type: "run.failed", Data: agent.RunFailed{RunID: id, Error: "late failure"}})
+	req.Sink.Emit(agent.Event{Type: "run.finished", Data: agent.RunFinished{RunID: req.RunID, Answer: "hello"}})
+	req.Sink.Emit(agent.Event{Type: "run.finished", Data: agent.RunFinished{RunID: req.RunID, Answer: "duplicate"}})
+	req.Sink.Emit(agent.Event{Type: "run.failed", Data: agent.RunFailed{RunID: req.RunID, Error: "late failure"}})
 	return "hello", nil
 }
 
 func TestRunFiltersDuplicateTerminalEvents(t *testing.T) {
-	w := request(t, testHandler(malformedTerminalRunner{}), http.MethodPost, "/api/runs", `{"message":"do it"}`, true)
+	w := request(t, testHandler(t, malformedTerminalRunner{}), http.MethodPost, "/api/runs", `{"message":"do it"}`, true)
 	body := w.Body.String()
 	terminalCount := strings.Count(body, "event: run.finished") + strings.Count(body, "event: run.failed")
 	if terminalCount != 1 {
@@ -422,7 +442,7 @@ func TestRunFiltersDuplicateTerminalEvents(t *testing.T) {
 }
 
 func TestRunSynthesizesOneTerminalWhenRunnerOmitsIt(t *testing.T) {
-	w := request(t, testHandler(malformedTerminalRunner{missing: true}), http.MethodPost, "/api/runs", `{"message":"do it"}`, true)
+	w := request(t, testHandler(t, malformedTerminalRunner{missing: true}), http.MethodPost, "/api/runs", `{"message":"do it"}`, true)
 	body := w.Body.String()
 	if strings.Count(body, "event: run.finished") != 1 || strings.Contains(body, "event: run.failed") {
 		t.Fatalf("terminal semantics: %s", body)
@@ -433,7 +453,7 @@ func TestRunSynthesizesOneTerminalWhenRunnerOmitsIt(t *testing.T) {
 }
 
 func TestHTTPGuardsAndStrictBodies(t *testing.T) {
-	h := testHandler(fakeRunner{})
+	h := testHandler(t, fakeRunner{})
 	cases := []struct {
 		name, method, path, body string
 		origin                   bool
@@ -471,7 +491,7 @@ func TestHTTPGuardsAndStrictBodies(t *testing.T) {
 }
 
 func TestStateAndHealthContainNoSecretAndHonestConnectionState(t *testing.T) {
-	h := testHandler(fakeRunner{})
+	h := testHandler(t, fakeRunner{})
 	w := request(t, h, http.MethodGet, "/api/state", "", false)
 	if w.Code != 200 {
 		t.Fatal(w.Code)
@@ -495,7 +515,7 @@ func TestStateAndHealthContainNoSecretAndHonestConnectionState(t *testing.T) {
 // /api/state reports every allowlisted tool, not one active entry: a single
 // active record could not name which tool had failed.
 func TestStateReportsEveryToolAndNoSingleActiveEntry(t *testing.T) {
-	w := request(t, testHandler(fakeRunner{}), http.MethodGet, "/api/state", "", false)
+	w := request(t, testHandler(t, fakeRunner{}), http.MethodGet, "/api/state", "", false)
 	body := w.Body.String()
 	if strings.Contains(body, `"active":{`) {
 		t.Fatalf("state still carries a single active entry: %s", body)
@@ -525,11 +545,11 @@ func TestStateReportsEveryToolAndNoSingleActiveEntry(t *testing.T) {
 
 // Readiness covers the whole tool set: one live tool is not enough.
 func TestHealthzRequiresEveryAllowlistedTool(t *testing.T) {
-	full := request(t, testHandler(fakeRunner{}), http.MethodGet, "/healthz", "", false)
+	full := request(t, testHandler(t, fakeRunner{}), http.MethodGet, "/healthz", "", false)
 	if !strings.Contains(full.Body.String(), `"plugin_active":true`) {
 		t.Fatalf("health with every tool active: %s", full.Body.String())
 	}
-	partial := New(&fakePlugins{state: pluginState(pluginhost.ToolTextTransform)}, fakeRunner{}, Info{BoundHost: "127.0.0.1:43210", Model: "fake-model", ProviderHost: "provider.test", WebDir: "../../web"})
+	partial := New(&fakePlugins{state: pluginState(pluginhost.ToolTextTransform)}, fakeRunner{}, newTestStore(t), Info{BoundHost: "127.0.0.1:43210", Model: "fake-model", ProviderHost: "provider.test", WebDir: "../../web"})
 	w := request(t, partial, http.MethodGet, "/healthz", "", false)
 	body := w.Body.String()
 	if !strings.Contains(body, `"plugin_active":false`) || !strings.Contains(body, `"ready":false`) {

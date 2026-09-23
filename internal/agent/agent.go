@@ -3,12 +3,16 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Qaraku/luna-agent/internal/config"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
+	"github.com/Qaraku/luna-agent/internal/store"
 	"github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/model"
@@ -35,6 +39,42 @@ type Sink interface{ Emit(Event) }
 type sinkKey struct{}
 type runIDKey struct{}
 
+// RunRequest is one admitted run. RunID is core-owned; SessionID names the
+// durable session the run belongs to and is carried to the client on the
+// existing run.started event.
+type RunRequest struct {
+	RunID     string
+	SessionID string
+	Message   string
+	Sink      Sink
+}
+
+// History is the read side of persisted conversation. The history of a run is
+// read from disk, never from memory, so a restarted process continues the same
+// session.
+type History interface {
+	Messages(sessionID string) ([]store.MessageRecord, error)
+}
+
+// Transcript is the write side of persisted conversation. Each append is one
+// complete line, and a failed append fails the run: a run whose transcript
+// cannot be written must not report success.
+type Transcript interface {
+	AppendMessage(sessionID string, record store.MessageRecord) error
+	AppendToolCall(sessionID string, record store.ToolCallRecord) error
+	AppendRun(sessionID string, record store.RunRecord) error
+}
+
+// Option configures the durable side of a Runner.
+type Option func(*Runner)
+
+// WithHistory supplies the persisted history a run's model input is assembled
+// from.
+func WithHistory(h History) Option { return func(r *Runner) { r.history = h } }
+
+// WithTranscript supplies the durable transcript a run appends to.
+func WithTranscript(t Transcript) Option { return func(r *Runner) { r.transcript = t } }
+
 func WithRun(ctx context.Context, runID string, sink Sink) context.Context {
 	ctx = context.WithValue(ctx, sinkKey{}, sink)
 	return context.WithValue(ctx, runIDKey{}, runID)
@@ -47,7 +87,8 @@ func emit(ctx context.Context, e Event) {
 func runID(ctx context.Context) string { v, _ := ctx.Value(runIDKey{}).(string); return v }
 
 type RunStarted struct {
-	RunID string `json:"run_id"`
+	RunID     string `json:"run_id"`
+	SessionID string `json:"session_id,omitempty"`
 }
 type AssistantDelta struct {
 	Text string `json:"text"`
@@ -221,41 +262,186 @@ var (
 	_ tool.InvokableTool = (*ReadFileTool)(nil)
 )
 
-type Runner struct{ runner *adk.Runner }
+type Runner struct {
+	runner     *adk.Runner
+	history    History
+	transcript Transcript
+}
 
-func NewRunner(ctx context.Context, m model.ToolCallingChatModel, invoker Invoker, reader FileReader) (*Runner, error) {
+func NewRunner(ctx context.Context, m model.ToolCallingChatModel, invoker Invoker, reader FileReader, opts ...Option) (*Runner, error) {
 	tools := []tool.BaseTool{NewTextTransformTool(invoker), NewReadFileTool(reader)}
 	a, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{Name: "luna", Description: "Local Luna core preview", Instruction: instruction, Model: m, ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: tools, ExecuteSequentially: true}}, MaxIterations: 6})
 	if err != nil {
 		return nil, err
 	}
-	return &Runner{runner: adk.NewRunner(ctx, adk.RunnerConfig{Agent: a, EnableStreaming: true})}, nil
+	r := &Runner{runner: adk.NewRunner(ctx, adk.RunnerConfig{Agent: a, EnableStreaming: true})}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r, nil
 }
 
-func NewOpenAIRunner(ctx context.Context, cfg config.Config, invoker Invoker, reader FileReader) (*Runner, error) {
+func NewOpenAIRunner(ctx context.Context, cfg config.Config, invoker Invoker, reader FileReader, opts ...Option) (*Runner, error) {
 	m, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL, Model: cfg.Model})
 	if err != nil {
 		return nil, err
 	}
-	return NewRunner(ctx, m, invoker, reader)
+	return NewRunner(ctx, m, invoker, reader, opts...)
 }
 
-func (r *Runner) Run(parent context.Context, message, id string, sink Sink) (answer string, err error) {
-	ctx := WithRun(parent, id, sink)
-	emit(ctx, Event{Type: "run.started", Data: RunStarted{RunID: id}})
-	defer func() {
-		if err != nil {
-			emit(ctx, Event{Type: "run.failed", Data: RunFailed{RunID: id, Error: err.Error()}})
-		} else {
-			emit(ctx, Event{Type: "run.finished", Data: RunFinished{RunID: id, Answer: answer}})
+// The history cap is stated here, in the S2a spec's terms: a run's model input
+// is the system prompt, then the session's prior messages in order, then this
+// turn's user message. The prior messages are capped, and the policy is
+// deterministic — keep the most recent ones and drop the oldest. Summarization,
+// retrieval and long-term memory are deliberately absent; they belong to S3.
+const (
+	// MaxHistoryMessages is the largest number of prior messages kept.
+	MaxHistoryMessages = 40
+	// MaxHistoryBytes is the largest total size of the kept prior messages, in
+	// UTF-8 bytes of message text. It sits above the 16,384-byte HTTP message
+	// cap, so this turn's own message always fits.
+	MaxHistoryBytes = 64 * 1024
+)
+
+// selectHistory returns the messages that fit the cap, oldest dropped first:
+// the kept set is a contiguous suffix of the persisted history, accumulated
+// from the newest message backwards. The scan stops at the first message that
+// would exceed either MaxHistoryMessages or MaxHistoryBytes, so messages are
+// never reordered, sampled, or skipped over.
+func selectHistory(messages []store.MessageRecord) []store.MessageRecord {
+	kept, size := 0, 0
+	for i := len(messages) - 1; i >= 0; i-- {
+		messageSize := len(messages[i].Text)
+		if kept == MaxHistoryMessages || size+messageSize > MaxHistoryBytes {
+			break
 		}
+		kept++
+		size += messageSize
+	}
+	if kept == 0 {
+		return nil
+	}
+	return append([]store.MessageRecord{}, messages[len(messages)-kept:]...)
+}
+
+// priorMessages reads the session's history from disk, drops this run's own
+// records — the user message is persisted before the model runs — and applies
+// the documented cap.
+func (r *Runner) priorMessages(req RunRequest) ([]store.MessageRecord, error) {
+	if r.history == nil || req.SessionID == "" {
+		return nil, nil
+	}
+	records, err := r.history.Messages(req.SessionID)
+	if err != nil {
+		return nil, fmt.Errorf("load session history: %w", err)
+	}
+	prior := make([]store.MessageRecord, 0, len(records))
+	for _, record := range records {
+		if record.RunID == req.RunID {
+			continue
+		}
+		if record.Role != store.RoleUser && record.Role != store.RoleAssistant {
+			// An unknown role is dropped rather than guessed at.
+			continue
+		}
+		prior = append(prior, record)
+	}
+	return selectHistory(prior), nil
+}
+
+// modelInput assembles what the model sees for this turn. The system prompt is
+// not repeated here: the Eino agent prepends its instruction to exactly this
+// input. Only message text enters the input, so no plugin identity and no tool
+// result can leak into the model's context through the persisted history.
+func (r *Runner) modelInput(req RunRequest) ([]*schema.Message, error) {
+	prior, err := r.priorMessages(req)
+	if err != nil {
+		return nil, err
+	}
+	input := make([]*schema.Message, 0, len(prior)+1)
+	for _, message := range prior {
+		if message.Role == store.RoleAssistant {
+			input = append(input, schema.AssistantMessage(message.Text, nil))
+			continue
+		}
+		input = append(input, schema.UserMessage(message.Text))
+	}
+	return append(input, schema.UserMessage(req.Message)), nil
+}
+
+// runStatus maps a run outcome onto the frozen status vocabulary.
+// store.StatusInterrupted is reserved for a run that left no run line at all
+// (a crash); this slice never writes it, because a record that was not
+// persisted cannot be reported.
+func runStatus(err error) string {
+	switch {
+	case err == nil:
+		return store.StatusOK
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return store.StatusCancelled
+	default:
+		return store.StatusError
+	}
+}
+
+func (r *Runner) appendMessage(req RunRequest, role, text string, at time.Time) error {
+	if r.transcript == nil || req.SessionID == "" {
+		return nil
+	}
+	if err := r.transcript.AppendMessage(req.SessionID, store.MessageRecord{RunID: req.RunID, Role: role, Text: text, At: at}); err != nil {
+		return fmt.Errorf("persist %s message: %w", role, err)
+	}
+	return nil
+}
+
+func (r *Runner) appendRun(req RunRequest, startedAt time.Time, status string) error {
+	if r.transcript == nil || req.SessionID == "" {
+		return nil
+	}
+	if err := r.transcript.AppendRun(req.SessionID, store.RunRecord{RunID: req.RunID, StartedAt: startedAt, EndedAt: time.Now(), Status: status}); err != nil {
+		return fmt.Errorf("persist run record: %w", err)
+	}
+	return nil
+}
+
+func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err error) {
+	startedAt := time.Now()
+	recorder := newRecorder(req.Sink, r.transcript, req.SessionID, req.RunID)
+	ctx := WithRun(parent, req.RunID, recorder)
+	emit(ctx, Event{Type: "run.started", Data: RunStarted{RunID: req.RunID, SessionID: req.SessionID}})
+	defer func() {
+		status := runStatus(err)
+		if appendErr := r.appendRun(req, startedAt, status); appendErr != nil && err == nil {
+			// The run itself succeeded but its transcript entry did not: the
+			// run is reported as failed rather than as a success that cannot
+			// survive a restart.
+			err = appendErr
+		}
+		if err != nil {
+			emit(ctx, Event{Type: "run.failed", Data: RunFailed{RunID: req.RunID, Error: err.Error()}})
+			return
+		}
+		emit(ctx, Event{Type: "run.finished", Data: RunFinished{RunID: req.RunID, Answer: answer}})
 	}()
-	iter := r.runner.Query(ctx, message)
+	// The user message is persisted before the model runs, so a crash mid-run
+	// still records what was asked; assembly drops this run's own records
+	// instead of depending on that ordering.
+	if err := r.appendMessage(req, store.RoleUser, req.Message, startedAt); err != nil {
+		return "", err
+	}
+	input, err := r.modelInput(req)
+	if err != nil {
+		return "", err
+	}
+	iter := r.runner.Run(ctx, input)
 	var b strings.Builder
 	for {
 		ev, ok := iter.Next()
 		if !ok {
 			break
+		}
+		if err := recorder.Err(); err != nil {
+			return "", err
 		}
 		if ev == nil {
 			continue
@@ -305,9 +491,117 @@ func (r *Runner) Run(parent context.Context, message, id string, sink Sink) (ans
 			emit(ctx, Event{Type: "assistant.delta", Data: AssistantDelta{Text: mv.Message.Content}})
 		}
 	}
+	if err := recorder.Err(); err != nil {
+		return "", err
+	}
 	answer = b.String()
 	if answer == "" {
 		return "", fmt.Errorf("agent completed without visible assistant text")
 	}
+	if err := r.appendMessage(req, store.RoleAssistant, answer, time.Now()); err != nil {
+		return "", err
+	}
 	return answer, nil
+}
+
+// recorder persists a run's tool calls while forwarding every event unchanged to
+// the real sink, so neither the event stream nor the model-visible answer is
+// affected by persistence. Only the frozen tool_call fields are written:
+// plugin generation, version and process id stay in the event stream, and the
+// store has no field for them, so identity cannot reach the model through the
+// replay path either. A failed append is kept and returned to the run, which
+// fails rather than reporting a run that left no transcript.
+type recorder struct {
+	sink       Sink
+	transcript Transcript
+	sessionID  string
+	runID      string
+
+	mu      sync.Mutex
+	pending *store.ToolCallRecord
+	err     error
+}
+
+func newRecorder(sink Sink, transcript Transcript, sessionID, runID string) *recorder {
+	return &recorder{sink: sink, transcript: transcript, sessionID: sessionID, runID: runID}
+}
+
+func (r *recorder) Emit(e Event) {
+	r.persist(e)
+	r.sink.Emit(e)
+}
+
+// Err is the first persistence failure of the run.
+func (r *recorder) Err() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.err
+}
+
+func (r *recorder) persist(e Event) {
+	if r.transcript == nil || r.sessionID == "" {
+		return
+	}
+	switch e.Type {
+	case "tool.started":
+		started, ok := e.Data.(ToolStarted)
+		if !ok {
+			return
+		}
+		r.mu.Lock()
+		r.pending = &store.ToolCallRecord{Type: store.TypeToolCall, RunID: r.runID, Name: started.Name, Arguments: argumentsText(started.Arguments), At: time.Now()}
+		r.mu.Unlock()
+	case "tool.finished":
+		finished, ok := e.Data.(ToolFinished)
+		if !ok {
+			return
+		}
+		r.complete(finished.Name, finished.Result, "")
+	case "tool.failed":
+		failed, ok := e.Data.(ToolFailed)
+		if !ok {
+			return
+		}
+		r.complete(failed.Name, "", failed.Error)
+	}
+}
+
+// complete writes the tool_call line for the call a tool.started opened. Tool
+// calls execute sequentially, so at most one call is pending.
+func (r *recorder) complete(name, result, errText string) {
+	record := store.ToolCallRecord{Type: store.TypeToolCall, RunID: r.runID, Name: name, Result: result, Error: errText, At: time.Now()}
+	r.mu.Lock()
+	if r.pending != nil {
+		record.Name = r.pending.Name
+		record.Arguments = r.pending.Arguments
+		r.pending = nil
+	}
+	r.mu.Unlock()
+	if err := r.transcript.AppendToolCall(r.sessionID, record); err != nil {
+		r.fail(fmt.Errorf("persist tool call %s: %w", record.Name, err))
+	}
+}
+
+func (r *recorder) fail(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err == nil {
+		r.err = err
+	}
+}
+
+// argumentsText keeps the model's own argument text: a JSON object as JSON, and
+// the raw string when the model produced something that was not JSON.
+func argumentsText(arguments any) string {
+	switch typed := arguments.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	}
+	encoded, err := json.Marshal(arguments)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
 }

@@ -195,6 +195,21 @@ func TestResolveRootDeduplicatesCandidates(t *testing.T) {
 	}
 }
 
+func TestSessionsDirDefaultsUnderRoot(t *testing.T) {
+	got := sessionsDir("/repo", "")
+	want := filepath.Join("/repo", ".runtime", "sessions")
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestSessionsDirPrefersExplicitValue(t *testing.T) {
+	got := sessionsDir("/repo", "/elsewhere/sessions")
+	if got != "/elsewhere/sessions" {
+		t.Fatalf("got %q, want the explicit value", got)
+	}
+}
+
 func TestWorkingDirOrEmptyWhenDirectoryIsRemoved(t *testing.T) {
 	original, err := os.Getwd()
 	if err != nil {

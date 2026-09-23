@@ -19,6 +19,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/config"
 	"github.com/Qaraku/luna-agent/internal/httpapi"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
+	"github.com/Qaraku/luna-agent/internal/store"
 )
 
 // rootFromExecutable assumes the conventional layout where the built binary
@@ -86,11 +87,22 @@ func resolveRoot(explicit, executable, workingDir string) (string, error) {
 	return "", fmt.Errorf("cannot locate web/ and plugins/; tried %s; pass -root", strings.Join(tried, ", "))
 }
 
+// sessionsDir resolves the session directory. An explicit value wins; otherwise
+// sessions live under the resolved root, where .runtime/ is already ignored by
+// git.
+func sessionsDir(root, explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return filepath.Join(root, ".runtime", "sessions")
+}
+
 func run() error {
 	addr := flag.String("addr", "127.0.0.1:0", "literal loopback listen address")
 	rootFlag := flag.String("root", "", "repository root holding web/ and plugins/ (default: auto-detect)")
 	readRoot := flag.String("read-root", "", "directory luna_read_file may read inside (default: the resolved root)")
 	readLimit := flag.Int("read-limit", 0, "single-read cap in bytes for luna_read_file (default: 262144)")
+	sessionsFlag := flag.String("sessions-dir", "", "directory holding the append-only session files (default: <root>/.runtime/sessions/)")
 	flag.Parse()
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
@@ -103,6 +115,10 @@ func run() error {
 	root, err := resolveRoot(*rootFlag, executable, workingDirOrEmpty())
 	if err != nil {
 		return err
+	}
+	sessions, err := store.Open(sessionsDir(root, *sessionsFlag))
+	if err != nil {
+		return fmt.Errorf("open session store: %w", err)
 	}
 	listener, err := httpapi.Listen(*addr)
 	if err != nil {
@@ -117,12 +133,14 @@ func run() error {
 		return fmt.Errorf("start plugin host: %w", err)
 	}
 	defer plugins.Close()
-	runner, err := agent.NewOpenAIRunner(ctx, cfg, plugins, plugins)
+	// The store is both sides of the conversation: history is read from it and
+	// the transcript of every run is appended to it.
+	runner, err := agent.NewOpenAIRunner(ctx, cfg, plugins, plugins, agent.WithHistory(sessions), agent.WithTranscript(sessions))
 	if err != nil {
 		return fmt.Errorf("construct Eino agent: %w", err)
 	}
 	bound := listener.Addr().String()
-	handler := httpapi.New(plugins, runner, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, WebDir: filepath.Join(root, "web")})
+	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, WebDir: filepath.Join(root, "web")})
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: 70 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() {

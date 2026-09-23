@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/Qaraku/luna-agent/internal/agent"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
+	"github.com/Qaraku/luna-agent/internal/store"
 )
 
 type PluginManager interface {
@@ -26,8 +28,18 @@ type PluginManager interface {
 	Reload(context.Context, string) error
 }
 type Runner interface {
-	Run(context.Context, string, string, agent.Sink) (string, error)
+	Run(context.Context, agent.RunRequest) (string, error)
 }
+
+// Sessions is the durable session store. The HTTP layer owns the wire shapes;
+// the store owns the records.
+type Sessions interface {
+	Create(title string) (string, error)
+	Exists(id string) (bool, error)
+	List() ([]store.Summary, error)
+	Read(id string) (store.Session, error)
+}
+
 type Info struct {
 	BoundHost    string
 	Model        string
@@ -49,8 +61,31 @@ type State struct {
 	Plugins         []pluginhost.Record `json:"plugins"`
 	Busy            bool                `json:"busy"`
 	CurrentRunID    string              `json:"current_run_id,omitempty"`
-	Events          []LifecycleEvent    `json:"events"`
-	Demo            bool                `json:"demo"`
+	// CurrentSessionID is the session the active run belongs to. It is added by
+	// S2a and changes no existing field's meaning.
+	CurrentSessionID string           `json:"current_session_id,omitempty"`
+	Events           []LifecycleEvent `json:"events"`
+	Demo             bool             `json:"demo"`
+}
+
+// sessionSummary is the frozen list shape of GET /api/sessions.
+type sessionSummary struct {
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	UpdatedAt time.Time `json:"updated_at"`
+	RunCount  int       `json:"run_count"`
+}
+
+// sessionDetail is the replay shape of GET /api/sessions/{id}. Each record is
+// the JSONL line itself, so a client replays exactly what is on disk.
+type sessionDetail struct {
+	ID        string         `json:"id"`
+	Title     string         `json:"title"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+	RunCount  int            `json:"run_count"`
+	Truncated bool           `json:"truncated"`
+	Records   []store.Record `json:"records"`
 }
 
 // pluginsReady reports whether every allowlisted tool has a published
@@ -77,11 +112,13 @@ var runTimeout = 60 * time.Second
 type Server struct {
 	plugins   PluginManager
 	runner    Runner
+	sessions  Sessions
 	info      Info
 	started   time.Time
 	runMu     sync.Mutex
 	busy      bool
 	runID     string
+	sessionID string
 	eventMu   sync.Mutex
 	events    []LifecycleEvent
 	connected atomic.Bool
@@ -98,8 +135,8 @@ func Listen(addr string) (net.Listener, error) {
 	}
 	return net.Listen("tcp", addr)
 }
-func New(p PluginManager, r Runner, info Info) http.Handler {
-	s := &Server{plugins: p, runner: r, info: info, started: time.Now()}
+func New(p PluginManager, r Runner, sessions Sessions, info Info) http.Handler {
+	s := &Server{plugins: p, runner: r, sessions: sessions, info: info, started: time.Now()}
 	return http.HandlerFunc(s.serveHTTP)
 }
 func send(w http.ResponseWriter, status int, v any) {
@@ -140,12 +177,12 @@ func (s *Server) addEvent(kind, msg string) {
 func (s *Server) state() State {
 	ps := s.plugins.State()
 	s.runMu.Lock()
-	busy, id := s.busy, s.runID
+	busy, id, sessionID := s.busy, s.runID, s.sessionID
 	s.runMu.Unlock()
 	s.eventMu.Lock()
 	events := append([]LifecycleEvent{}, s.events...)
 	s.eventMu.Unlock()
-	return State{HostPID: os.Getpid(), StartedAt: s.started, Model: s.info.Model, ProviderHost: s.info.ProviderHost, ModelConfigured: s.info.Model != "" && s.info.ProviderHost != "", ModelConnected: s.connected.Load(), Plugins: ps.Plugins, Busy: busy, CurrentRunID: id, Events: events, Demo: true}
+	return State{HostPID: os.Getpid(), StartedAt: s.started, Model: s.info.Model, ProviderHost: s.info.ProviderHost, ModelConfigured: s.info.Model != "" && s.info.ProviderHost != "", ModelConnected: s.connected.Load(), Plugins: ps.Plugins, Busy: busy, CurrentRunID: id, CurrentSessionID: sessionID, Events: events, Demo: true}
 }
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -188,6 +225,12 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.reload(w, r)
+	case "/api/sessions":
+		if r.Method != http.MethodGet {
+			method(w, http.MethodGet)
+			return
+		}
+		s.listSessions(w)
 	case "/api/runs":
 		if r.Method != http.MethodPost {
 			method(w, http.MethodPost)
@@ -201,8 +244,70 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.static(w, r)
 	default:
+		if id, ok := sessionPathID(r.URL.Path); ok {
+			if r.Method != http.MethodGet {
+				method(w, http.MethodGet)
+				return
+			}
+			s.readSession(w, id)
+			return
+		}
 		http.NotFound(w, r)
 	}
+}
+
+// sessionPathID extracts {id} from /api/sessions/{id}. The remainder is handed
+// on unread: the store's id validation is what keeps a separator, a dot or an
+// empty string from ever reaching the filesystem as a path.
+func sessionPathID(path string) (string, bool) {
+	const prefix = "/api/sessions/"
+	if !strings.HasPrefix(path, prefix) {
+		return "", false
+	}
+	id := strings.TrimPrefix(path, prefix)
+	if id == "" {
+		return "", false
+	}
+	return id, true
+}
+
+// sessionStatus maps a store failure onto the HTTP status. An unknown session is
+// a clear 4xx and never a silently created one.
+func sessionStatus(err error) int {
+	switch {
+	case errors.Is(err, store.ErrInvalidID):
+		return 400
+	case errors.Is(err, store.ErrNotFound):
+		return 404
+	default:
+		return 500
+	}
+}
+
+func (s *Server) listSessions(w http.ResponseWriter) {
+	summaries, err := s.sessions.List()
+	if err != nil {
+		fail(w, 500, err)
+		return
+	}
+	list := make([]sessionSummary, 0, len(summaries))
+	for _, summary := range summaries {
+		list = append(list, sessionSummary{ID: summary.ID, Title: summary.Title, UpdatedAt: summary.UpdatedAt, RunCount: summary.RunCount})
+	}
+	send(w, 200, map[string]any{"sessions": list})
+}
+
+func (s *Server) readSession(w http.ResponseWriter, id string) {
+	session, err := s.sessions.Read(id)
+	if err != nil {
+		fail(w, sessionStatus(err), err)
+		return
+	}
+	records := session.Records
+	if records == nil {
+		records = []store.Record{}
+	}
+	send(w, 200, sessionDetail{ID: session.ID, Title: session.Title, CreatedAt: session.CreatedAt, UpdatedAt: session.UpdatedAt, RunCount: session.RunCount, Truncated: session.Truncated, Records: records})
 }
 func method(w http.ResponseWriter, allow string) {
 	w.Header().Set("Allow", allow)
@@ -236,7 +341,8 @@ func newRunID() string {
 }
 func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Message string `json:"message"`
+		Message   string `json:"message"`
+		SessionID string `json:"session_id"`
 	}
 	if !decode(w, r, &in) {
 		return
@@ -244,6 +350,19 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(in.Message) == "" || len(in.Message) > 16384 {
 		fail(w, 400, fmt.Errorf("message is required and must not exceed 16384 bytes"))
 		return
+	}
+	// A supplied session must exist. This is checked before admission, so an
+	// unknown id costs the caller a 4xx and not the single-run slot.
+	if in.SessionID != "" {
+		exists, err := s.sessions.Exists(in.SessionID)
+		if err != nil {
+			fail(w, sessionStatus(err), err)
+			return
+		}
+		if !exists {
+			fail(w, 404, fmt.Errorf("unknown session %q", in.SessionID))
+			return
+		}
 	}
 	s.runMu.Lock()
 	if s.busy {
@@ -255,7 +374,27 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	s.busy = true
 	s.runID = id
 	s.runMu.Unlock()
-	defer func() { s.runMu.Lock(); s.busy = false; s.runID = ""; s.runMu.Unlock() }()
+	defer func() {
+		s.runMu.Lock()
+		s.busy = false
+		s.runID = ""
+		s.sessionID = ""
+		s.runMu.Unlock()
+	}()
+	// A run without a session id starts a session; its id reaches the client on
+	// the existing run.started event, and no terminal event is added or changed.
+	sessionID := in.SessionID
+	if sessionID == "" {
+		created, err := s.sessions.Create(in.Message)
+		if err != nil {
+			fail(w, sessionStatus(err), fmt.Errorf("create session: %w", err))
+			return
+		}
+		sessionID = created
+	}
+	s.runMu.Lock()
+	s.sessionID = sessionID
+	s.runMu.Unlock()
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		fail(w, 500, fmt.Errorf("streaming unsupported"))
@@ -271,7 +410,7 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	sink := &streamSink{ctx: runCtx, events: make(chan agent.Event, 32)}
 	result := make(chan runResult, 1)
 	go func() {
-		answer, err := s.runner.Run(runCtx, in.Message, id, sink)
+		answer, err := s.runner.Run(runCtx, agent.RunRequest{RunID: id, SessionID: sessionID, Message: in.Message, Sink: sink})
 		close(sink.events)
 		result <- runResult{answer, err}
 	}()

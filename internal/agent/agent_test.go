@@ -189,7 +189,7 @@ func TestRunSuppressesStreamingContentBeforeToolCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	sink := &collectingSink{}
-	answer, err := r.Run(context.Background(), "transform", "run-1", sink)
+	answer, err := r.Run(context.Background(), RunRequest{Message: "transform", RunID: "run-1", Sink: sink})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,7 @@ func TestRunSuppressesStreamingContentAfterToolCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	sink := &collectingSink{}
-	answer, err := r.Run(context.Background(), "transform", "run-1", sink)
+	answer, err := r.Run(context.Background(), RunRequest{Message: "transform", RunID: "run-1", Sink: sink})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +252,7 @@ func TestRunSuppressesNonStreamingContentWithToolCall(t *testing.T) {
 	}
 	r := newNonStreamingTestRunner(t, m, fakeInvoker{out: pluginhost.Output{Result: "hello"}})
 	sink := &collectingSink{}
-	answer, err := r.Run(context.Background(), "transform", "run-1", sink)
+	answer, err := r.Run(context.Background(), RunRequest{Message: "transform", RunID: "run-1", Sink: sink})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +328,7 @@ func TestRunnerExecutesMultipleToolCallsSequentially(t *testing.T) {
 		t.Fatal(err)
 	}
 	sink := &collectingSink{}
-	if _, err := r.Run(context.Background(), "transform twice", "run-1", sink); err != nil {
+	if _, err := r.Run(context.Background(), RunRequest{Message: "transform twice", RunID: "run-1", Sink: sink}); err != nil {
 		t.Fatal(err)
 	}
 	if got := invoker.maximumActive(); got != 1 {
@@ -392,7 +392,7 @@ func TestFakeModelEinoEndToEndMapsAppEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	sink := &collectingSink{}
-	answer, err := r.Run(context.Background(), "fake-model request", "run-e2e", sink)
+	answer, err := r.Run(context.Background(), RunRequest{Message: "fake-model request", RunID: "run-e2e", Sink: sink})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -559,7 +559,7 @@ func TestFakeModelReadsAFileThroughEinoEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	sink := &collectingSink{}
-	answer, err := r.Run(context.Background(), "read docs/architecture.md", "run-read", sink)
+	answer, err := r.Run(context.Background(), RunRequest{Message: "read docs/architecture.md", RunID: "run-read", Sink: sink})
 	if err != nil {
 		t.Fatal(err)
 	}
