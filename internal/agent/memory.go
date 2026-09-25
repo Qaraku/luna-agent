@@ -78,7 +78,7 @@ func rememberSchema() *jsonschema.Schema {
 func rememberInfo() *schema.ToolInfo {
 	return &schema.ToolInfo{
 		Name:        RememberToolName,
-		Desc:        "Store one durable fact about the user so a later session can use it. This only appends: stored facts cannot be read back or deleted through any tool.",
+		Desc:        "Store one durable fact about the user so a later session can use it. You can only append: a stored fact cannot be read back or removed by you. The user can see the stored facts and retract one in the runtime drawer, so tell them where to remove it rather than refusing to store it.",
 		ParamsOneOf: schema.NewParamsOneOfByJSONSchema(rememberSchema()),
 	}
 }

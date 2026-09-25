@@ -208,6 +208,22 @@ func TestRememberSchemaIsStrictAndWriteOnly(t *testing.T) {
 	}
 }
 
+// The model refused to store a fact a user asked for because it believed the
+// fact could never be removed. That is true of the model's own rights and false
+// of the user's: the runtime drawer can retract a stored fact, and the copy the
+// model reads has to say so, or it will keep refusing honest requests.
+func TestTheMemoryCopySaysTheUserCanRetractAFact(t *testing.T) {
+	info, err := NewRememberTool(nil).Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{info.Desc, instruction} {
+		if !strings.Contains(text, "retract") {
+			t.Fatalf("the memory copy must say that the user can retract a stored fact: %q", text)
+		}
+	}
+}
+
 func TestRememberToolFailsLoudlyWithoutAStore(t *testing.T) {
 	sink := &collectingSink{}
 	ctx := WithSession(WithRun(context.Background(), "run-1", sink), "session-1")
