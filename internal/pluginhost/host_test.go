@@ -212,9 +212,51 @@ func TestRejectsUnknownCandidate(t *testing.T) {
 func TestUnknownToolIsNotInvokable(t *testing.T) {
 	h := testHost(t, Options{})
 	for _, tool := range []string{"../../plugins/v1", "luna_shell", "", ToolTextTransform + " "} {
-		if _, err := h.invoke(context.Background(), tool, Input{Text: "x"}); err == nil {
+		_, err := h.invoke(context.Background(), tool, Input{Text: "x"})
+		if err == nil {
 			t.Fatalf("unknown tool %q was invoked", tool)
 		}
+		if !errors.Is(err, ErrUnknownTool) {
+			t.Fatalf("unknown tool %q error = %v, want ErrUnknownTool", tool, err)
+		}
+	}
+}
+
+// A plugin that dies mid-call must be reported as infrastructure, not as a
+// refusal: nothing about the call was wrong, the process serving it was gone.
+func TestAPluginThatDiesMidCallIsReportedAsInfrastructure(t *testing.T) {
+	h := testHost(t, Options{})
+	record := active(t, h, ToolTextTransform)
+	proc, err := os.FindProcess(record.PluginPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proc.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		_, err := h.Invoke(context.Background(), Input{Text: "hi"})
+		if errors.Is(err, ErrPluginGone) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("invoke after killing plugin pid %d = %v, want ErrPluginGone", record.PluginPID, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// A tool with no active generation is infrastructure too: the call never
+// reached a plugin, so nothing about it can be reported as a refusal.
+func TestAClosedHostReportsInfrastructure(t *testing.T) {
+	h, err := New(context.Background(), testRoot(t), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Close()
+	if _, err := h.Invoke(context.Background(), Input{Text: "hi"}); !errors.Is(err, ErrNoActivePlugin) {
+		t.Fatalf("invoke on a closed host = %v, want ErrNoActivePlugin", err)
 	}
 }
 

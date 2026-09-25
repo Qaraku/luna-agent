@@ -3,8 +3,10 @@ package pluginhost
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/rpc"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,6 +53,27 @@ var Allowlist = []ToolSpec{
 	{Tool: ToolTextTransform, Dir: "text_transform", Candidates: []string{"v1", "v2", "broken"}},
 	{Tool: ToolReadFile, Dir: "read_file", Candidates: []string{"v1", "v2", "broken"}},
 }
+
+// Infrastructure failures mean the tool never ran because its owned plugin
+// could not serve the call. They end the run, unlike a refusal the tool makes
+// about the call itself: internal/agent turns those into a result the model can
+// read and explain. Each one is a sentinel so that decision is a classification
+// rather than a message match.
+var (
+	// ErrUnknownTool reports a tool name outside the allowlist.
+	ErrUnknownTool = errors.New("unknown tool")
+	// ErrNoActivePlugin reports a tool with no active generation: the host is
+	// closed, or every generation it started has failed.
+	ErrNoActivePlugin = errors.New("no active plugin")
+	// ErrRPCTimeout reports a call that outlived RPCTimeout; the owned plugin
+	// was terminated.
+	ErrRPCTimeout = errors.New("plugin RPC timeout")
+	// ErrRPCCanceled reports a call whose run context ended; the owned plugin
+	// was terminated.
+	ErrRPCCanceled = errors.New("plugin RPC canceled")
+	// ErrPluginGone reports a plugin process that died mid-call.
+	ErrPluginGone = errors.New("plugin process is gone")
+)
 
 type Input = pluginprotocol.Input
 type Output struct {
@@ -351,11 +374,11 @@ func (h *Host) invoke(ctx context.Context, tool string, in Input) (Output, error
 	rt := h.runtime(tool)
 	if rt == nil {
 		h.mu.Unlock()
-		return Output{}, fmt.Errorf("unknown tool")
+		return Output{}, fmt.Errorf("%w: %s", ErrUnknownTool, tool)
 	}
 	if h.closed || rt.active == nil {
 		h.mu.Unlock()
-		return Output{}, fmt.Errorf("no active plugin for %s", tool)
+		return Output{}, fmt.Errorf("%w for %s", ErrNoActivePlugin, tool)
 	}
 	g := rt.active
 	g.record.Inflight++
@@ -376,12 +399,15 @@ func (h *Host) invoke(ctx context.Context, tool string, in Input) (Output, error
 		terminated = true
 		g.client.Kill()
 		r = <-done
-		r.err = fmt.Errorf("plugin RPC timeout; owned plugin terminated")
+		r.err = fmt.Errorf("%w; owned plugin terminated", ErrRPCTimeout)
 	case <-ctx.Done():
 		terminated = true
 		g.client.Kill()
 		r = <-done
-		r.err = fmt.Errorf("plugin RPC canceled; owned plugin terminated: %w", ctx.Err())
+		r.err = fmt.Errorf("%w; owned plugin terminated: %w", ErrRPCCanceled, ctx.Err())
+	}
+	if r.err != nil && !terminated && pluginGone(g, r.err) {
+		r.err = fmt.Errorf("%w: %s", ErrPluginGone, r.err)
 	}
 	h.mu.Lock()
 	g.record.Inflight--
@@ -398,6 +424,17 @@ func (h *Host) invoke(ctx context.Context, tool string, in Input) (Output, error
 		h.retire(g)
 	}
 	return Output{Result: r.v, Generation: g.record.Generation, Version: g.record.Version, PluginPID: g.record.PluginPID}, r.err
+}
+
+// pluginGone reports whether an RPC error means the owned plugin process is no
+// longer there to serve calls. A plugin that refuses a call answers with an
+// error of its own and stays alive, so only a dead connection counts here — a
+// refusal must not be mistaken for a dead process.
+func pluginGone(g *generation, err error) bool {
+	if g.client != nil && g.client.Exited() {
+		return true
+	}
+	return errors.Is(err, rpc.ErrShutdown) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 // allowedCandidate reports whether every allowlisted tool has this candidate,
