@@ -28,6 +28,21 @@ tagged and released, so this roadmap no longer tracks it.
 - **S3** — the rules that decide what enters the model's context are explicit and unit-tested.
 - **S4** — front-end contribution points register, mount, unmount, and release their resources.
 
+## v1.1.0 scope
+
+The first acceptance pass found one gap the v1.0.0 slices left: memory could be written and injected but not seen or corrected from the product, so a fact recorded wrongly could only be answered with a second fact.
+
+| Slice | Content | Depends on | Status |
+|---|---|---|---|
+| S5 | Memory you can see and retract | S3 | on `main` |
+
+### Slice acceptance
+
+- **S5** — `GET /api/memory` lists the facts in effect and the facts that were retracted; `POST /api/memory/retract`
+  takes exactly the fact named by its text and its timestamp out of the effective set, and refuses one that is not
+  in effect. Retraction is an appended record, so the store stays append-only, the file stays bounded even when
+  facts are retracted in a loop, and the model's own rights are unchanged: it can still add a fact and nothing else.
+
 ## How this is being built
 
 One slice at a time. Each slice is verified by compilation plus focused unit tests; end-to-end

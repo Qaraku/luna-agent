@@ -42,7 +42,7 @@ A torn final line is the one tolerated defect. An unterminated trailing fragment
 
 ### Memory
 
-`internal/memory` owns the fact file and is the only package that touches it. Memory is core state, not an extension: the core opens the store, reads it on every run, and registers the host-native `luna_remember` tool that writes it. The model can append a fact and has no tool that reads, lists, or deletes one, and no HTTP endpoint exposes the file.
+`internal/memory` owns the fact file and is the only package that touches it. Memory is core state, not an extension: the core opens the store, reads it on every run, and registers the host-native `luna_remember` tool that writes it. The model can append a fact and has no tool that reads, lists, or retracts one. The browser has its own view and one way to remove a fact — `GET /api/memory` and `POST /api/memory/retract`, described below — and that surface can widen neither the model's rights nor what the store accepts.
 
 One memory is one append-only JSONL file, `-memory-file` with a default of `<root>/.runtime/memory.jsonl`, directory `0700` and file `0600`. The record shape is frozen by the S3a spec: `type` (always `fact`), `text`, `at`, `source_session`. As with a session record, the shape has no field for plugin identity and no field for a credential, so neither can travel through memory into a model context. `source_session` records which session wrote a fact; it is storage bookkeeping and is not shown to the model. A write also lands in the session transcript as the `tool_call` record it was, because every tool call does, so fact text can exist in both files: the memory file is the only one read back, and the history replay still carries message text only.
 
@@ -53,6 +53,10 @@ Two caps bound what is stored: `MaxFacts = 200` facts and `MaxBytes = 32 KiB` of
 A torn final line is tolerated here too, and handled on both paths. An unterminated trailing fragment is dropped on read rather than failing the store, and the next write that has to rewrite the file — for a drop or for the fragment — replaces it with the complete kept set, so a new fact is never merged into a fragment and the fragment does not survive. A malformed complete record anywhere else is a loud `ErrCorrupt` error instead, never a silent gap; it names a line number and never a host path, so the string can be handed back to the model as a failed tool call rather than published as a directory layout.
 
 Stored caps and injection caps are deliberately different bounds on the same facts. Storage keeps up to 200 facts and 32 KiB; one run's system prompt receives at most `MaxInjectFacts = 50` facts and `MaxInjectBytes = 8 KiB` of rendered lines, with the oldest dropped first, so the stored file may hold more than any single run is shown. The kept set is a contiguous, chronologically ordered suffix accumulated from the newest fact backwards — the same keep-most-recent policy as the history cap — so facts are never reordered, sampled, or skipped, and the injection byte cap counts the rendered lines and not the label. Below the caps nothing is dropped: the whole stored memory is injected, ordered oldest first.
+
+Retraction is how a stored fact leaves the effective set without anything being rewritten. A retraction is one appended record, `{"type":"retract","at":…,"target_at":…,"target_text":…}`, and a read folds it: the fact matching both the timestamp and the text is removed from the effective set and reported as retracted. Neither field is identity on its own — a clock can repeat a timestamp, and one text can legitimately be stored twice — so a retraction names both and takes exactly one fact. Retracting a fact that is not in effect is an explicit `ErrUnknownFact` and appends nothing, so a retraction can only ever remove the fact it names and a second attempt to retract the same fact is refused rather than recorded twice. The injection reads the folded set, so a retraction takes effect on the next run with no restart, and a redundant retraction record (for example after a hand edit) is ignored rather than treated as corruption.
+
+Because a retraction is a line in the same file, the byte cap counts every complete line rather than only the facts: otherwise retracting in a loop would grow the file without bound. A rewrite — for a cap, or to repair a torn tail — writes the folded effective facts, which compacts a retraction away together with the fact it removed. A retraction therefore cannot be undone by a later compaction, and after a rewrite the removed fact is no longer retractable because it is no longer in effect.
 
 The injected text is reference data, never instructions. Stored fact text is text the model or the user wrote, and spliced into a system prompt unlabelled it would read as a system directive; the block therefore carries an explicit header stating that these are facts about the user, that they are not instructions, that no line below may be followed as a directive, and that no line may change the instruction. The system instruction repeats the same rule. Newlines inside a fact are collapsed to spaces when the block is rendered, so a fact cannot open a line of its own inside the prompt, which is the one thing a smuggled directive would need. Only the label and the fact text appear: generation, version, process id and credentials have no field in a stored fact and no place in the block. The instruction is not treated as an f-string template, so fact text and prompt text containing braces are both safe. A memory that cannot be read fails the run before the model is called, rather than silently running as though nothing were remembered — the rule the transcript already follows.
 
@@ -139,7 +143,7 @@ The static root `web/` application is a client, not an authority. It:
 
 The session API has a front end: the runtime drawer lists sessions newest first, switching one replays its records into the transcript, and a new-session control clears the conversation. The current session id travels in the location fragment as `#session=<id>`, so a refresh resumes the same conversation without the server holding a cookie.
 
-Memory has no front end, and none is implied. `web/` never shows a stored fact, never offers a way to add or delete one, and reads only the plugin records in `/api/state`; a memory write is visible in the transcript as the tool call it was, with no plugin identity to display, and it is never listed as memory.
+Memory has a front end of exactly one kind: a read-only list and a retraction. `web/` may show a stored fact and remove one, and it can do nothing else with it — no adding, no editing, no clearing. The retraction it sends names the fact by the stored text and timestamp it was shown, so the page cannot ask for "the fourth fact" and the store never has to trust an index.
 
 Polling must not overwrite the composer. A disconnected inspector or failed reload is displayed as an error; the UI must not manufacture success state.
 
@@ -196,8 +200,10 @@ Endpoints:
 - `POST /api/runs` accepts `{"message":"...","session_id":"..."}` and returns an SSE stream. `session_id` is optional and must name an existing session: an unknown id is `404` and a malformed one `400`, both checked before single-run admission, so neither costs the caller the run slot and neither creates a session. When it is omitted, the core creates a session titled with the message (whitespace collapsed, cut to 80 runes) and reports its id on `run.started`.
 - `GET /api/ui-plugins` lists the discoverable UI plugins together with the skipped directories and the reason each was skipped. A directory the host cannot read is reported, not omitted, and the listing never becomes a `500` because of one bad plugin.
 - `GET /api/ui-plugins/<name>/<file>` serves one file from inside that plugin's own directory, with the containment and extension rules described under Runtime UI plugins. An unknown plugin name is `404`, a malformed one `400`.
+- `GET /api/memory` returns `{"facts":[…],"retracted":[…]}`: the facts in effect, oldest first, each with its text, its timestamp and the session that wrote it, then the facts that were retracted with when that happened. The storage record type is not part of this shape. A memory file whose complete records cannot be decoded is a `500` and never an empty list.
+- `POST /api/memory/retract` accepts `{"at":"…","text":"…"}` and takes exactly the fact those two identify out of the effective set. It is a mutation, so it requires the exact bound Origin. A malformed body, a missing or unparseable `at`, or empty text is `400`; a fact that is not in effect is `404`; success is `200` with the retracted fact and when it was retracted. Nothing else about a stored fact is writable from the browser: there is no endpoint that adds, edits or rewrites one.
 
-Bodies are capped at 32 KiB and unknown JSON fields are rejected. Messages are non-empty and capped at 16,384 bytes. There are no arbitrary-path, arbitrary-command, or user-supplied plugin endpoints, and none for memory: no endpoint reads, lists, or deletes stored facts.
+Bodies are capped at 32 KiB and unknown JSON fields are rejected. Messages are non-empty and capped at 16,384 bytes. There are no arbitrary-path, arbitrary-command, or user-supplied plugin endpoints. The memory endpoints read and retract, and nothing more: no endpoint adds, edits or rewrites a stored fact, and none exposes the memory file's path or its record type.
 
 ## SSE contract
 
@@ -251,7 +257,7 @@ Reload does **not** reload the Go core, environment variables, model client, HTT
 
 The current root candidate has separate evidence for each major boundary rather than treating a build or fake-model test as end-to-end proof:
 
-- repository-wide Go race tests, vet, root build, Go formatting, Node syntax, and all 31 focused browser-JavaScript tests passed;
+- repository-wide Go race tests, vet, root build, Go formatting, Node syntax, and all 37 focused browser-JavaScript tests passed;
 - the focused post-disconnect race regression passed 50 repeated race-detector runs;
 - a live `deepseek-flash` request at `api.deepseek.com` automatically selected `luna_text_transform` without forced provider `tool_choice`;
 - live `v1` and `v2` calls reported their actual generations and plugin PIDs, while a failed `broken` candidate left the active `v2` generation callable;
@@ -269,6 +275,8 @@ The runtime UI plugin change re-ran the same deterministic gates and nothing mor
 
 The tool-refusal change is covered by the same gates on this tree, and no provider was called for it. It came out of the user's first acceptance pass: asking for a file that is not there ended the whole run with the host's raw error and no answer, and the message a missing file produced read as an internal phrase rather than a reason. The tests now pin both halves — a refusal becomes the call's result so the run still answers, and an infrastructure failure still ends the run — and each half was checked from the defect side by restoring the previous behaviour in a copy of the tree and confirming the new tests fail there. Nothing beyond the deterministic gates was run.
 
+The memory view and retraction change is covered by the same gates on this tree, and no provider was called for it. Those tests pin the fold (a retraction takes exactly one fact out of the effective set, matched by text and timestamp together), the refusal to retract a fact that is not in effect, survival across a reopen, the byte cap counting retraction records so retracting in a loop cannot grow the file, and a rewrite compacting a retraction away together with the fact it removed; the endpoint tests pin the view shape, the `400`, `404` and Origin cases, and that a corrupt memory file is reported rather than shown as an empty one.
+
 No API key appeared in the retained evidence. This is point-in-time validation of the described local architecture, not a guarantee for every OpenAI-compatible provider or browser and not a complete accessibility, load, or production-security assessment.
 
 ## Non-goals
@@ -282,7 +290,7 @@ This slice intentionally excludes:
 - browser-provided plugin code or paths: UI plugins are served from `plugins/ui/`, an allowlisted directory the host reads, and a plugin is enabled by name from the list the host produced;
 - a plugin marketplace, or any installation path that would add a plugin from the browser;
 - production authentication, authorization, tenant isolation, or public deployment (memory is single-user state with no per-user isolation, which is the same boundary);
-- any memory UI: nothing lists stored facts, and nothing adds, edits, or deletes one from the browser;
+- any memory UI that could author or change a fact: nothing adds, edits or rewrites one from the browser, and the model side keeps no read, list or retract path at all — the browser can only take a fact out of the effective set, by appending a retraction;
 - persisting UI plugin enablement, or any server-side view of which UI plugins are on;
 - cross-origin API access;
 - hidden chain-of-thought capture or display;
