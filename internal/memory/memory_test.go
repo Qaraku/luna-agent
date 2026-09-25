@@ -419,3 +419,329 @@ func TestConcurrentWritersKeepWholeLines(t *testing.T) {
 		t.Fatalf("distinct facts on disk=%d, want %d", len(seen), writers)
 	}
 }
+
+// --- S5: retraction ---------------------------------------------------------
+
+func mustSnapshot(t *testing.T, s *Store) Snapshot {
+	t.Helper()
+	snapshot, err := s.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	return snapshot
+}
+
+func TestRetractTakesTheFactOutOfTheEffectiveSet(t *testing.T) {
+	s, path := newStore(t)
+	at := time.Date(2026, time.September, 25, 10, 0, 0, 0, time.UTC)
+	if _, err := s.Remember("session-a", "first fact", at); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if _, err := s.Remember("session-b", "second fact", at.Add(time.Minute)); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+
+	retracted, err := s.Retract(at, "first fact")
+	if err != nil {
+		t.Fatalf("Retract: %v", err)
+	}
+	if retracted.Fact.Text != "first fact" || !retracted.Fact.At.Equal(at) {
+		t.Fatalf("retracted=%+v", retracted)
+	}
+	if retracted.RetractedAt.IsZero() {
+		t.Fatalf("a retraction must carry when it happened: %+v", retracted)
+	}
+	snapshot := mustSnapshot(t, s)
+	if len(snapshot.Facts) != 1 || snapshot.Facts[0].Text != "second fact" {
+		t.Fatalf("effective facts=%+v", snapshot.Facts)
+	}
+	if len(snapshot.Retracted) != 1 || snapshot.Retracted[0].Fact.Text != "first fact" {
+		t.Fatalf("retracted list=%+v", snapshot.Retracted)
+	}
+	if snapshot.Retracted[0].RetractedAt.IsZero() {
+		t.Fatalf("a retraction must carry when it happened: %+v", snapshot.Retracted[0])
+	}
+
+	// The retraction is an appended record: the fact line is still in the file,
+	// and nothing was rewritten.
+	written := lines(t, path)
+	if len(written) != 3 {
+		t.Fatalf("the file has %d lines, want 3 (two facts and one retraction)", len(written))
+	}
+	if !strings.Contains(written[0], "first fact") {
+		t.Fatalf("the retracted fact line was rewritten away: %q", written[0])
+	}
+	var rec map[string]any
+	if err := json.Unmarshal([]byte(written[2]), &rec); err != nil {
+		t.Fatalf("the retraction line does not decode: %v", err)
+	}
+	if rec["type"] != TypeRetract {
+		t.Fatalf("the third line is not a retraction: %v", rec)
+	}
+	if rec["target_text"] != "first fact" {
+		t.Fatalf("the retraction must name its target: %v", rec)
+	}
+	for _, forbidden := range []string{"generation", "version", "plugin_pid", "key", "token"} {
+		if _, ok := rec[forbidden]; ok {
+			t.Fatalf("the retraction record carries %q: %v", forbidden, rec)
+		}
+	}
+}
+
+func TestRetractionSurvivesReopeningTheStore(t *testing.T) {
+	s, path := newStore(t)
+	at := time.Date(2026, time.September, 25, 10, 0, 0, 0, time.UTC)
+	for i, text := range []string{"kept", "forgotten", "also kept"} {
+		if _, err := s.Remember("s", text, at.Add(time.Duration(i)*time.Second)); err != nil {
+			t.Fatalf("Remember: %v", err)
+		}
+	}
+	if _, err := s.Retract(at.Add(time.Second), "forgotten"); err != nil {
+		t.Fatalf("Retract: %v", err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	snapshot := mustSnapshot(t, reopened)
+	if len(snapshot.Facts) != 2 || snapshot.Facts[0].Text != "kept" || snapshot.Facts[1].Text != "also kept" {
+		t.Fatalf("facts after reopening=%+v", snapshot.Facts)
+	}
+	if len(snapshot.Retracted) != 1 {
+		t.Fatalf("retracted after reopening=%+v", snapshot.Retracted)
+	}
+}
+
+// A fact's identity is the (time, text) pair: two facts written in the same
+// instant must be retractable one at a time.
+func TestRetractMatchesTimeAndTextTogether(t *testing.T) {
+	s, _ := newStore(t)
+	at := time.Date(2026, time.September, 25, 10, 0, 0, 0, time.UTC)
+	if _, err := s.Remember("s", "same instant one", at); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if _, err := s.Remember("s", "same instant two", at); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if _, err := s.Retract(at, "same instant two"); err != nil {
+		t.Fatalf("Retract: %v", err)
+	}
+	facts := mustRead(t, s)
+	if len(facts) != 1 || facts[0].Text != "same instant one" {
+		t.Fatalf("facts=%+v", facts)
+	}
+
+	// Identical text and time twice: each retraction takes one of them.
+	if _, err := s.Remember("s", "twice", at.Add(time.Hour)); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if _, err := s.Remember("s", "twice", at.Add(time.Hour)); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if _, err := s.Retract(at.Add(time.Hour), "twice"); err != nil {
+		t.Fatalf("Retract: %v", err)
+	}
+	if facts := mustRead(t, s); len(facts) != 2 || facts[1].Text != "twice" {
+		t.Fatalf("one retraction must remove exactly one of them: %+v", facts)
+	}
+	if _, err := s.Retract(at.Add(time.Hour), "twice"); err != nil {
+		t.Fatalf("Retract: %v", err)
+	}
+	if facts := mustRead(t, s); len(facts) != 1 {
+		t.Fatalf("facts=%+v", facts)
+	}
+}
+
+func TestRetractRefusesAFactThatIsNotInEffect(t *testing.T) {
+	s, path := newStore(t)
+	at := time.Date(2026, time.September, 25, 10, 0, 0, 0, time.UTC)
+	if _, err := s.Remember("s", "only fact", at); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if _, err := s.Retract(at, "never stored"); !errors.Is(err, ErrUnknownFact) {
+		t.Fatalf("retracting unknown text: err=%v, want ErrUnknownFact", err)
+	}
+	if _, err := s.Retract(at.Add(time.Hour), "only fact"); !errors.Is(err, ErrUnknownFact) {
+		t.Fatalf("retracting unknown time: err=%v, want ErrUnknownFact", err)
+	}
+	if _, err := s.Retract(at, "only fact"); err != nil {
+		t.Fatalf("Retract: %v", err)
+	}
+	if _, err := s.Retract(at, "only fact"); !errors.Is(err, ErrUnknownFact) {
+		t.Fatalf("retracting twice: err=%v, want ErrUnknownFact", err)
+	}
+	// A refused retraction appends nothing.
+	if written := lines(t, path); len(written) != 2 {
+		t.Fatalf("the file has %d lines, want 2 (one fact and one retraction)", len(written))
+	}
+}
+
+// sizeOf is fileSize for a file that may not exist yet.
+func sizeOf(t *testing.T, path string) int64 {
+	t.Helper()
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	return fileSize(t, path)
+}
+
+// fillerFacts stores facts of the maximum length until the byte cap is in play,
+// and returns the effective facts afterwards, oldest first.
+func fillerFacts(t *testing.T, s *Store, count int) []Fact {
+	t.Helper()
+	at := time.Date(2026, time.September, 25, 10, 0, 0, 0, time.UTC)
+	text := strings.Repeat("x", MaxFactChars)
+	for i := 0; i < count; i++ {
+		if _, err := s.Remember("s", text, at.Add(time.Duration(i)*time.Second)); err != nil {
+			t.Fatalf("Remember: %v", err)
+		}
+	}
+	return mustRead(t, s)
+}
+
+// A retraction is a line in the file, so it counts against the byte cap: the
+// store must stay bounded even when facts are retracted repeatedly, and the file
+// has to compact at some point instead of growing.
+func TestTheByteCapCountsRetractionsToo(t *testing.T) {
+	s, path := newStore(t)
+	facts := fillerFacts(t, s, 60)
+	if len(facts) < 20 {
+		t.Fatalf("the fixture only kept %d facts", len(facts))
+	}
+	if size := sizeOf(t, path); size > MaxBytes {
+		t.Fatalf("the fixture left a %d byte file, over the %d byte cap", size, MaxBytes)
+	}
+
+	// Retract the newest half: a rewrite drops the oldest facts, so retracting
+	// those would fight the cap instead of exercising it.
+	retractedAt := []time.Time{}
+	previous := sizeOf(t, path)
+	compacted := false
+	for i := len(facts) - 1; i >= len(facts)/2; i-- {
+		if _, err := s.Retract(facts[i].At, facts[i].Text); err != nil {
+			t.Fatalf("Retract %d: %v", i, err)
+		}
+		size := sizeOf(t, path)
+		if size > MaxBytes {
+			t.Fatalf("after retracting %d facts the file is %d bytes, over the %d byte cap", len(retractedAt)+1, size, MaxBytes)
+		}
+		if size < previous {
+			compacted = true
+		}
+		previous = size
+		retractedAt = append(retractedAt, facts[i].At)
+	}
+	if !compacted {
+		t.Fatal("no retraction compacted the file, so the byte cap never counted a retraction record")
+	}
+
+	snapshot := mustSnapshot(t, s)
+	if len(snapshot.Facts) != len(facts)-len(retractedAt) {
+		t.Fatalf("effective facts=%d, want %d", len(snapshot.Facts), len(facts)-len(retractedAt))
+	}
+	// Retracted facts never come back, whatever the rewrite did.
+	for _, fact := range snapshot.Facts {
+		for _, gone := range retractedAt {
+			if fact.At.Equal(gone) {
+				t.Fatalf("a retracted fact came back: %+v", fact)
+			}
+		}
+	}
+}
+
+// A rewrite compacts: the retracted facts and the retraction records are both
+// gone, so a retraction can never be reversed by a later compaction.
+func TestARewriteCompactsRetractedFactsAndRetractions(t *testing.T) {
+	s, path := newStore(t)
+	facts := fillerFacts(t, s, 30)
+	if len(facts) < 20 {
+		t.Fatalf("the fixture only kept %d facts", len(facts))
+	}
+	target := facts[len(facts)-1]
+	if _, err := s.Retract(target.At, target.Text); err != nil {
+		t.Fatalf("Retract: %v", err)
+	}
+	// With headroom under the cap the retraction is a plain append.
+	if !strings.Contains(strings.Join(lines(t, path), "\n"), `"`+TypeRetract+`"`) {
+		t.Fatal("the retraction was not appended")
+	}
+
+	// Keep writing until the byte cap forces a rewrite.
+	at := time.Date(2026, time.September, 26, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 40; i++ {
+		if _, err := s.Remember("s", strings.Repeat("z", MaxFactChars), at.Add(time.Duration(i)*time.Second)); err != nil {
+			t.Fatalf("Remember: %v", err)
+		}
+	}
+	for _, line := range lines(t, path) {
+		if strings.Contains(line, `"`+TypeRetract+`"`) {
+			t.Fatalf("a rewrite left a retraction record behind: %q", line)
+		}
+	}
+	for _, fact := range mustRead(t, s) {
+		if fact.At.Equal(target.At) {
+			t.Fatalf("a rewrite resurrected a retracted fact: %+v", fact)
+		}
+	}
+	if _, err := s.Retract(target.At, target.Text); !errors.Is(err, ErrUnknownFact) {
+		t.Fatalf("after the rewrite the retracted fact is still retractable: err=%v", err)
+	}
+}
+
+func TestATornTailCoexistsWithARetraction(t *testing.T) {
+	s, path := newStore(t)
+	at := time.Date(2026, time.September, 25, 10, 0, 0, 0, time.UTC)
+	if _, err := s.Remember("s", "kept", at); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if _, err := s.Remember("s", "gone", at.Add(time.Second)); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	if _, err := s.Retract(at.Add(time.Second), "gone"); err != nil {
+		t.Fatalf("Retract: %v", err)
+	}
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := file.WriteString(`{"type":"retract","target_`); err != nil {
+		t.Fatalf("write fragment: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	facts := mustRead(t, s)
+	if len(facts) != 1 || facts[0].Text != "kept" {
+		t.Fatalf("a torn tail changed the effective set: %+v", facts)
+	}
+	if _, err := s.Remember("s", "after the repair", at.Add(time.Hour)); err != nil {
+		t.Fatalf("Remember: %v", err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	facts = mustRead(t, reopened)
+	if len(facts) != 2 || facts[0].Text != "kept" || facts[1].Text != "after the repair" {
+		t.Fatalf("facts after the repair=%+v", facts)
+	}
+}
+
+func TestAnUnknownRecordTypeIsStillCorrupt(t *testing.T) {
+	_, path := newStore(t)
+	body := `{"type":"something-else","text":"x","at":"2026-09-25T10:00:00Z"}` + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := s.Snapshot(); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Snapshot err=%v, want ErrCorrupt", err)
+	}
+	if _, err := s.Retract(time.Now(), "x"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Retract err=%v, want ErrCorrupt", err)
+	}
+}

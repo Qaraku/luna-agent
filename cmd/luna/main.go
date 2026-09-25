@@ -168,7 +168,7 @@ func run() error {
 		return fmt.Errorf("construct Eino agent: %w", err)
 	}
 	bound := listener.Addr().String()
-	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)})
+	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithMemory(facts))
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: 70 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() {
