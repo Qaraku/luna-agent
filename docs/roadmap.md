@@ -2,21 +2,30 @@
 
 ## Destination
 
-`v1.0.0` turns the `v0.1.0` kernel slice into a local agent worth using every day: more than one real
-tool, conversations that survive a restart, an explicit context strategy, and a browser front end
-that can be extended at runtime.
+A local agent worth using every day: more than one real tool, conversations that survive a restart,
+an explicit context strategy, and a browser front end that can be extended at runtime.
 
-`v0.1.0` shipped first as a portability and presentation pass that added no agent capability. It is
-tagged and released, so this roadmap no longer tracks it.
+## Version numbers
 
-## v1.0.0 scope
+Releases stay in `0.x` while this is an experimental, single-user kernel whose interfaces can still
+change. `1.0.0` is deliberately unscheduled: nothing here is a stable-interface promise, and the
+README's boundaries — loopback only, one run at a time, no authentication or tenant isolation — are
+as much part of the current version as its features are.
+
+| Version | What it contains |
+|---|---|
+| `v0.1.0` | the plugin kernel slice: subprocess tools, validated reload, drain and rollback. It shipped before this roadmap's slices and is no longer tracked here |
+| `v0.2.0` | S1–S5 below, plus the defects the first acceptance pass found |
+
+## v0.2.0 scope
 
 | Slice | Content | Depends on | Status |
 |---|---|---|---|
-| S1 | A second tool plugin: bounded file reading | — | on `main` |
-| S2 | Persistent sessions and run history | — | on `main` |
-| S3 | Context and memory strategy | S2 | on `main` |
-| S4 | Runtime UI plugin loading | — | on `main` |
+| S1 | A second tool plugin: bounded file reading | — | in `v0.2.0` |
+| S2 | Persistent sessions and run history | — | in `v0.2.0` |
+| S3 | Context and memory strategy | S2 | in `v0.2.0` |
+| S4 | Runtime UI plugin loading | — | in `v0.2.0` |
+| S5 | Memory you can see and retract | S3 | in `v0.2.0` |
 
 ### Slice acceptance
 
@@ -27,30 +36,21 @@ tagged and released, so this roadmap no longer tracks it.
 - **S2** — conversations and run records survive a process restart and a page reload.
 - **S3** — the rules that decide what enters the model's context are explicit and unit-tested.
 - **S4** — front-end contribution points register, mount, unmount, and release their resources.
-
-## v1.1.0 scope
-
-The first acceptance pass found one gap the v1.0.0 slices left: memory could be written and injected but not seen or corrected from the product, so a fact recorded wrongly could only be answered with a second fact.
-
-| Slice | Content | Depends on | Status |
-|---|---|---|---|
-| S5 | Memory you can see and retract | S3 | on `main` |
-
-### Slice acceptance
-
-- **S5** — `GET /api/memory` lists the facts in effect and the facts that were retracted; `POST /api/memory/retract`
-  takes exactly the fact named by its text and its timestamp out of the effective set, and refuses one that is not
-  in effect. Retraction is an appended record, so the store stays append-only, the file stays bounded even when
-  facts are retracted in a loop, and the model's own rights are unchanged: it can still add a fact and nothing else.
+- **S5** — `GET /api/memory` lists the facts in effect and the facts that were retracted, and
+  `POST /api/memory/retract` takes exactly the fact named by its text and its timestamp out of the
+  effective set, refusing one that is not in effect. Retraction is an appended record, so the store
+  stays append-only, the file stays bounded even when facts are retracted in a loop, and the model's
+  own rights are unchanged: it can still add a fact and nothing else.
 
 ## How this is being built
 
-One slice at a time. Each slice is verified by compilation plus focused unit tests; end-to-end
-verification against a live provider happens once, at the `v1.0.0` boundary. An unreleased
-intermediate slice that fails end to end is corrected by the slices that follow it rather than by
-stopping the line.
+One slice at a time. A slice is verified by compilation plus focused unit tests; the end-to-end pass
+against a live provider, and the browser, happen at the boundary of a tagged release rather than per
+slice, so a tag points at the tree the acceptance actually ran against. An unreleased intermediate
+slice that fails end to end is corrected by the slices that follow it rather than by stopping the
+line.
 
-## Non-goals for v1.0.0
+## Non-goals
 
 Multi-agent orchestration, arbitrary shell execution, unbounded filesystem access, a plugin
 marketplace, production authentication, tenant isolation, public deployment, cross-origin API
