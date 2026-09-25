@@ -123,7 +123,7 @@ test('Moonline markup is conversation-first with an accessible hidden runtime dr
   const html = source('index.html');
   assert.match(html, /<title>Luna<\/title>/);
   assert.match(html, />Luna<\/span>/);
-  assert.match(html, /本地会话 · 不保存记录/);
+  assert.match(html, /本地运行 · 会话记录保存在本机/);
   assert.match(html, /有什么想一起看看？/);
   assert.match(html, /给 Luna 发消息…/);
   assert.match(html, />发送<\/button>/);
@@ -158,6 +158,72 @@ test('the plugin section is an empty list in markup and never a fixed tool', () 
   assert.equal(js.includes('state.active'), false, 'the removed single-active field must not be read');
   assert.equal(js.includes('plugin-version'), false, 'the removed single-plugin field must not be written');
   assert.match(js, /pluginRows\(state\.plugins\)/, 'the drawer renders the plugins array');
+});
+
+test('the memory section is an empty list in markup and says what it can do', () => {
+  const html = source('index.html');
+  assert.match(html, /<section class="drawer-section" aria-labelledby="memory-title">/);
+  assert.match(html, /<h3 id="memory-title">记忆<\/h3>/);
+  assert.match(html, /<ul id="memory-list" class="memory-list"><\/ul>/, 'the list is filled from the API, not from markup');
+  assert.match(html, /id="memory-empty"[^>]*hidden[^>]*>还没有记录任何事实。/);
+  assert.match(html, /id="memory-status"[^>]*role="status"/);
+  assert.match(html, /只能撤回/, 'the section must say that retracting is all it can do');
+});
+
+test('memory rows show every fact newest first with where it came from', () => {
+  const { memoryRows } = require('./app.js');
+  const view = memoryRows({
+    facts: [
+      { text: 'prefers Go', at: '2026-09-25T10:00:00Z', source_session: 'aaaaaaaa11112222' },
+      { text: 'uses voice input', at: '2026-09-25T11:00:00Z', source_session: 'bbbbbbbb33334444' }
+    ],
+    retracted: [{ text: 'a stale fact', at: '2026-09-24T09:00:00Z', retracted_at: '2026-09-25T12:00:00Z' }]
+  });
+  assert.equal(view.facts.length, 2);
+  assert.equal(view.facts[0].text, 'uses voice input', 'the newest fact comes first');
+  assert.equal(view.facts[1].text, 'prefers Go');
+  assert.equal(view.facts[0].at, '2026-09-25T11:00:00Z', 'the exact timestamp is what a retraction posts back');
+  assert.equal(view.facts[0].session, '#bbbbbbbb');
+  assert.equal(view.retracted.length, 1);
+  assert.equal(view.retracted[0].text, 'a stale fact');
+});
+
+test('memory rows stay honest for an empty or malformed payload', () => {
+  const { memoryRows } = require('./app.js');
+  assert.deepEqual(memoryRows(undefined), { facts: [], retracted: [] });
+  assert.deepEqual(memoryRows({}), { facts: [], retracted: [] });
+  assert.deepEqual(
+    memoryRows({ facts: [null, {}, { text: 'no timestamp' }, { at: '2026-09-25T10:00:00Z' }] }),
+    { facts: [], retracted: [] },
+    'a fact without both a text and a timestamp is never rendered as a fact'
+  );
+});
+
+test('a retraction names its target exactly and never invents one', () => {
+  const { retractPayload } = require('./app.js');
+  assert.deepEqual(retractPayload({ at: '2026-09-25T11:00:00Z', text: 'uses voice input' }), {
+    at: '2026-09-25T11:00:00Z', text: 'uses voice input'
+  });
+  assert.equal(retractPayload({ at: '', text: 'x' }), null);
+  assert.equal(retractPayload({ at: '2026-09-25T11:00:00Z', text: '' }), null);
+  assert.equal(retractPayload({ text: 'x' }), null);
+  assert.equal(retractPayload(null), null);
+});
+
+test('the memory section reads the API and posts the retraction to it', () => {
+  const js = source('app.js');
+  assert.match(js, /fetch\('\/api\/memory'/);
+  assert.match(js, /fetch\('\/api\/memory\/retract'/);
+  assert.match(js, /memoryRows\(payload\)/);
+  assert.match(js, /retractPayload\(/);
+  assert.equal(/innerHTML/.test(js), false, 'fact text reaches the DOM as text, never as markup');
+});
+
+test('the primary surface does not claim that nothing is stored', () => {
+  const html = source('index.html');
+  assert.equal(html.includes('不保存记录'), false, 'sessions are written to disk since the session slice');
+  assert.equal(html.includes('刷新后不会保留'), false, 'a reload resumes the same session through the fragment');
+  assert.match(html, /会话记录保存在本机/);
 });
 
 test('the primary surface omits console-era and fabricated content', () => {
@@ -493,7 +559,7 @@ test('the front end keeps the session in the hash and reaches the DOM only throu
 
 test('every session style the script builds a class for exists in the stylesheet', () => {
   const css = source('style.css');
-  const selectors = ['.session-new', '.session-list', '.session-row', '.session-row.is-current', '.session-title', '.session-meta', '.session-current', '.session-empty', '.session-status', '.session-notice', '.turn-note', '.assistant-body.failed'];
+  const selectors = ['.session-new', '.session-list', '.session-row', '.session-row.is-current', '.session-title', '.session-meta', '.session-current', '.session-empty', '.session-status', '.session-notice', '.turn-note', '.assistant-body.failed', '.memory-list', '.memory-item', '.memory-text', '.memory-meta', '.memory-retract'];
   for (const selector of selectors) {
     assert.ok(
       [`${selector} {`, `${selector}:`, `${selector},`, `${selector}.`].some((form) => css.includes(form)),

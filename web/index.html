@@ -13,7 +13,7 @@
       <div class="brand" aria-label="Luna">
         <span class="luna-mark" aria-hidden="true"></span>
         <span class="brand-name">Luna</span>
-        <span class="session-note">本地会话 · 不保存记录</span>
+        <span class="session-note">本地运行 · 会话记录保存在本机</span>
       </div>
       <div class="runtime-actions">
         <span id="runtime-brief" class="runtime-brief"><span class="state-dot" aria-hidden="true"></span>正在确认</span>
@@ -26,7 +26,7 @@
         <div class="transcript-content">
           <section id="empty-state" class="empty-state" aria-labelledby="empty-title">
             <h1 id="empty-title">有什么想一起看看？</h1>
-            <p>把问题或想处理的文字发给 Luna。内容仅用于当前本地会话，刷新后不会保留。</p>
+            <p>把问题或想处理的文字发给 Luna。会话记录保存在本机，刷新后仍在；发送的内容会交给你自己在环境里配置的模型服务。</p>
           </section>
           <div id="session-notices" class="session-notices" hidden></div>
           <div id="conversation" class="conversation"></div>
@@ -79,6 +79,17 @@
         <ul id="session-list" class="session-list"></ul>
         <p id="sessions-empty" class="session-empty" hidden>还没有历史会话。</p>
         <p id="session-status" class="session-status" role="status"></p>
+      </section>
+
+      <section class="drawer-section" aria-labelledby="memory-title">
+        <div class="section-heading">
+          <h3 id="memory-title">记忆</h3>
+          <span>由模型写入</span>
+        </div>
+        <p class="ui-plugin-hint">事实由模型通过 luna_remember 写入；这里只能撤回一条，不能编辑或新增。</p>
+        <ul id="memory-list" class="memory-list"></ul>
+        <p id="memory-empty" class="session-empty" hidden>还没有记录任何事实。</p>
+        <p id="memory-status" class="ui-plugin-status" role="status" hidden></p>
       </section>
 
       <section class="drawer-section" aria-labelledby="plugins-title">

@@ -403,6 +403,41 @@ function sessionRows(payload, currentID) {
   return rows;
 }
 
+// memoryRows turns GET /api/memory into display rows: the facts in effect,
+// newest first, each carrying the exact text and timestamp a retraction posts
+// back. A row that is not both a text and a timestamp is dropped rather than
+// rendered as a fact with an invented field.
+function memoryRows(payload) {
+  const view = { facts: [], retracted: [] };
+  if (!payload || typeof payload !== 'object') return view;
+  const facts = Array.isArray(payload.facts) ? payload.facts : [];
+  for (const entry of facts) {
+    const fact = entry && typeof entry === 'object' ? entry : {};
+    if (typeof fact.text !== 'string' || !fact.text) continue;
+    if (typeof fact.at !== 'string' || !fact.at) continue;
+    const session = typeof fact.source_session === 'string' && fact.source_session ? `#${fact.source_session.slice(0, 8)}` : '来源未知';
+    view.facts.push({ text: fact.text, at: fact.at, time: sessionTime(fact.at), session });
+  }
+  view.facts.reverse();
+  const retracted = Array.isArray(payload.retracted) ? payload.retracted : [];
+  for (const entry of retracted) {
+    const gone = entry && typeof entry === 'object' ? entry : {};
+    if (typeof gone.text !== 'string' || !gone.text) continue;
+    view.retracted.push({ text: gone.text, time: sessionTime(gone.retracted_at) });
+  }
+  return view;
+}
+
+// retractPayload is what a retraction posts: the stored text and the stored
+// timestamp, unchanged, so the store can name exactly one fact. A row that
+// cannot name its target is never sent.
+function retractPayload(row) {
+  if (!row || typeof row !== 'object') return null;
+  if (typeof row.at !== 'string' || !row.at) return null;
+  if (typeof row.text !== 'string' || !row.text) return null;
+  return { at: row.at, text: row.text };
+}
+
 // Replay shows the frozen record facts and nothing else. The store has no field
 // for plugin generation, version or process id, so a replayed tool call cannot
 // show an execution identity and must not invent one.
@@ -600,7 +635,7 @@ function parseMarkdownBlocks(markdown) {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { parseEventBlock, toolSummary, toolLabel, toolActivityLabel, candidateLabel, reloadCopy, valueOrDash, pluginStatusLabel, pluginRows, parseInline, parseMarkdownBlocks, isSessionID, parseSessionHash, sessionHash, sessionTitle, sessionTime, runCountLabel, runStatusLabel, sessionRows, argumentsText, toolCallFacts, replaySession, runPayload, uiPluginText, uiPluginNameValid, uiPluginEntrySafe, uiPluginEntryURL, uiPluginRows, uiPluginMissingExports, uiPluginErrorDetail, uiPluginImportError, uiPluginMissingExportError, uiPluginMountError, uiPluginUnmountError, uiPluginState, uiPluginInitialState, uiPluginTransition, uiPluginEnableFailureEvent, uiPluginDisableEvent, uiPluginTeardown, uiPluginAbandonMount, uiPluginToggleAction, uiPluginToggleLabel, uiPluginStatusText, uiPluginHostAPI, UI_PLUGIN_API_VERSION, UI_PLUGIN_ENTRY_REASON, UI_PLUGIN_REQUIRED_EXPORTS };
+  module.exports = { parseEventBlock, toolSummary, toolLabel, toolActivityLabel, candidateLabel, reloadCopy, valueOrDash, pluginStatusLabel, pluginRows, parseInline, parseMarkdownBlocks, isSessionID, parseSessionHash, sessionHash, sessionTitle, sessionTime, runCountLabel, runStatusLabel, sessionRows, memoryRows, retractPayload, argumentsText, toolCallFacts, replaySession, runPayload, uiPluginText, uiPluginNameValid, uiPluginEntrySafe, uiPluginEntryURL, uiPluginRows, uiPluginMissingExports, uiPluginErrorDetail, uiPluginImportError, uiPluginMissingExportError, uiPluginMountError, uiPluginUnmountError, uiPluginState, uiPluginInitialState, uiPluginTransition, uiPluginEnableFailureEvent, uiPluginDisableEvent, uiPluginTeardown, uiPluginAbandonMount, uiPluginToggleAction, uiPluginToggleLabel, uiPluginStatusText, uiPluginHostAPI, UI_PLUGIN_API_VERSION, UI_PLUGIN_ENTRY_REASON, UI_PLUGIN_REQUIRED_EXPORTS };
 }
 
 if (typeof document !== 'undefined') {
@@ -630,6 +665,9 @@ if (typeof document !== 'undefined') {
   const sessionStatus = $('session-status');
   const sessionNotices = $('session-notices');
   const uiPluginList = $('ui-plugin-list');
+  const memoryList = $('memory-list');
+  const memoryEmpty = $('memory-empty');
+  const memoryStatus = $('memory-status');
   const uiPluginsEmpty = $('ui-plugins-empty');
   const uiPluginStatus = $('ui-plugins-status');
   const uiPluginsRetry = $('ui-plugins-retry');
@@ -980,6 +1018,7 @@ if (typeof document !== 'undefined') {
     // Reading every session file has a cost, so the list is refreshed when the
     // drawer that shows it is opened and while it stays open.
     updateSessions();
+    updateMemory();
     updateUIPlugins();
     requestAnimationFrame(() => {
       runtimeDrawer.classList.add('is-open');
@@ -1252,8 +1291,12 @@ if (typeof document !== 'undefined') {
       runtimeBrief.className = 'runtime-brief unavailable';
     }
     // The list is only visible in the drawer, so it is only polled while that
-    // drawer is open; the store reads every session file to answer it.
-    if (!runtimeDrawer.hidden) updateSessions();
+    // drawer is open; the store reads every session file to answer it, and the
+    // facts only change when a run writes one.
+    if (!runtimeDrawer.hidden) {
+      updateSessions();
+      updateMemory();
+    }
   }
 
   // --- Sessions in the drawer and the address bar -------------------------
@@ -1461,6 +1504,82 @@ if (typeof document !== 'undefined') {
 
   sessionNew.addEventListener('click', newSession);
   window.addEventListener('hashchange', applySessionHash);
+
+  // --- Memory in the drawer ------------------------------------------------
+  //
+  // The user's own view of the durable facts: what is stored, and a way to
+  // retract one. There is deliberately no way to add or edit a fact here — a
+  // fact is written by the model through luna_remember — and retracting posts
+  // the stored text and timestamp back unchanged, so the store can name exactly
+  // one fact rather than trusting the page to point at "the fourth one".
+
+  let memoryView = { facts: [], retracted: [] };
+  let memoryReading = false;
+
+  function setMemoryStatus(text, className = '') {
+    memoryStatus.textContent = text;
+    memoryStatus.className = `ui-plugin-status${className ? ` ${className}` : ''}`;
+    memoryStatus.hidden = !text;
+  }
+
+  function memoryRowNode(row, index) {
+    const item = make('li', 'memory-item');
+    item.append(make('p', 'memory-text', row.text));
+    item.append(make('p', 'memory-meta', `${row.time} · 来自 ${row.session}`));
+    const button = make('button', 'memory-retract', '撤回');
+    button.type = 'button';
+    button.dataset.memoryIndex = String(index);
+    button.addEventListener('click', () => retractFact(row, button));
+    item.append(button);
+    return item;
+  }
+
+  function renderMemory(note = '') {
+    memoryList.replaceChildren();
+    memoryView.facts.forEach((row, index) => memoryList.append(memoryRowNode(row, index)));
+    memoryEmpty.hidden = memoryView.facts.length > 0;
+    const parts = [];
+    if (memoryView.retracted.length > 0) parts.push(`已撤回 ${memoryView.retracted.length} 条`);
+    if (note) parts.push(note);
+    setMemoryStatus(parts.join(' · '));
+  }
+
+  async function updateMemory() {
+    if (memoryReading) return;
+    memoryReading = true;
+    try {
+      const response = await fetch('/api/memory', { cache: 'no-store' });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      memoryView = memoryRows(await response.json());
+      renderMemory();
+    } catch (error) {
+      setMemoryStatus(`无法读取记忆：${error.message}`, 'failure');
+    } finally {
+      memoryReading = false;
+    }
+  }
+
+  async function retractFact(row, button) {
+    const payload = retractPayload(row);
+    if (payload === null) {
+      setMemoryStatus('这一条缺少时间或内容，无法撤回。', 'failure');
+      return;
+    }
+    button.disabled = true;
+    try {
+      const response = await fetch('/api/memory/retract', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      await updateMemory();
+      renderMemory('这一条已撤回，下一次运行不再注入它。');
+    } catch (error) {
+      button.disabled = false;
+      setMemoryStatus(`撤回失败：${error.message}`, 'failure');
+    }
+  }
 
   applySessionHash();
   updateSessions();

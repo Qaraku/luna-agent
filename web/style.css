@@ -512,6 +512,30 @@ button:focus-visible, textarea:focus-visible, select:focus-visible, summary:focu
 .session-meta { color: var(--text-tertiary); font: 11px/1.6 "Iosevka Fixed", monospace; }
 .session-current { margin-left: 6px; color: var(--warning); }
 .session-empty { margin: 10px 0 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.6; }
+.memory-list { margin: 12px 0 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+.memory-item {
+  padding: 9px 12px;
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--line-subtle);
+  border-radius: 8px;
+  background: var(--surface-1);
+  color: var(--text-secondary);
+}
+.memory-text { margin: 0; font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+.memory-meta { margin: 0; color: var(--text-tertiary); font: 11px/1.6 "Iosevka Fixed", monospace; }
+.memory-retract {
+  justify-self: start;
+  min-height: 30px;
+  padding: 4px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.memory-retract:hover { color: var(--danger); border-color: var(--danger); }
+.memory-retract:disabled { opacity: 0.6; }
 .session-status { min-height: 19px; margin: 10px 0 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.6; }
 .session-status.failure { color: var(--danger); }
 .session-notices { margin: 0 0 18px; }
