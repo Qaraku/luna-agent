@@ -67,3 +67,13 @@ When commits are explicitly requested, keep these histories separate:
 3. **web** — `web/` HTML/CSS/JavaScript and focused browser-JavaScript tests.
 
 Do not combine spike, core, and web changes in one commit. Repository-wide documentation may use its own documentation commit when that makes the boundary clearer.
+
+## Version numbers and tags
+
+A version number is the user's decision, never a contributor's inference. The rules below are the whole authority for creating one:
+
+1. **A tag name may only come from the user.** A number that appears in a plan, a roadmap heading, or a previous release is not authorization to use it. A roadmap section called `v1.0.0 scope` is a plan for work, not a name to tag.
+2. **A tag may only point at the tree the acceptance ran against.** Re-run the full gates on a clean extraction of that exact commit and keep the output as evidence before tagging, and point the tag at the commit whose *code* was accepted.
+3. **A pushed tag is not moved.** If the wrong number goes out, the remedy is delete-and-retag while nobody has fetched it, stated plainly in the report — never a silent force-push, and never a quiet rewrite of a public ref.
+4. **Releases stay in `0.x`.** This is an experimental, single-user kernel whose interfaces can still change, so `1.0.0` is not scheduled. Declaring a stable version is the user's call, not a milestone that finishing slices reaches.
+5. **A version number claims stability; it does not count work.** `docs/roadmap.md` is the only place that records what a released version contains, and nothing else in the repository may name a version.
