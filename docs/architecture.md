@@ -94,7 +94,7 @@ The model sees exactly three tools. Two are plugin-backed and are registered by 
 
 Each implementation is a real HashiCorp `go-plugin` net/rpc child process. Its RPC protocol is private to the core/plugin boundary. A child receives a minimal environment (`PATH`, `HOME`, `TMPDIR`, and `GOCACHE` when present), not the provider's OpenAI variables.
 
-`luna_read_file` splits its boundary in two. `internal/fileread.Resolve` runs on the host and is the only place a model-supplied path is interpreted: it normalizes the path, rejects absolute paths and `..` escapes, resolves symbolic links, and refuses anything that is not a regular file still inside the read root. The plugin is then handed the resolved absolute path plus the cap and never interprets a path itself. A read above the cap (default 256 KiB, `-read-limit`) and content containing a NUL byte are refused with an explicit error rather than truncated or guessed at, and error strings never carry an absolute host path. The read root defaults to the resolved repository root and is set by `-read-root`.
+`luna_read_file` splits its boundary in two. `internal/fileread.Resolve` runs on the host and is the only place a model-supplied path is interpreted: it normalizes the path, rejects absolute paths and `..` escapes, resolves symbolic links, and refuses anything that is not a regular file still inside the read root. The plugin is then handed the resolved absolute path plus the cap and never interprets a path itself. A read above the cap (default 256 KiB, `-read-limit`) and content containing a NUL byte are refused with an explicit error rather than truncated or guessed at, and error strings never carry an absolute host path. A file that is not there is reported as `file not found: "<the path the model asked for>"`; the host says what happened, not which internal boundary the path crossed. The read root defaults to the resolved repository root and is set by `-read-root`. Every one of these refusals reaches the model as the call's result rather than as a failed run — see the `tool.failed` entry in the SSE contract.
 
 Allowed candidates are compiled from `plugins/<tool>/<candidate>/`, all from root source:
 
@@ -137,11 +137,22 @@ The static root `web/` application is a client, not an authority. It:
 - keeps run and reload busy states separate;
 - uses DOM APIs and `textContent`, with no remote assets and no hidden-reasoning view.
 
-The session API has no front end: `web/` neither lists sessions nor resumes one, and the session endpoints were added for a later UI slice.
+The session API has a front end: the runtime drawer lists sessions newest first, switching one replays its records into the transcript, and a new-session control clears the conversation. The current session id travels in the location fragment as `#session=<id>`, so a refresh resumes the same conversation without the server holding a cookie.
 
-Memory has no front end either, and none is implied. `web/` never shows a stored fact, never offers a way to add or delete one, and reads only the plugin records in `/api/state`; a memory write is visible in the transcript as the tool call it was, with no plugin identity to display, and it is never listed as memory.
+Memory has no front end, and none is implied. `web/` never shows a stored fact, never offers a way to add or delete one, and reads only the plugin records in `/api/state`; a memory write is visible in the transcript as the tool call it was, with no plugin identity to display, and it is never listed as memory.
 
 Polling must not overwrite the composer. A disconnected inspector or failed reload is displayed as an error; the UI must not manufacture success state.
+
+### Runtime UI plugins
+
+The browser surface is extensible at runtime, from the same allowlisted directory shape the tool plugins use:
+
+- A plugin is a directory `plugins/ui/<name>/` holding `plugin.json` (`name`, `title`, `description`, `entry`) and an ES module exporting `mount(target, api)` and `unmount(target)`.
+- `GET /api/ui-plugins` lists what is discoverable and reports every directory it skipped with a reason. A missing, malformed, or name-mismatched plugin is visible to the caller rather than silently absent, and never turns the listing into a `500`.
+- `GET /api/ui-plugins/<name>/<file>` serves files from inside that plugin's own directory. `name` must match `^[a-z0-9-]{1,32}$`; containment is checked after normalization and again after resolving symlinks, through `internal/fileread`'s validator rather than a second copy of the check; an unknown extension is refused rather than guessed into a `Content-Type`; nested entry paths such as `dist/plugin.js` are servable. The plugin root itself must be a real directory, because a `plugins/ui/<name>` symlink pointing outside the tree would otherwise move the containment boundary along with it.
+- The host hands `mount` a container element and a deliberately narrow API: a log callback and the host version. Not internal state, not DOM references, not a fetch wrapper.
+- `unmount` owns the plugin's own listeners and timers, but the host removes the container even when `unmount` throws and surfaces that error, so no half-mounted state survives.
+- Enable state is deliberately not persisted: after a refresh every plugin is off, which is the honest state for a surface the server does not track.
 
 ## Request and event flow
 
@@ -183,6 +194,8 @@ Endpoints:
 - `GET /api/sessions` lists session summaries, newest `updated_at` first, as `{"sessions":[{"id":...,"title":...,"updated_at":...,"run_count":...}]}`. `updated_at` and `run_count` are derived from the session's records rather than stored in a separate index.
 - `GET /api/sessions/{id}` returns the replay object `{"id":...,"title":...,"created_at":...,"updated_at":...,"run_count":...,"truncated":...,"records":[...]}`. Each element of `records` is the stored JSONL line itself, in file order, so a client replays exactly what is on disk. A malformed id is `400`, an id with no session file is `404`, and a session file whose records cannot be decoded is `500`.
 - `POST /api/runs` accepts `{"message":"...","session_id":"..."}` and returns an SSE stream. `session_id` is optional and must name an existing session: an unknown id is `404` and a malformed one `400`, both checked before single-run admission, so neither costs the caller the run slot and neither creates a session. When it is omitted, the core creates a session titled with the message (whitespace collapsed, cut to 80 runes) and reports its id on `run.started`.
+- `GET /api/ui-plugins` lists the discoverable UI plugins together with the skipped directories and the reason each was skipped. A directory the host cannot read is reported, not omitted, and the listing never becomes a `500` because of one bad plugin.
+- `GET /api/ui-plugins/<name>/<file>` serves one file from inside that plugin's own directory, with the containment and extension rules described under Runtime UI plugins. An unknown plugin name is `404`, a malformed one `400`.
 
 Bodies are capped at 32 KiB and unknown JSON fields are rejected. Messages are non-empty and capped at 16,384 bytes. There are no arbitrary-path, arbitrary-command, or user-supplied plugin endpoints, and none for memory: no endpoint reads, lists, or deletes stored facts.
 
@@ -202,7 +215,7 @@ Event types and payloads are application-owned:
 - `assistant.delta` — `{"text":"..."}`; emitted for provider stream chunks or as one visible assistant message when output is not chunked, but never for a turn containing tool calls
 - `tool.started` — `{"run_id":"...","name":"...","arguments":...}`, where `name` is one of the three model-visible tool names: the plugin-backed `luna_text_transform` and `luna_read_file`, or the host-native `luna_remember`
 - `tool.finished` — `{"run_id":"...","name":"...","result":"...","generation":N,"version":"...","plugin_pid":N}` for a plugin-backed tool that served the call; for the host-native `luna_remember` the three identity fields are absent from the JSON rather than sent as zero, because no plugin served it
-- `tool.failed` — run/tool identity and an error, with generation/version/PID when a plugin served the attempt and omitted when it did not
+- `tool.failed` — run/tool identity and an error, with generation/version/PID when a plugin served the attempt and omitted when it did not. A **refusal** the tool makes about the call itself — a rejected path, the single-read size cap, binary content, a malformed argument — is also handed to the model as the call's result, so the run continues and the model can explain the reason to the user. Only an **infrastructure** failure ends the run: no active plugin, an RPC timeout or cancellation that terminated the plugin, or a plugin process that is gone. The plugin host tags those with sentinels (`pluginhost.ErrUnknownTool`, `ErrNoActivePlugin`, `ErrRPCTimeout`, `ErrRPCCanceled`, `ErrPluginGone`) so the wrapper classifies rather than matches message text; a refusal raised inside a plugin crosses `net/rpc` as plain text and is therefore never one of them. A refused call still writes its `tool_call` record with the error, so the failed call survives a restart.
 - `run.finished` — `{"run_id":"...","answer":"..."}`
 - `run.failed` — `{"run_id":"...","error":"..."}`
 
@@ -238,7 +251,7 @@ Reload does **not** reload the Go core, environment variables, model client, HTT
 
 The current root candidate has separate evidence for each major boundary rather than treating a build or fake-model test as end-to-end proof:
 
-- repository-wide Go race tests, vet, root build, Go formatting, Node syntax, and all 22 focused browser-JavaScript tests passed;
+- repository-wide Go race tests, vet, root build, Go formatting, Node syntax, and all 31 focused browser-JavaScript tests passed;
 - the focused post-disconnect race regression passed 50 repeated race-detector runs;
 - a live `deepseek-flash` request at `api.deepseek.com` automatically selected `luna_text_transform` without forced provider `tool_choice`;
 - live `v1` and `v2` calls reported their actual generations and plugin PIDs, while a failed `broken` candidate left the active `v2` generation callable;
@@ -252,6 +265,10 @@ The session change re-ran those same gates and nothing more. No server and no mo
 
 The memory change is covered by those same deterministic gates, which pass on this tree. No server and no model provider were run, so memory is not claimed as end-to-end verified either: the append-only fact file under a real crash, the injected block as a live provider receives it, and the memory tool's events in a real run were not exercised outside deterministic tests, and no browser was used. Those tests cover the store's round-trip, both caps, the torn trailing line and its repair, the whole-line guarantee under concurrent writers, the strict write-only tool schema, the injected block's label and ordering, the count and byte caps on injection, the newline collapse, the read failure that fails the run, and the absence of plugin identity on a host-native call. None of that is a substitute for the missing live run.
 
+The runtime UI plugin change re-ran the same deterministic gates and nothing more. No server, no model provider and no browser were run for it, so the plugin listing, the file serving, the mount/unmount cycle and the host-side teardown are not claimed as end-to-end verified. Those tests cover the skipped-directory report, containment after normalization and again after symlink resolution, the extension refusal, the host removing a container whose `unmount` threw, and the enable/disable cycle in `web/app.test.cjs`.
+
+The tool-refusal change is covered by the same gates on this tree, and no provider was called for it. It came out of the user's first acceptance pass: asking for a file that is not there ended the whole run with the host's raw error and no answer, and the message a missing file produced read as an internal phrase rather than a reason. The tests now pin both halves — a refusal becomes the call's result so the run still answers, and an infrastructure failure still ends the run — and each half was checked from the defect side by restoring the previous behaviour in a copy of the tree and confirming the new tests fail there. Nothing beyond the deterministic gates was run.
+
 No API key appeared in the retained evidence. This is point-in-time validation of the described local architecture, not a guarantee for every OpenAI-compatible provider or browser and not a complete accessibility, load, or production-security assessment.
 
 ## Non-goals
@@ -262,10 +279,11 @@ This slice intentionally excludes:
 - long-term memory in the sense of retrieval, embedding, ranking, or automatic extraction: memory exists only in the bounded form described above, an append-only fact file the model appends to through `luna_remember` and the system prompt injects under its own caps;
 - summarization or retrieval over a session's history, and any search over stored facts;
 - arbitrary shell, filesystem, or network tools;
-- browser-provided plugin code or paths;
-- runtime UI plugins or a plugin marketplace;
-- a browser front end for sessions (the session API has no UI in this slice), and any memory UI: nothing lists stored facts, and nothing adds, edits, or deletes one from the browser;
+- browser-provided plugin code or paths: UI plugins are served from `plugins/ui/`, an allowlisted directory the host reads, and a plugin is enabled by name from the list the host produced;
+- a plugin marketplace, or any installation path that would add a plugin from the browser;
 - production authentication, authorization, tenant isolation, or public deployment (memory is single-user state with no per-user isolation, which is the same boundary);
+- any memory UI: nothing lists stored facts, and nothing adds, edits, or deletes one from the browser;
+- persisting UI plugin enablement, or any server-side view of which UI plugins are on;
 - cross-origin API access;
 - hidden chain-of-thought capture or display;
 - retries that could duplicate model/tool effects;

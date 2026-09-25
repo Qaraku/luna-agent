@@ -21,6 +21,8 @@ flowchart LR
         Agent["internal/agent<br/>Eino ChatModelAgent"]
         PH["internal/pluginhost<br/>per-tool generation pinning"]
         Mem["internal/memory<br/>append-only facts"]
+        Store["internal/store<br/>append-only sessions"]
+        UIP["internal/uiplugin<br/>UI plugin listing + file serving"]
     end
 
     subgraph Plugins["Tool plugin subprocesses"]
@@ -29,14 +31,21 @@ flowchart LR
         C["candidate build · v2 for every tool"]
     end
 
+    subgraph UIPlugins["UI plugin directories · no process"]
+        UIPlug["plugins/ui/&lt;name&gt; · plugin.json + ES module"]
+    end
+
     UI <-->|"app-owned events"| API
     API --> Agent
+    API --> Store
+    API --> UIP
     Agent -->|"luna_remember (host-native, no generation)"| Mem
     Agent -->|"luna_text_transform"| PH
     Agent -->|"luna_read_file"| PH
     PH -->|"net/rpc"| T1
     PH -->|"net/rpc"| R1
     PH -.->|"build + handshake, then publish"| C
+    UIP -->|"mount / unmount in the page"| UIPlug
 ```
 
 Plugin sources live at `plugins/<tool>/<candidate>/`, so both the tool and the candidate are part of the path the core compiles.
@@ -45,7 +54,7 @@ Each layer has one owner and an explicit contract:
 
 1. **The Go core** owns runs, cancellation, budgets, plugin lifecycle, the event stream, and the durable files on disk — the session transcripts and the bounded memory facts. Eino types never cross the HTTP boundary.
 2. **Each plugin process** owns one tool implementation. It receives only the environment it needs, never the model credentials.
-3. **The browser UI** observes and controls the core through a small app-owned HTTP/SSE contract. Model output, tool arguments, and tool results reach the DOM only through `createElement` / `textContent`.
+3. **The browser UI** observes and controls the core through a small app-owned HTTP/SSE contract. Model output, tool arguments, and tool results reach the DOM only through `createElement` / `textContent`. A UI plugin is code the core serves and the page runs in its own container, under the narrow `mount`/`unmount` API described below.
 
 See [docs/architecture.md](docs/architecture.md) for ownership and reload semantics, and [docs/roadmap.md](docs/roadmap.md) for scope.
 
@@ -72,6 +81,10 @@ See [docs/architecture.md](docs/architecture.md) for ownership and reload semant
 - Public, app-owned SSE events instead of Eino or plugin RPC structs, with exactly one terminal event per writable stream.
 - Runs are persisted. Each session is one append-only JSONL file under `-sessions-dir` (default `<root>/.runtime/sessions/`); one line is one record, written by a single `Write` call, so a crash can lose only an unterminated tail fragment and never a completed record. A run appends the user message before the model runs, one record per tool call, the assistant answer, and one record carrying the run's status. A run whose transcript cannot be written is reported as failed instead of as a success.
 - A session's history is replayed into the model. The input for a turn is the system prompt — the instruction plus the labelled memory block, when facts are stored — then the session's prior messages in order, then this turn's user message, capped at the most recent 40 messages and 64 KiB of message text, dropping the oldest first. Summarization and retrieval are not implemented: history is replayed and memory is injected whole under its own caps, never searched.
+
+- The browser surface is extensible at runtime. A UI plugin is a directory `plugins/ui/<name>/` holding `plugin.json` and an ES module exporting `mount(target, api)` and `unmount(target)`; the host hands `mount` a container element and a narrow API (a log callback and the host version), lists what it found over `GET /api/ui-plugins` while reporting the directories it skipped and why, and serves each plugin's files from inside that plugin's own directory under the same containment validator the file tool uses. `unmount` owns the plugin's listeners and timers, but the host removes the container even when `unmount` throws, and reports it, so no half-mounted state survives. Enable state is deliberately not persisted: after a refresh every plugin is off.
+
+- A tool call can fail in two ways, and only one of them ends the run. A **refusal** — a rejected path, the file-read size cap, binary content, a malformed argument — is reported to the UI as `tool.failed` and handed to the model as the call's result, so the run continues and the model explains the reason in the user's language. An **infrastructure** failure — no active plugin, an RPC timeout or cancellation that terminated the plugin, a plugin process that is gone — is raised as an error and ends the run as `run.failed`, because a model cannot be told anything useful about a plugin that is not there.
 
 ## Quick start
 
@@ -129,6 +142,8 @@ Startup errors name the missing variable but never print its value.
 | `GET` | `/api/sessions/{id}` | One session for replay: `id`, `title`, `created_at`, `updated_at`, `run_count`, `truncated`, and its `records` in file order. An unknown id is `404`, a malformed one `400` |
 | `POST` | `/api/reload` | `{"candidate":"v1\|v2\|broken"}` — builds and validates the candidate for every allowlisted plugin tool, then publishes them as one generation, or fails leaving every plugin-backed tool on its previous generation. It never touches the host-native memory tool |
 | `POST` | `/api/runs` | `{"message":"...","session_id":"..."}` — `session_id` is optional and must name an existing session: an unknown id is `404` and a malformed one `400`, both before admission. When it is omitted a session is created and its id arrives on `run.started`. `text/event-stream` response using the event types in [docs/architecture.md](docs/architecture.md) |
+| `GET` | `/api/ui-plugins` | The discoverable UI plugins plus every directory that was skipped and the reason. A malformed plugin is reported, never silently omitted, and never turns the listing into a `500` |
+| `GET` | `/api/ui-plugins/<name>/<file>` | One file from inside that plugin's own directory, contained after normalization and after symlink resolution; an unknown extension is refused rather than guessed into a `Content-Type` |
 
 Mutation requests must come from the exact bound browser origin. There is no CORS support and no public-network mode.
 
@@ -152,7 +167,7 @@ node --check web/app.js
 node --test web/app.test.cjs
 ```
 
-The Node suite reports 22 passing tests. Go unit and integration coverage includes configuration alias handling, one process per allowlisted tool, real subprocess replacement and draining, broken-candidate rollback with the active generation kept serving, RPC timeout termination, host-side file-read path validation (absolute paths, `..` escapes, symlink escape, non-regular files, the size cap and binary content), strict tool schemas and trailing-JSON rejection, sequential tool execution, suppression of assistant text from tool-call turns, deterministic fake-model Eino event mapping, whole-run timeout and cancellation cleanup, exactly-one SSE terminal semantics, and HTTP guards. A focused post-disconnect race regression also passed 50 repeated race-detector runs.
+The Node suite reports 31 passing tests. Go unit and integration coverage includes configuration alias handling, one process per allowlisted tool, real subprocess replacement and draining, broken-candidate rollback with the active generation kept serving, RPC timeout termination, a plugin process killed mid-call classified as infrastructure, host-side file-read path validation (absolute paths, `..` escapes, symlink escape, non-regular files, the size cap and binary content), a refusal reaching the model as the call's result while an infrastructure failure still ends the run, strict tool schemas and trailing-JSON rejection, sequential tool execution, suppression of assistant text from tool-call turns, deterministic fake-model Eino event mapping, whole-run timeout and cancellation cleanup, exactly-one SSE terminal semantics, UI plugin listing and containment, and HTTP guards. A focused post-disconnect race regression also passed 50 repeated race-detector runs.
 
 Separate end-to-end validation completed the checks that deterministic tests cannot provide:
 
@@ -164,9 +179,13 @@ Separate end-to-end validation completed the checks that deterministic tests can
 
 The live-provider, headless-Chromium, Desktop Preview and clean-checkout checks above were captured for the one-tool kernel. The two-tool change re-ran the Go race, vet, root-build, Go-format, Node syntax and Node test gates listed at the top of this section; it did not re-run a live provider or a real browser.
 
-The session change re-ran those same gates and nothing more. No server and no model provider were run for it, so the session endpoints, the append-only store under a real crash, the history replay and the terminal-event contract are not claimed as end-to-end verified, and no browser was exercised against them. The front end does not surface sessions yet.
+The session change re-ran those same gates and nothing more. No server and no model provider were run for it, so the session endpoints, the append-only store under a real crash, the history replay and the terminal-event contract are not claimed as end-to-end verified, and no browser was exercised against them by that change. The session front end arrived in the following `web/` commit, which re-ran the same gates plus the browser-JavaScript suite.
+
+The runtime UI plugin change re-ran those same gates and nothing more. No server, no model provider and no browser were run for it either, so the plugin listing, the file serving, the mount/unmount cycle and the host-side teardown are not claimed as end-to-end verified.
 
 The memory change is covered by those same deterministic gates, which pass on this tree, including the new `internal/memory` package tests and the memory-path tests in `internal/agent`. No server and no model provider were run, so memory is not claimed as end-to-end verified either: the append-only fact file under a real crash, the injection into a live provider request, and the memory tool's events in a real run were not exercised outside deterministic tests, and no browser was used. Memory has no UI — `web/` never shows a stored fact and offers no way to add or delete one — and the memory tool is host-native, so it does not appear in `/api/state` or in what `/healthz` requires to report ready. Those report plugin-backed tools only.
+
+The tool-refusal change is covered by the same gates on this tree, and no provider was called for it. It came out of a user-run acceptance pass, where asking for a file that is not there ended the whole run with the host's raw error and no answer at all, and the message a missing file produced read as an internal phrase rather than a reason. A refusal is now the call's result, so the run continues and the model explains it; an infrastructure failure still ends the run. Each half was also checked from the defect side, by restoring the previous behaviour in a copy of the tree and confirming the new tests fail there.
 
 No API key appeared in the retained verification evidence. These results are point-in-time evidence for the tested provider and headless Chromium path, not a production-readiness claim, a compatibility guarantee for every OpenAI-compatible provider, or a complete accessibility/cross-browser audit.
 
@@ -178,7 +197,7 @@ The spike is a separate Go module and historical evidence. The root application 
 
 ## Boundaries
 
-The slice deliberately excludes multi-agent orchestration, arbitrary shell or network tools, filesystem access beyond the bounded read-only `luna_read_file`, browser-supplied plugin code or paths, runtime UI plugins, a session front end in `web/`, a plugin marketplace, production authentication, tenant isolation, public deployment, cross-origin API access, hidden reasoning capture, retries that could duplicate model or tool effects, and a public cancellation API.
+The slice deliberately excludes multi-agent orchestration, arbitrary shell or network tools, filesystem access beyond the bounded read-only `luna_read_file`, browser-supplied plugin code or paths, a plugin marketplace, an installation path that adds a UI plugin from the browser, persisted UI plugin enablement, production authentication, tenant isolation, public deployment, cross-origin API access, hidden reasoning capture, retries that could duplicate model or tool effects, and a public cancellation API.
 
 Memory is not excluded any more, and it is bounded by what it is not. There is no retrieval and no embedding, and no ranking of any kind: a run receives the most recent facts that fit the injection caps, not the most relevant ones. Nothing is extracted automatically from a conversation — a fact exists only if the model chose to call `luna_remember`. There is no read, list, edit or delete path to a stored fact, from the model or from the browser, so nothing can be forgotten through the product; the fact file itself is the only handle on it. Memory carries no user identity and no cross-user isolation, which suits a single-user local kernel and would not suit a shared one.
 
