@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"path/filepath"
 	"strings"
@@ -102,13 +103,20 @@ func TestToolHandsOnlyTheTransformedTextToTheModel(t *testing.T) {
 	}
 }
 
+// A malformed call is refused for the model rather than raised as a run error:
+// the model wrote the arguments, so it is the one that can act on the reason
+// while the run keeps going.
 func TestToolRejectsTrailingJSON(t *testing.T) {
 	sink := &collectingSink{}
 	ctx := WithRun(context.Background(), "run-1", sink)
 	tool := NewTextTransformTool(fakeInvoker{})
 
-	if _, err := tool.InvokableRun(ctx, `{"text":"first"}{"text":"second"}`); err == nil {
-		t.Fatal("expected trailing JSON to be rejected")
+	got, err := tool.InvokableRun(ctx, `{"text":"first"}{"text":"second"}`)
+	if err != nil {
+		t.Fatalf("a refused call must not become a run error: %v", err)
+	}
+	if !strings.HasPrefix(got, refusalPrefix) {
+		t.Fatalf("model-visible refusal = %q", got)
 	}
 	if len(sink.events) != 2 || sink.events[0].Type != "tool.started" || sink.events[1].Type != "tool.failed" {
 		t.Fatalf("events=%+v", sink.events)
@@ -470,8 +478,12 @@ func TestReadFileToolRejectsMalformedArgumentsBeforeTheHost(t *testing.T) {
 		sink := &collectingSink{}
 		ctx := WithRun(context.Background(), "run-1", sink)
 		reader := &recordingReader{out: pluginhost.Output{Result: "should not be reached"}}
-		if _, err := NewReadFileTool(reader).InvokableRun(ctx, arguments); err == nil {
-			t.Fatalf("arguments %q accepted", arguments)
+		got, err := NewReadFileTool(reader).InvokableRun(ctx, arguments)
+		if err != nil {
+			t.Fatalf("arguments %q became a run error instead of a refusal: %v", arguments, err)
+		}
+		if !strings.HasPrefix(got, refusalPrefix) {
+			t.Fatalf("arguments %q refusal = %q", arguments, got)
 		}
 		if len(reader.requests) != 0 {
 			t.Fatalf("arguments %q reached the host: %+v", arguments, reader.requests)
@@ -510,22 +522,54 @@ func TestReadFileSchemaIsStrict(t *testing.T) {
 	}
 }
 
-// A refusal by the host (here: an absolute path) surfaces as tool.failed with
-// the host's own message.
-func TestReadFileToolReportsAHostRefusalAsToolFailed(t *testing.T) {
+// A refusal by the host (here: a file the read root does not hold) is handed to
+// the model as the tool's result, so the run continues and the user gets an
+// explanation instead of a failed run. The UI still sees tool.failed with the
+// host's own message.
+func TestReadFileToolHandsAHostRefusalToTheModel(t *testing.T) {
 	sink := &collectingSink{}
 	ctx := WithRun(context.Background(), "run-1", sink)
-	reader := &recordingReader{err: fileread.ErrPathAbsolute}
-	_, err := NewReadFileTool(reader).InvokableRun(ctx, `{"path":"/etc/passwd"}`)
-	if err == nil || !errors.Is(err, fileread.ErrPathAbsolute) {
-		t.Fatalf("error = %v", err)
+	reader := &recordingReader{err: fmt.Errorf("%w: %q", fileread.ErrNotFound, "TMP.md")}
+	got, err := NewReadFileTool(reader).InvokableRun(ctx, `{"path":"TMP.md"}`)
+	if err != nil {
+		t.Fatalf("a refused read must not become a run error: %v", err)
 	}
-	if len(sink.events) != 2 || sink.events[1].Type != "tool.failed" {
+	if !strings.HasPrefix(got, refusalPrefix) || !strings.Contains(got, fileread.ErrNotFound.Error()) {
+		t.Fatalf("model-visible refusal = %q", got)
+	}
+	if !strings.Contains(got, "TMP.md") {
+		t.Fatalf("the refusal must name the path the model asked for: %q", got)
+	}
+	for _, leak := range []string{"Generation", "generation", "PluginPID", "plugin_pid", "v1", "v2"} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("refusal leaked plugin identity %q: %q", leak, got)
+		}
+	}
+	if len(sink.events) != 2 || sink.events[0].Type != "tool.started" || sink.events[1].Type != "tool.failed" {
 		t.Fatalf("events=%+v", sink.events)
 	}
 	failed := sink.events[1].Data.(ToolFailed)
-	if failed.Name != ReadFileToolName || !strings.Contains(failed.Error, "absolute paths are not allowed") {
+	if failed.Name != ReadFileToolName || failed.Error == "" {
 		t.Fatalf("failed payload=%+v", failed)
+	}
+}
+
+// Infrastructure failures still fail the run: the tool never ran, so the model
+// has nothing to explain and the failure belongs to the system rather than to
+// the call the model made.
+func TestPluginBackedToolsKeepInfrastructureFailuresFatal(t *testing.T) {
+	for _, infra := range []error{pluginhost.ErrUnknownTool, pluginhost.ErrNoActivePlugin, pluginhost.ErrRPCTimeout, pluginhost.ErrRPCCanceled, pluginhost.ErrPluginGone} {
+		sink := &collectingSink{}
+		ctx := WithRun(context.Background(), "run-1", sink)
+		if _, err := NewReadFileTool(&recordingReader{err: infra}).InvokableRun(ctx, `{"path":"docs/architecture.md"}`); !errors.Is(err, infra) {
+			t.Fatalf("read_file error = %v, want %v to stay fatal", err, infra)
+		}
+		if _, err := NewTextTransformTool(fakeInvoker{err: infra}).InvokableRun(ctx, `{"text":"x"}`); !errors.Is(err, infra) {
+			t.Fatalf("text_transform error = %v, want %v to stay fatal", err, infra)
+		}
+		if len(sink.events) == 0 || sink.events[len(sink.events)-1].Type != "tool.failed" {
+			t.Fatalf("infrastructure failure events=%+v", sink.events)
+		}
 	}
 }
 
@@ -594,5 +638,61 @@ func TestFakeModelReadsAFileThroughEinoEndToEnd(t *testing.T) {
 	}
 	if finished.Generation != 1 || finished.Version != "v1" || finished.PluginPID <= 0 {
 		t.Fatalf("finished identity=%+v", finished)
+	}
+}
+
+// refusalAwareModel calls the file tool once and then answers; it records what
+// the tool result actually said, so a test can prove the model saw the refusal
+// rather than a failed run.
+type refusalAwareModel struct{ toolResult string }
+
+func (m *refusalAwareModel) WithTools([]*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+	return m, nil
+}
+func (m *refusalAwareModel) Generate(_ context.Context, input []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+	for _, msg := range input {
+		if msg.Role == schema.Tool {
+			m.toolResult = msg.Content
+			return schema.AssistantMessage("I could not read that file.", nil), nil
+		}
+	}
+	return schema.AssistantMessage("", []schema.ToolCall{
+		{ID: "call-1", Type: "function", Function: schema.FunctionCall{Name: ReadFileToolName, Arguments: `{"path":"TMP.md"}`}},
+	}), nil
+}
+func (m *refusalAwareModel) Stream(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	msg, err := m.Generate(ctx, input, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return schema.StreamReaderFromArray([]*schema.Message{msg}), nil
+}
+
+// The user-visible defect this guards: asking for a file that is not there used
+// to end the run with the host's raw error and no answer at all.
+func TestARefusedToolCallStillAnswersTheUser(t *testing.T) {
+	modelUnderTest := &refusalAwareModel{}
+	runner, err := NewRunner(context.Background(), modelUnderTest, fakeInvoker{}, &recordingReader{err: fileread.ErrNotFound})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &collectingSink{}
+	answer, err := runner.Run(context.Background(), RunRequest{Message: "read TMP.md", RunID: "run-refused", Sink: sink})
+	if err != nil {
+		t.Fatalf("a refused read must not fail the run: %v", err)
+	}
+	if answer != "I could not read that file." {
+		t.Fatalf("answer=%q", answer)
+	}
+	if !strings.Contains(modelUnderTest.toolResult, refusalPrefix) || !strings.Contains(modelUnderTest.toolResult, fileread.ErrNotFound.Error()) {
+		t.Fatalf("the model did not receive the refusal: %q", modelUnderTest.toolResult)
+	}
+	types := []string{}
+	for _, e := range sink.events {
+		types = append(types, e.Type)
+	}
+	want := []string{"run.started", "tool.started", "tool.failed", "assistant.delta", "run.finished"}
+	if strings.Join(types, ",") != strings.Join(want, ",") {
+		t.Fatalf("events=%v", types)
 	}
 }

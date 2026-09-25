@@ -13,8 +13,9 @@
 //     content.
 //
 // Error strings never contain an absolute host path: they are model-visible
-// through tool.failed, and the model already knows the relative path it asked
-// for.
+// through tool.failed and, for a refusal, as the text of the tool result the
+// model reads (see internal/agent), and the model already knows the relative
+// path it asked for.
 package fileread
 
 import (
@@ -39,7 +40,7 @@ var (
 	ErrPathEscape    = errors.New("path escapes the read root")
 	ErrPathOutside   = errors.New("path is outside the read root")
 	ErrSymlinkEscape = errors.New("path leaves the read root through a symbolic link")
-	ErrNotFound      = errors.New("path does not exist inside the read root")
+	ErrNotFound      = errors.New("file not found")
 	ErrNotRegular    = errors.New("path is not a regular file")
 	ErrTooLarge      = errors.New("file exceeds the single-read limit")
 	ErrBinary        = errors.New("file is not text")
