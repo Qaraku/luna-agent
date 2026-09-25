@@ -46,7 +46,17 @@ git diff --check
   - it is read-only text: no writes, no execution, no network;
   - the plugin receives an already-validated absolute path plus the cap, and never interprets a model- or browser-supplied path itself.
 - Preserve bounded timeouts, one-run-at-a-time isolation, exact terminal SSE semantics, and secret-free state responses.
+- A tool refusal is not a run failure. A refusal about the call itself — a rejected path, the single-read size cap, binary content, a malformed argument — goes back to the model as the call's result under the `the tool refused this call: ` prefix, while `tool.failed` still reports it to the UI and the transcript keeps the failed call. Only the plugin host's infrastructure sentinels (`ErrUnknownTool`, `ErrNoActivePlugin`, `ErrRPCTimeout`, `ErrRPCCanceled`, `ErrPluginGone`) end the run: classify by sentinel, never by message text.
+- A change that adds or removes an API surface, a directory, or a tool updates `README.md` and `docs/architecture.md` in the same change, and this file with the user's approval. Re-read the sentences that promise what the code does and correct every count. A stale sentence in a public README is a defect, not a nit.
 - Do not stage, commit, push, reset, or delete user work unless the task explicitly authorizes it.
+
+## Surfaces that must stay honest
+
+Each capability that holds state or serves code has one property that the design exists to protect. Losing it is not a regression to fix later; it is the feature disappearing.
+
+- **Memory** is host-native: core state a `broken` candidate must not be able to replace, so it has no generation and cannot be reloaded. The model writes and never reads; the stored caps and the injection caps are separate limits; and a memory file that cannot be read fails the run instead of pretending nothing was remembered.
+- **Sessions** are append-only JSONL. An id comes from `crypto/rand`, is validated before any filesystem use, and is created with `O_EXCL`; a file is opened `O_RDWR|O_APPEND` (never `O_WRONLY`, which breaks torn-line detection) and each append is one whole line; an unknown id is a not-found, never a new session.
+- **UI plugins** are served only from `plugins/ui/<name>/`, with containment checked after normalization and again after resolving symlinks through `internal/fileread`'s validator — a second implementation of that check is exactly where the strength drops. The host removes the container even when `unmount` throws, and enable state is not persisted.
 
 ## Commit boundaries
 
