@@ -1,79 +1,66 @@
 # AGENTS.md
 
-Instructions for automated contributors working in this repository.
+本文件约束自动化贡献者在本仓库内的工作方式。
 
-## Scope and ownership
+## 语言与文档
 
-- Treat the root application as the authoritative implementation: `cmd/`, `internal/`, `plugins/`, `web/`, `go.mod`, and `go.sum`.
-- Treat `spikes/001-plugin-kernel/` as immutable historical evidence unless a task explicitly targets that spike.
-- Do not modify a spike and present it as production work. Port an idea into root-owned packages and test it there; never import across the spike's `internal/` boundary.
-- Keep core, subprocess plugin, HTTP/SSE, and UI contracts explicit. Do not expose Eino structs or HashiCorp RPC structs as the public browser protocol.
+- 文档、交付说明和解释性注释默认使用简体中文；Git commit（提交说明）的标题和正文保持英文。不为翻译而批量修改无关代码注释，也不重写已有提交历史。
+- 命令、路径、代码标识、接口字段、协议字符串和错误常量保持原样。术语首次出现时说明含义，不额外维护内容重复的中英文文档。
+- `README.md` 说明项目用途、当前能力与启动方法；`docs/architecture.md` 说明当前结构、接口和技术取舍；`docs/roadmap.md` 记录发布内容和已确认的近期方向。本文件只保留协作规则与关键约束。
+- 公开材料只记录项目事实、技术理由和可复现的验证方式。公开项目的构建、理解和维护不能依赖仓库外的私人文档。
+- 新增或移除接口、目录、工具时，同步更新 `README.md` 和 `docs/architecture.md` 中受影响的说明，检查能力描述与数量是否过期。修改本文件须经明确批准；不因一次澄清自动新增文档或长期规则。
 
-## Bounded commands
+## 工作范围
 
-Run commands from the repository root and give every potentially blocking operation a deadline. Suitable local gates are:
+- 根应用是正式实现：`cmd/`、`internal/`、`plugins/`、`web/`、`go.mod`、`go.sum`。`spikes/001-plugin-kernel/` 是历史实验，除非任务明确指向它，否则不修改、不运行其中的服务或二进制；根应用不得跨其 `internal/` 边界导入代码。
+- 每轮明确本轮目标、不做什么、完成条件，再处理相关实现。新想法先作为候选讨论，不自动扩成任务或版本计划。
+- 恢复上下文时，先核对当前任务、Git 状态和相关代码。旧规格和历史对话不能代替当前授权；文档与实现不符时说明差异，不凭文档宣布完成。
+- 每次交付简要说明：现在能做什么、涉及哪些模块、关键取舍、代码阅读入口。区分已实现、助手已验证、用户已确认和未验证内容。
+- 不擅自暂存、提交、推送、重置或删除已有工作。不把历史实验的改动当作正式应用的交付。
+
+## 验证与运行
+
+- 按可验证的小改动推进。行为改动先写失败测试，再实现并运行相关测试，保留真实的失败与通过证据；日常只跑与改动相关的检查。
+- 发布前对目标提交的干净副本运行完整检查，再验证本次新增或改变的端到端行为。已确认的行为只有在实现变化、证据不足或存在回归风险时才安排复测，并说明原因；自动化能完成的检查不默认转交人工。
+- 所有命令从仓库根目录运行；可能阻塞的操作必须有截止时间。完整检查命令如下：
 
 ```sh
 timeout 180s go test -race ./...
 timeout 60s go vet ./...
 timeout 120s go build -o .runtime/luna ./cmd/luna
+timeout 30s gofmt -l internal cmd plugins
 timeout 30s node --check web/app.js
 timeout 30s node --test web/app.test.cjs
 git diff --check
 ```
 
-- Use ephemeral loopback addresses (`127.0.0.1:0`) for runtime checks.
-- If a server is needed for a bounded check, capture its PID, apply a timeout, terminate it, wait for exit, and verify that no owned server/plugin process remains.
-- Do not leave persistent servers running.
-- Do not operate a server or generated binary under `spikes/` unless the task explicitly requires spike work.
+- `gofmt -l` 应无输出。纯文档改动检查差异和表述即可，不启动服务或调用模型。
+- 运行验证使用临时本地地址 `127.0.0.1:0`。记录所启动进程的 PID（进程编号），限定运行时间，结束后终止并等待退出，确认没有遗留所启动的服务或插件进程。
+- 默认使用假模型或测试环境。只有获得真实模型验证的明确授权后，才能由可信 shell 加载指定凭据文件；不得打印或复制凭据。
 
-## Secrets and evidence
+## 安全与接口边界
 
-- Never read, print, copy, commit, or persist credential values, and never include them in evidence, logs, or lifecycle output.
-- Never log API keys, authorization headers, provider request/response bodies, prompts, tool arguments/results, or hidden reasoning in lifecycle evidence.
-- Application startup errors may identify missing environment-variable names, but must not include their values.
-- Only source a trusted secrets file when an explicitly authorized live-provider check requires it. The normal implementation and deterministic test path must use fake models or process-environment stubs.
-- Keep local logs and evidence in ignored paths such as `.evidence/`; do not overwrite source documentation with captured output.
+- 凭据值不得读出、打印、复制或写入提交与证据。启动报错只能给出缺失的环境变量名，不能给出值。生命周期日志不得记录授权头、模型请求或响应正文、提示词、工具参数或结果、隐藏推理。
+- 本地验证输出保存在已确认被 Git 忽略的目录（如 `.evidence/`），不得用捕获输出覆盖源文档。
+- 核心、子进程插件、HTTP 接口、SSE（服务器发送事件）和浏览器界面之间保持明确契约，不把 Eino 或 HashiCorp RPC（远程过程调用）结构直接暴露为浏览器协议。
+- 模型可见工具由核心注册，工具与候选均采用白名单；候选仅限 `v1`、`v2`、`broken`。浏览器提供的路径、工具名或候选名不得直接成为构建路径或执行命令；不得执行白名单外的 shell 命令。
+- 保留超时、一次只运行一个任务、每个可写事件流恰好一个终止事件，以及不含秘密的状态响应。
+- `luna_read_file` 是唯一的模型文件系统能力，仅能读取限定根目录内的文本，不写入、不执行、不联网。宿主先规范化路径，拒绝绝对路径和 `..` 越界，再解析符号链接并确认仍在根目录内；插件只接收已验证的绝对路径和大小上限。
+- 单次读取超过上限（默认 256 KiB）或实际读到 NUL 字节时明确拒绝，不截断、不当作文本继续处理。
+- 工具拒绝某次调用不等于整轮失败：路径、大小、二进制、参数等拒绝作为结果返回模型，前缀为 `the tool refused this call: `，同时保留 `tool.failed` 事件和失败调用记录。只有插件宿主的基础设施错误标记 `ErrUnknownTool`、`ErrNoActivePlugin`、`ErrRPCTimeout`、`ErrRPCCanceled`、`ErrPluginGone` 结束整轮；按错误标记判断，不匹配报错文字。
 
-## Change discipline
+## 必须保留的状态约束
 
-- Use test-driven vertical slices and retain honest RED/GREEN command evidence in the implementation report.
-- Keep the tool set and candidate selection allowlisted. The core registers every model-visible tool itself, and a candidate name (`v1`, `v2`, `broken`) may only come from that allowlist. No browser-supplied path, tool name, or candidate name may become a build path or an executed command, and nothing beyond the allowlist may be executed as a shell command.
-- `luna_read_file` is the only filesystem capability, and it is bounded:
-  - it reads only inside the configured read root;
-  - the host normalizes the requested path, rejects absolute paths and `..` escapes, then resolves symbolic links and rejects any path that is not still inside the read root, so a symlink cannot be used to escape;
-  - a single read above the size cap (default 256 KiB) is refused with an explicit error instead of being truncated, and binary content (any NUL byte in the bytes actually read) is refused;
-  - it is read-only text: no writes, no execution, no network;
-  - the plugin receives an already-validated absolute path plus the cap, and never interprets a model- or browser-supplied path itself.
-- Preserve bounded timeouts, one-run-at-a-time isolation, exact terminal SSE semantics, and secret-free state responses.
-- A tool refusal is not a run failure. A refusal about the call itself — a rejected path, the single-read size cap, binary content, a malformed argument — goes back to the model as the call's result under the `the tool refused this call: ` prefix, while `tool.failed` still reports it to the UI and the transcript keeps the failed call. Only the plugin host's infrastructure sentinels (`ErrUnknownTool`, `ErrNoActivePlugin`, `ErrRPCTimeout`, `ErrRPCCanceled`, `ErrPluginGone`) end the run: classify by sentinel, never by message text.
-- A change that adds or removes an API surface, a directory, or a tool updates `README.md` and `docs/architecture.md` in the same change, and this file with the user's approval. Re-read the sentences that promise what the code does and correct every count. A stale sentence in a public README is a defect, not a nit.
-- Do not stage, commit, push, reset, or delete user work unless the task explicitly authorizes it.
+- **记忆**属于宿主核心，无插件 generation（运行代次），不能热重载或被 `broken` 候选替换。模型只有追加事实的工具，没有读取、列出、编辑或撤回工具；宿主读取事实并注入上下文，存储上限与注入上限分开。读取失败必须让本轮失败，不能假装没有记忆；`/api/state` 不返回记忆。
+- **记忆撤回**由用户发起，追加 `retract` 记录，以事实文本和时间戳共同匹配；读取时排除被撤回事实。字节上限计算所有记录，不能因反复撤回而无限增长；压缩重写时一起移除事实和对应撤回记录。
+- **会话**使用仅追加的 JSONL（每行一条 JSON 记录）。标识由 `crypto/rand` 生成，任何文件操作前先验证，以 `O_EXCL` 防止覆盖创建；追加时使用 `O_RDWR|O_APPEND`，不能用会破坏残行检测的 `O_WRONLY`。每次写入一整行；未知标识必须报不存在，不能悄悄新建会话。
+- **界面插件**只能从 `plugins/ui/<name>/` 提供文件，路径规范化与符号链接解析后的边界检查复用 `internal/fileread`，不得另写一套。即使 `unmount` 抛错，宿主也须移除容器并报告错误；启用状态不持久化。
 
-## Surfaces that must stay honest
+## 提交与版本
 
-Each capability that holds state or serves code has one property that the design exists to protect. Losing it is not a regression to fix later; it is the feature disappearing.
-
-- **Memory** is host-native: core state a `broken` candidate must not be able to replace, so it has no generation and cannot be reloaded. The model writes and never reads; the stored caps and the injection caps are separate limits; and a memory file that cannot be read fails the run instead of pretending nothing was remembered. A retraction is an appended `retract` record folded out of the effective set on read, matched by the fact's text and timestamp together; the byte cap counts every line, so retracting cannot grow the file, and a rewrite compacts a retraction away with its fact. The model side gains nothing from it: no read, list, edit or retract path, and `/api/state` still reports no memory.
-- **Sessions** are append-only JSONL. An id comes from `crypto/rand`, is validated before any filesystem use, and is created with `O_EXCL`; a file is opened `O_RDWR|O_APPEND` (never `O_WRONLY`, which breaks torn-line detection) and each append is one whole line; an unknown id is a not-found, never a new session.
-- **UI plugins** are served only from `plugins/ui/<name>/`, with containment checked after normalization and again after resolving symlinks through `internal/fileread`'s validator — a second implementation of that check is exactly where the strength drops. The host removes the container even when `unmount` throws, and enable state is not persisted.
-
-## Commit boundaries
-
-When commits are explicitly requested, keep these histories separate:
-
-1. **spike** — changes under `spikes/` only;
-2. **core** — Go kernel, subprocess plugins, module files, and core documentation;
-3. **web** — `web/` HTML/CSS/JavaScript and focused browser-JavaScript tests.
-
-Do not combine spike, core, and web changes in one commit. Repository-wide documentation may use its own documentation commit when that makes the boundary clearer.
-
-## Version numbers and tags
-
-A version number is the user's decision, never a contributor's inference. The rules below are the whole authority for creating one:
-
-1. **A tag name may only come from the user.** A number that appears in a plan, a roadmap heading, or a previous release is not authorization to use it. A roadmap section called `v1.0.0 scope` is a plan for work, not a name to tag.
-2. **A tag may only point at the tree the acceptance ran against.** Re-run the full gates on a clean extraction of that exact commit and keep the output as evidence before tagging, and point the tag at the commit whose *code* was accepted.
-3. **A pushed tag is not moved.** If the wrong number goes out, the remedy is delete-and-retag while nobody has fetched it, stated plainly in the report — never a silent force-push, and never a quiet rewrite of a public ref.
-4. **Releases stay in `0.x`.** This is an experimental, single-user kernel whose interfaces can still change, so `1.0.0` is not scheduled. Declaring a stable version is the user's call, not a milestone that finishing slices reaches.
-5. **A version number claims stability; it does not count work.** `docs/roadmap.md` is the only place that records what a released version contains, and nothing else in the repository may name a version.
+- 获得提交授权后，每个提交只处理一个逻辑改动。历史实验（`spikes/`）、核心（Go、子进程插件、模块文件及核心文档）、前端（`web/` 及其测试）分开提交；仓库通用文档可独立提交。
+- 提交说明用英文写改动及必要的技术原因。版本说明可用中文，不为语言调整重写历史。
+- tag（版本标签）的名称和发布操作须获得明确授权；路线图标题或旧版本号不构成授权。标签只指向实际通过发布验证的提交，不能用其他工作树的结果代替。
+- 已推送的标签不得擅自移动、覆盖或删除；发现错误先报告，处理方案另行批准，不强制推送或悄悄重写公开历史。
+- 项目处于 `0.x` 实验阶段，接口可以演进，但要说明变化；宣布稳定版本须单独决定，不能由完成任务的数量推导。
+- `docs/roadmap.md` 集中记录已发布版本包含的功能和修复；其他文档可以在必要时引用版本号，不重复维护发布清单，也不自动安排未来版本内容。
