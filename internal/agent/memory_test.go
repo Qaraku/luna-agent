@@ -208,10 +208,7 @@ func TestRememberSchemaIsStrictAndWriteOnly(t *testing.T) {
 	}
 }
 
-// The model refused to store a fact a user asked for because it believed the
-// fact could never be removed. That is true of the model's own rights and false
-// of the user's: the runtime drawer can retract a stored fact, and the copy the
-// model reads has to say so, or it will keep refusing honest requests.
+// 模型只能追加事实；用户能从页头的独立记忆入口撤回，指引不能再指向运行详情。
 func TestTheMemoryCopySaysTheUserCanRetractAFact(t *testing.T) {
 	info, err := NewRememberTool(nil).Info(context.Background())
 	if err != nil {
@@ -220,6 +217,12 @@ func TestTheMemoryCopySaysTheUserCanRetractAFact(t *testing.T) {
 	for _, text := range []string{info.Desc, instruction} {
 		if !strings.Contains(text, "retract") {
 			t.Fatalf("the memory copy must say that the user can retract a stored fact: %q", text)
+		}
+		if !strings.Contains(text, "Memory (记忆) panel") || !strings.Contains(text, "page header") {
+			t.Error("the memory copy must point to the dedicated Memory (记忆) panel opened from the page header")
+		}
+		if strings.Contains(strings.ToLower(text), "runtime drawer") {
+			t.Error("the memory copy must not direct the user to the runtime drawer")
 		}
 	}
 }
