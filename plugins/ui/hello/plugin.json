@@ -1,6 +1,6 @@
 {
   "name": "hello",
-  "title": "Hello",
-  "description": "The smallest UI plugin: it renders one line of text and holds no state.",
+  "title": "最简示例",
+  "description": "最小的界面插件：只渲染一行文字，不保存状态。",
   "entry": "plugin.js"
 }

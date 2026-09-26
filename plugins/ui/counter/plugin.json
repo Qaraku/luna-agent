@@ -1,6 +1,6 @@
 {
   "name": "counter",
-  "title": "Counter",
-  "description": "A counter whose button listener and timer are both removed by unmount.",
+  "title": "计数器",
+  "description": "带状态的示例：按钮监听器和计时器都由 unmount 清理。",
   "entry": "plugin.js"
 }

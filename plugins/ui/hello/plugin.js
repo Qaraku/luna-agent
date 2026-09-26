@@ -1,16 +1,15 @@
-// The smallest UI plugin: one line of text, no state.
+// 最小的界面插件：一行文字，没有状态。
 //
-// The host contract is mount(target, api) and unmount(target). This plugin only
-// needs target, so it assumes nothing about api: that shape belongs to the host.
-// Text goes in through textContent: nothing is parsed as markup and nothing is
-// evaluated as code.
+// 宿主契约是 mount(target, api) 与 unmount(target)。本示例只用 target，
+// 因此不假设 api 的形状——那是宿主自己的约定。文字通过 textContent 写入：
+// 不解析标记，也不执行代码。样式沿用宿主公开的公共类，插件不必自带配色。
 
 const CLASS_NAME = "ui-plugin-hello";
 
 export function mount(target, api) {
   const line = document.createElement("p");
-  line.className = CLASS_NAME;
-  line.textContent = "hello from a UI plugin";
+  line.className = CLASS_NAME + " luna-muted";
+  line.textContent = "界面插件在浏览器里运行，只从宿主拿到契约版本和一个日志回调。";
   target.appendChild(line);
 }
 
