@@ -3,30 +3,53 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <meta name="color-scheme" content="dark">
+  <meta name="color-scheme" content="light dark">
   <title>Luna</title>
+  <script id="theme-bootstrap">
+    (() => {
+      let preference = 'system';
+      try {
+        const saved = window.localStorage.getItem('luna.theme');
+        if (saved === 'light' || saved === 'dark') preference = saved;
+      } catch (_) {}
+      document.documentElement.dataset.theme = preference === 'system'
+        ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : preference;
+    })();
+  </script>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <div class="app-shell">
     <header class="utility-header">
-      <div class="brand" aria-label="Luna">
-        <span class="luna-mark" aria-hidden="true"></span>
-        <span class="brand-name">Luna</span>
-        <span class="session-note">本地运行 · 会话记录保存在本机</span>
-      </div>
-      <div class="runtime-actions">
-        <span id="runtime-brief" class="runtime-brief"><span class="state-dot" aria-hidden="true"></span>正在确认</span>
-        <button id="runtime-toggle" class="quiet-button" type="button" aria-expanded="false" aria-controls="runtime-drawer">运行详情</button>
+      <!-- topbar 与正文、输入区共用同一个 content container，形成同一条左基线。 -->
+      <div class="content-container topbar-inner">
+        <div class="conversation-heading">
+          <button id="session-toggle" class="icon-button session-toggle" type="button" aria-expanded="false" aria-controls="session-sidebar" aria-label="会话" title="会话">
+            <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"></rect><path d="M9 4v16"></path></svg>
+          </button>
+          <h1 id="conversation-title" class="conversation-title">新会话</h1>
+        </div>
+        <div class="runtime-actions">
+          <button id="memory-toggle" class="icon-button" type="button" aria-expanded="false" aria-controls="memory-panel" aria-label="记忆" title="记忆">
+            <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M5 6h14M5 12h14M5 18h9"></path></svg>
+          </button>
+          <button id="extensions-toggle" class="icon-button" type="button" aria-expanded="false" aria-controls="extensions-panel" aria-label="扩展" title="扩展">
+            <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="4" y="4" width="9" height="9" rx="2"></rect><rect x="11" y="11" width="9" height="9" rx="2"></rect></svg>
+          </button>
+          <button id="runtime-toggle" class="icon-button diagnostic-toggle" type="button" aria-expanded="false" aria-controls="runtime-drawer" aria-label="运行详情" title="运行详情">
+            <svg class="ui-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.6"></circle><circle cx="12" cy="12" r="1.6"></circle><circle cx="19" cy="12" r="1.6"></circle></svg>
+          </button>
+        </div>
       </div>
     </header>
 
     <main id="app-content" class="chat-pane">
       <div id="transcript" class="transcript" tabindex="0" aria-label="对话记录">
-        <div class="transcript-content">
+        <div class="content-container transcript-content">
           <section id="empty-state" class="empty-state" aria-labelledby="empty-title">
-            <h1 id="empty-title">有什么想一起看看？</h1>
-            <p>把问题或想处理的文字发给 Luna。会话记录保存在本机，刷新后仍在；发送的内容会交给你自己在环境里配置的模型服务。</p>
+            <svg class="empty-moon" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M33 32a17 17 0 0 1-16-23A18 18 0 1 0 39 31a17 17 0 0 1-6 1Z"></path></svg>
+            <h2 id="empty-title">有什么想一起看看？</h2>
+            <p>从一个问题、一段文字，或一个想法开始。</p>
           </section>
           <div id="session-notices" class="session-notices" hidden></div>
           <div id="conversation" class="conversation"></div>
@@ -37,18 +60,131 @@
       <div id="run-status" class="run-status" role="status" hidden></div>
 
       <div class="composer-shell">
-        <form id="chat-form" class="composer">
-          <label class="sr-only" for="message">消息</label>
-          <textarea id="message" maxlength="16384" rows="1" placeholder="给 Luna 发消息…" required></textarea>
-          <button id="send" class="send-button" type="submit">发送</button>
-        </form>
-        <p class="composer-hint">Enter 发送 · Shift + Enter 换行</p>
+        <div class="content-container composer-inner">
+          <form id="chat-form" class="composer">
+            <label class="sr-only" for="message">消息</label>
+            <textarea id="message" maxlength="16384" rows="1" placeholder="给 Luna 发消息…" aria-describedby="composer-hint" required></textarea>
+            <button id="send" class="send-button" type="submit" aria-label="发送" title="发送">
+              <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"></path></svg>
+            </button>
+          </form>
+          <p id="composer-hint" class="composer-hint">Enter 发送 · Shift + Enter 换行</p>
+        </div>
       </div>
     </main>
   </div>
 
+  <aside id="session-sidebar" class="session-sidebar" aria-labelledby="sessions-title" tabindex="-1">
+    <header class="sidebar-header">
+      <div class="brand" aria-label="Luna">
+        <svg class="luna-mark" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M23 22a12 12 0 0 1-12-16A12 12 0 1 0 27 21a12 12 0 0 1-4 1Z"></path></svg>
+        <span class="brand-name">Luna</span>
+      </div>
+      <button id="sidebar-collapse" class="icon-button sidebar-collapse" type="button" aria-label="收起会话栏" title="收起会话栏">
+        <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 6l-6 6 6 6"></path></svg>
+      </button>
+      <button id="session-close" class="icon-button session-close" type="button" aria-label="关闭会话列表">关闭</button>
+    </header>
+    <div class="sidebar-body">
+      <button id="session-new" class="session-new" type="button">
+        <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>
+        <span>新建会话</span>
+      </button>
+      <h2 id="sessions-title" class="sidebar-heading">会话</h2>
+      <ul id="session-list" class="session-list"></ul>
+      <p id="sessions-empty" class="session-empty" hidden>还没有历史会话。</p>
+      <p id="session-status" class="session-status" role="status"></p>
+    </div>
+    <footer class="sidebar-footer">
+      <button id="settings-toggle" class="sidebar-settings" type="button" aria-expanded="false" aria-controls="settings-panel">
+        <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="3"></circle><path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1m0-12.8-2.1 2.1M7.7 16.3l-2.1 2.1"></path></svg>
+        <span>设置</span>
+      </button>
+      <span id="runtime-brief" class="runtime-brief"><span class="state-dot" aria-hidden="true"></span>正在确认</span>
+    </footer>
+    <div id="sidebar-resizer" class="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="调整会话栏宽度" tabindex="0"></div>
+  </aside>
+
+  <aside id="memory-panel" class="runtime-drawer" role="dialog" aria-modal="true" aria-labelledby="memory-title" tabindex="-1" hidden>
+    <header class="drawer-header">
+      <h2 id="memory-title">记忆</h2>
+      <button id="memory-close" class="icon-button" type="button" aria-label="关闭记忆">关闭</button>
+    </header>
+    <div class="drawer-body">
+      <section class="drawer-section" aria-label="记忆事实">
+        <p class="ui-plugin-hint">Luna 在对话中记下的事实，会用于之后的回应。这里只能撤回，不能编辑或新增。</p>
+        <ul id="memory-list" class="memory-list"></ul>
+        <p id="memory-empty" class="session-empty" hidden>还没有记录任何事实。</p>
+        <p id="memory-status" class="ui-plugin-status" role="status" hidden></p>
+      </section>
+    </div>
+  </aside>
+
+  <aside id="extensions-panel" class="runtime-drawer extensions-panel" role="dialog" aria-modal="true" aria-labelledby="extensions-title" tabindex="-1" hidden>
+    <header class="drawer-header">
+      <h2 id="extensions-title">扩展</h2>
+      <button id="extensions-close" class="icon-button" type="button" aria-label="关闭扩展">关闭</button>
+    </header>
+    <div class="drawer-body">
+      <section class="drawer-section" aria-labelledby="ui-plugins-title">
+        <div class="section-heading">
+          <h3 id="ui-plugins-title">界面插件</h3>
+          <span>刷新后回到停用</span>
+        </div>
+        <p class="ui-plugin-hint">只启用可信的本地插件。插件与页面同源运行，并非安全沙箱；宿主接口仅提供契约版本和日志，不提供会话 API。</p>
+        <ul id="ui-plugin-list" class="ui-plugin-list"></ul>
+        <p id="ui-plugins-empty" class="plugin-empty" hidden>暂未读到界面插件。</p>
+        <p id="ui-plugins-status" class="ui-plugin-status" role="status" hidden></p>
+        <button id="ui-plugins-retry" class="ui-plugin-retry" type="button" hidden>重新读取插件列表</button>
+      </section>
+    </div>
+  </aside>
+
+  <!-- 设置是一个完整模态：自己的分类导航与内容面，内部自己滚动，
+       关闭后回到原来的会话上下文。外观、本机数据与模型服务都在这里。 -->
+  <aside id="settings-panel" class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabindex="-1" hidden>
+    <div class="settings-dialog">
+      <header class="settings-header">
+        <h2 id="settings-title">设置</h2>
+        <button id="settings-close" class="icon-button" type="button" aria-label="关闭设置" title="关闭设置">
+          <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"></path></svg>
+        </button>
+      </header>
+      <div class="settings-body">
+        <nav class="settings-nav" role="tablist" aria-orientation="vertical" aria-label="设置分类">
+          <button id="settings-tab-appearance" class="settings-tab" role="tab" type="button" aria-selected="true" aria-controls="settings-pane-appearance" data-pane="settings-pane-appearance" tabindex="0">外观</button>
+          <button id="settings-tab-data" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-data" data-pane="settings-pane-data" tabindex="-1">本机数据</button>
+          <button id="settings-tab-model" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-model" data-pane="settings-pane-model" tabindex="-1">模型服务</button>
+        </nav>
+        <div class="settings-panes">
+          <section id="settings-pane-appearance" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-appearance" tabindex="0">
+            <h3>外观</h3>
+            <div class="settings-field">
+              <label for="theme-select">主题</label>
+              <select id="theme-select" class="luna-input">
+                <option value="system">跟随系统</option>
+                <option value="light">浅色</option>
+                <option value="dark">深色</option>
+              </select>
+            </div>
+            <p class="luna-muted">主题只影响这一台机器的浏览器显示，与模型和会话内容无关。</p>
+          </section>
+          <section id="settings-pane-data" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-data" tabindex="0" hidden>
+            <h3>本机数据</h3>
+            <p class="luna-muted">会话记录和记忆事实都保存在本机。会话刷新后仍在；记忆可在“记忆”里查看和撤回。</p>
+          </section>
+          <section id="settings-pane-model" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-model" tabindex="0" hidden>
+            <h3>模型服务</h3>
+            <p class="luna-muted">发送的内容会交给这台机器上配置的模型服务处理。</p>
+            <div><button id="settings-runtime" class="luna-button" type="button">查看运行详情</button></div>
+          </section>
+        </div>
+      </div>
+    </div>
+  </aside>
+
   <div id="runtime-backdrop" class="drawer-backdrop" hidden></div>
-  <aside id="runtime-drawer" class="runtime-drawer" role="dialog" aria-modal="true" aria-labelledby="runtime-title" hidden>
+  <aside id="runtime-drawer" class="runtime-drawer" role="dialog" aria-modal="true" aria-labelledby="runtime-title" tabindex="-1" hidden>
     <header class="drawer-header">
       <div>
         <h2 id="runtime-title">运行详情</h2>
@@ -70,44 +206,10 @@
         </dl>
       </section>
 
-      <section class="drawer-section" aria-labelledby="sessions-title">
-        <div class="section-heading">
-          <h3 id="sessions-title">会话</h3>
-          <span>保存在本机</span>
-        </div>
-        <button id="session-new" class="session-new" type="button">新建会话</button>
-        <ul id="session-list" class="session-list"></ul>
-        <p id="sessions-empty" class="session-empty" hidden>还没有历史会话。</p>
-        <p id="session-status" class="session-status" role="status"></p>
-      </section>
-
-      <section class="drawer-section" aria-labelledby="memory-title">
-        <div class="section-heading">
-          <h3 id="memory-title">记忆</h3>
-          <span>由模型写入</span>
-        </div>
-        <p class="ui-plugin-hint">事实由模型通过 luna_remember 写入；这里只能撤回一条，不能编辑或新增。</p>
-        <ul id="memory-list" class="memory-list"></ul>
-        <p id="memory-empty" class="session-empty" hidden>还没有记录任何事实。</p>
-        <p id="memory-status" class="ui-plugin-status" role="status" hidden></p>
-      </section>
-
       <section class="drawer-section" aria-labelledby="plugins-title">
         <h3 id="plugins-title">工具插件</h3>
         <dl id="plugins" class="fact-list"></dl>
         <p id="plugins-empty" class="plugin-empty" hidden>暂未读到工具插件。</p>
-      </section>
-
-      <section class="drawer-section" aria-labelledby="ui-plugins-title">
-        <div class="section-heading">
-          <h3 id="ui-plugins-title">界面插件</h3>
-          <span>刷新后回到停用</span>
-        </div>
-        <p class="ui-plugin-hint">插件在浏览器里运行，只能拿到受限的宿主接口：契约版本与一个日志回调。</p>
-        <ul id="ui-plugin-list" class="ui-plugin-list"></ul>
-        <p id="ui-plugins-empty" class="plugin-empty" hidden>暂未读到界面插件。</p>
-        <p id="ui-plugins-status" class="ui-plugin-status" role="status" hidden></p>
-        <button id="ui-plugins-retry" class="ui-plugin-retry" type="button" hidden>重新读取插件列表</button>
       </section>
 
       <section class="drawer-section" aria-labelledby="reload-title">
@@ -118,12 +220,12 @@
         <form id="reload-form" class="reload-form">
           <label for="candidate">候选版本</label>
           <div class="reload-controls">
-            <select id="candidate">
+            <select id="candidate" class="luna-input">
               <option value="v1">稳定版本 v1</option>
               <option value="v2">候选版本 v2</option>
               <option value="broken">故障演练 broken</option>
             </select>
-            <button id="reload" type="submit">验证并启用</button>
+            <button id="reload" class="luna-button" type="submit">验证并启用</button>
           </div>
         </form>
         <p id="reload-status" class="reload-status" role="status"></p>

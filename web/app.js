@@ -310,10 +310,8 @@ function uiPluginStatusText(state) {
   return '';
 }
 
-// uiPluginHostAPI is the entire host interface a plugin receives: the contract
-// version and one bounded log line. No host state, no DOM reference outside the
-// plugin's own container and no fetch wrapper, so a plugin cannot read the
-// session, the tool plugins or anything else in the drawer.
+// 宿主只主动提供契约版本与有界日志，不提供会话 API 或状态。
+// 同源模块不是沙箱：只应启用可信的本地插件，样式作用域也不提供权限隔离。
 function uiPluginHostAPI(version, log) {
   const write = typeof log === 'function' ? log : () => {};
   return Object.freeze({
@@ -366,6 +364,24 @@ function sessionTime(value) {
   return match ? `${match[1]} ${match[2]}` : '—';
 }
 
+// 会话列表里的时间是次要信息，用相对量级更容易扫读。
+// 解析失败按缺失处理，不猜一个时间出来；now 可注入，便于测试。
+function relativeTime(value, now = Date.now()) {
+  const at = Date.parse(typeof value === 'string' ? value : '');
+  if (Number.isNaN(at)) return '—';
+  const seconds = Math.max(0, Math.round((now - at) / 1000));
+  if (seconds < 60) return '刚刚';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days} 天前`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `${months} 个月前`;
+  return `${Math.floor(months / 12)} 年前`;
+}
+
 function runCountLabel(value) {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) return '运行次数未知';
   return value === 0 ? '尚无运行' : `${value} 次运行`;
@@ -385,7 +401,7 @@ function runStatusLabel(status) {
 // without a usable id cannot be switched to, so it is dropped rather than
 // rendered as a dead row, while a record with an id but missing fields is
 // still listed and labelled honestly.
-function sessionRows(payload, currentID) {
+function sessionRows(payload, currentID, now = Date.now()) {
   const list = payload && typeof payload === 'object' && Array.isArray(payload.sessions) ? payload.sessions : [];
   const rows = [];
   for (const entry of list) {
@@ -395,7 +411,7 @@ function sessionRows(payload, currentID) {
       id: record.id,
       shortId: record.id.slice(0, 8),
       title: sessionTitle(record.title),
-      time: sessionTime(record.updated_at),
+      time: relativeTime(record.updated_at, now),
       runs: runCountLabel(record.run_count),
       current: record.id === currentID
     });
@@ -635,11 +651,33 @@ function parseMarkdownBlocks(markdown) {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { parseEventBlock, toolSummary, toolLabel, toolActivityLabel, candidateLabel, reloadCopy, valueOrDash, pluginStatusLabel, pluginRows, parseInline, parseMarkdownBlocks, isSessionID, parseSessionHash, sessionHash, sessionTitle, sessionTime, runCountLabel, runStatusLabel, sessionRows, memoryRows, retractPayload, argumentsText, toolCallFacts, replaySession, runPayload, uiPluginText, uiPluginNameValid, uiPluginEntrySafe, uiPluginEntryURL, uiPluginRows, uiPluginMissingExports, uiPluginErrorDetail, uiPluginImportError, uiPluginMissingExportError, uiPluginMountError, uiPluginUnmountError, uiPluginState, uiPluginInitialState, uiPluginTransition, uiPluginEnableFailureEvent, uiPluginDisableEvent, uiPluginTeardown, uiPluginAbandonMount, uiPluginToggleAction, uiPluginToggleLabel, uiPluginStatusText, uiPluginHostAPI, UI_PLUGIN_API_VERSION, UI_PLUGIN_ENTRY_REASON, UI_PLUGIN_REQUIRED_EXPORTS };
+  module.exports = { parseEventBlock, toolSummary, toolLabel, toolActivityLabel, candidateLabel, reloadCopy, valueOrDash, pluginStatusLabel, pluginRows, parseInline, parseMarkdownBlocks, isSessionID, parseSessionHash, sessionHash, sessionTitle, sessionTime, relativeTime, runCountLabel, runStatusLabel, sessionRows, memoryRows, retractPayload, argumentsText, toolCallFacts, replaySession, runPayload, uiPluginText, uiPluginNameValid, uiPluginEntrySafe, uiPluginEntryURL, uiPluginRows, uiPluginMissingExports, uiPluginErrorDetail, uiPluginImportError, uiPluginMissingExportError, uiPluginMountError, uiPluginUnmountError, uiPluginState, uiPluginInitialState, uiPluginTransition, uiPluginEnableFailureEvent, uiPluginDisableEvent, uiPluginTeardown, uiPluginAbandonMount, uiPluginToggleAction, uiPluginToggleLabel, uiPluginStatusText, uiPluginHostAPI, UI_PLUGIN_API_VERSION, UI_PLUGIN_ENTRY_REASON, UI_PLUGIN_REQUIRED_EXPORTS };
 }
 
 if (typeof document !== 'undefined') {
   const $ = (id) => document.getElementById(id);
+  // 外观是唯一持久化的浏览器设置；切换只改根 token，不重建会话或插件。
+  const themeMedia = window.matchMedia('(prefers-color-scheme: dark)');
+  // 外观只有一个入口：设置面板里的 #theme-select。
+  const themeControls = [$('theme-select')];
+  const validTheme = (value) => ['light', 'dark', 'system'].includes(value) ? value : 'system';
+  let themePreference = 'system';
+  try { themePreference = validTheme(window.localStorage.getItem('luna.theme')); } catch (_) {}
+  function applyTheme() {
+    document.documentElement.dataset.theme = themePreference === 'system'
+      ? (themeMedia.matches ? 'dark' : 'light') : themePreference;
+    for (const control of themeControls) control.value = themePreference;
+  }
+  for (const control of themeControls) {
+    control.addEventListener('change', () => {
+      themePreference = validTheme(control.value);
+      // 存储被禁用时仍尊重本页选择；刷新后按系统恢复，不让设置操作失效。
+      try { window.localStorage.setItem('luna.theme', themePreference); } catch (_) {}
+      applyTheme();
+    });
+  }
+  themeMedia.addEventListener('change', () => { if (themePreference === 'system') applyTheme(); });
+  applyTheme();
   const transcript = $('transcript');
   const conversation = $('conversation');
   const emptyState = $('empty-state');
@@ -652,6 +690,18 @@ if (typeof document !== 'undefined') {
   const runtimeClose = $('runtime-close');
   const runtimeDrawer = $('runtime-drawer');
   const runtimeBackdrop = $('runtime-backdrop');
+  const sessionSidebar = $('session-sidebar');
+  const sessionToggle = $('session-toggle');
+  const sessionClose = $('session-close');
+  const memoryPanel = $('memory-panel');
+  const sessionMedia = window.matchMedia('(max-width: 800px)');
+  const panels = {
+    runtime: { element: runtimeDrawer, toggle: runtimeToggle, close: runtimeClose, refresh: updateState },
+    extensions: { element: $('extensions-panel'), toggle: $('extensions-toggle'), close: $('extensions-close'), refresh: updateUIPlugins },
+    sessions: { element: sessionSidebar, toggle: sessionToggle, close: sessionClose, refresh: updateSessions },
+    memory: { element: memoryPanel, toggle: $('memory-toggle'), close: $('memory-close'), refresh: updateMemory },
+    settings: { element: $('settings-panel'), toggle: $('settings-toggle'), close: $('settings-close'), refresh: () => {} }
+  };
   const appShell = document.querySelector('.app-shell');
   const runtimeBrief = $('runtime-brief');
   const runtimeAvailability = $('runtime-availability');
@@ -677,12 +727,56 @@ if (typeof document !== 'undefined') {
   let currentTurn = null;
   let openTools = [];
   let lastFocused = null;
-  let drawerTimer = null;
+  let activePanel = null;
   // switching guards a session replay in flight; sessionsPayload is the last
   // good list, so a busy flag can re-render the rows without a second request.
   let switching = false;
   let sessionsPayload = null;
   let currentSessionID = '';
+
+  // --- 侧栏折叠与宽度 ---------------------------------------------------------
+  // 只存在浏览器本地；桌面端生效，窄屏始终走 drawer（见 CSS 的 min-width 查询）。
+  const sidebarCollapse = $('sidebar-collapse');
+  const sidebarResizer = $('sidebar-resizer');
+  const SIDEBAR_MIN = 200;
+  const SIDEBAR_MAX = 420;
+  const SIDEBAR_DEFAULT = 244;
+  const clampSidebarWidth = (value) =>
+    Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, Math.round(value)));
+  const readStoredSidebar = (key, fallback) => {
+    try {
+      const saved = window.localStorage.getItem(key);
+      return saved === null ? fallback : saved;
+    } catch (_) {
+      return fallback;
+    }
+  };
+  const storedWidth = Number(readStoredSidebar('luna.sidebarWidth', String(SIDEBAR_DEFAULT)));
+  let sidebarWidth = Number.isFinite(storedWidth) && storedWidth > 0 ? clampSidebarWidth(storedWidth) : SIDEBAR_DEFAULT;
+  let sidebarCollapsed = readStoredSidebar('luna.sidebar', 'expanded') === 'collapsed';
+  let resizingSidebar = false;
+
+  function applySidebar() {
+    // 折叠就是把这条宽度归零，主内容自然接管整块空间，不留空白。
+    document.documentElement.style.setProperty('--luna-sidebar-w', sidebarCollapsed ? '0px' : `${sidebarWidth}px`);
+    document.documentElement.dataset.sidebar = sidebarCollapsed ? 'collapsed' : 'expanded';
+    sidebarResizer.setAttribute('aria-valuenow', String(sidebarWidth));
+    sidebarResizer.setAttribute('aria-valuemin', String(SIDEBAR_MIN));
+    sidebarResizer.setAttribute('aria-valuemax', String(SIDEBAR_MAX));
+    syncSessionLayout();
+  }
+
+  function setSidebarCollapsed(value) {
+    sidebarCollapsed = Boolean(value);
+    try { window.localStorage.setItem('luna.sidebar', sidebarCollapsed ? 'collapsed' : 'expanded'); } catch (_) {}
+    applySidebar();
+  }
+
+  function setSidebarWidth(value) {
+    sidebarWidth = clampSidebarWidth(value);
+    try { window.localStorage.setItem('luna.sidebarWidth', String(sidebarWidth)); } catch (_) {}
+    applySidebar();
+  }
 
   function make(tag, className, text) {
     const node = document.createElement(tag);
@@ -752,6 +846,7 @@ if (typeof document !== 'undefined') {
 
   function addUserTurn(text) {
     const stick = nearBottom();
+    if (!currentSessionID) setConversationTitle(text);
     hideEmptyState();
     conversation.append(userTurnNode(text));
     contentChanged(stick);
@@ -1006,45 +1101,175 @@ if (typeof document !== 'undefined') {
 
   function setBackgroundInert(value) {
     if ('inert' in appShell) appShell.inert = value;
+    sessionSidebar.inert = value && activePanel !== panels.sessions;
   }
 
-  function openDrawer() {
-    clearTimeout(drawerTimer);
-    lastFocused = document.activeElement;
-    runtimeDrawer.hidden = false;
+  function canFocus(node) {
+    return node?.isConnected && !node.disabled && !node.closest('[inert]') && node.getClientRects().length > 0;
+  }
+
+  function panelFocusables() {
+    return [...activePanel.element.querySelectorAll('button, [href], input, select, textarea, summary, [tabindex]')]
+      .filter((node) => node.tabIndex >= 0 && canFocus(node));
+  }
+
+  function openDrawer(panel) {
+    if (panel === panels.sessions && !sessionMedia.matches) return;
+    if (activePanel === panel) return;
+    // 面板共用一个模态层；立即隐藏旧面板，避免关闭动画留下可聚焦的控件。
+    closeDrawer(false);
+    activePanel = panel;
+    lastFocused = panel.toggle;
+    panel.element.hidden = false;
     runtimeBackdrop.hidden = false;
-    runtimeToggle.setAttribute('aria-expanded', 'true');
+    panel.toggle.setAttribute('aria-expanded', 'true');
     setBackgroundInert(true);
-    // Reading every session file has a cost, so the list is refreshed when the
-    // drawer that shows it is opened and while it stays open.
-    updateSessions();
-    updateMemory();
-    updateUIPlugins();
+    panel.close.focus();
+    panel.refresh();
     requestAnimationFrame(() => {
-      runtimeDrawer.classList.add('is-open');
+      if (activePanel !== panel) return;
+      panel.element.classList.add('is-open');
       runtimeBackdrop.classList.add('is-open');
-      runtimeClose.focus();
     });
   }
 
-  function closeDrawer() {
-    if (runtimeDrawer.hidden) return;
-    runtimeDrawer.classList.remove('is-open');
+  function closeDrawer(restoreFocus = true) {
+    if (!activePanel) return;
+    const panel = activePanel;
+    activePanel = null;
+    panel.element.classList.remove('is-open');
+    panel.element.hidden = true;
     runtimeBackdrop.classList.remove('is-open');
-    runtimeToggle.setAttribute('aria-expanded', 'false');
+    runtimeBackdrop.hidden = true;
+    panel.toggle.setAttribute('aria-expanded', 'false');
     setBackgroundInert(false);
-    drawerTimer = setTimeout(() => {
-      runtimeDrawer.hidden = true;
-      runtimeBackdrop.hidden = true;
-    }, 180);
-    if (lastFocused && typeof lastFocused.focus === 'function') lastFocused.focus();
+    if (restoreFocus) (canFocus(lastFocused) ? lastFocused : input).focus();
   }
 
-  runtimeToggle.addEventListener('click', openDrawer);
-  runtimeClose.addEventListener('click', closeDrawer);
-  runtimeBackdrop.addEventListener('click', closeDrawer);
+  function syncSessionLayout() {
+    const focused = document.activeElement;
+    const wasInSidebar = sessionSidebar.contains(focused);
+    if (!sessionMedia.matches && activePanel === panels.sessions) closeDrawer(false);
+    sessionSidebar.hidden = sessionMedia.matches && activePanel !== panels.sessions;
+    // 窄屏常驻（drawer 入口）；桌面端只在侧栏折叠时出现，作为展开入口。
+    sessionToggle.hidden = sessionMedia.matches ? false : !sidebarCollapsed;
+    sessionClose.hidden = !sessionMedia.matches;
+    if (sessionMedia.matches) {
+      sessionSidebar.setAttribute('role', 'dialog');
+      sessionSidebar.setAttribute('aria-modal', 'true');
+    } else {
+      sessionSidebar.removeAttribute('role');
+      sessionSidebar.removeAttribute('aria-modal');
+    }
+    setBackgroundInert(Boolean(activePanel));
+    if (wasInSidebar && !canFocus(focused)) {
+      (sessionMedia.matches ? sessionToggle : sessionNew).focus();
+    } else if (wasInSidebar && document.activeElement !== focused && canFocus(focused)) {
+      focused.focus();
+    }
+  }
+
+  for (const panel of Object.values(panels)) {
+    panel.toggle.addEventListener('click', () => openDrawer(panel));
+    panel.close.addEventListener('click', () => closeDrawer());
+  }
+  // 设置面板是统一详情入口：详细的运行信息仍由运行详情呈现。
+  $('settings-runtime').addEventListener('click', () => openDrawer(panels.runtime));
+  runtimeBackdrop.addEventListener('click', () => closeDrawer());
+
+  // 折叠、拖拽与展开都由同一个宽度变量驱动。
+  sidebarCollapse.addEventListener('click', () => setSidebarCollapsed(true));
+  sessionToggle.addEventListener('click', () => {
+    // 桌面端折叠后，页头左边这个按钮就是展开入口；窄屏仍然是打开 drawer。
+    if (!sessionMedia.matches && sidebarCollapsed) setSidebarCollapsed(false);
+  });
+  sidebarResizer.addEventListener('pointerdown', (event) => {
+    if (sessionMedia.matches || event.button !== 0) return;
+    event.preventDefault();
+    resizingSidebar = true;
+    document.documentElement.dataset.resizing = 'true';
+    if (sidebarResizer.setPointerCapture) sidebarResizer.setPointerCapture(event.pointerId);
+  });
+  sidebarResizer.addEventListener('pointermove', (event) => {
+    if (!resizingSidebar) return;
+    // 侧栏贴着窗口左边，指针的 x 就是想要的宽度。
+    setSidebarWidth(event.clientX);
+  });
+  const endSidebarResize = () => {
+    if (!resizingSidebar) return;
+    resizingSidebar = false;
+    delete document.documentElement.dataset.resizing;
+  };
+  sidebarResizer.addEventListener('pointerup', endSidebarResize);
+  sidebarResizer.addEventListener('pointercancel', endSidebarResize);
+  sidebarResizer.addEventListener('keydown', (event) => {
+    // 键盘也能调整：方向键 8px，按住 Shift 32px，Home/End 到两端。
+    const step = event.shiftKey ? 32 : 8;
+    const moves = {
+      ArrowLeft: -step,
+      ArrowRight: step,
+      Home: SIDEBAR_MIN - sidebarWidth,
+      End: SIDEBAR_MAX - sidebarWidth
+    };
+    if (!(event.key in moves)) return;
+    event.preventDefault();
+    setSidebarWidth(sidebarWidth + moves[event.key]);
+  });
+
+  // 设置模态的分类导航：同一时刻只有一个 pane 可见，方向键在同一组 tab 内移动。
+  const settingsTabs = [...$('settings-panel').querySelectorAll('[role="tab"]')];
+  function selectSettingsTab(tab) {
+    if (!tab) return;
+    for (const item of settingsTabs) {
+      const active = item === tab;
+      item.setAttribute('aria-selected', active ? 'true' : 'false');
+      // 用属性而不是 tabIndex 属性赋值：两者在浏览器里等价，但属性写法更明确。
+      item.setAttribute('tabindex', active ? '0' : '-1');
+      const pane = $(item.dataset.pane);
+      if (pane) pane.hidden = !active;
+    }
+  }
+  for (const tab of settingsTabs) tab.addEventListener('click', () => selectSettingsTab(tab));
+  $('settings-panel').addEventListener('keydown', (event) => {
+    const index = settingsTabs.indexOf(document.activeElement);
+    if (index < 0) return;
+    const target =
+      event.key === 'ArrowDown' ? settingsTabs[(index + 1) % settingsTabs.length]
+      : event.key === 'ArrowUp' ? settingsTabs[(index - 1 + settingsTabs.length) % settingsTabs.length]
+      : event.key === 'Home' ? settingsTabs[0]
+      : event.key === 'End' ? settingsTabs[settingsTabs.length - 1]
+      : null;
+    if (!target) return;
+    event.preventDefault();
+    target.focus();
+    selectSettingsTab(target);
+  });
+  // 模态占满视口，点对话框之外的空白就关闭。
+  $('settings-panel').addEventListener('click', (event) => {
+    if (event.target === $('settings-panel')) closeDrawer();
+  });
+  selectSettingsTab(settingsTabs[0]);
+  applySidebar();
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && !runtimeDrawer.hidden) closeDrawer();
+    if (!activePanel) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeDrawer();
+    } else if (event.key === 'Tab') {
+      const nodes = panelFocusables();
+      const index = nodes.indexOf(document.activeElement);
+      if (!nodes.length || index < 0 || (event.shiftKey ? index === 0 : index === nodes.length - 1)) {
+        event.preventDefault();
+        (nodes[event.shiftKey ? nodes.length - 1 : 0] || activePanel.element).focus();
+      }
+    }
+  });
+  document.addEventListener('focusin', (event) => {
+    if (activePanel && !activePanel.element.contains(event.target)) activePanel.close.focus();
+  });
+  sessionMedia.addEventListener('change', () => {
+    syncSessionLayout();
+    if (!sessionSidebar.hidden) updateSessions();
   });
 
   function updateReloadStatus(copy, className = '') {
@@ -1290,45 +1515,66 @@ if (typeof document !== 'undefined') {
       runtimeBrief.lastChild.textContent = '状态暂不可用';
       runtimeBrief.className = 'runtime-brief unavailable';
     }
-    // The list is only visible in the drawer, so it is only polled while that
-    // drawer is open; the store reads every session file to answer it, and the
-    // facts only change when a run writes one.
-    if (!runtimeDrawer.hidden) {
-      updateSessions();
-      updateMemory();
-    }
+    // 各列表只跟随自己的可见性刷新，不再依赖运行详情。
+    if (!sessionSidebar.hidden) updateSessions();
+    if (!memoryPanel.hidden) updateMemory();
   }
 
-  // --- Sessions in the drawer and the address bar -------------------------
+  // --- 会话侧栏与地址栏 ---------------------------------------------------
 
   function setSessionStatus(text, className = '') {
     sessionStatus.textContent = text;
     sessionStatus.className = `session-status${className ? ` ${className}` : ''}`;
   }
 
+  // 用稳定标识复用列表控件，避免轮询在按下与点击之间替换节点或丢失键盘焦点。
+  function reconcileList(list, rows, keyFor, createNode, updateNode, fallback) {
+    const focused = document.activeElement;
+    const hadFocus = list.contains(focused);
+    const existing = new Map([...list.children].map((node) => [node.dataset.rowKey, node]));
+    rows.forEach((row, index) => {
+      const key = keyFor(row);
+      const node = existing.get(key) || createNode(row);
+      existing.delete(key);
+      node.dataset.rowKey = key;
+      updateNode(node, row, index);
+      if (list.children[index] !== node) list.insertBefore(node, list.children[index] || null);
+    });
+    for (const node of existing.values()) node.remove();
+    if (hadFocus && document.activeElement !== focused) {
+      const target = canFocus(focused) ? focused : fallback;
+      if (canFocus(target)) target.focus();
+    }
+  }
+
   function sessionRowNode(row) {
     const item = make('li');
-    const button = make('button', `session-row${row.current ? ' is-current' : ''}`);
+    const button = make('button', 'session-row');
     button.type = 'button';
-    if (row.current) button.setAttribute('aria-current', 'true');
-    button.append(make('span', 'session-title', row.title));
-    const meta = make('span', 'session-meta', `${row.time} · ${row.runs} · #${row.shortId}`);
-    // A title is the session's first message, so two sessions can share one.
-    // The id prefix is what tells them apart, and the current one is said in
-    // words rather than only in colour.
-    if (row.current) meta.append(make('span', 'session-current', '当前'));
-    button.append(meta);
-    button.disabled = running || switching;
+    button.append(make('span', 'session-title'), make('span', 'session-meta'));
     button.addEventListener('click', () => switchSession(row.id));
     item.append(button);
     return item;
   }
 
+  function updateSessionRow(item, row) {
+    const button = item.querySelector('button');
+    button.classList.toggle('is-current', row.current);
+    if (row.current) button.setAttribute('aria-current', 'true');
+    else button.removeAttribute('aria-current');
+    item.querySelector('.session-title').textContent = row.title;
+    const meta = item.querySelector('.session-meta');
+    meta.textContent = row.time === '—' ? '' : row.time;
+    button.setAttribute('title', `${row.title}\n#${row.id} · ${row.runs}`);
+    button.disabled = running || switching;
+  }
+
   function renderSessions(payload) {
     sessionsPayload = payload;
     const rows = sessionRows(payload, currentSessionID);
-    sessionList.replaceChildren();
-    for (const row of rows) sessionList.append(sessionRowNode(row));
+    const current = rows.find((row) => row.current);
+    if (current) setConversationTitle(current.title);
+    reconcileList(sessionList, rows, (row) => row.id, sessionRowNode, updateSessionRow, sessionNew);
     $('sessions-empty').hidden = rows.length > 0;
   }
 
@@ -1356,7 +1602,14 @@ if (typeof document !== 'undefined') {
     rerenderSessions();
   }
 
+  function setConversationTitle(text = '新会话') {
+    const title = sessionTitle(text);
+    $('conversation-title').textContent = title;
+    $('conversation-title').setAttribute('title', title);
+  }
+
   function resetConversation() {
+    setConversationTitle();
     conversation.replaceChildren();
     sessionNotices.replaceChildren();
     sessionNotices.hidden = true;
@@ -1399,6 +1652,7 @@ if (typeof document !== 'undefined') {
 
   function renderReplayedSession(detail) {
     const replay = replaySession(detail);
+    setConversationTitle(replay.title);
     conversation.replaceChildren();
     sessionNotices.replaceChildren();
     for (const notice of replay.notices) sessionNotices.append(make('p', 'session-notice', notice));
@@ -1433,7 +1687,7 @@ if (typeof document !== 'undefined') {
       const response = await fetch(`/api/sessions/${id}`, { cache: 'no-store' });
       if (!response.ok) throw new Error(await errorMessage(response));
       renderReplayedSession(await response.json());
-      setSessionStatus(`已恢复会话 #${id.slice(0, 8)}。`);
+      setSessionStatus('已恢复会话。');
     } catch (error) {
       dropSession();
       setSessionStatus(`无法读取这个会话：${error.message}`, 'failure');
@@ -1454,12 +1708,15 @@ if (typeof document !== 'undefined') {
 
   function newSession() {
     if (running || switching) return;
+    if (activePanel === panels.sessions) closeDrawer();
     dropSession();
     setSessionStatus('新会话：发送第一条消息后开始记录。');
   }
 
   function switchSession(id) {
-    if (running || switching || !isSessionID(id) || id === currentSessionID) return;
+    if (running || switching || !isSessionID(id)) return;
+    if (activePanel === panels.sessions) closeDrawer();
+    if (id === currentSessionID) return;
     // The hash is what carries the session, so a switch is a URL change; the
     // hashchange handler is what performs the replay.
     location.hash = sessionHash(id);
@@ -1472,7 +1729,7 @@ if (typeof document !== 'undefined') {
     currentSessionID = id;
     location.hash = sessionHash(id);
     rerenderSessions();
-    setSessionStatus(`已开始新会话 #${id.slice(0, 8)}。`);
+    setSessionStatus('会话已开始记录。');
   }
 
   async function applySessionHash() {
@@ -1505,7 +1762,7 @@ if (typeof document !== 'undefined') {
   sessionNew.addEventListener('click', newSession);
   window.addEventListener('hashchange', applySessionHash);
 
-  // --- Memory in the drawer ------------------------------------------------
+  // --- 独立记忆面板 -------------------------------------------------------
   //
   // The user's own view of the durable facts: what is stored, and a way to
   // retract one. There is deliberately no way to add or edit a fact here — a
@@ -1514,7 +1771,8 @@ if (typeof document !== 'undefined') {
   // one fact rather than trusting the page to point at "the fourth one".
 
   let memoryView = { facts: [], retracted: [] };
-  let memoryReading = false;
+  let memoryReading = null;
+  let memoryRetracting = false;
 
   function setMemoryStatus(text, className = '') {
     memoryStatus.textContent = text;
@@ -1522,21 +1780,24 @@ if (typeof document !== 'undefined') {
     memoryStatus.hidden = !text;
   }
 
-  function memoryRowNode(row, index) {
+  function memoryRowNode(row) {
     const item = make('li', 'memory-item');
     item.append(make('p', 'memory-text', row.text));
     item.append(make('p', 'memory-meta', `${row.time} · 来自 ${row.session}`));
     const button = make('button', 'memory-retract', '撤回');
     button.type = 'button';
-    button.dataset.memoryIndex = String(index);
     button.addEventListener('click', () => retractFact(row, button));
     item.append(button);
     return item;
   }
 
   function renderMemory(note = '') {
-    memoryList.replaceChildren();
-    memoryView.facts.forEach((row, index) => memoryList.append(memoryRowNode(row, index)));
+    reconcileList(memoryList, memoryView.facts, (row) => JSON.stringify([row.at, row.text]), memoryRowNode, (item, row, index) => {
+      item.querySelector('.memory-meta').textContent = `${row.time} · 来自 ${row.session}`;
+      const button = item.querySelector('button');
+      button.dataset.memoryIndex = String(index);
+      button.disabled = memoryRetracting;
+    }, panels.memory.close);
     memoryEmpty.hidden = memoryView.facts.length > 0;
     const parts = [];
     if (memoryView.retracted.length > 0) parts.push(`已撤回 ${memoryView.retracted.length} 条`);
@@ -1544,28 +1805,39 @@ if (typeof document !== 'undefined') {
     setMemoryStatus(parts.join(' · '));
   }
 
-  async function updateMemory() {
-    if (memoryReading) return;
-    memoryReading = true;
-    try {
-      const response = await fetch('/api/memory', { cache: 'no-store' });
-      if (!response.ok) throw new Error(await errorMessage(response));
-      memoryView = memoryRows(await response.json());
-      renderMemory();
-    } catch (error) {
-      setMemoryStatus(`无法读取记忆：${error.message}`, 'failure');
-    } finally {
-      memoryReading = false;
-    }
+  function updateMemory(afterRetraction = false) {
+    if (memoryRetracting && !afterRetraction) return Promise.resolve(false);
+    if (memoryReading) return memoryReading;
+    memoryReading = (async () => {
+      try {
+        const response = await fetch('/api/memory', { cache: 'no-store' });
+        if (!response.ok) throw new Error(await errorMessage(response));
+        const payload = await response.json();
+        // 撤回前发出的轮询不能覆盖撤回中的状态；写入完成后再单独读取。
+        if (memoryRetracting && !afterRetraction) return false;
+        memoryView = memoryRows(payload);
+        renderMemory();
+        return true;
+      } catch (error) {
+        setMemoryStatus(`无法读取记忆：${error.message}`, 'failure');
+        return false;
+      } finally {
+        memoryReading = null;
+      }
+    })();
+    return memoryReading;
   }
 
   async function retractFact(row, button) {
+    if (memoryRetracting) return;
     const payload = retractPayload(row);
     if (payload === null) {
       setMemoryStatus('这一条缺少时间或内容，无法撤回。', 'failure');
       return;
     }
-    button.disabled = true;
+    const hadFocus = document.activeElement === button;
+    memoryRetracting = true;
+    for (const action of memoryList.querySelectorAll('button')) action.disabled = true;
     try {
       const response = await fetch('/api/memory/retract', {
         method: 'POST',
@@ -1573,14 +1845,20 @@ if (typeof document !== 'undefined') {
         body: JSON.stringify(payload)
       });
       if (!response.ok) throw new Error(await errorMessage(response));
-      await updateMemory();
-      renderMemory('这一条已撤回，下一次运行不再注入它。');
+      await memoryReading;
+      if (await updateMemory(true)) renderMemory('这一条已撤回，下一次运行不再注入它。');
     } catch (error) {
-      button.disabled = false;
       setMemoryStatus(`撤回失败：${error.message}`, 'failure');
+    } finally {
+      memoryRetracting = false;
+      for (const action of memoryList.querySelectorAll('button')) action.disabled = false;
+      if (hadFocus && activePanel === panels.memory && (document.activeElement === button || document.activeElement === document.body)) {
+        (canFocus(button) ? button : panels.memory.close).focus();
+      }
     }
   }
 
+  syncSessionLayout();
   applySessionHash();
   updateSessions();
   updateState();

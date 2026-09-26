@@ -6,6 +6,638 @@ const path = require('node:path');
 const root = __dirname;
 const source = (name) => fs.readFileSync(path.join(root, name), 'utf8');
 
+// 无外部依赖的 DOM 适配器：执行完整 app.js 与真实页面结构，不模拟被测导航逻辑。
+// 几何、CSS 与浏览器原生 Tab 顺序仍由隔离浏览器验收负责。
+function navigationHarness({ narrow = false, hash = '', respond, dark = false, storage = new Map(), storageError = '' } = {}) {
+  const vm = require('node:vm');
+  const listeners = () => ({
+    handlers: new Map(),
+    addEventListener(type, handler) {
+      if (!this.handlers.has(type)) this.handlers.set(type, []);
+      this.handlers.get(type).push(handler);
+    },
+    emit(type, extra = {}) {
+      const event = { type, target: this, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...extra };
+      for (const handler of this.handlers.get(type) || []) handler(event);
+      return event;
+    }
+  });
+  const document = listeners();
+  class Element {
+    constructor(tag) {
+      Object.assign(this, listeners());
+      this.tagName = tag.toUpperCase();
+      this.childNodes = [];
+      this.parentElement = null;
+      this.attributes = new Map();
+      this.dataset = {};
+      // 真实 DOM 的 style 支持 setProperty；应用用 inline 变量驱动侧栏宽度。
+      this.style = {
+        setProperty(name, value) { this[name] = String(value); },
+        removeProperty(name) { delete this[name]; }
+      };
+      this.hidden = false;
+      this.inert = false;
+      this.disabled = false;
+      this.value = '';
+      this.className = '';
+      this.scrollHeight = 100;
+      this.scrollTop = 0;
+      this.clientHeight = 100;
+      this.classList = {
+        contains: (name) => this.className.split(/\s+/).includes(name),
+        toggle: (name, force) => {
+          const names = new Set(this.className.split(/\s+/).filter(Boolean));
+          const add = force === undefined ? !names.has(name) : force;
+          if (add) names.add(name); else names.delete(name);
+          this.className = [...names].join(' ');
+          return add;
+        },
+        add: (name) => this.classList.toggle(name, true),
+        remove: (name) => this.classList.toggle(name, false)
+      };
+    }
+    get children() { return this.childNodes.filter((child) => child.tagName !== '#TEXT'); }
+    get childElementCount() { return this.children.length; }
+    get firstElementChild() { return this.children[0]; }
+    get lastChild() { return this.childNodes.at(-1); }
+    get isConnected() { return this === document.body || Boolean(this.parentElement?.isConnected); }
+    get tabIndex() {
+      return this.attributes.has('tabindex') ? Number(this.getAttribute('tabindex'))
+        : ['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'SUMMARY', 'A'].includes(this.tagName) ? 0 : -1;
+    }
+    get textContent() { return this._text || this.childNodes.map((child) => child.textContent).join(''); }
+    set textContent(text) { this.replaceChildren(); this._text = String(text); }
+    setAttribute(name, value) {
+      this.attributes.set(name, String(value));
+      if (name === 'class') this.className = value;
+      if (name === 'id') this.id = value;
+      // 真实 DOM 把 data-* 映射到 dataset；分类导航靠 dataset.pane 找面板。
+      if (name.startsWith('data-')) {
+        this.dataset[name.slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = String(value);
+      }
+      if (name === 'hidden' || name === 'inert' || name === 'disabled') this[name] = true;
+    }
+    getAttribute(name) { return this.attributes.get(name) ?? null; }
+    removeAttribute(name) {
+      this.attributes.delete(name);
+      if (name === 'hidden' || name === 'inert' || name === 'disabled') this[name] = false;
+    }
+    append(...nodes) { for (const node of nodes) this.insertBefore(node, null); }
+    insertBefore(node, before) {
+      node.remove();
+      const index = before ? this.childNodes.indexOf(before) : this.childNodes.length;
+      this.childNodes.splice(index, 0, node);
+      node.parentElement = this;
+      this._text = '';
+    }
+    remove() {
+      if (!this.parentElement) return;
+      if (this.contains(document.activeElement)) document.activeElement = document.body;
+      const siblings = this.parentElement.childNodes;
+      siblings.splice(siblings.indexOf(this), 1);
+      this.parentElement = null;
+    }
+    replaceChildren(...nodes) { for (const node of [...this.childNodes]) node.remove(); this._text = ''; this.append(...nodes); }
+    contains(node) { return node === this || this.childNodes.some((child) => child.contains(node)); }
+    matches(selector) {
+      return selector.split(',').some((part) => {
+        const token = part.trim();
+        if (token.startsWith('.')) return this.classList.contains(token.slice(1));
+        if (token.startsWith('#')) return this.id === token.slice(1);
+        if (token.startsWith('[')) {
+          const body = token.slice(1, -1);
+          const equals = body.indexOf('=');
+          if (equals >= 0) {
+            const value = body.slice(equals + 1).replace(/^"|"$/g, '');
+            return this.attributes.get(body.slice(0, equals)) === value;
+          }
+          return ['hidden', 'inert', 'disabled'].includes(body) ? this[body] : this.attributes.has(body);
+        }
+        return this.tagName === token.toUpperCase();
+      });
+    }
+    closest(selector) { return this.matches(selector) ? this : this.parentElement?.closest(selector) || null; }
+    querySelectorAll(selector) {
+      return this.children.flatMap((child) => [...(child.matches(selector) ? [child] : []), ...child.querySelectorAll(selector)]);
+    }
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+    getClientRects() { return this.isConnected && !this.closest('[hidden]') ? [{}] : []; }
+    focus() {
+      if (!this.disabled && this.getClientRects().length && !this.closest('[inert]')) {
+        document.activeElement = this;
+        document.emit('focusin', { target: this });
+      }
+    }
+    click() { if (!this.disabled) this.emit('click'); }
+    scrollTo({ top }) { this.scrollTop = top; }
+    requestSubmit() { this.emit('submit'); }
+  }
+  document.body = new Element('body');
+  document.documentElement = new Element('html');
+  document.documentElement.append(document.body);
+  document.activeElement = document.body;
+  document.createElement = (tag) => new Element(tag);
+  document.createTextNode = (text) => { const node = new Element('#text'); node.textContent = text; return node; };
+  document.querySelector = (selector) => document.body.querySelector(selector);
+  document.getElementById = (id) => document.querySelector(`#${id}`);
+  const stack = [document.body];
+  const body = source('index.html').split('<body>')[1].split('</body>')[0];
+  for (const token of body.match(/<[^>]+>|[^<]+/g)) {
+    if (token.startsWith('</')) { stack.pop(); continue; }
+    if (!token.startsWith('<')) { stack.at(-1).append(document.createTextNode(token)); continue; }
+    const tag = token.match(/^<(\w+)/)?.[1];
+    if (!tag) continue;
+    const node = new Element(tag);
+    for (const attr of token.slice(tag.length + 1, -1).matchAll(/([\w-]+)(?:="([^"]*)")?/g)) node.setAttribute(attr[1], attr[2] ?? '');
+    stack.at(-1).append(node);
+    if (!['input', 'meta', 'link', 'br', 'hr'].includes(tag)) stack.push(node);
+  }
+  const window = listeners();
+  const media = Object.assign(listeners(), { matches: narrow });
+  const colorMedia = Object.assign(listeners(), { matches: dark });
+  window.matchMedia = (query) => query.includes('prefers-color-scheme') ? colorMedia : media;
+  const storageCalls = [];
+  Object.defineProperty(window, 'localStorage', { get() {
+    if (storageError === 'access') throw new Error('storage inaccessible');
+    return {
+      getItem(key) {
+        if (storageError === 'read') throw new Error('storage unreadable');
+        return storage.get(key) ?? null;
+      },
+      setItem(key, value) {
+        if (storageError === 'write') throw new Error('storage full');
+        storageCalls.push([key, value]);
+        storage.set(key, value);
+      }
+    };
+  } });
+  const calls = [];
+  const frames = [];
+  const intervals = [];
+  const location = { pathname: '/', search: '', _hash: hash };
+  Object.defineProperty(location, 'hash', {
+    get() { return this._hash; },
+    set(value) { this._hash = value; queueMicrotask(() => window.emit('hashchange')); }
+  });
+  const data = {
+    sessions: { sessions: [{ id: 'aaaaaaaa', title: '会话 A', run_count: 1 }, { id: 'bbbbbbbb', title: '会话 B', run_count: 2 }] },
+    memory: { facts: [{ text: '测试事实', at: '2026-09-25T10:00:00Z', source_session: 'aaaaaaaa' }] }
+  };
+  const context = vm.createContext({
+    document, window, location, URLSearchParams, TextDecoder, console,
+    history: { replaceState(_state, _title, url) { location._hash = url.includes('#') ? `#${url.split('#')[1]}` : ''; } },
+    requestAnimationFrame: (fn) => frames.push(fn),
+    setTimeout: (fn) => frames.push(fn), clearTimeout() {}, setInterval: (fn) => intervals.push(fn),
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      const custom = respond && await respond(url, options, data);
+      if (custom) return custom;
+      const payload = url === '/api/sessions' ? data.sessions : url === '/api/memory' ? data.memory
+        : url.startsWith('/api/sessions/') ? { records: [{ type: 'message', role: 'user', text: '已保存的消息' }] } : {};
+      return { ok: true, json: async () => payload };
+    }
+  });
+  const bootstrap = source('index.html').match(/<script id="theme-bootstrap">([\s\S]*?)<\/script>/)?.[1];
+  if (bootstrap) vm.runInContext(bootstrap, context, { filename: 'theme-bootstrap' });
+  const bootstrapTheme = document.documentElement.dataset.theme;
+  vm.runInContext(source('app.js'), context, { filename: 'app.js' });
+  const settle = async () => {
+    await new Promise((resolve) => setImmediate(resolve));
+    while (frames.length) frames.shift()();
+    await new Promise((resolve) => setImmediate(resolve));
+  };
+  return {
+    document, window, location, data, calls, settle, storage, storageCalls, bootstrapTheme,
+    $: document.getElementById,
+    async click(id) { const node = document.getElementById(id); node.focus(); node.click(); await settle(); },
+    async poll() { for (const fn of intervals) fn(); await settle(); },
+    async resize(matches) { media.matches = matches; media.emit('change'); await settle(); },
+    async systemTheme(matches) { colorMedia.matches = matches; colorMedia.emit('change'); await settle(); },
+    async theme(value, id = 'theme-select') { const control = document.getElementById(id); control.value = value; control.emit('change'); await settle(); },
+    key(key, shiftKey = false) { return document.emit('keydown', { key, shiftKey }); }
+  };
+}
+
+test('theme follows the OS until explicitly selected and restores only its preference on reload', async () => {
+  const h = navigationHarness({ dark: true });
+  await h.settle();
+  assert.equal(h.bootstrapTheme, 'dark', '首帧主题在样式载入前确定');
+  assert.equal(h.document.documentElement.dataset.theme, 'dark');
+  assert.equal(h.$('theme-select').value, 'system');
+  await h.systemTheme(false);
+  assert.equal(h.document.documentElement.dataset.theme, 'light');
+  h.$('message').value = '主题切换不丢草稿';
+  h.$('message').focus();
+  const sessionButton = h.$('session-list').querySelector('button');
+  const requests = h.calls.length;
+  await h.theme('dark');
+  assert.equal(h.document.documentElement.dataset.theme, 'dark');
+  assert.equal(h.$('theme-select').value, 'dark', '外观只有一个控件，设置面板里那一个');
+  assert.equal(h.$('message').value, '主题切换不丢草稿');
+  assert.equal(h.document.activeElement, h.$('message'));
+  assert.equal(h.$('session-list').querySelector('button'), sessionButton);
+  assert.equal(h.calls.length, requests, '切主题不请求或重新渲染产品数据');
+  assert.deepEqual(h.storageCalls, [['luna.theme', 'dark']]);
+  await h.systemTheme(true);
+  await h.systemTheme(false);
+  assert.equal(h.document.documentElement.dataset.theme, 'dark', '显式主题不受 OS 改变影响');
+  const reloaded = navigationHarness({ storage: h.storage });
+  await reloaded.settle();
+  assert.equal(reloaded.bootstrapTheme, 'dark');
+  assert.equal(reloaded.$('theme-select').value, 'dark');
+  await h.theme('light');
+  await h.systemTheme(true);
+  assert.equal(h.document.documentElement.dataset.theme, 'light');
+  await h.theme('system');
+  assert.equal(h.document.documentElement.dataset.theme, 'dark');
+  assert.equal(h.storage.get('luna.theme'), 'system');
+});
+
+test('theme rejects invalid preferences and safely follows system when storage fails', async () => {
+  for (const value of ['sepia', '', 'Dark', '<style>', null]) {
+    const h = navigationHarness({ dark: true, storage: new Map([['luna.theme', value]]) });
+    await h.settle();
+    assert.equal(h.bootstrapTheme, 'dark');
+    assert.equal(h.$('theme-select').value, 'system');
+    await h.theme('invalid');
+    assert.equal(h.$('theme-select').value, 'system');
+    assert.equal(h.storage.get('luna.theme'), 'system');
+  }
+  for (const storageError of ['access', 'read', 'write']) {
+    const h = navigationHarness({ dark: true, storageError });
+    await h.settle();
+    assert.equal(h.bootstrapTheme, 'dark');
+    assert.equal(h.$('theme-select').value, 'system');
+    await h.systemTheme(false);
+    assert.equal(h.document.documentElement.dataset.theme, 'light');
+    await h.theme('dark');
+    assert.equal(h.$('theme-select').value, 'dark', '写入失败不忽略本页用户的显式选择');
+    assert.equal(h.document.documentElement.dataset.theme, 'dark');
+    const reloaded = navigationHarness({ storage: h.storage, storageError });
+    await reloaded.settle();
+    assert.equal(reloaded.$('theme-select').value, 'system');
+  }
+});
+
+test('extensions open independently of diagnostics and preserve their subtree across theme and panel changes', async () => {
+  const h = navigationHarness({ respond: async (url) => {
+    if (url === '/api/ui-plugins') return { ok: true, json: async () => ({ plugins: [
+      { name: 'counter', title: '计数器', description: '计数与计时', entry: 'plugin.js' }
+    ] }) };
+  } });
+  await h.settle();
+  assert.ok(h.$('extensions-toggle'), '扩展有独立可见入口');
+  assert.equal(h.$('runtime-drawer').contains(h.$('ui-plugin-list')), false);
+  assert.equal(h.$('extensions-panel').contains(h.$('ui-plugin-list')), true);
+  await h.click('runtime-toggle');
+  assert.equal(h.calls.some(({ url }) => url === '/api/ui-plugins'), false, '诊断不请求界面插件');
+  h.$('extensions-toggle').click();
+  await h.settle();
+  assert.equal(h.$('runtime-drawer').hidden, true);
+  assert.equal(h.$('extensions-panel').hidden, false);
+  assert.equal(h.document.activeElement, h.$('extensions-close'));
+  const list = h.$('ui-plugin-list');
+  const row = list.firstElementChild;
+  const stage = row.querySelector('.ui-plugin-stage');
+  const content = h.document.createElement('button');
+  content.textContent = '插件自己的状态';
+  // 挂载容器默认是隐藏的；这里按已启用插件的状态取焦点。
+  stage.hidden = false;
+  stage.append(content);
+  // 主题更新与面板开关不得触碰插件自行维护的 DOM，也不应重新读清单。
+  content.focus();
+  await h.theme('dark');
+  assert.equal(h.document.activeElement, content, '切主题不移动插件内的焦点');
+  assert.equal(stage.firstElementChild, content);
+  assert.equal(list.firstElementChild, row);
+  assert.equal(h.$('theme-select').value, 'dark');
+  // 焦点陷阱覆盖插件自己的控件：从最后一个可聚焦元素回绕到关闭按钮，再回绕回来。
+  h.key('Tab');
+  assert.equal(h.document.activeElement, h.$('extensions-close'));
+  h.key('Tab', true);
+  assert.equal(h.document.activeElement, content);
+  await h.resize(true);
+  assert.equal(h.$('extensions-panel').hidden, false);
+  h.key('Escape');
+  assert.equal(h.document.activeElement, h.$('extensions-toggle'));
+  assert.equal(h.document.querySelector('.app-shell').inert, false);
+  await h.click('extensions-toggle');
+  assert.equal(stage.firstElementChild, content);
+  assert.equal(h.calls.filter(({ url }) => url === '/api/ui-plugins').length, 1);
+  await h.click('runtime-backdrop');
+  assert.equal(h.$('extensions-panel').hidden, true);
+  assert.equal(h.document.activeElement, h.$('extensions-toggle'));
+});
+
+test('navigation lifecycle routes independent panels and restores focus', async () => {
+  const h = navigationHarness({ narrow: true });
+  await h.settle();
+  assert.equal(h.$('session-sidebar').hidden, true, '窄屏会话侧栏初始关闭');
+  h.$('message').value = '保留草稿';
+  await h.click('memory-toggle');
+  assert.equal(h.$('memory-panel').hidden, false);
+  assert.equal(h.$('runtime-drawer').hidden, true);
+  assert.equal(h.$('memory-toggle').getAttribute('aria-expanded'), 'true');
+  assert.equal(h.document.querySelector('.app-shell').inert, true);
+  assert.equal(h.document.activeElement, h.$('memory-close'));
+  assert.equal(h.calls.filter(({ url }) => url === '/api/memory').length, 1);
+  const retract = h.$('memory-list').querySelector('button');
+  h.key('Tab', true);
+  assert.equal(h.document.activeElement, retract, 'Shift+Tab 留在面板内');
+  h.key('Tab');
+  assert.equal(h.document.activeElement, h.$('memory-close'));
+  assert.equal(h.key('Escape').defaultPrevented, true);
+  assert.equal(h.$('memory-panel').hidden, true);
+  assert.equal(h.document.activeElement, h.$('memory-toggle'));
+  assert.equal(h.document.querySelector('.app-shell').inert, false);
+  await h.click('runtime-toggle');
+  assert.equal(h.$('runtime-drawer').hidden, false);
+  await h.poll();
+  assert.equal(h.calls.filter(({ url }) => url === '/api/memory').length, 1, '运行详情不读取记忆');
+  // 即使入口被程序触发，也不能堆叠模态层。
+  h.$('memory-toggle').click();
+  await h.settle();
+  assert.equal(h.$('runtime-drawer').hidden, true);
+  assert.equal(h.$('memory-panel').hidden, false);
+  await h.click('runtime-backdrop');
+  assert.equal(h.$('memory-panel').hidden, true);
+  await h.click('session-toggle');
+  assert.equal(h.$('session-sidebar').hidden, false);
+  assert.equal(h.$('session-sidebar').getAttribute('aria-modal'), 'true');
+  h.key('Escape');
+  assert.equal(h.document.activeElement, h.$('session-toggle'));
+  assert.equal(h.$('message').value, '保留草稿');
+});
+
+test('session navigation closes after selection and survives breakpoint changes', async () => {
+  const h = navigationHarness({ narrow: true, hash: '#session=aaaaaaaa' });
+  await h.settle();
+  assert.match(h.$('conversation').textContent, /已保存的消息/);
+  h.$('message').value = '保留草稿';
+  await h.click('session-toggle');
+  h.$('session-list').querySelectorAll('button')[1].click();
+  await h.settle();
+  assert.equal(h.location.hash, '#session=bbbbbbbb');
+  assert.equal(h.$('session-sidebar').hidden, true, '选中会话后回到对话');
+  assert.equal(h.$('runtime-backdrop').hidden, true);
+  await h.click('session-toggle');
+  await h.resize(false);
+  assert.equal(h.$('session-sidebar').hidden, false);
+  assert.equal(h.$('session-sidebar').getAttribute('aria-modal'), null);
+  assert.equal(h.$('runtime-backdrop').hidden, true);
+  assert.equal(h.document.querySelector('.app-shell').inert, false);
+  assert.equal(h.document.activeElement, h.$('session-new'));
+  await h.click('memory-toggle');
+  assert.equal(h.$('session-sidebar').inert, true);
+  await h.resize(true);
+  assert.equal(h.$('memory-panel').hidden, false, '切换断点不关闭另一模态面板');
+  h.key('Escape');
+  assert.equal(h.$('session-sidebar').hidden, true);
+  await h.click('session-toggle');
+  await h.click('session-new');
+  assert.equal(h.$('session-sidebar').hidden, true);
+  assert.equal(h.location.hash, '');
+  assert.equal(h.$('message').value, '保留草稿');
+});
+
+test('the shell reserves desktop space for the sidebar and contains it when narrow', () => {
+  const css = source('style.css');
+  // 侧栏宽度只有一个来源，页头和正文都让开同一个值。
+  assert.match(css, /--luna-sidebar-w:\s*244px/);
+  assert.match(css, /\.chat-pane\s*\{[^}]*margin-left:\s*var\(--luna-sidebar-w\)/s);
+  assert.match(css, /\.session-sidebar\s*\{[^}]*width:\s*var\(--luna-sidebar-w\)/s);
+  assert.match(css, /@media\s*\(max-width:\s*800px\)/);
+  const narrow = css.slice(css.indexOf('@media (max-width: 800px)'), css.indexOf('@media (max-width: 600px)'));
+  assert.match(narrow, /\.chat-pane\s*\{[^}]*margin-left:\s*0/s);
+  assert.match(narrow, /\.utility-header\s*\{[^}]*margin-left:\s*0/s, '窄屏页头必须让出侧栏宽度');
+  assert.match(narrow, /\.session-sidebar\s*\{[^}]*width:\s*min\(320px, calc\(100vw - 36px\)\)/s);
+});
+
+test('the sidebar collapses, expands and remembers its width in the browser', async () => {
+  const h = navigationHarness();
+  await h.settle();
+  assert.equal(h.document.documentElement.dataset.sidebar, 'expanded');
+  assert.equal(h.document.documentElement.style['--luna-sidebar-w'], '244px');
+  assert.equal(h.$('session-toggle').hidden, true, '展开时页头不显示展开入口');
+  await h.click('sidebar-collapse');
+  assert.equal(h.document.documentElement.dataset.sidebar, 'collapsed');
+  assert.equal(h.document.documentElement.style['--luna-sidebar-w'], '0px', '折叠后主内容接管整块宽度');
+  assert.equal(h.$('session-toggle').hidden, false, '折叠后页头出现展开入口');
+  assert.equal(h.storage.get('luna.sidebar'), 'collapsed');
+  await h.click('session-toggle');
+  assert.equal(h.document.documentElement.dataset.sidebar, 'expanded');
+  assert.equal(h.document.documentElement.style['--luna-sidebar-w'], '244px');
+
+  // 拖拽把指针的 x 当作宽度，并且夹在 min/max 之间。
+  const resizer = h.$('sidebar-resizer');
+  resizer.emit('pointerdown', { button: 0, clientX: 244, preventDefault() {} });
+  resizer.emit('pointermove', { clientX: 320 });
+  assert.equal(h.document.documentElement.style['--luna-sidebar-w'], '320px');
+  resizer.emit('pointermove', { clientX: 5000 });
+  assert.equal(h.document.documentElement.style['--luna-sidebar-w'], '420px', '不允许无限拉宽');
+  resizer.emit('pointermove', { clientX: 10 });
+  assert.equal(h.document.documentElement.style['--luna-sidebar-w'], '200px', '不允许压到不可用');
+  resizer.emit('pointerup', {});
+  assert.equal(h.storage.get('luna.sidebarWidth'), '200');
+
+  // 键盘同样可用：方向键 8px，Shift 32px，Home/End 到两端。
+  resizer.emit('keydown', { key: 'ArrowRight', preventDefault() {} });
+  assert.equal(h.document.documentElement.style['--luna-sidebar-w'], '208px');
+  resizer.emit('keydown', { key: 'ArrowRight', shiftKey: true, preventDefault() {} });
+  assert.equal(h.document.documentElement.style['--luna-sidebar-w'], '240px');
+  resizer.emit('keydown', { key: 'End', preventDefault() {} });
+  assert.equal(h.document.documentElement.style['--luna-sidebar-w'], '420px');
+  resizer.emit('keydown', { key: 'Home', preventDefault() {} });
+  assert.equal(h.document.documentElement.style['--luna-sidebar-w'], '200px');
+
+  // 重新打开页面沿用上一次的状态。
+  const reloaded = navigationHarness({ storage: h.storage });
+  await reloaded.settle();
+  assert.equal(reloaded.document.documentElement.style['--luna-sidebar-w'], '200px');
+
+  // 窄屏不套用桌面折叠：侧栏由 drawer 控制，页头入口常驻。
+  reloaded.$('session-sidebar').hidden = false;
+  await reloaded.resize(true);
+  assert.equal(reloaded.$('session-toggle').hidden, false);
+  assert.equal(reloaded.$('session-sidebar').hidden, true);
+});
+
+test('settings is one modal with its own category navigation and panes', async () => {
+  const h = navigationHarness();
+  await h.settle();
+  await h.click('settings-toggle');
+  assert.equal(h.$('settings-panel').hidden, false);
+  assert.equal(h.$('settings-panel').getAttribute('role'), 'dialog');
+  assert.equal(h.$('settings-panel').getAttribute('aria-modal'), 'true');
+  assert.equal(h.$('settings-pane-appearance').hidden, false);
+  assert.equal(h.$('settings-pane-model').hidden, true);
+  // 背景内容让位给模态，关闭后回到原来的会话上下文。
+  assert.equal(h.document.querySelector('.app-shell').inert, true);
+  await h.click('settings-tab-model');
+  assert.equal(h.$('settings-tab-model').getAttribute('aria-selected'), 'true');
+  assert.equal(h.$('settings-tab-appearance').getAttribute('aria-selected'), 'false');
+  assert.equal(h.$('settings-pane-model').hidden, false);
+  assert.equal(h.$('settings-pane-appearance').hidden, true);
+  assert.equal(h.$('settings-tab-appearance').tabIndex, -1, '未选中的分类不参与 Tab');
+  h.$('settings-tab-model').focus();
+  h.$('settings-panel').emit('keydown', { key: 'ArrowDown', preventDefault() {} });
+  assert.equal(h.document.activeElement, h.$('settings-tab-appearance'), '方向键在分类之间循环');
+  // 模态自身占满视口，点对话框外的空白关闭。
+  h.$('settings-panel').emit('click', { target: h.$('settings-panel') });
+  assert.equal(h.$('settings-panel').hidden, true);
+  assert.equal(h.document.querySelector('.app-shell').inert, false);
+  assert.equal(h.document.activeElement, h.$('settings-toggle'));
+});
+
+test('visible sessions refresh without diagnostics or replacing the focused action', async () => {
+  const h = navigationHarness();
+  await h.settle();
+  assert.equal(h.$('session-sidebar').hidden, false);
+  assert.equal(h.$('runtime-drawer').hidden, true);
+  const buttons = h.$('session-list').querySelectorAll('button');
+  buttons[1].focus();
+  const before = h.calls.filter(({ url }) => url === '/api/sessions').length;
+  h.data.sessions.sessions[1].title = '标题更新';
+  h.data.sessions.sessions.reverse();
+  await h.poll();
+  assert.equal(h.calls.filter(({ url }) => url === '/api/sessions').length, before + 1);
+  assert.equal(h.document.activeElement, buttons[1], '列表更新仍保留原来的会话按钮');
+  assert.match(buttons[1].textContent, /标题更新/);
+  assert.equal(h.$('session-list').querySelectorAll('button')[0], buttons[1]);
+  await h.poll();
+  assert.equal(h.document.activeElement, buttons[1], '无变更的轮询不重建按钮');
+  await h.resize(true);
+  assert.equal(h.document.activeElement, h.$('session-toggle'));
+  const hiddenCount = h.calls.length;
+  await h.poll();
+  assert.deepEqual(h.calls.slice(hiddenCount).map(({ url }) => url), ['/api/state']);
+});
+
+test('memory polling preserves the retract action and posts its exact fact', async () => {
+  let finishRetraction;
+  let posted;
+  const h = navigationHarness({ respond: async (url, options, data) => {
+    if (url !== '/api/memory/retract') return;
+    posted = JSON.parse(options.body);
+    await new Promise((resolve) => { finishRetraction = resolve; });
+    data.memory = { facts: [], retracted: [posted] };
+    return { ok: true, json: async () => ({}) };
+  } });
+  await h.settle();
+  await h.click('memory-toggle');
+  const button = h.$('memory-list').querySelector('button');
+  button.focus();
+  await h.poll();
+  assert.ok(h.document.activeElement === button, '记忆轮询保留原撤回按钮');
+  button.click();
+  await h.settle();
+  assert.equal(button.disabled, true);
+  await h.poll();
+  assert.ok(h.$('memory-list').querySelector('button') === button, '撤回进行中不替换按钮');
+  assert.equal(button.disabled, true, '轮询不能重新启用正在撤回的按钮');
+  assert.deepEqual(posted, { text: '测试事实', at: '2026-09-25T10:00:00Z' });
+  finishRetraction();
+  await h.settle();
+  assert.equal(h.$('memory-list').childElementCount, 0);
+  assert.equal(h.$('memory-empty').hidden, false);
+  assert.match(h.$('memory-status').textContent, /这一条已撤回/);
+  assert.ok(h.document.activeElement === h.$('memory-close'), '撤回后焦点留在面板内');
+});
+
+test('navigation preserves running and switching guards without discarding drafts', async () => {
+  let finishRead;
+  let finishRun;
+  const h = navigationHarness({ respond: async (url) => {
+    if (url === '/api/sessions/bbbbbbbb') {
+      await new Promise((resolve) => { finishRead = resolve; });
+      return { ok: true, json: async () => ({ records: [] }) };
+    }
+    if (url === '/api/runs') {
+      await new Promise((resolve) => { finishRun = resolve; });
+      return { ok: false, status: 409, json: async () => ({ error: '测试准入拒绝' }) };
+    }
+  } });
+  await h.settle();
+  h.$('session-list').querySelectorAll('button')[1].click();
+  await h.settle();
+  assert.equal(h.$('send').disabled, true);
+  assert.equal(h.$('session-new').disabled, true);
+  assert.ok(h.$('session-list').querySelectorAll('button').every((button) => button.disabled));
+  await h.click('session-new');
+  assert.equal(h.location.hash, '#session=bbbbbbbb');
+  finishRead();
+  await h.settle();
+  assert.equal(h.$('send').disabled, false);
+  assert.equal(h.$('session-new').disabled, false);
+  h.$('message').value = '发送内容';
+  h.$('chat-form').emit('submit');
+  await h.settle();
+  assert.equal(h.$('session-new').disabled, true);
+  assert.ok(h.$('session-list').querySelectorAll('button').every((button) => button.disabled));
+  h.location.hash = '#session=aaaaaaaa';
+  await h.settle();
+  assert.equal(h.location.hash, '#session=bbbbbbbb', '运行中更改 hash 会恢复原会话');
+  await h.click('memory-toggle');
+  finishRun();
+  await h.settle();
+  assert.ok(h.document.activeElement === h.$('memory-close'), '运行结束不夺走面板焦点');
+  assert.equal(h.$('session-new').disabled, false);
+  assert.equal(h.$('message').value, '发送内容', '准入失败保留原有草稿恢复行为');
+});
+
+test('memory waits out an older read before refreshing a completed retraction', async () => {
+  let finishRead;
+  let reads = 0;
+  const h = navigationHarness({ respond: async (url, options, data) => {
+    if (url === '/api/memory' && ++reads === 2) {
+      const older = data.memory;
+      await new Promise((resolve) => { finishRead = resolve; });
+      return { ok: true, json: async () => older };
+    }
+    if (url === '/api/memory/retract') {
+      data.memory = { facts: [], retracted: [JSON.parse(options.body)] };
+      return { ok: true, json: async () => ({}) };
+    }
+  } });
+  await h.settle();
+  await h.click('memory-toggle');
+  await h.poll();
+  const button = h.$('memory-list').querySelector('button');
+  button.focus();
+  button.click();
+  await h.settle();
+  assert.equal(button.disabled, true);
+  finishRead();
+  await h.settle();
+  assert.equal(reads, 3, '旧读取结束后确实重新读取，而不是用旧事实宣布撤回完成');
+  assert.equal(h.$('memory-list').childElementCount, 0);
+  assert.match(h.$('memory-status').textContent, /这一条已撤回/);
+});
+
+test('closing a panel before its frame or request completes cannot reopen it', async () => {
+  let finishRead;
+  const h = navigationHarness({ narrow: true, respond: async (url) => {
+    if (url === '/api/memory') {
+      await new Promise((resolve) => { finishRead = resolve; });
+      return { ok: false, status: 500, json: async () => ({ error: '测试读取失败' }) };
+    }
+  } });
+  await h.settle();
+  h.$('memory-toggle').click();
+  h.key('Escape');
+  finishRead();
+  await h.settle();
+  assert.equal(h.$('memory-panel').hidden, true);
+  assert.equal(h.$('memory-panel').classList.contains('is-open'), false);
+  assert.equal(h.$('runtime-backdrop').hidden, true);
+  assert.ok(h.document.activeElement === h.$('memory-toggle'));
+  assert.match(h.$('memory-status').textContent, /无法读取记忆/);
+  await h.click('session-toggle');
+  await h.click('runtime-backdrop');
+  assert.ok(h.document.activeElement === h.$('session-toggle'));
+});
+
 test('SSE parser preserves app-owned type and JSON payload', () => {
   const { parseEventBlock } = require('./app.js');
   assert.deepEqual(parseEventBlock('event: tool.finished\ndata: {"generation":2,"version":"v2","plugin_pid":44}\n'), {
@@ -119,14 +751,15 @@ test('plugin rows cover every tool and stay honest for empty and partial states'
   ]);
 });
 
-test('Moonline markup is conversation-first with an accessible hidden runtime drawer', () => {
+test('chat markup is conversation-first with an accessible hidden runtime drawer', () => {
   const html = source('index.html');
   assert.match(html, /<title>Luna<\/title>/);
   assert.match(html, />Luna<\/span>/);
-  assert.match(html, /本地运行 · 会话记录保存在本机/);
+  assert.match(html, /会话记录和记忆事实都保存在本机/);
   assert.match(html, /有什么想一起看看？/);
   assert.match(html, /给 Luna 发消息…/);
-  assert.match(html, />发送<\/button>/);
+  assert.match(html, /id="send"[^>]*aria-label="发送"/);
+  assert.match(html, /id="conversation-title"/);
   assert.match(html, /id="runtime-toggle"[^>]*aria-expanded="false"[^>]*aria-controls="runtime-drawer"/);
   assert.match(html, /id="runtime-drawer"[^>]*hidden/);
   assert.match(html, /id="runtime-backdrop"[^>]*hidden/);
@@ -162,8 +795,8 @@ test('the plugin section is an empty list in markup and never a fixed tool', () 
 
 test('the memory section is an empty list in markup and says what it can do', () => {
   const html = source('index.html');
-  assert.match(html, /<section class="drawer-section" aria-labelledby="memory-title">/);
-  assert.match(html, /<h3 id="memory-title">记忆<\/h3>/);
+  assert.match(html, /id="memory-panel"[^>]*aria-labelledby="memory-title"/);
+  assert.match(html, /<h2 id="memory-title">记忆<\/h2>/);
   assert.match(html, /<ul id="memory-list" class="memory-list"><\/ul>/, 'the list is filled from the API, not from markup');
   assert.match(html, /id="memory-empty"[^>]*hidden[^>]*>还没有记录任何事实。/);
   assert.match(html, /id="memory-status"[^>]*role="status"/);
@@ -223,7 +856,7 @@ test('the primary surface does not claim that nothing is stored', () => {
   const html = source('index.html');
   assert.equal(html.includes('不保存记录'), false, 'sessions are written to disk since the session slice');
   assert.equal(html.includes('刷新后不会保留'), false, 'a reload resumes the same session through the fragment');
-  assert.match(html, /会话记录保存在本机/);
+  assert.match(html, /会话记录和记忆事实都保存在本机/);
 });
 
 test('the primary surface omits console-era and fabricated content', () => {
@@ -237,16 +870,33 @@ test('the primary surface omits console-era and fabricated content', () => {
   assert.equal(/\b(?:src|href)=["']https?:\/\//.test(html), false, 'remote assets are not allowed');
 });
 
-test('styles implement fixed-shell Moonline tokens, type, motion and mobile sheet', () => {
+test('styles expose semantic light and dark tokens with opt-in controls and readable chat', () => {
   const css = source('style.css');
-  for (const token of ['#100F0D', '#151411', '#1B1915', '#2C2A24', '#454139', '#F1EDE4', '#B7B0A3', '#8B8579', '#D8D4C8', '#E6E1D5', '#C7C2B7', '#171612', '#9FB59C', '#C4A978', '#C88982']) {
-    assert.match(css.toUpperCase(), new RegExp(token.toUpperCase()), `missing token ${token}`);
+  const light = css.match(/:root\s*\{([^}]+)\}/)?.[1] || '';
+  const dark = css.match(/:root\[data-theme="dark"\]\s*\{([^}]+)\}/)?.[1] || '';
+  for (const token of ['bg', 'surface', 'raised', 'code', 'text', 'text-muted', 'text-subtle', 'border-weak', 'border',
+                       'accent', 'accent-contrast', 'success', 'warning', 'danger', 'hover', 'active']) {
+    assert.match(light, new RegExp(`--luna-${token}:`), `light token ${token}`);
+    assert.match(dark, new RegExp(`--luna-${token}:`), `dark token ${token}`);
   }
+  // 尺度只能来自这一套有限的值，组件不得自己决定。
+  for (const scale of ['--luna-radius-xs: 4px', '--luna-radius-lg: 12px', '--luna-control-md: 32px',
+                       '--luna-row-h: 32px', '--luna-font-label: 11px', '--luna-font-body: 15px',
+                       '--luna-content-max: 820px', '--luna-sidebar-w: 244px', '--luna-gutter:', '--luna-topbar-h:']) {
+    assert.ok(light.includes(scale), `missing scale token ${scale}`);
+  }
+  for (const control of ['button', 'input', 'list', 'list-item', 'status']) {
+    assert.match(css, new RegExp(`\\.luna-${control}[\\s:{,.]`), `opt-in control ${control}`);
+  }
+  // topbar、正文和输入区共用同一个 content container，才有同一条左基线。
+  assert.match(css, /\.content-container\s*\{[^}]*max-width:\s*var\(--luna-content-max\)/s);
+  assert.match(css, /\.topbar-inner\s*\{/);
+  assert.match(css, /\.composer-inner\s*\{/);
+  assert.match(css, /\.utility-header\s*\{[^}]*margin-left:\s*var\(--luna-sidebar-w\)/s, '页头让开同一个侧栏宽度');
+  assert.match(css, /\.transcript-content\s*\{[^}]*padding-block/s);
   assert.match(css, /height:\s*100dvh/);
-  assert.match(css, /height:\s*52px/);
-  assert.match(css, /max-width:\s*760px/);
   assert.match(css, /Noto Sans SC/);
-  assert.match(css, /Noto Serif SC/);
+  assert.doesNotMatch(css, /Noto Serif SC/);
   assert.match(css, /Iosevka Fixed/);
   assert.match(css, /\.assistant-body\s*>\s*p/);
   assert.match(css, /\.assistant-body\s+code/);
@@ -254,19 +904,38 @@ test('styles implement fixed-shell Moonline tokens, type, motion and mobile shee
   assert.match(css, /@media\s*\(max-width:\s*600px\)/);
   assert.equal(/\.section-kicker|\.empty-kicker/.test(css), false, 'unused kicker styles must not remain');
   assert.equal(/\.turn\.assistant\s*\{[^}]*padding-right/.test(css), false, 'assistant turns must share one right edge with user turns');
-  assert.match(css, /\.composer-hint[^}]*font-size:\s*11px/s);
+  assert.match(css, /\.composer-hint[^}]*font-size:\s*var\(--luna-font-label\)/s);
   assert.match(css, /max-height:\s*92dvh/);
   assert.match(css, /prefers-reduced-motion:\s*reduce/);
   const reducedMotion = css.slice(css.indexOf('prefers-reduced-motion'));
   assert.equal(/transform:\s*none/.test(reducedMotion), false, 'reduced motion must not cancel the drawer transform');
-  assert.match(css, /\.luna-mark[^}]*width:\s*12px/s);
+  assert.match(css, /\.luna-mark[^}]*width:\s*24px/s);
   assert.equal(/gradient\s*\(/i.test(css), false, 'gradients are not allowed');
-  assert.equal(/box-shadow\s*:/i.test(css), false, 'ambient shadows are not allowed');
-  for (const match of css.matchAll(/border-radius:\s*([^;}]+)/gi)) {
-    for (const radius of match[1].trim().split(/\s+/)) {
-      assert.ok(['0', '4px', '8px', '12px'].includes(radius), `unsupported radius ${radius}`);
-    }
-  }
+  assert.match(css, /\.composer\s*\{[^}]*border-radius:\s*var\(--luna-radius-lg\)/s, '输入和发送在同一个有边界的容器中');
+  assert.match(css, /\.composer textarea\s*\{[^}]*border:\s*0/s);
+  assert.match(css, /\.session-row\s*\{[^}]*border:\s*0/s, '历史记录是列表行而不是卡片');
+  assert.match(css, /\.session-row\s*\{[^}]*height:\s*var\(--luna-row-h\)/s, '会话项是紧凑单行');
+  assert.match(css, /\.session-title\s*\{[^}]*text-overflow:\s*ellipsis/s, '过长标题省略而不是撑宽');
+  assert.match(css, /\.empty-moon\s*\{[^}]*width:\s*56px/s, '空状态图标是 illustration 尺寸，不是页面主体');
+  assert.doesNotMatch(css, /border-radius:\s*(?:1[0-9]|[2-9][0-9])px/, '圆角只来自尺度 token');
+  assert.doesNotMatch(css, /(?:^|\n)button\s*[{,:]/, '不为插件的任意原生按钮强加全局样式');
+});
+
+test('conversation header reflects the selected title while session rows hide technical metadata', async () => {
+  const h = navigationHarness({ hash: '#session=aaaaaaaa' });
+  await h.settle();
+  assert.ok(h.$('conversation-title'), '主标题显示当前会话而非品牌或运行状态');
+  assert.equal(h.$('conversation-title').textContent, '会话 A');
+  const button = h.$('session-list').querySelector('button');
+  assert.doesNotMatch(button.textContent, /aaaaaaaa|次运行|当前/);
+  assert.match(button.getAttribute('title'), /aaaaaaaa.*1 次运行/);
+  h.data.sessions.sessions[0].title = '新的标题';
+  button.focus();
+  await h.poll();
+  assert.equal(h.$('conversation-title').textContent, '新的标题');
+  assert.equal(h.document.activeElement, button);
+  await h.click('session-new');
+  assert.equal(h.$('conversation-title').textContent, '新会话');
 });
 
 test('frontend uses safe DOM APIs and includes interaction contracts', () => {
@@ -326,17 +995,28 @@ test('the current session travels in the URL hash and only a well formed id is u
   assert.equal(isSessionID(undefined), false);
 });
 
-test('session rows carry title, time and run count while the current one is marked', () => {
-  const { sessionRows } = require('./app.js');
+test('session rows carry title, relative time and run count while the current one is marked', () => {
+  const { sessionRows, relativeTime } = require('./app.js');
+  const now = Date.parse('2026-09-25T17:14:16+08:00');
   assert.deepEqual(sessionRows({
     sessions: [
       { id: '8f2a1c4d9e0b', title: '把这段文字改短', updated_at: '2026-09-23T17:14:16.123456789+08:00', run_count: 3 },
       { id: 'a1b2c3d4e5f6', title: '', updated_at: '', run_count: 0 }
     ]
-  }, '8f2a1c4d9e0b'), [
-    { id: '8f2a1c4d9e0b', shortId: '8f2a1c4d', title: '把这段文字改短', time: '2026-09-23 17:14', runs: '3 次运行', current: true },
+  }, '8f2a1c4d9e0b', now), [
+    { id: '8f2a1c4d9e0b', shortId: '8f2a1c4d', title: '把这段文字改短', time: '2 天前', runs: '3 次运行', current: true },
     { id: 'a1b2c3d4e5f6', shortId: 'a1b2c3d4', title: '未命名会话', time: '—', runs: '尚无运行', current: false }
   ]);
+
+  // 相对时间每一档都有界；无法解析的值和未来时间都不编造。
+  assert.equal(relativeTime('2026-09-25T17:13:46+08:00', now), '刚刚');
+  assert.equal(relativeTime('2026-09-25T17:09:16+08:00', now), '5 分钟前');
+  assert.equal(relativeTime('2026-09-25T14:14:16+08:00', now), '3 小时前');
+  assert.equal(relativeTime('2026-08-16T17:14:16+08:00', now), '1 个月前');
+  assert.equal(relativeTime('2025-07-25T17:14:16+08:00', now), '1 年前');
+  assert.equal(relativeTime('not-a-time', now), '—');
+  assert.equal(relativeTime('', now), '—');
+  assert.equal(relativeTime('2027-01-01T00:00:00+08:00', now), '刚刚', '未来时间不倒负');
 
   // No list, an unreadable list or entries without an id: nothing is invented.
   assert.deepEqual(sessionRows({ sessions: [] }, ''), []);
@@ -515,11 +1195,30 @@ test('a run carries the current session only when there is one', () => {
   assert.equal(runPayload('你好', undefined).message, '你好');
 });
 
-test('the drawer carries a 会话 section and the replay area without widening the transcript contract', () => {
+test('sessions and memory have independent navigation outside diagnostics', () => {
   const html = source('index.html');
-  assert.match(html, /<section class="drawer-section" aria-labelledby="sessions-title">/);
-  assert.match(html, /<h3 id="sessions-title">会话<\/h3>/);
-  assert.match(html, /id="session-new"[^>]*>新建会话<\/button>/);
+  const runtime = html.match(/<aside\b[^>]*id="runtime-drawer"[\s\S]*?<\/aside>/)?.[0];
+  const sessions = html.match(/<aside\b[^>]*id="session-sidebar"[\s\S]*?<\/aside>/)?.[0];
+  const memory = html.match(/<aside\b[^>]*id="memory-panel"[\s\S]*?<\/aside>/)?.[0];
+  assert.ok(sessions, '会话需要独立的侧栏，不能藏在运行详情内');
+  assert.ok(memory, '记忆需要独立面板');
+  assert.match(sessions, /id="session-new"/);
+  assert.match(sessions, /id="session-list"/);
+  assert.match(memory, /id="memory-list"/);
+  assert.doesNotMatch(runtime, /id="(?:session-new|session-list|memory-list)"/);
+  for (const [button, panel] of [['session-toggle', 'session-sidebar'], ['memory-toggle', 'memory-panel']]) {
+    assert.match(html, new RegExp(`id="${button}"[^>]*aria-controls="${panel}"`));
+  }
+  for (const id of ['session-new', 'session-list', 'memory-list', 'session-status', 'memory-status']) {
+    assert.equal([...html.matchAll(new RegExp(`id="${id}"`, 'g'))].length, 1, `${id} 只能有一个实例`);
+  }
+});
+
+test('the session surface keeps the replay area without widening the transcript contract', () => {
+  const html = source('index.html');
+  assert.match(html, /id="session-sidebar"[^>]*aria-labelledby="sessions-title"/);
+  assert.match(html, /<h2 id="sessions-title"[^>]*>会话<\/h2>/);
+  assert.match(html, /<button id="session-new"[\s\S]*?<svg class="ui-icon"[^>]*aria-hidden="true"[\s\S]*?<span>新建会话<\/span>\s*<\/button>/, '新建会话是带图标的动作控件');
   assert.match(html, /<ul id="session-list" class="session-list"><\/ul>/, 'the list is filled from the server, not from markup');
   assert.match(html, /id="sessions-empty"[^>]*hidden[^>]*>还没有历史会话。/);
   assert.match(html, /id="session-notices" class="session-notices" hidden/);
@@ -539,7 +1238,9 @@ test('the drawer carries a 会话 section and the replay area without widening t
 
 test('the front end keeps the session in the hash and reaches the DOM only through safe APIs', () => {
   const js = source('app.js');
-  assert.equal(js.includes('localStorage'), false, 'the current session must not be kept in browser storage');
+  // 浏览器本地只放界面偏好：主题、侧栏折叠、侧栏宽度。会话仍然只走 hash。
+  const storedKeys = new Set([...js.matchAll(/localStorage\.(?:getItem|setItem)\('([^']+)'/g)].map((match) => match[1]));
+  assert.deepEqual([...storedKeys].sort(), ['luna.sidebar', 'luna.sidebarWidth', 'luna.theme'], 'storage 只保存界面偏好，会话仍用 hash');
   assert.match(js, /location\.hash/);
   assert.match(js, /addEventListener\('hashchange'/);
   assert.match(js, /history\.replaceState/);
@@ -559,23 +1260,16 @@ test('the front end keeps the session in the hash and reaches the DOM only throu
 
 test('every session style the script builds a class for exists in the stylesheet', () => {
   const css = source('style.css');
-  const selectors = ['.session-new', '.session-list', '.session-row', '.session-row.is-current', '.session-title', '.session-meta', '.session-current', '.session-empty', '.session-status', '.session-notice', '.turn-note', '.assistant-body.failed', '.memory-list', '.memory-item', '.memory-text', '.memory-meta', '.memory-retract'];
+  const selectors = ['.session-new', '.session-list', '.session-row', '.session-row.is-current', '.session-title', '.session-meta', '.session-empty', '.session-status', '.session-notice', '.turn-note', '.assistant-body.failed', '.memory-list', '.memory-item', '.memory-text', '.memory-meta', '.memory-retract'];
   for (const selector of selectors) {
     assert.ok(
       [`${selector} {`, `${selector}:`, `${selector},`, `${selector}.`].some((form) => css.includes(form)),
       `missing style ${selector}`
     );
   }
-  // The new rules are inside the same budget the existing stylesheet test
-  // measures: no shadow, no gradient, and only the four allowed radii.
-  const added = css.slice(css.indexOf('/* Session list, replay notices'));
-  assert.equal(/box-shadow\s*:/i.test(added), false);
+  // 会话与记忆沿用语义主题，不用另一套装饰色。
+  const added = css.slice(css.indexOf('/* --- Sidebar'));
   assert.equal(/gradient\s*\(/i.test(added), false);
-  for (const match of added.matchAll(/border-radius:\s*([^;}]+)/gi)) {
-    for (const radius of match[1].trim().split(/\s+/)) {
-      assert.ok(['0', '4px', '8px', '12px'].includes(radius), `unsupported radius ${radius}`);
-    }
-  }
 });
 
 test('the UI plugin listing shows every plugin and never hides a skipped one', () => {
@@ -778,7 +1472,7 @@ test('the host interface handed to a plugin is narrow and frozen', () => {
   assert.equal(uiPluginHostAPI(undefined).version, '');
 });
 
-test('the drawer carries a 界面插件 section and imports a plugin only on a click', () => {
+test('the extensions panel carries a 界面插件 section and imports a plugin only on a click', () => {
   const html = source('index.html');
   const js = source('app.js');
   assert.match(html, /<section class="drawer-section" aria-labelledby="ui-plugins-title">/);
@@ -802,7 +1496,8 @@ test('the drawer carries a 界面插件 section and imports a plugin only on a c
   assert.match(js, /failUIPlugin\(node, target, uiPluginMissingExportError/, 'a missing export names itself');
   assert.match(js, /failUIPlugin\(node, target, uiPluginMountError/, 'a throwing mount names itself');
   assert.match(js, /fetch\('\/api\/ui-plugins'/);
-  assert.equal(js.includes('localStorage'), false, 'enable state is not persisted anywhere');
+  assert.doesNotMatch(js, /localStorage\.(?:getItem|setItem)\('(?!luna\.(?:theme|sidebar|sidebarWidth)')/,
+    '启用状态不持久化，只有界面偏好在浏览器本地');
   assert.equal(js.includes('sessionStorage'), false);
   assert.equal(js.includes('innerHTML'), false);
   assert.equal(js.includes('new Function'), false);
@@ -817,15 +1512,8 @@ test('every UI plugin style the script builds a class for exists in the styleshe
       `missing style ${selector}`
     );
   }
-  // The added rules stay inside the same budget the rest of the stylesheet is
-  // measured against: no shadow, no gradient, only the four allowed radii.
-  const added = css.slice(css.indexOf('/* Runtime UI plugins'), css.indexOf('.reload-status.failure'));
+  // 插件容器沿用语义主题，控件须显式使用 luna-* 类。
+  const added = css.slice(css.indexOf('/* --- 界面插件'), css.indexOf('/* --- 记忆与回放提示'));
   assert.ok(added.length > 0, 'the UI plugin block must be present');
-  assert.equal(/box-shadow\s*:/i.test(added), false);
   assert.equal(/gradient\s*\(/i.test(added), false);
-  for (const match of added.matchAll(/border-radius:\s*([^;}]+)/gi)) {
-    for (const radius of match[1].trim().split(/\s+/)) {
-      assert.ok(['0', '4px', '8px', '12px'].includes(radius), `unsupported radius ${radius}`);
-    }
-  }
 });
