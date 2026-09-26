@@ -15,17 +15,23 @@ as much part of the current version as its features are.
 | Version | What it contains |
 |---|---|
 | `v0.1.0` | the plugin kernel slice: subprocess tools, validated reload, drain and rollback. It shipped before this roadmap's slices and is no longer tracked here |
-| `v0.2.0` | S1–S5 below, plus the defects the first acceptance pass found |
+| `v0.2.0` | S1–S5 below, plus the defects the first acceptance pass found. Each slice's introducing commits are recorded in the scope table below |
 
 ## v0.2.0 scope
 
-| Slice | Content | Depends on | Status |
-|---|---|---|---|
-| S1 | A second tool plugin: bounded file reading | — | in `v0.2.0` |
-| S2 | Persistent sessions and run history | — | in `v0.2.0` |
-| S3 | Context and memory strategy | S2 | in `v0.2.0` |
-| S4 | Runtime UI plugin loading | — | in `v0.2.0` |
-| S5 | Memory you can see and retract | S3 | in `v0.2.0` |
+| Slice | Content | Depends on | Introduced by | Status |
+|---|---|---|---|---|
+| S1 | A second tool plugin: bounded file reading | — | `55a64e6` (core), `3372ce6` (web) | in `v0.2.0` |
+| S2 | Persistent sessions and run history | — | `60de6ff` (core), `85a441d` (web) | in `v0.2.0` |
+| S3 | Context and memory strategy | S2 | `6629806` (core) | in `v0.2.0` |
+| S4 | Runtime UI plugin loading | — | `5508cfb` (core), `edce312` (web) | in `v0.2.0` |
+| S5 | Memory you can see and retract | S3 | `c037517` (core), `99e321a` (web) | in `v0.2.0` |
+
+`v0.2.0` also carries the fixes the first acceptance pass produced: `6ed5315` (classify plugin
+infrastructure failures by sentinel), `f1839ed` (return a tool refusal to the model instead of ending
+the run) and `9b39721` (the memory copy claiming a fact can never be removed). `v0.1.0` shipped one
+plugin-backed tool — `text_transform`, from a flat `plugins/<candidate>/` layout — so
+`luna_read_file`, sessions, memory and runtime UI plugins are all `v0.2.0` additions.
 
 ### Slice acceptance
 
