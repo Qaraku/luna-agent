@@ -20,8 +20,8 @@ import (
 
 	"github.com/Qaraku/luna-agent/internal/agent"
 	"github.com/Qaraku/luna-agent/internal/fileread"
-	"github.com/Qaraku/luna-agent/internal/memory"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
+	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	"github.com/Qaraku/luna-agent/internal/store"
 	"github.com/Qaraku/luna-agent/internal/uiplugin"
 )

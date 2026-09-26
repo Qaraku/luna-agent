@@ -42,7 +42,7 @@ Eino 拥有内部的模型/工具循环。它是实现依赖，不是 Luna 的�
 
 ### 记忆
 
-`internal/memory` 拥有事实文件，是唯一接触它的包。记忆属于核心状态，不是扩展：核心打开这个 store，在每次运行时读取它，并注册写入它的宿主原生工具 `luna_remember`。模型可以追加事实，但没有读取、列出或撤回事实的工具。浏览器有自己的视图和一种移除事实的方式——`GET /api/memory` 与 `POST /api/memory/retract`，见下文——而这个界面既不能扩大模型的权限，也不能放宽 store 接受的内容。
+`internal/plugins/memory` 拥有事实文件，是唯一接触它的包。记忆属于核心状态，不是扩展：核心打开这个 store，在每次运行时读取它，并注册写入它的宿主原生工具 `luna_remember`。模型可以追加事实，但没有读取、列出或撤回事实的工具。浏览器有自己的视图和一种移除事实的方式——`GET /api/memory` 与 `POST /api/memory/retract`，见下文——而这个界面既不能扩大模型的权限，也不能放宽 store 接受的内容。
 
 一个记忆是一个仅追加的 JSONL 文件，由 `-memory-file` 指定，默认 `<root>/.runtime/memory.jsonl`，目录权限 `0700`、文件权限 `0600`。记录形状由 S3a 规格固定：`type`（始终为 `fact`）、`text`、`at`、`source_session`。与会话记录一样，这个形状没有插件身份字段，也没有凭据字段，因此两者都无法经由记忆进入模型上下文。`source_session` 记录哪个会话写入了一条事实；它属于存储记账，不展示给模型。一次写入同时会以它本来就是的 `tool_call` 记录落到会话记录中，因为每次工具调用都会如此，所以事实文本可以同时存在于两个文件里：只有记忆文件会被回读，而历史回放仍然只携带消息文本。
 
@@ -191,12 +191,12 @@ Eino 的 `ToolsNode` 配置为 `ExecuteSequentially: true`。如果一个模型�
   ├─ POST /api/runs ──> HTTP 守卫 + 会话解析 + 一次只运行一个任务的准入
   │                        └─ 60 秒运行上下文
   │                             └─ Eino ChatModelAgent
-  │                                  ├─ 系统提示词 <── 指令 + internal/memory 事实（带标注的参考数据）
+  │                                  ├─ 系统提示词 <── 指令 + internal/plugins/memory 事实（带标注的参考数据）
   │                                  ├─ 会话历史 <── internal/store（仅追加 JSONL）
   │                                  ├─ OpenAI 兼容 ChatModel
   │                                  ├─ luna_text_transform 包装器 ──> 固定的插件 generation，走 net/rpc
   │                                  ├─ luna_read_file 包装器 ──> 固定的插件 generation，走 net/rpc
-  │                                  └─ luna_remember（宿主原生）──> internal/memory（仅追加 JSONL）
+  │                                  └─ luna_remember（宿主原生）──> internal/plugins/memory（仅追加 JSONL）
   └─ SSE 事件 <──────── Luna 自有的运行局部事件出口
 
 浏览器 ── GET /api/sessions, GET /api/sessions/{id} ──> internal/store（只读）

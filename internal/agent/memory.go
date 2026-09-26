@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Qaraku/luna-agent/internal/memory"
+	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"

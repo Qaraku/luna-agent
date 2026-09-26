@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Qaraku/luna-agent/internal/memory"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
+	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 )

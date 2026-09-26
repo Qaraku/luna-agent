@@ -20,7 +20,7 @@ flowchart LR
         API["internal/httpapi<br/>loopback HTTP + SSE"]
         Agent["internal/agent<br/>Eino ChatModelAgent"]
         PH["internal/pluginhost<br/>per-tool generation pinning"]
-        Mem["internal/memory<br/>append-only facts"]
+        Mem["internal/plugins/memory<br/>append-only facts"]
         Store["internal/store<br/>append-only sessions"]
         UIP["internal/uiplugin<br/>UI plugin listing + file serving"]
     end
@@ -204,7 +204,7 @@ The session change re-ran those same gates and nothing more. No server and no mo
 
 The runtime UI plugin change re-ran those same gates and nothing more. No server, no model provider and no browser were run for it either, so the plugin listing, the file serving, the mount/unmount cycle and the host-side teardown are not claimed as end-to-end verified.
 
-最初的记忆后端改动由确定性检查覆盖，包括 `internal/memory` 包和 `internal/agent` 中的记忆路径测试；当时没有运行服务、真实模型或浏览器，因此没有验证真实崩溃下的文件行为、真实模型请求中的注入或真实运行中的记忆事件。当前界面已支持通过页头“记忆”入口查看与撤回事实，但不支持新增或编辑。记忆工具仍属于宿主，不出现在 `/api/state` 或 `/healthz` 的插件就绪要求中。
+最初的记忆后端改动由确定性检查覆盖，包括 `internal/plugins/memory` 包和 `internal/agent` 中的记忆路径测试；当时没有运行服务、真实模型或浏览器，因此没有验证真实崩溃下的文件行为、真实模型请求中的注入或真实运行中的记忆事件。当前界面已支持通过页头“记忆”入口查看与撤回事实，但不支持新增或编辑。记忆工具仍属于宿主，不出现在 `/api/state` 或 `/healthz` 的插件就绪要求中。
 
 The tool-refusal change is covered by the same gates on this tree, and no provider was called for it. It came out of a user-run acceptance pass, where asking for a file that is not there ended the whole run with the host's raw error and no answer at all, and the message a missing file produced read as an internal phrase rather than a reason. A refusal is now the call's result, so the run continues and the model explains it; an infrastructure failure still ends the run. Each half was also checked from the defect side, by restoring the previous behaviour in a copy of the tree and confirming the new tests fail there.
 

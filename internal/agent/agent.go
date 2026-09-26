@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/Qaraku/luna-agent/internal/config"
-	"github.com/Qaraku/luna-agent/internal/memory"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
+	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	"github.com/Qaraku/luna-agent/internal/store"
 	"github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/adk"

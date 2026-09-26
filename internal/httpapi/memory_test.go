@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Qaraku/luna-agent/internal/memory"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
+	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 )
 
 // memoryFactJSON is one fact as the browser sees it. The stored record type is
