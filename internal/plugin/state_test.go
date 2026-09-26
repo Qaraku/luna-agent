@@ -6,46 +6,32 @@ import (
 	"testing"
 )
 
-func TestStateDirResolvesTheClaimedNamespace(t *testing.T) {
-	reg := NewRegistry()
-	p := barePlugin{d: withClaims(desc("memory", DeploymentBuiltin), Claim{Kind: ClaimStateNamespace, ID: ".runtime"})}
-	if err := reg.Register(p); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-	got, err := reg.StateDir("memory", "/repo")
+func TestStateDirForResolvesTheClaimedNamespace(t *testing.T) {
+	d := withClaims(desc("memory", DeploymentBuiltin), Claim{Kind: ClaimStateNamespace, ID: ".runtime"})
+	got, err := StateDirFor(d, "/repo")
 	if err != nil {
-		t.Fatalf("StateDir: %v", err)
+		t.Fatalf("StateDirFor: %v", err)
 	}
 	if want := filepath.Join("/repo", ".runtime"); got != want {
-		t.Fatalf("StateDir = %q, want %q", got, want)
+		t.Fatalf("StateDirFor = %q, want %q", got, want)
 	}
 }
 
-func TestStateDirErrors(t *testing.T) {
-	reg := NewRegistry()
-	if err := reg.Register(barePlugin{d: desc("plain", DeploymentBuiltin)}); err != nil {
-		t.Fatal(err)
-	}
-	if err := reg.Register(barePlugin{d: withClaims(desc("memory", DeploymentBuiltin),
-		Claim{Kind: ClaimStateNamespace, ID: ".runtime"})}); err != nil {
-		t.Fatal(err)
-	}
-
+func TestStateDirForErrors(t *testing.T) {
 	cases := []struct {
 		name    string
-		id      string
+		d       Descriptor
 		root    string
 		wantErr string
 	}{
-		{"unknown plugin", "ghost", "/repo", "is not registered"},
-		{"plugin without a state namespace", "plain", "/repo", "claims no state namespace"},
-		{"relative state root", "memory", "repo", "must be absolute"},
+		{"no state namespace claimed", desc("plain", DeploymentBuiltin), "/repo", "claims no state namespace"},
+		{"relative state root", withClaims(desc("memory", DeploymentBuiltin), Claim{Kind: ClaimStateNamespace, ID: ".runtime"}), "repo", "must be absolute"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := reg.StateDir(tc.id, tc.root)
+			got, err := StateDirFor(tc.d, tc.root)
 			if err == nil {
-				t.Fatalf("StateDir = %q, want an error", got)
+				t.Fatalf("StateDirFor = %q, want an error", got)
 			}
 			if !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("err = %v, want it to name %q", err, tc.wantErr)
@@ -60,8 +46,8 @@ func TestContextContributionIdsAreNotGlobal(t *testing.T) {
 	reg := NewRegistry()
 	mk := func(id string) contextPlugin {
 		return contextPlugin{
-			d:    withContrib(desc(id, DeploymentBuiltin), Contribution{Kind: ContributionContext, ID: "facts"}),
-			list: []ContextBlock{{ID: "facts", Kind: ContextReference, Text: id}},
+			d:    withContrib(desc(id, DeploymentBuiltin), Contribution{Kind: ContributionContext, ID: "notes"}),
+			list: []ContextBlock{{ID: "notes", Kind: ContextReference, Text: id}},
 		}
 	}
 	if err := reg.Register(mk("first")); err != nil {

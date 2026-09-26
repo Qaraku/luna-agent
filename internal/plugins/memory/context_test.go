@@ -16,7 +16,7 @@ import (
 // newContextPlugin is a real plugin over a real store in a temporary directory.
 func newContextPlugin(t *testing.T) (*Plugin, *Store) {
 	t.Helper()
-	p, err := New(filepath.Join(t.TempDir(), ".runtime", "memory.jsonl"))
+	p, err := New(filepath.Join(t.TempDir(), ".runtime"))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestContextReadFailureReturnsAnError(t *testing.T) {
 	if err := os.WriteFile(path, []byte("not json\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	p, err := New(path)
+	p, err := New(dir)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -261,8 +261,8 @@ func TestSelectFactsKeepsAChronologicalSuffix(t *testing.T) {
 // The store is read on every call, and a restarted plugin reads the same file
 // back: a fact written by the tool reaches the next context read.
 func TestAFactStoredByTheToolReachesTheNextContextRead(t *testing.T) {
-	path := filepath.Join(t.TempDir(), ".runtime", "memory.jsonl")
-	p, err := New(path)
+	dir := filepath.Join(t.TempDir(), ".runtime")
+	p, err := New(dir)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -273,7 +273,7 @@ func TestAFactStoredByTheToolReachesTheNextContextRead(t *testing.T) {
 		t.Fatalf("the fact written in this round is not injectable: %q", got)
 	}
 
-	restarted, err := New(path)
+	restarted, err := New(dir)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

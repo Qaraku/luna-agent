@@ -1,6 +1,8 @@
 package memory
 
 import (
+	"path/filepath"
+
 	"github.com/Qaraku/luna-agent/internal/plugin"
 )
 
@@ -33,6 +35,11 @@ const (
 	// root and the plugin's own file inside it keeps the name memory.jsonl, so
 	// the default data path does not change and no migration is needed.
 	stateNamespace = ".runtime"
+
+	// stateFileName is the file this package keeps inside its state directory.
+	// Only this package names it; the Kernel hands over a directory and never
+	// learns what is in it.
+	stateFileName = "memory.jsonl"
 )
 
 // Plugin is the official Memory contribution: one write-only tool, one injected
@@ -49,21 +56,28 @@ type Plugin struct {
 	tool  *RememberTool
 }
 
-// New opens the durable fact file at path and wires the plugin to it. Only
-// Open's failure (an empty path, an unusable directory) can fail here: the file
-// itself is created by the first write.
-func New(path string) (*Plugin, error) {
-	store, err := Open(path)
+// New opens the capability's fact file inside stateDir and wires the plugin to
+// it. stateDir is the directory the Kernel resolved from this capability's
+// state namespace; the file name inside it belongs to this package.
+//
+// Only Open's failure (an empty path, an unusable directory) can fail here: the
+// file itself is created by the first write.
+func New(stateDir string) (*Plugin, error) {
+	store, err := Open(filepath.Join(stateDir, stateFileName))
 	if err != nil {
 		return nil, err
 	}
 	return &Plugin{store: store, tool: NewRememberTool(store)}, nil
 }
 
-// Descriptor declares exactly what the plugin exposes. The registry checks both
-// directions, so this has to stay in step with Tools, Contexts and Routes: a
-// declared tool or route that is never exposed fails registration.
-func (p *Plugin) Descriptor() plugin.Descriptor {
+// Descriptor declares exactly what the Memory capability exposes. The registry
+// checks both directions, so this has to stay in step with Tools, Contexts and
+// Routes: a declared tool or route that is never exposed fails registration.
+//
+// It is a package-level function as well as a method because the Kernel needs it
+// before it can build the plugin: resolving the state directory happens first,
+// and a capability whose store lives on disk cannot be constructed without it.
+func Descriptor() plugin.Descriptor {
 	return plugin.Descriptor{
 		ID:         PluginID,
 		Title:      PluginTitle,
@@ -85,6 +99,9 @@ func (p *Plugin) Descriptor() plugin.Descriptor {
 		},
 	}
 }
+
+// Descriptor implements plugin.Plugin.
+func (p *Plugin) Descriptor() plugin.Descriptor { return Descriptor() }
 
 // Tools returns the model-visible surface: exactly luna_remember, append only.
 func (p *Plugin) Tools() []plugin.Tool {

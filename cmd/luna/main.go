@@ -18,6 +18,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/agent"
 	"github.com/Qaraku/luna-agent/internal/config"
 	"github.com/Qaraku/luna-agent/internal/httpapi"
+	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	"github.com/Qaraku/luna-agent/internal/store"
@@ -99,14 +100,16 @@ func sessionsDir(root, explicit string) string {
 	return filepath.Join(root, ".runtime", "sessions")
 }
 
-// memoryFile resolves the append-only memory file, the same way: an explicit
-// path wins, otherwise the file lives under the resolved root next to the
-// sessions.
-func memoryFile(root, explicit string) string {
+// stateRoot resolves where capabilities keep their state: an explicit directory
+// wins, otherwise state lives under the resolved root next to the sessions. A
+// capability then claims a namespace inside it, and the kernel resolves that
+// claim to a directory — never to a file, because which file a capability keeps
+// is its own business.
+func stateRoot(root, explicit string) string {
 	if explicit != "" {
 		return explicit
 	}
-	return filepath.Join(root, ".runtime", "memory.jsonl")
+	return root
 }
 
 // uiPluginsDir resolves the runtime UI plugin directory. It always lives under
@@ -122,7 +125,7 @@ func run() error {
 	readRoot := flag.String("read-root", "", "directory luna_read_file may read inside (default: the resolved root)")
 	readLimit := flag.Int("read-limit", 0, "single-read cap in bytes for luna_read_file (default: 262144)")
 	sessionsFlag := flag.String("sessions-dir", "", "directory holding the append-only session files (default: <root>/.runtime/sessions/)")
-	memoryFlag := flag.String("memory-file", "", "file holding the append-only memory facts (default: <root>/.runtime/memory.jsonl)")
+	stateFlag := flag.String("state-dir", "", "root directory holding capability state (default: <root>)")
 	flag.Parse()
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
@@ -140,11 +143,23 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("open session store: %w", err)
 	}
-	// Memory is core state, not a plugin: the tool that writes it and the
-	// injection that reads it both live in the core, backed by this file.
-	facts, err := memory.Open(memoryFile(root, *memoryFlag))
+	// Capabilities are the product surface; the kernel owns what runs them. The
+	// Memory capability is the first one: a built-in plugin whose state file
+	// lives where it always has, so no stored data moves.
+	registry := plugin.NewRegistry(plugin.PermissionStateWrite)
+	memoryDir, err := plugin.StateDirFor(memory.Descriptor(), stateRoot(root, *stateFlag))
+	if err != nil {
+		return fmt.Errorf("resolve memory state directory: %w", err)
+	}
+	facts, err := memory.New(memoryDir)
 	if err != nil {
 		return fmt.Errorf("open memory store: %w", err)
+	}
+	if err := registry.Register(facts); err != nil {
+		return fmt.Errorf("register memory capability: %w", err)
+	}
+	if err := registry.Enable(memory.PluginID); err != nil {
+		return fmt.Errorf("enable memory capability: %w", err)
 	}
 	listener, err := httpapi.Listen(*addr)
 	if err != nil {
@@ -160,15 +175,14 @@ func run() error {
 	}
 	defer plugins.Close()
 	// The store is both sides of the conversation: history is read from it and
-	// the transcript of every run is appended to it. The same pattern holds for
-	// memory, whose read side is the system prompt and whose write side is the
-	// host-native luna_remember tool.
-	runner, err := agent.NewOpenAIRunner(ctx, cfg, plugins, plugins, agent.WithHistory(sessions), agent.WithTranscript(sessions), agent.WithMemory(facts))
+	// the transcript of every run is appended to it. Capabilities are assembled
+	// from the registry, which is what makes them capabilities rather than core.
+	runner, err := agent.NewOpenAIRunner(ctx, cfg, plugins, plugins, agent.WithHistory(sessions), agent.WithTranscript(sessions), agent.WithCapabilities(registry))
 	if err != nil {
 		return fmt.Errorf("construct Eino agent: %w", err)
 	}
 	bound := listener.Addr().String()
-	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithMemory(facts))
+	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry))
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: 70 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() {

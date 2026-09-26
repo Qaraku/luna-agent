@@ -20,8 +20,8 @@ import (
 
 	"github.com/Qaraku/luna-agent/internal/agent"
 	"github.com/Qaraku/luna-agent/internal/fileread"
+	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
-	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	"github.com/Qaraku/luna-agent/internal/store"
 	"github.com/Qaraku/luna-agent/internal/uiplugin"
 )
@@ -72,7 +72,11 @@ type State struct {
 	// S2a and changes no existing field's meaning.
 	CurrentSessionID string           `json:"current_session_id,omitempty"`
 	Events           []LifecycleEvent `json:"events"`
-	Demo             bool             `json:"demo"`
+	// Capabilities is what each registered capability declares and whether it is
+	// in service. It carries none of the capability's own data: what a capability
+	// stores is its own business, and the kernel has no view of it.
+	Capabilities []capabilityView `json:"capabilities"`
+	Demo         bool             `json:"demo"`
 }
 
 // sessionSummary is the frozen list shape of GET /api/sessions.
@@ -116,35 +120,27 @@ func pluginsReady(records []pluginhost.Record) bool {
 
 var runTimeout = 60 * time.Second
 
-// Memory is the durable fact store as the browser may use it: read the facts in
-// effect and retract one. There is deliberately no write path here — a fact is
-// authored by the model through luna_remember — and nothing here can widen the
-// model's own rights, which stay write-only.
-type Memory interface {
-	Snapshot() (memory.Snapshot, error)
-	Retract(at time.Time, text string) (memory.Retracted, error)
-}
-
 // Option configures what a Server can reach.
 type Option func(*Server)
 
-// WithMemory supplies the fact store behind /api/memory.
-func WithMemory(m Memory) Option { return func(s *Server) { s.memory = m } }
+// WithCapabilities supplies the registry the server asks about capabilities:
+// which routes they serve, which state they are in, and how to change it.
+func WithCapabilities(reg *plugin.Registry) Option { return func(s *Server) { s.capabilities = reg } }
 
 type Server struct {
-	plugins   PluginManager
-	runner    Runner
-	sessions  Sessions
-	memory    Memory
-	info      Info
-	started   time.Time
-	runMu     sync.Mutex
-	busy      bool
-	runID     string
-	sessionID string
-	eventMu   sync.Mutex
-	events    []LifecycleEvent
-	connected atomic.Bool
+	plugins      PluginManager
+	runner       Runner
+	sessions     Sessions
+	capabilities *plugin.Registry
+	info         Info
+	started      time.Time
+	runMu        sync.Mutex
+	busy         bool
+	runID        string
+	sessionID    string
+	eventMu      sync.Mutex
+	events       []LifecycleEvent
+	connected    atomic.Bool
 }
 
 func Listen(addr string) (net.Listener, error) {
@@ -208,7 +204,7 @@ func (s *Server) state() State {
 	s.eventMu.Lock()
 	events := append([]LifecycleEvent{}, s.events...)
 	s.eventMu.Unlock()
-	return State{HostPID: os.Getpid(), StartedAt: s.started, Model: s.info.Model, ProviderHost: s.info.ProviderHost, ModelConfigured: s.info.Model != "" && s.info.ProviderHost != "", ModelConnected: s.connected.Load(), Plugins: ps.Plugins, Busy: busy, CurrentRunID: id, CurrentSessionID: sessionID, Events: events, Demo: true}
+	return State{HostPID: os.Getpid(), StartedAt: s.started, Model: s.info.Model, ProviderHost: s.info.ProviderHost, ModelConfigured: s.info.Model != "" && s.info.ProviderHost != "", ModelConnected: s.connected.Load(), Plugins: ps.Plugins, Busy: busy, CurrentRunID: id, CurrentSessionID: sessionID, Events: events, Capabilities: capabilityViews(s.capabilities), Demo: true}
 }
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -218,8 +214,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(w, 403, fmt.Errorf("Host must match bound address %s", s.info.BoundHost))
 		return
 	}
-	mutation := r.URL.Path == "/api/reload" || r.URL.Path == "/api/runs" || r.URL.Path == "/api/memory/retract"
-	if mutation {
+	if s.requiresOrigin(r.Method, r.URL.Path) {
 		origins, ok := r.Header["Origin"]
 		if !ok || len(origins) != 1 || origins[0] != "http://"+s.info.BoundHost {
 			fail(w, 403, fmt.Errorf("missing, null or foreign Origin rejected"))
@@ -263,18 +258,6 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.listUIPlugins(w)
-	case "/api/memory":
-		if r.Method != http.MethodGet {
-			method(w, http.MethodGet)
-			return
-		}
-		s.listMemory(w)
-	case "/api/memory/retract":
-		if r.Method != http.MethodPost {
-			method(w, http.MethodPost)
-			return
-		}
-		s.retractMemory(w, r)
 	case "/api/runs":
 		if r.Method != http.MethodPost {
 			method(w, http.MethodPost)
@@ -288,6 +271,14 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.static(w, r)
 	default:
+		if id, action, ok := pluginStatePath(r.URL.Path); ok {
+			if r.Method != http.MethodPost {
+				method(w, http.MethodPost)
+				return
+			}
+			s.setPluginState(w, id, action)
+			return
+		}
 		if id, ok := sessionPathID(r.URL.Path); ok {
 			if r.Method != http.MethodGet {
 				method(w, http.MethodGet)
@@ -304,96 +295,16 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			s.serveUIPluginFile(w, name, file)
 			return
 		}
+		route, allowed, known := s.capabilityRoute(r.Method, r.URL.Path)
+		switch {
+		case route != nil:
+			route.ServeHTTP(w, r)
+			return
+		case known:
+			method(w, allowed)
+			return
+		}
 		http.NotFound(w, r)
-	}
-}
-
-// memoryFact is one fact as the browser sees it. The stored record type is not
-// part of this contract: everything in facts is a fact.
-type memoryFact struct {
-	Text          string    `json:"text"`
-	At            time.Time `json:"at"`
-	SourceSession string    `json:"source_session"`
-}
-
-// memoryRetractedFact is a fact that is no longer in effect, with when it was
-// retracted.
-type memoryRetractedFact struct {
-	Text        string    `json:"text"`
-	At          time.Time `json:"at"`
-	RetractedAt time.Time `json:"retracted_at"`
-}
-
-type memoryView struct {
-	Facts     []memoryFact          `json:"facts"`
-	Retracted []memoryRetractedFact `json:"retracted"`
-}
-
-// listMemory reports what the durable memory holds. This is the user's view of
-// their own store: the model has no equivalent, because memory reaches it only
-// through the labelled injection.
-func (s *Server) listMemory(w http.ResponseWriter) {
-	if s.memory == nil {
-		fail(w, 500, fmt.Errorf("memory is not configured"))
-		return
-	}
-	snapshot, err := s.memory.Snapshot()
-	if err != nil {
-		fail(w, 500, err)
-		return
-	}
-	view := memoryView{Facts: make([]memoryFact, 0, len(snapshot.Facts)), Retracted: make([]memoryRetractedFact, 0, len(snapshot.Retracted))}
-	for _, fact := range snapshot.Facts {
-		view.Facts = append(view.Facts, memoryFact{Text: fact.Text, At: fact.At, SourceSession: fact.SourceSession})
-	}
-	for _, gone := range snapshot.Retracted {
-		view.Retracted = append(view.Retracted, memoryRetractedFact{Text: gone.Fact.Text, At: gone.Fact.At, RetractedAt: gone.RetractedAt})
-	}
-	send(w, 200, view)
-}
-
-// retractMemory takes one fact out of the effective set. The fact is named by
-// its text and its timestamp together, so a retraction can only remove the fact
-// it was made about, and a fact that is not in effect is a 404 rather than a
-// silent success.
-func (s *Server) retractMemory(w http.ResponseWriter, r *http.Request) {
-	if s.memory == nil {
-		fail(w, 500, fmt.Errorf("memory is not configured"))
-		return
-	}
-	var req struct {
-		At   string `json:"at"`
-		Text string `json:"text"`
-	}
-	if !decode(w, r, &req) {
-		return
-	}
-	at, err := time.Parse(time.RFC3339Nano, req.At)
-	if err != nil {
-		fail(w, 400, fmt.Errorf("at must be an RFC3339 timestamp"))
-		return
-	}
-	if strings.TrimSpace(req.Text) == "" {
-		fail(w, 400, fmt.Errorf("text is required"))
-		return
-	}
-	gone, err := s.memory.Retract(at, req.Text)
-	if err != nil {
-		fail(w, memoryStatus(err), err)
-		return
-	}
-	send(w, 200, map[string]any{"retracted": memoryRetractedFact{Text: gone.Fact.Text, At: gone.Fact.At, RetractedAt: gone.RetractedAt}})
-}
-
-// memoryStatus maps a store failure onto the HTTP status: retracting a fact that
-// is not in effect is the caller's mistake, a memory file that cannot be read is
-// the server's.
-func memoryStatus(err error) int {
-	switch {
-	case errors.Is(err, memory.ErrUnknownFact):
-		return 404
-	default:
-		return 500
 	}
 }
 

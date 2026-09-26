@@ -233,7 +233,7 @@ func TestRememberWithoutRunIdentityStoresAnEmptySource(t *testing.T) {
 }
 
 func TestTheToolIsBoundToThePluginDescriptor(t *testing.T) {
-	p, err := New(filepath.Join(t.TempDir(), ".runtime", "memory.jsonl"))
+	p, err := New(filepath.Join(t.TempDir(), ".runtime"))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

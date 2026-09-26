@@ -353,10 +353,13 @@ func validatePermissions(d Descriptor, grants map[PermissionKind]bool) error {
 	return nil
 }
 
-// checkConsistency 校验声明与实现一致：实现了某个可选接口就必须声明至少一个对应
-// 贡献项，声明了某类贡献却没有实现对应接口同样报错。暴露与声明的对应关系分两种：
-// 工具、路由与面板的返回值在运行期是固定的，因此要求双向一致（声明了就必须暴露）；
-// ContextProvider 按运行态取内容，声明项是它可能贡献的上限，因此只要求暴露项都有声明。
+// checkConsistency 校验声明与暴露一致：暴露了什么就必须声明什么，声明了就必须
+// 真的暴露。实现一个返回空集的可选接口不是错误——那个能力只是没有可贡献的东西；
+// 出错的是两者对不上。
+//
+// 两个方向并不对称：工具、路由与面板的返回值在运行期是固定的，因此声明了就必须
+// 暴露；ContextProvider 按运行态取内容，声明项是它可能贡献的上限，所以允许只暴露
+// 其中一部分（甚至可以一轮什么都不贡献）。
 func checkConsistency(p Plugin, d Descriptor) error {
 	declared := func(kind ContributionKind) map[string]bool {
 		ids := make(map[string]bool)
@@ -370,9 +373,6 @@ func checkConsistency(p Plugin, d Descriptor) error {
 
 	if tp, ok := p.(ToolProvider); ok {
 		ids := declared(ContributionTool)
-		if len(ids) == 0 {
-			return fmt.Errorf("plugin %q implements ToolProvider but declares no tool contribution", d.ID)
-		}
 		exposed := make(map[string]bool)
 		for _, t := range tp.Tools() {
 			name := t.Name()
@@ -390,9 +390,6 @@ func checkConsistency(p Plugin, d Descriptor) error {
 
 	if cp, ok := p.(ContextProvider); ok {
 		ids := declared(ContributionContext)
-		if len(ids) == 0 {
-			return fmt.Errorf("plugin %q implements ContextProvider but declares no context contribution", d.ID)
-		}
 		blocks, err := cp.Contexts(context.Background())
 		if err != nil {
 			return fmt.Errorf("plugin %q failed to list contexts: %w", d.ID, err)
@@ -408,9 +405,6 @@ func checkConsistency(p Plugin, d Descriptor) error {
 
 	if rp, ok := p.(RouteProvider); ok {
 		ids := declared(ContributionRoute)
-		if len(ids) == 0 {
-			return fmt.Errorf("plugin %q implements RouteProvider but declares no route contribution", d.ID)
-		}
 		exposed := make(map[string]bool)
 		for _, route := range rp.Routes() {
 			path := route.Path()
@@ -428,9 +422,6 @@ func checkConsistency(p Plugin, d Descriptor) error {
 
 	if pp, ok := p.(PanelProvider); ok {
 		ids := declared(ContributionPanel)
-		if len(ids) == 0 {
-			return fmt.Errorf("plugin %q implements PanelProvider but declares no panel contribution", d.ID)
-		}
 		exposed := make(map[string]bool)
 		for _, panel := range pp.Panels() {
 			if !ids[panel.ID] {

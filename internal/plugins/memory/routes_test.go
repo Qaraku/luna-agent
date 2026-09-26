@@ -17,7 +17,7 @@ import (
 // so the routes are exercised through their real implementation.
 func newRoutePlugin(t *testing.T) (*Plugin, *Store) {
 	t.Helper()
-	p, err := New(filepath.Join(t.TempDir(), ".runtime", "memory.jsonl"))
+	p, err := New(filepath.Join(t.TempDir(), ".runtime"))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestMemoryRouteReportsACorruptStoreWithoutAHostPath(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{\"type\":\"fact\",\"text\":\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	p, err := New(path)
+	p, err := New(dir)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

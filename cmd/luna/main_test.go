@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Qaraku/luna-agent/internal/plugin"
+	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 )
 
 func TestRootFromExecutableRuntimeBinary(t *testing.T) {
@@ -210,27 +213,35 @@ func TestSessionsDirPrefersExplicitValue(t *testing.T) {
 	}
 }
 
-func TestMemoryFileDefaultsUnderRoot(t *testing.T) {
-	got := memoryFile("/repo", "")
-	want := filepath.Join("/repo", ".runtime", "memory.jsonl")
+func TestStateRootDefaultsToTheResolvedRoot(t *testing.T) {
+	got := stateRoot("/repo", "")
+	want := "/repo"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
-func TestMemoryFilePrefersExplicitValue(t *testing.T) {
-	got := memoryFile("/repo", "/elsewhere/memory.jsonl")
-	if got != "/elsewhere/memory.jsonl" {
+func TestStateRootPrefersExplicitValue(t *testing.T) {
+	got := stateRoot("/repo", "/elsewhere/state")
+	if got != "/elsewhere/state" {
 		t.Fatalf("got %q, want the explicit value", got)
 	}
 }
 
-// The default memory file sits next to the session directory, both under the
-// git-ignored .runtime/, so neither is a repository artifact.
-func TestMemoryAndSessionsShareTheRuntimeDirectory(t *testing.T) {
+// The capability's state namespace resolves next to the session directory, both
+// under the git-ignored .runtime/, so neither is a repository artifact — and the
+// default memory file keeps the path it always had.
+func TestCapabilityStateResolvesNextToTheSessions(t *testing.T) {
 	root := "/repo"
-	if filepath.Dir(memoryFile(root, "")) != filepath.Dir(sessionsDir(root, "")) {
-		t.Fatalf("memory %q and sessions %q do not share a directory", memoryFile(root, ""), sessionsDir(root, ""))
+	dir, err := plugin.StateDirFor(memory.Descriptor(), stateRoot(root, ""))
+	if err != nil {
+		t.Fatalf("StateDirFor: %v", err)
+	}
+	if want := filepath.Join(root, ".runtime"); dir != want {
+		t.Fatalf("capability state dir = %q, want %q", dir, want)
+	}
+	if filepath.Dir(sessionsDir(root, "")) != dir {
+		t.Fatalf("capability state %q and sessions %q do not share a directory", dir, sessionsDir(root, ""))
 	}
 }
 

@@ -11,7 +11,7 @@ import (
 // newPluginForRegistry is the plugin under a fresh temporary state file.
 func newPluginForRegistry(t *testing.T) *Plugin {
 	t.Helper()
-	p, err := New(filepath.Join(t.TempDir(), ".runtime", "memory.jsonl"))
+	p, err := New(filepath.Join(t.TempDir(), ".runtime"))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

@@ -138,6 +138,12 @@ func TestRegisterAccepts(t *testing.T) {
 			p:    barePlugin{d: desc("luna-tool-2", DeploymentBuiltin)},
 		},
 		{
+			// 实现一个返回空集的可选接口不是错误：这个能力只是没有可贡献的
+			// 东西，描述符里也就没有对应声明。出错的是声明与暴露对不上。
+			name: "provider that exposes nothing and declares nothing",
+			p:    toolPlugin{d: desc("empty", DeploymentBuiltin)},
+		},
+		{
 			name: "process deployment registers",
 			p:    barePlugin{d: desc("luna-process", DeploymentProcess)},
 		},
@@ -323,14 +329,6 @@ func TestRegisterRejects(t *testing.T) {
 			wantErr: `unknown contribution kind "hook"`,
 		},
 		{
-			name: "tool provider without a tool contribution",
-			target: toolPlugin{
-				d:     desc("luna", DeploymentBuiltin),
-				tools: []Tool{fakeTool{name: "echo"}},
-			},
-			wantErr: "implements ToolProvider but declares no tool contribution",
-		},
-		{
 			name: "tool exposed without a matching contribution",
 			target: toolPlugin{
 				d:     withContrib(desc("luna", DeploymentBuiltin), Contribution{Kind: ContributionTool, ID: "echo"}),
@@ -342,14 +340,6 @@ func TestRegisterRejects(t *testing.T) {
 			name:    "tool contribution without a ToolProvider implementation",
 			target:  barePlugin{d: withContrib(desc("luna", DeploymentBuiltin), Contribution{Kind: ContributionTool, ID: "echo"})},
 			wantErr: "declares tool contributions but does not implement ToolProvider",
-		},
-		{
-			name: "context provider without a context contribution",
-			target: contextPlugin{
-				d:    desc("luna", DeploymentBuiltin),
-				list: []ContextBlock{{ID: "docs", Kind: ContextReference}},
-			},
-			wantErr: "implements ContextProvider but declares no context contribution",
 		},
 		{
 			name: "context exposed without a matching contribution",
@@ -373,14 +363,6 @@ func TestRegisterRejects(t *testing.T) {
 			wantErr: "failed to list contexts",
 		},
 		{
-			name: "route provider without a route contribution",
-			target: routePlugin{
-				d:      desc("luna", DeploymentBuiltin),
-				routes: []Route{fakeRoute{method: http.MethodGet, path: "/api/luna"}},
-			},
-			wantErr: "implements RouteProvider but declares no route contribution",
-		},
-		{
 			name: "route exposed without a matching contribution",
 			target: routePlugin{
 				d:      withContrib(desc("luna", DeploymentBuiltin), Contribution{Kind: ContributionRoute, ID: "/api/luna/other"}),
@@ -392,14 +374,6 @@ func TestRegisterRejects(t *testing.T) {
 			name:    "route contribution without a RouteProvider implementation",
 			target:  barePlugin{d: withContrib(desc("luna", DeploymentBuiltin), Contribution{Kind: ContributionRoute, ID: "/api/luna"})},
 			wantErr: "declares route contributions but does not implement RouteProvider",
-		},
-		{
-			name: "panel provider without a panel contribution",
-			target: panelPlugin{
-				d:      desc("luna", DeploymentBuiltin),
-				panels: []Panel{{ID: "memory"}},
-			},
-			wantErr: "implements PanelProvider but declares no panel contribution",
 		},
 		{
 			name: "panel exposed without a matching contribution",
