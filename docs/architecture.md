@@ -141,11 +141,36 @@ The static root `web/` application is a client, not an authority. It:
 - keeps run and reload busy states separate;
 - uses DOM APIs and `textContent`, with no remote assets and no hidden-reasoning view.
 
-The session API has a front end: the runtime drawer lists sessions newest first, switching one replays its records into the transcript, and a new-session control clears the conversation. The current session id travels in the location fragment as `#session=<id>`, so a refresh resumes the same conversation without the server holding a cookie.
+会话入口独立于运行详情：桌面左侧常驻列表，窄屏由页头“会话”按钮打开模态侧栏。列表按最近更新排序，“新建会话”清空当前对话，选中历史会话后回放记录；窄屏完成选择即关闭侧栏。当前会话仍通过地址片段 `#session=<id>` 保存，刷新可恢复，不新增 cookie 或浏览器端会话存储。运行或回放期间继续禁止切换会话。
 
-Memory has a front end of exactly one kind: a read-only list and a retraction. `web/` may show a stored fact and remove one, and it can do nothing else with it — no adding, no editing, no clearing. The retraction it sends names the fact by the stored text and timestamp it was shown, so the page cannot ask for "the fourth fact" and the store never has to trust an index.
+记忆从页头“记忆”按钮打开独立面板，仅提供查看与撤回，不新增、编辑或清空。撤回请求继续使用展示出的原始文本与时间戳标识事实，不依赖列表位置。模型指令和工具描述同步指向这个入口，不再引导用户到运行详情。
 
-Polling must not overwrite the composer. A disconnected inspector or failed reload is displayed as an error; the UI must not manufacture success state.
+会话和记忆列表分别按自身可见性刷新，不再依赖运行详情是否打开。列表复用稳定标识对应的控件，轮询不得替换正在聚焦的操作按钮或覆盖输入草稿；撤回进行中禁止重复操作，撤回前发出的读取不能覆盖操作后的结果。
+
+窄屏会话、记忆、扩展和运行详情共用单一模态层，同一时刻只打开一个；支持 Escape、背景点击关闭、Tab 焦点约束和关闭后焦点恢复。切换到桌面宽度时，会话侧栏恢复常驻并解除模态状态。界面插件的管理和内容展示位于独立“扩展”面板，运行详情只保留诊断、工具插件与重载；读取失败或重载失败必须显示错误，不制造成功状态。
+
+### 界面主题与插件样式
+
+主题由浏览器管理，与会话记录和插件启用状态分开。`localStorage` 的 `luna.theme` 只接受 `system`、`light`、`dark`；缺失、非法或无法读取的值回退到跟随系统。显式选择优先于系统外观，`system` 模式响应系统明暗变化；写入浏览器存储失败时仍应用本页选择，但不能保证刷新后保留。页面在样式表加载前设置根元素的 `data-theme`，主脚本接管后继续同步选择控件。
+
+`web/style.css` 中的 `--luna-*` 是宿主和界面插件共用的语义设计变量；颜色按背景、文字、边框、强调和状态划分，同时提供字体、间距与圆角。插件应引用这些变量或公共 `.luna-*` 控件类，不复制配色，也不依赖宿主内部布局选择器。切换主题只更新根元素属性，不重新挂载插件，不清空计数器、输入草稿或当前会话。
+
+### 外壳布局：侧栏的折叠与宽度
+
+侧栏宽度只有一个来源：根元素上的 `--luna-sidebar-w`。侧栏自身、页头的左外边距和对话区的左外边距都引用它，所以折叠就是把这条变量设为 `0px`，主内容随之接管整块宽度，不会留下一段空白。
+
+- 折叠只在桌面生效（`@media (min-width: 801px)`）。窄屏下侧栏始终是抽屉，由 `.is-open` 控制滑入，页头入口常驻。
+- 拖拽把指针的 x 当作目标宽度，并夹在 200–420px 之间；键盘也能调整（方向键 8px、Shift 32px、Home/End 到两端），`role="separator"` 上带 `aria-valuenow` 等属性。
+- 会话列表用 `grid-template-columns: minmax(0, 1fr)`：默认的 `auto` 列会被长标题撑到内容宽度，把侧栏顶出横向滚动。标题单行省略，时间固定不收缩，侧栏只允许纵向滚动。
+- 浏览器本地只保存三项界面偏好：`luna.theme`、`luna.sidebar`、`luna.sidebarWidth`。会话 id 仍然只走地址栏片段。
+
+### 设置的模态结构
+
+设置是一个完整模态：`.settings-modal` 占满视口并居中 `.settings-dialog`，背景由 `.drawer-backdrop` 压暗但会话仍在原处。对话框内部是 `role="tablist"` 的分类导航加内容面，同一时刻只有一个 `role="tabpanel"` 可见，方向键在分类之间循环；内容区自己滚动，不影响后面的 conversation。
+
+记忆、扩展和运行详情仍然是右侧抽屉。三种内容都走同一套面板机制（一次只开一个、Escape、焦点约束、背景 inert），但只有设置需要持续浏览和切换分类，所以只有它做成模态。
+
+这是一份外观契约，不是任意 CSS 的隔离机制，也没有引入主题包安装、插件市场或新的会话访问接口。现有 `hello` 和 `counter` 示例复用公共样式；`mount(target, api)` / `unmount(target)` 及 `api.version`、`api.log` 保持不变。
 
 ### Runtime UI plugins
 
@@ -155,6 +180,7 @@ The browser surface is extensible at runtime, from the same allowlisted director
 - `GET /api/ui-plugins` lists what is discoverable and reports every directory it skipped with a reason. A missing, malformed, or name-mismatched plugin is visible to the caller rather than silently absent, and never turns the listing into a `500`.
 - `GET /api/ui-plugins/<name>/<file>` serves files from inside that plugin's own directory. `name` must match `^[a-z0-9-]{1,32}$`; containment is checked after normalization and again after resolving symlinks, through `internal/fileread`'s validator rather than a second copy of the check; an unknown extension is refused rather than guessed into a `Content-Type`; nested entry paths such as `dist/plugin.js` are servable. The plugin root itself must be a real directory, because a `plugins/ui/<name>` symlink pointing outside the tree would otherwise move the containment boundary along with it.
 - The host hands `mount` a container element and a deliberately narrow API: a log callback and the host version. Not internal state, not DOM references, not a fetch wrapper.
+- 受限 API 不是安全沙箱：插件模块与宿主在同一页面和源中执行，仍能使用浏览器全局对象。目录边界校验限制的是文件提供范围，不能隔离恶意 JavaScript；只加载可信的本地插件。
 - `unmount` owns the plugin's own listeners and timers, but the host removes the container even when `unmount` throws and surfaces that error, so no half-mounted state survives.
 - Enable state is deliberately not persisted: after a refresh every plugin is off, which is the honest state for a surface the server does not track.
 
@@ -255,9 +281,17 @@ Reload does **not** reload the Go core, environment variables, model client, HTT
 
 ## Verification status
 
-The current root candidate has separate evidence for each major boundary rather than treating a build or fake-model test as end-to-end proof:
+本次导航调整通过前端语法检查、Node 测试及 `internal/agent` 包测试；真实 Chromium 在隔离接口夹具下验证桌面与窄屏的导航、撤回、焦点、草稿和缩放行为。未调用真实模型或启动 Go 服务，不把这轮前端检查当作后端端到端证明。
 
-- repository-wide Go race tests, vet, root build, Go formatting, Node syntax, and all 37 focused browser-JavaScript tests passed;
+本轮界面重做通过 JavaScript 语法检查和 50 项 Node 测试，并在隔离 Chromium 接口夹具下验证：明暗主题与跟随系统、显式选择的持久化与存储失败回退、独立“扩展”面板、模态键盘操作、1440px 与 390px 下没有元素越出视口、主要文字的自选对比度不低于 4.5:1，以及真实计数器插件在切换主题时不重新挂载、停用时释放定时器。没有调用真实模型，也没有启动 Go 服务，因此不构成端到端验收。
+
+侧栏折叠与设置模态这一轮通过 52 项 Node 测试，并在隔离 Chromium 下验证：折叠后宽度变量归零、对话区左缘随之左移、页头出现展开入口、刷新后保持；拖拽与键盘调整都被夹在 200–420px；一个极端长标题（长串中文与不含空格的长标识）在 200/244/420px 三档下都单行省略、时间完整落在侧栏内、`scrollWidth` 不超过 `clientWidth`；设置模态居中、背景惰性、内部滚动不影响 conversation、点对话框外关闭后回到原界面；390px 下设置铺满视口且侧栏仍是抽屉。同样没有调用真实模型或启动 Go 服务；视觉判断不来自这些断言。
+
+外观能力有明确边界：手写 Markdown 渲染器仍只支持段落、一至三级标题、有序与无序列表、围栏代码块、加粗和行内代码，不做语法高亮、链接、表格或代码复制按钮。这些是当前实现的取舍，不是回归。
+
+以下为既有内核与功能切片的验证记录，不表示本次重新运行了全部检查：
+
+- 既有内核检查包括 Go race 测试、vet、根应用构建、Go 格式和当时的前端检查；当前前端检查结果见 `README.md`。
 - the focused post-disconnect race regression passed 50 repeated race-detector runs;
 - a live `deepseek-flash` request at `api.deepseek.com` automatically selected `luna_text_transform` without forced provider `tool_choice`;
 - live `v1` and `v2` calls reported their actual generations and plugin PIDs, while a failed `broken` candidate left the active `v2` generation callable;
