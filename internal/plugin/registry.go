@@ -57,15 +57,21 @@ type Registry struct {
 
 	// claims 记录 (Kind, ID) 的当前占用者。
 	claims map[claimKey]string
+
+	// contributions 记录全局名字的占用者：工具名、路由路径与面板 id 会被模型或浏览器
+	// 直接看到，两个插件不能各贡献一个同名项。上下文贡献的 ID 只在本插件内有意义，
+	// 因此不进这张表。
+	contributions map[contribKey]string
 }
 
 // NewRegistry 建立一个授权表为 grants 的注册表；不传参数表示默认无授权，
 // 即任何 Permissions 声明都会被拒绝。
 func NewRegistry(grants ...PermissionKind) *Registry {
 	r := &Registry{
-		granted: make(map[PermissionKind]bool, len(grants)),
-		index:   make(map[string]int),
-		claims:  make(map[claimKey]string),
+		granted:       make(map[PermissionKind]bool, len(grants)),
+		index:         make(map[string]int),
+		claims:        make(map[claimKey]string),
+		contributions: make(map[contribKey]string),
 	}
 	for _, g := range grants {
 		if g == "" || r.granted[g] {
@@ -117,6 +123,19 @@ func (r *Registry) Register(p Plugin) error {
 			return fmt.Errorf("claim %s %q is already claimed by plugin %q", c.Kind, c.ID, owner)
 		}
 	}
+	// 工具、路由与面板的名字是全局的：模型看到的是工具名，浏览器打到的是路由路径，
+	// 宿主渲染的是面板 id，重名会让内核必须挑一个，因此在这里直接拒绝。
+	shared := make(map[contribKey]bool, len(d.Contributions))
+	for _, c := range d.Contributions {
+		if !exposedGlobally(c.Kind) {
+			continue
+		}
+		k := contribKey{Kind: c.Kind, ID: c.ID}
+		shared[k] = true
+		if owner, ok := r.contributions[k]; ok {
+			return fmt.Errorf("contribution %s %q is already contributed by plugin %q", c.Kind, c.ID, owner)
+		}
+	}
 
 	// 全部通过后才落库，保证失败不留痕。
 	r.index[d.ID] = len(r.entries)
@@ -128,7 +147,21 @@ func (r *Registry) Register(p Plugin) error {
 	for k := range pending {
 		r.claims[k] = d.ID
 	}
+	for k := range shared {
+		r.contributions[k] = d.ID
+	}
 	return nil
+}
+
+// exposedGlobally 报告这类贡献的 ID 是不是全局名字。工具名给模型看，路由路径给浏览器
+// 打，面板 id 给宿主渲染，三者都必须唯一；上下文贡献的 ID 只是插件内部的名字。
+func exposedGlobally(kind ContributionKind) bool {
+	switch kind {
+	case ContributionTool, ContributionRoute, ContributionPanel:
+		return true
+	default:
+		return false
+	}
 }
 
 // Enable 按生命周期状态机启用一个 builtin 插件。

@@ -455,6 +455,43 @@ func TestRegisterRejects(t *testing.T) {
 			wantErr: `claim panel "memory" is already claimed by plugin "memory"`,
 		},
 		{
+			// 工具名是模型看到的名字，两个插件各贡献一个同名工具会让内核必须挑一个。
+			name: "two plugins contribute a tool with the same name",
+			pre: []Plugin{toolPlugin{
+				d:     withContrib(desc("first", DeploymentBuiltin), Contribution{Kind: ContributionTool, ID: "echo"}),
+				tools: []Tool{fakeTool{name: "echo"}},
+			}},
+			target: toolPlugin{
+				d:     withContrib(desc("second", DeploymentBuiltin), Contribution{Kind: ContributionTool, ID: "echo"}),
+				tools: []Tool{fakeTool{name: "echo"}},
+			},
+			wantErr: `contribution tool "echo" is already contributed by plugin "first"`,
+		},
+		{
+			name: "two plugins contribute the same route path",
+			pre: []Plugin{routePlugin{
+				d:      withContrib(desc("first", DeploymentBuiltin), Contribution{Kind: ContributionRoute, ID: "/api/first/echo"}),
+				routes: []Route{fakeRoute{method: http.MethodGet, path: "/api/first/echo"}},
+			}},
+			target: routePlugin{
+				d:      withContrib(desc("second", DeploymentBuiltin), Contribution{Kind: ContributionRoute, ID: "/api/first/echo"}),
+				routes: []Route{fakeRoute{method: http.MethodGet, path: "/api/first/echo"}},
+			},
+			wantErr: `contribution route "/api/first/echo" is already contributed by plugin "first"`,
+		},
+		{
+			name: "two plugins contribute a panel with the same id",
+			pre: []Plugin{panelPlugin{
+				d:      withContrib(desc("first", DeploymentBuiltin), Contribution{Kind: ContributionPanel, ID: "notes"}),
+				panels: []Panel{{ID: "notes", Title: "Notes", Entry: "/api/first/panel.js"}},
+			}},
+			target: panelPlugin{
+				d:      withContrib(desc("second", DeploymentBuiltin), Contribution{Kind: ContributionPanel, ID: "notes"}),
+				panels: []Panel{{ID: "notes", Title: "Notes", Entry: "/api/second/panel.js"}},
+			},
+			wantErr: `contribution panel "notes" is already contributed by plugin "first"`,
+		},
+		{
 			name: "two plugins fight over the same route prefix",
 			pre: []Plugin{barePlugin{d: withClaims(desc("memory-api", DeploymentBuiltin),
 				Claim{Kind: ClaimRoutePrefix, ID: "/api/memory"})}},
