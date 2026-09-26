@@ -1,68 +1,68 @@
-# Luna Agent architecture
+# Luna Agent 架构
 
-## Scope
+## 范围
 
-Luna Agent is a bounded local preview with three deliberately separate layers:
+Luna Agent 是一个有边界的本地预览（preview），由三个刻意分离的层次组成：
 
-1. an authoritative Go core;
-2. replaceable subprocess tool plugins — one process per plugin-backed tool;
-3. a browser UI that observes and controls the core through a small HTTP/SSE contract.
+1. 一个权威的 Go 核心；
+2. 可替换的子进程工具插件——每个由插件支撑的工具一个进程；
+3. 一个通过小型 HTTP/SSE 契约观察并控制核心的浏览器界面。
 
-The root application is the current implementation. `spikes/001-plugin-kernel/` is historical verification evidence and is not linked into the root binary.
+根应用是当前实现。`spikes/001-plugin-kernel/` 是历史验证证据，没有被链接进根应用二进制。
 
-## Authority boundaries
+## 权限边界
 
-### Authoritative core
+### 权威核心
 
-The root Go process owns all application truth:
+根 Go 进程拥有全部应用事实：
 
-- startup configuration and OpenAI-compatible model construction;
-- run IDs, the one-run-at-a-time admission rule, the default 60-second whole-run context deadline, HTTP request/disconnect cancellation, and Eino's six-iteration limit;
-- mapping Eino output and tool callbacks into Luna-owned events;
-- event order and SSE framing;
-- the active generation of each allowlisted plugin tool, publication of a replacement across the whole plugin tool set, retirement, and owned-process cleanup;
-- loopback binding, Host/Origin validation, request limits, and secret-free state;
-- the bounded lifecycle records exposed by `/api/state`;
-- the durable session records: creating a session, appending one record per line to its file, and reading a session's history back from disk for a later run's model input;
-- the durable memory facts: appending one fact per line through the host-native `luna_remember` tool, bounding the file with two caps, and reading the stored facts back on every run to inject them into the system prompt under their own caps.
+- 启动配置和 OpenAI 兼容模型的构建；
+- 运行 ID、一次只运行一个任务（single-run admission）的准入规则、默认 60 秒的整轮运行上下文截止时间、HTTP 请求与断连取消，以及 Eino 的六次迭代上限；
+- 把 Eino 的输出和工具回调映射为 Luna 自有的事件；
+- 事件顺序与 SSE 分帧；
+- 每个白名单插件工具当前生效的 generation（运行代次）、对整个插件工具集合的整体发布替换、退役，以及自有进程的清理；
+- 回环地址绑定、Host/Origin 校验、请求大小限制，以及不含秘密的状态；
+- `/api/state` 暴露的有界生命周期记录；
+- 持久化的会话记录：创建会话、按行向会话文件追加记录，以及为后续运行的模型输入从磁盘回读会话历史；
+- 持久化的记忆事实：通过宿主原生的 `luna_remember` 工具按行追加事实、用两个上限约束文件，以及在每次运行时回读已存储的事实，并在各自的上限下把它们注入系统提示词。
 
-Eino owns the internal model/tool loop. It is an implementation dependency, not Luna's public protocol. Eino messages, callbacks, and structs must not be serialized directly to clients.
+Eino 拥有内部的模型/工具循环。它是实现依赖，不是 Luna 的公开协议。Eino 的消息、回调和结构体不得直接序列化给客户端。
 
-The core permits one active run. A second `POST /api/runs` receives `409` rather than sharing a mutable event sink. Pre-admission failures keep their own status instead: a malformed body or message is `400`, and an unknown session id is `404`, both decided before the busy check. Run-local context carries the event sink and run ID, preventing events from crossing runs. Client disconnect or an SSE write failure cancels that context. The HTTP handler then joins the runner—continuing to drain its event channel without further writes—before clearing the busy state, so a canceled run cannot overlap its successor. There is no public cancel endpoint.
+核心只允许一个活动运行。第二次 `POST /api/runs` 会收到 `409`，而不是共享一个可变的事件出口。准入前的失败保留各自的状态：请求体或消息格式错误是 `400`，会话 ID 未知是 `404`，两者都在忙碌检查之前判定。运行局部上下文携带事件出口和运行 ID，防止事件跨运行。客户端断连或 SSE 写入失败会取消该上下文。随后 HTTP 处理器会等待 runner 结束——在不继续写入的情况下继续排空其事件通道——再清除忙碌状态，因此被取消的运行不会与它的后继重叠。没有公开的取消接口。
 
-The current root wraps each admitted model run in an explicit, default 60-second `context.WithTimeout`. That whole-run deadline is below the server's 70-second HTTP write deadline. Component deadlines remain 60 seconds for plugin build and 5 seconds for plugin startup/RPC; an earlier parent deadline can still end any of this work sooner.
+当前根应用用一个显式的、默认 60 秒的 `context.WithTimeout` 包裹每个通过准入的模型运行。这个整轮截止时间低于服务器 70 秒的 HTTP 写入截止时间。组件自身的截止时间保持为插件构建 60 秒、插件启动/RPC 5 秒；更早的父级截止时间仍可能更早结束其中任何一项工作。
 
-### Session storage
+### 会话存储
 
-`internal/store` owns the session files and is the only package that touches them. `internal/httpapi` creates a session and reads sessions back for `GET /api/sessions` and `GET /api/sessions/{id}`; `internal/agent` reads a session's history and appends a run's records through the store's own methods. One session is one append-only JSONL file, `<id>.jsonl`, in the session directory (`-sessions-dir`, default `<root>/.runtime/sessions/`, directory `0700`, files `0600`). An id is 12 random bytes in lowercase hex and is validated against a lowercase alphanumeric charset and a length bound before it can name a file, so no separator, no dot and no empty string reaches the filesystem; an id that fails that check is `400`, and an id with no file behind it is `404`.
+`internal/store` 拥有会话文件，是唯一接触这些文件的包。`internal/httpapi` 创建会话，并为 `GET /api/sessions` 和 `GET /api/sessions/{id}` 回读会话；`internal/agent` 通过 store 自己的方法读取会话历史并追加一次运行的记录。一个会话是一个仅追加的 JSONL 文件，`<id>.jsonl`，位于会话目录（`-sessions-dir`，默认 `<root>/.runtime/sessions/`，目录权限 `0700`，文件权限 `0600`）。ID 是 12 个随机字节的小写十六进制表示，在它可以命名文件之前，会按小写字母数字字符集和长度上限校验，因此不会有分隔符、点号或空字符串到达文件系统；校验失败的 ID 是 `400`，没有对应文件的 ID 是 `404`。
 
-The format is append-only and frozen. Every record is one `Write` call terminated by a newline, so a crash can lose only the unterminated fragment at the tail and never a completed record. No record is ever rewritten; there is no database and no migration. Every write takes one store mutex, so concurrent runs cannot interleave halves of a line inside one session, and a session directory belongs to a single process. The record types are `session` (the first line: id, `created_at`, title), `message` (run id, role `user` or `assistant`, text, timestamp), `tool_call` (run id, tool name, the model's raw argument text, result or error, timestamp), and `run` (run id, start, end, status `ok` / `error` / `cancelled`). A `run` record is written once, after the run ends, so a crash mid-run leaves the run unrecorded rather than half-recorded; `interrupted` is reserved for exactly that case and is not written by this slice. Plugin identity — generation, version, process id — has no field in a record, so it cannot travel back into a model context through the replay path.
+格式是仅追加且固定的。每条记录是一次以换行结尾的 `Write` 调用，因此崩溃最多只会丢失尾部未终止的片段，绝不会丢失一条完整记录。记录从不被重写；没有数据库，也没有迁移。每次写入都取同一把 store 互斥锁，因此并发运行无法在一个会话内交错写入同一行的两半，而一个会话目录只属于单个进程。记录类型包括 `session`（第一行：id、`created_at`、标题）、`message`（运行 ID、角色 `user` 或 `assistant`、文本、时间戳）、`tool_call`（运行 ID、工具名、模型的原始参数文本、结果或错误、时间戳）和 `run`（运行 ID、开始、结束、状态 `ok` / `error` / `cancelled`）。`run` 记录在运行结束后写入一次，因此运行中途崩溃会让这次运行完全没有记录，而不是留下半条记录；`interrupted` 正是为这种情况保留，本切片不写入它。插件身份——generation、版本、进程 ID——在记录中没有对应字段，因此无法通过回放路径回到模型上下文。
 
-A torn final line is the one tolerated defect. An unterminated trailing fragment is dropped on read, reported as `truncated: true` to the client rather than failing the session, and the store truncates that fragment before an append so a new record is never merged into it. A malformed record anywhere else is a loud `ErrCorrupt` error, never a silent gap, and surfaces as `500`.
+残缺的末行是唯一被容忍的缺陷。读取时丢弃未终止的尾部片段，并向客户端报告 `truncated: true`，而不是让会话失败；store 会在追加前截断该片段，因此新记录绝不会被并入其中。其他位置的格式错误记录是明确的 `ErrCorrupt` 错误，绝不是静默的空缺，并表现为 `500`。
 
-### Memory
+### 记忆
 
-`internal/memory` owns the fact file and is the only package that touches it. Memory is core state, not an extension: the core opens the store, reads it on every run, and registers the host-native `luna_remember` tool that writes it. The model can append a fact and has no tool that reads, lists, or retracts one. The browser has its own view and one way to remove a fact — `GET /api/memory` and `POST /api/memory/retract`, described below — and that surface can widen neither the model's rights nor what the store accepts.
+`internal/memory` 拥有事实文件，是唯一接触它的包。记忆属于核心状态，不是扩展：核心打开这个 store，在每次运行时读取它，并注册写入它的宿主原生工具 `luna_remember`。模型可以追加事实，但没有读取、列出或撤回事实的工具。浏览器有自己的视图和一种移除事实的方式——`GET /api/memory` 与 `POST /api/memory/retract`，见下文——而这个界面既不能扩大模型的权限，也不能放宽 store 接受的内容。
 
-One memory is one append-only JSONL file, `-memory-file` with a default of `<root>/.runtime/memory.jsonl`, directory `0700` and file `0600`. The record shape is frozen by the S3a spec: `type` (always `fact`), `text`, `at`, `source_session`. As with a session record, the shape has no field for plugin identity and no field for a credential, so neither can travel through memory into a model context. `source_session` records which session wrote a fact; it is storage bookkeeping and is not shown to the model. A write also lands in the session transcript as the `tool_call` record it was, because every tool call does, so fact text can exist in both files: the memory file is the only one read back, and the history replay still carries message text only.
+一个记忆是一个仅追加的 JSONL 文件，由 `-memory-file` 指定，默认 `<root>/.runtime/memory.jsonl`，目录权限 `0700`、文件权限 `0600`。记录形状由 S3a 规格固定：`type`（始终为 `fact`）、`text`、`at`、`source_session`。与会话记录一样，这个形状没有插件身份字段，也没有凭据字段，因此两者都无法经由记忆进入模型上下文。`source_session` 记录哪个会话写入了一条事实；它属于存储记账，不展示给模型。一次写入同时会以它本来就是的 `tool_call` 记录落到会话记录中，因为每次工具调用都会如此，所以事实文本可以同时存在于两个文件里：只有记忆文件会被回读，而历史回放仍然只携带消息文本。
 
-The append-only guarantee is the same one the session store makes, restated for this file. Each fact is encoded as one newline-terminated line and written with a single `Write` call to a file opened read-write and appended to, so a crash can lose only the unterminated fragment at the tail and never a completed record, and no stored fact is ever rewritten. A missing file reads as an empty memory, because the first run of a fresh checkout has no facts. Both the read side and the write side take one store mutex, so concurrent runs cannot interleave halves of a line and a read-modify-write cannot lose a fact.
+仅追加保证与会话存储所作的是同一个保证，这里针对该文件再次陈述。每条事实编码为一个以换行结尾的行，用一次 `Write` 调用写入一个以读写方式打开并追加的文件，因此崩溃最多只会丢失尾部未终止的片段，绝不会丢失一条完整记录，已存储的事实也从不被重写。文件缺失时按空记忆读取，因为全新检出的第一次运行没有任何事实。读侧和写侧都取同一把 store 互斥锁，因此并发运行无法交错写入同一行的两半，读-改-写也不会丢失事实。
 
-Two caps bound what is stored: `MaxFacts = 200` facts and `MaxBytes = 32 KiB` of encoded lines, with `MaxFactChars = 500` characters on one fact's text. Above either cap the oldest facts are dropped, and that drop is the one case that rewrites the file — atomically, through a temporary file in the same directory and a rename, so a reader sees either the old complete set or the new complete set. The fact just accepted is never the one dropped, so a fact the caller was told was stored cannot vanish in the same call. Both the tool and the store enforce the per-character cap, so a model-facing bound and a storage bound cannot drift apart.
+两个上限约束存储内容：`MaxFacts = 200` 条事实和 `MaxBytes = 32 KiB` 的编码行，单条事实文本另有 `MaxFactChars = 500` 个字符的上限。超过任一上限时丢弃最旧的事实，这也是唯一会重写文件的情形——通过同一目录下的临时文件和重命名原子完成，因此读取者看到的要么是旧的完整集合，要么是新的完整集合。刚刚被接受的事实绝不会是被丢弃的那条，因此调用方被告知已存储的事实不会在同一次调用中消失。工具和 store 都执行单条字符上限，因此面向模型的边界与存储边界不会彼此漂移。
 
-A torn final line is tolerated here too, and handled on both paths. An unterminated trailing fragment is dropped on read rather than failing the store, and the next write that has to rewrite the file — for a drop or for the fragment — replaces it with the complete kept set, so a new fact is never merged into a fragment and the fragment does not survive. A malformed complete record anywhere else is a loud `ErrCorrupt` error instead, never a silent gap; it names a line number and never a host path, so the string can be handed back to the model as a failed tool call rather than published as a directory layout.
+残缺的末行在这里同样被容忍，并在两条路径上处理。读取时丢弃未终止的尾部片段，而不是让 store 失败；下一次因丢弃或因为这个片段而必须重写文件时，会用完整保留集合替换它，因此新事实绝不会被并入片段，片段也不会留存。其他位置格式完整的错误记录则明确报 `ErrCorrupt`，绝不是静默空缺；它给出行号而绝不给出宿主路径，因此这个字符串可以作为失败的工具调用交回模型，而不会被当作目录结构公布。
 
-Stored caps and injection caps are deliberately different bounds on the same facts. Storage keeps up to 200 facts and 32 KiB; one run's system prompt receives at most `MaxInjectFacts = 50` facts and `MaxInjectBytes = 8 KiB` of rendered lines, with the oldest dropped first, so the stored file may hold more than any single run is shown. The kept set is a contiguous, chronologically ordered suffix accumulated from the newest fact backwards — the same keep-most-recent policy as the history cap — so facts are never reordered, sampled, or skipped, and the injection byte cap counts the rendered lines and not the label. Below the caps nothing is dropped: the whole stored memory is injected, ordered oldest first.
+存储上限与注入上限是针对同一批事实刻意设定的不同边界。存储最多保留 200 条事实和 32 KiB；一次运行的系统提示词最多接收 `MaxInjectFacts = 50` 条事实和 `MaxInjectBytes = 8 KiB` 的渲染行，先丢弃最旧的，因此存储文件可能比任何单次运行看到的内容更多。保留集合是从最新事实向前累积的、按时间排序的连续后缀——与历史上限相同的保留最近策略——因此事实从不被重排、抽样或跳过，注入字节上限计算的是渲染后的行而不是标签。在上限以内不会丢弃任何内容：整份已存储记忆都会被注入，按最旧优先排序。
 
-Retraction is how a stored fact leaves the effective set without anything being rewritten. A retraction is one appended record, `{"type":"retract","at":…,"target_at":…,"target_text":…}`, and a read folds it: the fact matching both the timestamp and the text is removed from the effective set and reported as retracted. Neither field is identity on its own — a clock can repeat a timestamp, and one text can legitimately be stored twice — so a retraction names both and takes exactly one fact. Retracting a fact that is not in effect is an explicit `ErrUnknownFact` and appends nothing, so a retraction can only ever remove the fact it names and a second attempt to retract the same fact is refused rather than recorded twice. The injection reads the folded set, so a retraction takes effect on the next run with no restart, and a redundant retraction record (for example after a hand edit) is ignored rather than treated as corruption.
+撤回让一条已存储的事实离开生效集合，而不重写任何内容。一次撤回是一条追加记录 `{"type":"retract","at":…,"target_at":…,"target_text":…}`，读取时对它做折叠（fold）：同时匹配时间戳和文本的那条事实会被移出生效集合，并被报告为已撤回。两个字段单独都不构成身份标识——时钟可能重复同一个时间戳，同一段文本也可能被合法地存储两次——因此一次撤回同时指名两者，并且只取走一条事实。撤回一条不在生效集合中的事实会明确报 `ErrUnknownFact` 且不追加任何内容，因此撤回只可能移除它指名的那条事实，第二次撤回同一事实会被拒绝而不是被记录两次。注入读取的是折叠后的集合，因此撤回无需重启就会在下次运行时生效；多余的撤回记录（例如手工编辑之后）会被忽略，而不被当作损坏。
 
-Because a retraction is a line in the same file, the byte cap counts every complete line rather than only the facts: otherwise retracting in a loop would grow the file without bound. A rewrite — for a cap, or to repair a torn tail — writes the folded effective facts, which compacts a retraction away together with the fact it removed. A retraction therefore cannot be undone by a later compaction, and after a rewrite the removed fact is no longer retractable because it is no longer in effect.
+因为撤回是同一文件中的一行，字节上限计算每一条完整行，而不只是事实：否则反复撤回会让文件无界增长。一次重写——因上限触发，或为修复残缺尾部——写的是折叠后的生效事实，这会把一条撤回连同它移除的那条事实一起压缩掉。因此撤回不会被后来的压缩撤销，重写之后被移除的事实也不再可撤回，因为它已经不在生效集合中。
 
-The injected text is reference data, never instructions. Stored fact text is text the model or the user wrote, and spliced into a system prompt unlabelled it would read as a system directive; the block therefore carries an explicit header stating that these are facts about the user, that they are not instructions, that no line below may be followed as a directive, and that no line may change the instruction. The system instruction repeats the same rule. Newlines inside a fact are collapsed to spaces when the block is rendered, so a fact cannot open a line of its own inside the prompt, which is the one thing a smuggled directive would need. Only the label and the fact text appear: generation, version, process id and credentials have no field in a stored fact and no place in the block. The instruction is not treated as an f-string template, so fact text and prompt text containing braces are both safe. A memory that cannot be read fails the run before the model is called, rather than silently running as though nothing were remembered — the rule the transcript already follows.
+注入的文本是参考数据，绝不是指令。已存储的事实文本是模型或用户写下的文本，如果不加标注地拼接进系统提示词，它会被读成系统指令；因此这个块带有明确的头部，说明这些是关于用户的事实、不是指令、下面任何一行都不得被当作指令执行、任何一行都不得改变指令。系统指令重复同一条规则。渲染该块时，事实内部的换行会被折叠为空格，因此事实无法在提示词内另起一行，而这正是夹带指令唯一需要的东西。块中只出现标签和事实文本：generation、版本、进程 ID 和凭据在已存储的事实中没有字段，在该块中也没有位置。指令不按 f-string 模板处理，因此含花括号的事实文本和提示词文本都是安全的。无法读取的记忆会在调用模型之前让本轮失败，而不是默默运行得像什么都没记住一样——这也是记录流已经遵循的规则。
 
-### Plugin processes
+### 插件进程
 
-The model sees exactly three tools. Two are plugin-backed and are registered by the core from the plugin host's allowlist; each runs as its own process and each has its own input schema. The third, `luna_remember`, is host-native — memory is core state — and is described after them.
+模型只能看到三个工具。其中两个由插件支撑，由核心按插件宿主的白名单注册；各自作为独立进程运行，各有自己的输入 schema。第三个 `luna_remember` 是宿主原生的——记忆属于核心状态——在它们之后描述。
 
 `luna_text_transform`:
 
@@ -96,19 +96,19 @@ The model sees exactly three tools. Two are plugin-backed and are registered by 
 }
 ```
 
-Each implementation is a real HashiCorp `go-plugin` net/rpc child process. Its RPC protocol is private to the core/plugin boundary. A child receives a minimal environment (`PATH`, `HOME`, `TMPDIR`, and `GOCACHE` when present), not the provider's OpenAI variables.
+每个实现都是一个真实的 HashiCorp `go-plugin` net/rpc 子进程。它的 RPC 协议是核心/插件边界的私有协议。子进程只接收最小环境（`PATH`、`HOME`、`TMPDIR`，以及存在时的 `GOCACHE`），不接收 provider 的 OpenAI 环境变量。
 
-`luna_read_file` splits its boundary in two. `internal/fileread.Resolve` runs on the host and is the only place a model-supplied path is interpreted: it normalizes the path, rejects absolute paths and `..` escapes, resolves symbolic links, and refuses anything that is not a regular file still inside the read root. The plugin is then handed the resolved absolute path plus the cap and never interprets a path itself. A read above the cap (default 256 KiB, `-read-limit`) and content containing a NUL byte are refused with an explicit error rather than truncated or guessed at, and error strings never carry an absolute host path. A file that is not there is reported as `file not found: "<the path the model asked for>"`; the host says what happened, not which internal boundary the path crossed. The read root defaults to the resolved repository root and is set by `-read-root`. Every one of these refusals reaches the model as the call's result rather than as a failed run — see the `tool.failed` entry in the SSE contract.
+`luna_read_file` 把它的边界分成两半。`internal/fileread.Resolve` 在宿主上运行，是唯一解释模型提供的路径的地方：它规范化路径、拒绝绝对路径和 `..` 越界、解析符号链接，并拒绝任何不是仍位于读取根目录内的普通文件。随后插件拿到的是已解析的绝对路径加上大小上限，它自己从不解释路径。超过上限（默认 256 KiB，`-read-limit`）的读取和包含 NUL 字节的内容都会被明确报错拒绝，而不是被截断或猜测，错误字符串绝不携带宿主绝对路径。文件不存在时报告为 `file not found: "<the path the model asked for>"`；宿主说明发生了什么，而不说明路径越过了哪个内部边界。读取根目录默认为解析出的仓库根目录，由 `-read-root` 设置。上述每一种拒绝都以调用结果的形式到达模型，而不是让运行失败——见 SSE 契约中的 `tool.failed` 条目。
 
-Allowed candidates are compiled from `plugins/<tool>/<candidate>/`, all from root source:
+允许的候选从 `plugins/<tool>/<candidate>/` 编译，全部来自根应用源码：
 
-- `v1`: `luna_text_transform` trims surrounding whitespace; `luna_read_file` returns the text of the path the host validated;
-- `v2`: `luna_text_transform` trims, uppercases with Go string handling, and prepends `Luna · `; `luna_read_file` normalizes `CRLF` and lone `CR` to `LF`;
-- `broken`: starts a program that cannot complete the expected handshake, for either tool.
+- `v1`：`luna_text_transform` 去除首尾空白；`luna_read_file` 返回宿主已校验路径的文本；
+- `v2`：`luna_text_transform` 去除首尾空白、用 Go 字符串处理转大写，并在前面加上 `Luna · `；`luna_read_file` 把 `CRLF` 和单独的 `CR` 规范化为 `LF`；
+- `broken`：对两个工具都启动一个无法完成预期握手的程序。
 
-### Host-native memory tool
+### 宿主原生的记忆工具
 
-`luna_remember` is the host-native tool, and it is not a plugin:
+`luna_remember` 是宿主原生工具，它不是插件：
 
 ```json
 {
@@ -124,22 +124,22 @@ Allowed candidates are compiled from `plugins/<tool>/<candidate>/`, all from roo
 }
 ```
 
-It has exactly one write-only action. The whole result the model sees is the string `fact stored`, and the tool deliberately has no parameter that reads the stored facts back and none that removes one: memory is written by the model and read only by the system, which injects it as labelled reference data. It is registered by the core against the same store the injection reads, so no candidate, no reload and no plugin failure can be involved in writing a fact; when no store is configured at all, the call fails with an explicit error instead of reporting a success nothing recorded.
+它只有一个只写动作。模型看到的完整结果就是字符串 `fact stored`，而这个工具刻意没有任何回读已存储事实的参数，也没有移除事实的参数：记忆由模型写入，只由系统读取，系统把它作为带标注的参考数据注入。它由核心注册，面向与注入所读同一个 store，因此没有任何候选、重载或插件故障能参与写入事实；当完全没有配置 store 时，该调用会明确报错，而不是报告一个没有任何东西被记录的成功。
 
-Each successful tool result returned to the model is JSON containing that tool's result plus the immutable generation, version, and plugin PID that actually served the call — for a plugin-backed call. A host-native call publishes no plugin identity at all: `luna_remember` has no candidate, generation, version or process, so `tool.finished` for it omits `generation`, `version` and `plugin_pid` rather than reporting zeros. Those three fields are `omitempty` and a plugin-backed call always carries all three non-zero, so the byte layout of a plugin-backed `tool.finished` is unchanged. Tool arguments must decode as exactly one JSON object: unknown fields, malformed input, a missing or empty `text` or `path`, and trailing JSON values are rejected with `tool.failed` rather than reaching a plugin.
+返回给模型的每个成功工具结果都是 JSON，包含该工具的结果，以及在由插件支撑的调用中实际服务该调用的、不可变的 generation、版本和 plugin PID。宿主原生调用完全不发布插件身份：`luna_remember` 没有候选、generation、版本或进程，因此它的 `tool.finished` 省略 `generation`、`version` 和 `plugin_pid`，而不是报告为 0。这三个字段是 `omitempty`，而由插件支撑的调用总是携带三个非零值，因此由插件支撑的 `tool.finished` 的字节布局不变。工具参数必须能解码为恰好一个 JSON 对象：未知字段、格式错误的输入、缺失或为空的 `text` 或 `path`，以及尾随的 JSON 值都会被 `tool.failed` 拒绝，而不会到达插件。
 
-The Eino `ToolsNode` is configured with `ExecuteSequentially: true`. If a model turn requests multiple tools, Luna invokes them one at a time — host-native and plugin-backed alike — and preserves `tool.started`/`tool.finished` ordering instead of running tool calls concurrently.
+Eino 的 `ToolsNode` 配置为 `ExecuteSequentially: true`。如果一个模型回合请求多个工具，Luna 会逐个调用它们——宿主原生和由插件支撑的一视同仁——并保持 `tool.started`/`tool.finished` 的顺序，而不是并发执行工具调用。
 
-### Browser UI
+### 浏览器界面
 
-The static root `web/` application is a client, not an authority. It:
+静态根应用 `web/` 是客户端，不是权威。它：
 
-- submits one chat run and renders assistant deltas;
-- renders tool arguments, the serving generation/version/PID, and its own per-tool copy in expandable cards;
-- polls secret-free state for the side inspector, which lists one row per plugin record: tool name, status, version, generation and PID;
-- requests an allowlisted candidate reload;
-- keeps run and reload busy states separate;
-- uses DOM APIs and `textContent`, with no remote assets and no hidden-reasoning view.
+- 提交一次对话运行，并渲染助手增量；
+- 在可展开卡片中渲染工具参数、服务该调用的 generation/版本/PID，以及它自己的逐工具文案；
+- 为侧边检查器轮询不含秘密的状态，它按插件记录逐行列出：工具名、状态、版本、generation 和 PID；
+- 请求重载一个白名单内的候选；
+- 保持运行与重载两种忙碌状态彼此独立；
+- 使用 DOM API 和 `textContent`，不加载远程资源，也没有隐藏推理视图。
 
 会话入口独立于运行详情：桌面左侧常驻列表，窄屏由页头“会话”按钮打开模态侧栏。列表按最近更新排序，“新建会话”清空当前对话，选中历史会话后回放记录；窄屏完成选择即关闭侧栏。当前会话仍通过地址片段 `#session=<id>` 保存，刷新可恢复，不新增 cookie 或浏览器端会话存储。运行或回放期间继续禁止切换会话。
 
@@ -172,68 +172,68 @@ The static root `web/` application is a client, not an authority. It:
 
 这是一份外观契约，不是任意 CSS 的隔离机制，也没有引入主题包安装、插件市场或新的会话访问接口。现有 `hello` 和 `counter` 示例复用公共样式；`mount(target, api)` / `unmount(target)` 及 `api.version`、`api.log` 保持不变。
 
-### Runtime UI plugins
+### 运行时界面插件
 
-The browser surface is extensible at runtime, from the same allowlisted directory shape the tool plugins use:
+浏览器界面可以在运行时扩展，使用与工具插件相同的白名单目录形状：
 
-- A plugin is a directory `plugins/ui/<name>/` holding `plugin.json` (`name`, `title`, `description`, `entry`) and an ES module exporting `mount(target, api)` and `unmount(target)`.
-- `GET /api/ui-plugins` lists what is discoverable and reports every directory it skipped with a reason. A missing, malformed, or name-mismatched plugin is visible to the caller rather than silently absent, and never turns the listing into a `500`.
-- `GET /api/ui-plugins/<name>/<file>` serves files from inside that plugin's own directory. `name` must match `^[a-z0-9-]{1,32}$`; containment is checked after normalization and again after resolving symlinks, through `internal/fileread`'s validator rather than a second copy of the check; an unknown extension is refused rather than guessed into a `Content-Type`; nested entry paths such as `dist/plugin.js` are servable. The plugin root itself must be a real directory, because a `plugins/ui/<name>` symlink pointing outside the tree would otherwise move the containment boundary along with it.
-- The host hands `mount` a container element and a deliberately narrow API: a log callback and the host version. Not internal state, not DOM references, not a fetch wrapper.
+- 一个插件是一个目录 `plugins/ui/<name>/`，其中包含 `plugin.json`（`name`、`title`、`description`、`entry`）和一个导出 `mount(target, api)` 与 `unmount(target)` 的 ES 模块。
+- `GET /api/ui-plugins` 列出可发现的内容，并报告它跳过的每个目录及原因。缺失、格式错误或名称不匹配的插件对调用方可见，而不是静默缺席，也绝不会让列表变成 `500`。
+- `GET /api/ui-plugins/<name>/<file>` 从该插件自己的目录内提供文件。`name` 必须匹配 `^[a-z0-9-]{1,32}$`；边界（containment）在规范化之后检查一次，在解析符号链接之后再检查一次，复用 `internal/fileread` 的校验器而不是再写一份；未知扩展名会被拒绝，而不会被猜成某个 `Content-Type`；`dist/plugin.js` 这样的嵌套入口路径可以正常提供。插件根目录本身必须是真实目录，否则一个指向树外的 `plugins/ui/<name>` 符号链接会把边界一起挪走。
+- 宿主交给 `mount` 一个容器元素和一个刻意收窄的 API：一个日志回调和宿主版本。不包括内部状态，不包括 DOM 引用，也不是 fetch 包装器。
 - 受限 API 不是安全沙箱：插件模块与宿主在同一页面和源中执行，仍能使用浏览器全局对象。目录边界校验限制的是文件提供范围，不能隔离恶意 JavaScript；只加载可信的本地插件。
-- `unmount` owns the plugin's own listeners and timers, but the host removes the container even when `unmount` throws and surfaces that error, so no half-mounted state survives.
-- Enable state is deliberately not persisted: after a refresh every plugin is off, which is the honest state for a surface the server does not track.
+- `unmount` 拥有插件自己的监听器和定时器，但即使 `unmount` 抛错，宿主也会移除容器并上报该错误，因此不会留下半挂载状态。
+- 启用状态刻意不持久化：刷新后每个插件都是关闭的，这是服务器并不跟踪的界面应有的诚实状态。
 
-## Request and event flow
+## 请求与事件流
 
 ```text
-Browser
-  ├─ POST /api/runs ──> HTTP guard + session resolution + single-run admission
-  │                        └─ 60-second run context
+浏览器
+  ├─ POST /api/runs ──> HTTP 守卫 + 会话解析 + 一次只运行一个任务的准入
+  │                        └─ 60 秒运行上下文
   │                             └─ Eino ChatModelAgent
-  │                                  ├─ system prompt <── instruction + internal/memory facts (labelled reference data)
-  │                                  ├─ session history <── internal/store (append-only JSONL)
-  │                                  ├─ OpenAI-compatible ChatModel
-  │                                  ├─ luna_text_transform wrapper ──> pinned plugin generation over net/rpc
-  │                                  ├─ luna_read_file wrapper ──> pinned plugin generation over net/rpc
-  │                                  └─ luna_remember (host-native) ──> internal/memory (append-only JSONL)
-  └─ SSE events <──────── Luna-owned run-local event sink
+  │                                  ├─ 系统提示词 <── 指令 + internal/memory 事实（带标注的参考数据）
+  │                                  ├─ 会话历史 <── internal/store（仅追加 JSONL）
+  │                                  ├─ OpenAI 兼容 ChatModel
+  │                                  ├─ luna_text_transform 包装器 ──> 固定的插件 generation，走 net/rpc
+  │                                  ├─ luna_read_file 包装器 ──> 固定的插件 generation，走 net/rpc
+  │                                  └─ luna_remember（宿主原生）──> internal/memory（仅追加 JSONL）
+  └─ SSE 事件 <──────── Luna 自有的运行局部事件出口
 
-Browser ── GET /api/sessions, GET /api/sessions/{id} ──> internal/store (read-only)
+浏览器 ── GET /api/sessions, GET /api/sessions/{id} ──> internal/store（只读）
 
-Browser ── POST /api/reload ──> build the candidate for every allowlisted plugin tool
-                                └─ start + handshake + metadata validation, per tool
-                                     └─ publish one new generation for all of them, or none
+浏览器 ── POST /api/reload ──> 为每个白名单插件工具构建候选
+                                └─ 逐工具执行启动 + 握手 + 元数据校验
+                                     └─ 为全部工具发布一个新 generation，否则一个也不发布
 ```
 
-Model tool choice is automatic. The system instruction requires `luna_text_transform` when the user explicitly requests text transformation or explicitly asks to call it, and `luna_read_file` when the user asks for a file to be read, and it directs `luna_remember` when the user asks for a durable fact to be remembered; no request forces provider-level `tool_choice: required`. Assistant content emitted on a turn that contains tool calls is treated as transient and suppressed, both for streaming and non-streaming model output; only assistant text from a tool-free answer turn becomes `assistant.delta` and contributes to the final answer.
+模型工具选择是自动的。当用户明确要求文本转换或明确要求调用它时，系统指令要求使用 `luna_text_transform`；当用户要求读取文件时，要求使用 `luna_read_file`；当用户要求记住一条持久事实时，指令指向 `luna_remember`；没有任何请求会强制 provider 级的 `tool_choice: required`。含工具调用的回合中模型输出的助手内容被视为临时内容并被抑制，流式和非流式模型输出都如此；只有无工具调用的回答回合中的助手文本才会成为 `assistant.delta` 并构成最终答案。
 
-Each turn's model input is assembled from disk rather than from process state: the system instruction, then the session's earlier messages in file order, then this turn's user message. Memory is appended when there are stored facts, inside that system message rather than after the messages: the injected block is the instruction plus the labelled block described in the Memory section, so the system role keeps its position and fact text cannot arrive as a later message. The earlier messages are capped by two constants in `internal/agent` — `MaxHistoryMessages = 40` messages and `MaxHistoryBytes = 64 KiB` of message text — and the policy is deterministic: keep the most recent messages, drop the oldest first. The kept set is a contiguous suffix of the persisted history, accumulated from the newest message backwards until either cap would be exceeded, so a message is never reordered, sampled, or skipped over, and everything older than the point where the scan stopped is dropped as well. A message too large for the byte cap therefore ends the history rather than being truncated. The byte cap sits above the 16,384-byte HTTP message cap, so this turn's own message always fits. A run's own records are excluded from its own input, and only message text enters it: no tool result and no plugin identity can reach the model through the persisted history. Summarization and retrieval are absent from this slice: the history is replayed and memory is injected, and neither is searched, filtered or summarized.
+每个回合的模型输入都从磁盘组装，而不是来自进程状态：先是系统指令，然后是按文件顺序排列的会话早前消息，最后是本回合的用户消息。当存在已存储的事实时会追加记忆，位置在这条系统消息内部，而不是在消息之后：注入的块是指令加上“记忆”一节所述带标注的块，因此 system 角色保持它的位置，事实文本也无法作为后续消息到达。早前消息由 `internal/agent` 中的两个常量限定——`MaxHistoryMessages = 40` 条消息和 `MaxHistoryBytes = 64 KiB` 的消息文本——策略是确定性的：保留最近的消息，先丢弃最旧的。保留集合是持久化历史的连续后缀，从最新消息向前累积，直到任一上限将被超过，因此消息从不被重排、抽样或跳过，扫描停止点之前的所有内容也一并丢弃。因此对字节上限来说过大的消息会结束历史，而不是被截断。字节上限高于 16,384 字节的 HTTP 消息上限，因此本回合自己的消息总是能放下。一次运行自己的记录被排除在它自己的输入之外，且只有消息文本进入输入：没有任何工具结果或插件身份能通过持久化历史到达模型。本切片没有摘要和检索：历史被回放，记忆被注入，两者都不被搜索、过滤或摘要。
 
-Persistence is part of a run's outcome: the user message is appended before the model runs, the assistant answer and one `run` record after it, and a transcript that cannot be written fails the run rather than reporting a success no restart could reproduce.
+持久化是运行结果的一部分：用户消息在模型运行之前追加，助手答案和一条 `run` 记录在它之后追加；无法写入记录流会让这次运行失败，而不是报告一个重启后无法复现的成功。
 
-## Public HTTP contract
+## 公开 HTTP 契约
 
-The listener accepts literal loopback IPs only and defaults to `127.0.0.1:0`. The actual bound address is printed as `LISTEN_URL=...`. Requests must use that exact bound Host. Mutations require the exact same non-null Origin; no CORS policy opens the service to other origins.
+监听器只接受字面回环 IP，默认为 `127.0.0.1:0`。实际绑定的地址以 `LISTEN_URL=...` 打印。请求必须使用那个精确绑定的 Host。变更操作要求完全相同的非空 Origin；没有任何 CORS 策略把服务开放给其他源。
 
-Endpoints:
+接口：
 
-- `GET /healthz` reports whether model configuration exists and every allowlisted tool has an active generation. It does not probe the provider.
-- `GET /api/state` reports model/provider labels, the host PID, one plugin record per allowlisted tool (including any retiring generation, each with its candidate, status and in-flight count), single-run status, the ids of the current run and session (empty when idle), and bounded lifecycle events. `model_connected` is initially false and becomes true only after a successful run; configuration alone is represented by `model_configured`.
-- `POST /api/reload` accepts only `{"candidate":"v1"}`, `v2`, or `broken`, and applies it to every tool or to none.
-- `GET /api/sessions` lists session summaries, newest `updated_at` first, as `{"sessions":[{"id":...,"title":...,"updated_at":...,"run_count":...}]}`. `updated_at` and `run_count` are derived from the session's records rather than stored in a separate index.
-- `GET /api/sessions/{id}` returns the replay object `{"id":...,"title":...,"created_at":...,"updated_at":...,"run_count":...,"truncated":...,"records":[...]}`. Each element of `records` is the stored JSONL line itself, in file order, so a client replays exactly what is on disk. A malformed id is `400`, an id with no session file is `404`, and a session file whose records cannot be decoded is `500`.
-- `POST /api/runs` accepts `{"message":"...","session_id":"..."}` and returns an SSE stream. `session_id` is optional and must name an existing session: an unknown id is `404` and a malformed one `400`, both checked before single-run admission, so neither costs the caller the run slot and neither creates a session. When it is omitted, the core creates a session titled with the message (whitespace collapsed, cut to 80 runes) and reports its id on `run.started`.
-- `GET /api/ui-plugins` lists the discoverable UI plugins together with the skipped directories and the reason each was skipped. A directory the host cannot read is reported, not omitted, and the listing never becomes a `500` because of one bad plugin.
-- `GET /api/ui-plugins/<name>/<file>` serves one file from inside that plugin's own directory, with the containment and extension rules described under Runtime UI plugins. An unknown plugin name is `404`, a malformed one `400`.
-- `GET /api/memory` returns `{"facts":[…],"retracted":[…]}`: the facts in effect, oldest first, each with its text, its timestamp and the session that wrote it, then the facts that were retracted with when that happened. The storage record type is not part of this shape. A memory file whose complete records cannot be decoded is a `500` and never an empty list.
-- `POST /api/memory/retract` accepts `{"at":"…","text":"…"}` and takes exactly the fact those two identify out of the effective set. It is a mutation, so it requires the exact bound Origin. A malformed body, a missing or unparseable `at`, or empty text is `400`; a fact that is not in effect is `404`; success is `200` with the retracted fact and when it was retracted. Nothing else about a stored fact is writable from the browser: there is no endpoint that adds, edits or rewrites one.
+- `GET /healthz` 报告模型配置是否存在，以及每个白名单工具是否都有生效的 generation。它不探测 provider。
+- `GET /api/state` 报告模型/provider 标签、宿主 PID、每个白名单工具一条插件记录（包括任何正在退役的 generation，每条带有它的候选、状态和在途调用数）、单次运行状态、当前运行和会话的 ID（空闲时为空），以及有界的生命周期事件。`model_connected` 初始为 false，只有在一次成功运行之后才变为 true；仅配置存在由 `model_configured` 表示。
+- `POST /api/reload` 只接受 `{"candidate":"v1"}`、`v2` 或 `broken`，并把它应用到每个工具，或者一个也不应用。
+- `GET /api/sessions` 以 `{"sessions":[{"id":...,"title":...,"updated_at":...,"run_count":...}]}` 的形式列出会话摘要，`updated_at` 最新的在前。`updated_at` 和 `run_count` 由会话记录推导，而不是存放在单独的索引中。
+- `GET /api/sessions/{id}` 返回回放对象 `{"id":...,"title":...,"created_at":...,"updated_at":...,"run_count":...,"truncated":...,"records":[...]}`。`records` 的每个元素就是存储的 JSONL 行本身，按文件顺序排列，因此客户端回放的就是磁盘上的内容。格式错误的 ID 是 `400`，没有会话文件的 ID 是 `404`，记录无法解码的会话文件是 `500`。
+- `POST /api/runs` 接受 `{"message":"...","session_id":"..."}` 并返回 SSE 流。`session_id` 可选，且必须指定一个已存在的会话：未知 ID 是 `404`，格式错误是 `400`，两者都在一次性运行准入之前检查，因此都不会让调用方失去运行名额，也都不会创建会话。省略它时，核心会创建一个以消息为标题（空白折叠，截到 80 个 rune）的会话，并在 `run.started` 上报告它的 ID。
+- `GET /api/ui-plugins` 列出可发现的界面插件，以及被跳过的目录和每个目录被跳过的原因。宿主无法读取的目录会被报告，而不是被省略，列表绝不会因为一个坏插件而变成 `500`。
+- `GET /api/ui-plugins/<name>/<file>` 从该插件自己的目录内提供一个文件，边界与扩展名规则见“运行时界面插件”一节。插件名未知是 `404`，格式错误是 `400`。
+- `GET /api/memory` 返回 `{"facts":[…],"retracted":[…]}`：先是生效中的事实，最旧在前，每条带有它的文本、时间戳和写入它的会话，然后是已被撤回的事实及其撤回时间。存储记录类型不属于这个形状。完整记录无法解码的记忆文件是 `500`，绝不会是空列表。
+- `POST /api/memory/retract` 接受 `{"at":"…","text":"…"}`，把这两个字段共同指名的恰好那一条事实移出生效集合。它是一次变更，因此要求精确绑定的 Origin。请求体格式错误、`at` 缺失或无法解析、文本为空都是 `400`；事实不在生效集合中是 `404`；成功是 `200`，返回被撤回的事实和撤回时间。已存储事实的其他任何内容都不能从浏览器写入：没有任何接口可以新增、编辑或重写一条事实。
 
-Bodies are capped at 32 KiB and unknown JSON fields are rejected. Messages are non-empty and capped at 16,384 bytes. There are no arbitrary-path, arbitrary-command, or user-supplied plugin endpoints. The memory endpoints read and retract, and nothing more: no endpoint adds, edits or rewrites a stored fact, and none exposes the memory file's path or its record type.
+请求体上限为 32 KiB，未知 JSON 字段会被拒绝。消息非空且上限为 16,384 字节。没有任意路径、任意命令或用户提供插件的接口。记忆接口只能读取和撤回，别无其他：没有任何接口新增、编辑或重写已存储的事实，也没有任何接口暴露记忆文件的路径或其记录类型。
 
-## SSE contract
+## SSE 契约
 
-The wire framing is:
+线上分帧格式为：
 
 ```text
 event: <event-type>
@@ -241,45 +241,45 @@ data: <JSON payload>
 
 ```
 
-Event types and payloads are application-owned:
+事件类型和载荷由应用自有：
 
-- `run.started` — `{"run_id":"...","session_id":"..."}`; the session the run was admitted into, created by this request when it supplied none. The terminal-event rule below is unchanged.
-- `assistant.delta` — `{"text":"..."}`; emitted for provider stream chunks or as one visible assistant message when output is not chunked, but never for a turn containing tool calls
-- `tool.started` — `{"run_id":"...","name":"...","arguments":...}`, where `name` is one of the three model-visible tool names: the plugin-backed `luna_text_transform` and `luna_read_file`, or the host-native `luna_remember`
-- `tool.finished` — `{"run_id":"...","name":"...","result":"...","generation":N,"version":"...","plugin_pid":N}` for a plugin-backed tool that served the call; for the host-native `luna_remember` the three identity fields are absent from the JSON rather than sent as zero, because no plugin served it
-- `tool.failed` — run/tool identity and an error, with generation/version/PID when a plugin served the attempt and omitted when it did not. A **refusal** the tool makes about the call itself — a rejected path, the single-read size cap, binary content, a malformed argument — is also handed to the model as the call's result, so the run continues and the model can explain the reason to the user. Only an **infrastructure** failure ends the run: no active plugin, an RPC timeout or cancellation that terminated the plugin, or a plugin process that is gone. The plugin host tags those with sentinels (`pluginhost.ErrUnknownTool`, `ErrNoActivePlugin`, `ErrRPCTimeout`, `ErrRPCCanceled`, `ErrPluginGone`) so the wrapper classifies rather than matches message text; a refusal raised inside a plugin crosses `net/rpc` as plain text and is therefore never one of them. A refused call still writes its `tool_call` record with the error, so the failed call survives a restart.
-- `run.finished` — `{"run_id":"...","answer":"..."}`
-- `run.failed` — `{"run_id":"...","error":"..."}`
+- `run.started` —— `{"run_id":"...","session_id":"..."}`；运行被准入到的会话，当本次请求没有提供会话时由本请求创建。下面的终止事件规则不变。
+- `assistant.delta` —— `{"text":"..."}`；在 provider 流式分片时发出，或在输出未分块时作为一条可见的助手消息发出，但绝不会在含工具调用的回合中发出
+- `tool.started` —— `{"run_id":"...","name":"...","arguments":...}`，其中 `name` 是三个模型可见工具名之一：由插件支撑的 `luna_text_transform` 和 `luna_read_file`，或宿主原生的 `luna_remember`
+- `tool.finished` —— `{"run_id":"...","name":"...","result":"...","generation":N,"version":"...","plugin_pid":N}`，用于服务了该调用的由插件支撑的工具；对于宿主原生的 `luna_remember`，这三个身份字段在 JSON 中缺席，而不是被发成 0，因为没有插件服务它
+- `tool.failed` —— 运行/工具身份和一个错误；当有插件服务了这次尝试时带有 generation/版本/PID，没有时省略。工具就调用本身作出的**拒绝**——被拒绝的路径、单次读取大小上限、二进制内容、格式错误的参数——同样作为调用结果交给模型，因此运行继续，模型可以向用户解释原因。只有**基础设施**故障才结束整轮：没有活跃插件、终止了插件的 RPC 超时或取消，或插件进程已经消失。插件宿主用哨兵错误标记这些情况（`pluginhost.ErrUnknownTool`、`ErrNoActivePlugin`、`ErrRPCTimeout`、`ErrRPCCanceled`、`ErrPluginGone`），因此包装器按标记分类，而不是匹配报错文字；插件内部抛出的拒绝以纯文本穿越 `net/rpc`，因此永远不属于其中之一。被拒绝的调用仍然带着错误写入它的 `tool_call` 记录，因此失败的调用在重启后依然存在。
+- `run.finished` —— `{"run_id":"...","answer":"..."}`
+- `run.failed` —— `{"run_id":"...","error":"..."}`
 
-After a stream is established, `run.finished` or `run.failed` is the single terminal event. The HTTP layer forwards the first terminal event, discards later terminal events, and synthesizes one from the runner result if the runner omitted it. Thus every writable completed stream has exactly one terminal event. Pre-stream validation and admission failures are ordinary JSON HTTP errors instead. The handler flushes every event; client disconnect or write failure stops further writes, cancels the run, and waits for runner exit before releasing single-run admission.
+流建立之后，`run.finished` 或 `run.failed` 是唯一的终止事件。HTTP 层转发第一个终止事件，丢弃之后的终止事件，并在 runner 遗漏时从 runner 结果合成一个。因此每条可写的已完成流都恰好有一个终止事件。流建立前的校验和准入失败则是普通的 JSON HTTP 错误。处理器会 flush 每个事件；客户端断连或写入失败会停止后续写入、取消运行，并在 runner 退出之后才释放一次性运行准入。
 
-`tool.started.arguments` and `tool.finished.result` can contain user text because they are part of the live run transcript. The core's bounded lifecycle log stores only concise status messages and must not persist prompts, arguments, results, model bodies, authorization headers, secrets, or hidden chain-of-thought.
+`tool.started.arguments` 和 `tool.finished.result` 可能包含用户文本，因为它们是实时运行记录的一部分。核心的有界生命周期日志只保存简洁的状态消息，不得持久化提示词、参数、结果、模型响应正文、授权头、秘密或隐藏推理链。
 
-A session file is a separate record with a different rule: it deliberately stores the run's message text, the model's raw tool arguments, and the tool result, because replay needs them. It stores no model request or response body beyond that, no authorization header, no secret, and no hidden reasoning, and no plugin identity (see the Session storage section above).
+会话文件是另一套规则下的独立记录：它有意存储运行的消息文本、模型的原始工具参数和工具结果，因为回放需要它们。除此之外它不存储模型请求或响应正文、不存储授权头、秘密、隐藏推理，也不存储插件身份（见上文“会话存储”一节）。
 
-## Reload semantics
+## 重载语义
 
-A plugin reload is a generation replacement, not an in-place mutation:
+插件重载是 generation 替换，不是就地修改：
 
-1. compile the selected candidate for every allowlisted tool, each to its own new generated executable;
-2. start each child with the restricted environment;
-3. complete each plugin handshake and dispense the expected interface;
-4. validate protocol version, candidate version, and actual child PID for each tool;
-5. reject an expired context before publication;
-6. atomically publish one new generation for the whole tool set — if any single tool fails, nothing is published and the candidates that did start are killed;
-7. mark each previous generation retiring, let already-pinned calls finish, then terminate it and remove its generated executable.
+1. 为每个白名单工具编译所选候选，各自生成一个新的可执行文件；
+2. 用受限环境启动每个子进程；
+3. 完成每个插件的握手并交付预期接口；
+4. 校验每个工具的协议版本、候选版本和实际子进程 PID；
+5. 在发布之前拒绝已过期的上下文；
+6. 为整个工具集合原子地发布一个新 generation——如果任何一个工具失败，就什么都不发布，并杀掉已经启动的候选；
+7. 把每个先前的 generation 标记为退役，让已经固定到它的调用完成，然后终止它并删除它生成的可执行文件。
 
-Consequences:
+后果：
 
-- `broken` fails before publication and leaves the previous active generation unchanged; because publication is all-or-nothing, no other tool moves either;
-- reloading the same version still creates a new generation and PID for every tool;
-- new calls use the newly published generation while old in-flight calls finish against the generation they pinned, per tool;
-- an RPC timeout or cancellation terminates the owned plugin before the core reports that termination;
-- build, startup, and RPC work are bounded.
+- `broken` 在发布前失败，并让先前生效的 generation 保持不变；由于发布是全有或全无，其他工具也不会变化；
+- 重载同一版本仍会为每个工具创建新的 generation 和 PID；
+- 新调用使用新发布的 generation，而在途的旧调用按工具分别对着它们固定住的 generation 完成；
+- RPC 超时或取消在核心报告终止之前就终止了自有插件；
+- 构建、启动和 RPC 工作都有界。
 
-Reload does **not** reload the Go core, environment variables, model client, HTTP listener, or UI assets, and it cannot reach memory, which is core state and has no generation to replace. There is no filesystem watcher, automatic rebuild loop, dynamic plugin discovery, arbitrary plugin path, or zero-downtime core restart.
+重载**不会**重新加载 Go 核心、环境变量、模型客户端、HTTP 监听器或界面资源，也无法触及记忆，因为记忆属于核心状态、没有 generation 可被替换。没有文件系统监听器、自动重建循环、动态插件发现、任意插件路径，也没有零停机重启核心。
 
-## Verification status
+## 验证状态
 
 本次导航调整通过前端语法检查、Node 测试及 `internal/agent` 包测试；真实 Chromium 在隔离接口夹具下验证桌面与窄屏的导航、撤回、焦点、草稿和缩放行为。未调用真实模型或启动 Go 服务，不把这轮前端检查当作后端端到端证明。
 
@@ -292,44 +292,44 @@ Reload does **not** reload the Go core, environment variables, model client, HTT
 以下为既有内核与功能切片的验证记录，不表示本次重新运行了全部检查：
 
 - 既有内核检查包括 Go race 测试、vet、根应用构建、Go 格式和当时的前端检查；当前前端检查结果见 `README.md`。
-- the focused post-disconnect race regression passed 50 repeated race-detector runs;
-- a live `deepseek-flash` request at `api.deepseek.com` automatically selected `luna_text_transform` without forced provider `tool_choice`;
-- live `v1` and `v2` calls reported their actual generations and plugin PIDs, while a failed `broken` candidate left the active `v2` generation callable;
-- real headless Chromium interaction covered live runs, successful and failed reloads, composer draft preservation, zero page errors, and desktop/390 px overflow checks;
-- Desktop Preview read the running UI's visible model, provider, host, and plugin metadata;
-- final independent review reported no security concerns or logic errors.
+- 断连后的专项竞态回归通过了 50 次重复的竞态检测运行；
+- 对 `api.deepseek.com` 的一次真实 `deepseek-flash` 请求自动选择了 `luna_text_transform`，没有强制 provider 的 `tool_choice`；
+- 真实的 `v1` 和 `v2` 调用报告了它们实际的 generation 和插件 PID，而失败的 `broken` 候选让生效的 `v2` generation 仍然可调用；
+- 真实无头 Chromium 交互覆盖了真实运行、成功和失败的重载、输入区草稿保留、零页面错误，以及桌面/390 px 溢出检查；
+- Desktop Preview 读取了运行中界面可见的模型、provider、宿主和插件元数据；
+- 最终独立评审报告没有安全问题或逻辑错误。
 
-The live-provider, headless-Chromium, Desktop Preview and final-review items above were captured for the one-tool kernel. The two-tool change re-ran the Go race, vet, root-build, Go-format, Node syntax and Node test gates; it did not re-run a live provider or a real browser.
+上面的真实 provider、无头 Chromium、Desktop Preview 和最终评审记录是针对单工具内核采集的。双工具改动重新运行了 Go race、vet、根应用构建、Go 格式、Node 语法和 Node 测试门禁；它没有重新运行真实 provider 或真实浏览器。
 
-The session change re-ran those same gates and nothing more. No server and no model provider were run for it, so the session endpoints, the append-only store under a real crash, the history replay, and the terminal-event contract are not claimed as end-to-end verified, and no browser was exercised against them.
+会话改动重新运行了同样的门禁，别的没有。它没有运行服务器，也没有运行模型 provider，因此会话接口、真实崩溃下的仅追加存储、历史回放和终止事件契约都不声称为端到端已验证，也没有浏览器针对它们运行过。
 
-The memory change is covered by those same deterministic gates, which pass on this tree. No server and no model provider were run, so memory is not claimed as end-to-end verified either: the append-only fact file under a real crash, the injected block as a live provider receives it, and the memory tool's events in a real run were not exercised outside deterministic tests, and no browser was used. Those tests cover the store's round-trip, both caps, the torn trailing line and its repair, the whole-line guarantee under concurrent writers, the strict write-only tool schema, the injected block's label and ordering, the count and byte caps on injection, the newline collapse, the read failure that fails the run, and the absence of plugin identity on a host-native call. None of that is a substitute for the missing live run.
+记忆改动由同样的确定性门禁覆盖，它们在这棵树上通过。没有运行服务器，也没有运行模型 provider，因此记忆同样不声称为端到端已验证：真实崩溃下的仅追加事实文件、真实 provider 收到的注入块，以及真实运行中记忆工具的事件都没有在确定性测试之外被验证过，也没有使用浏览器。这些测试覆盖了 store 的往返、两个上限、残缺尾部行及其修复、并发写入下的整行保证、严格的只写工具 schema、注入块的标签与顺序、注入的条数与字节上限、换行折叠、令本轮失败的读取失败，以及宿主原生调用上没有插件身份。这些都不能替代缺失的真实运行。
 
-The runtime UI plugin change re-ran the same deterministic gates and nothing more. No server, no model provider and no browser were run for it, so the plugin listing, the file serving, the mount/unmount cycle and the host-side teardown are not claimed as end-to-end verified. Those tests cover the skipped-directory report, containment after normalization and again after symlink resolution, the extension refusal, the host removing a container whose `unmount` threw, and the enable/disable cycle in `web/app.test.cjs`.
+运行时界面插件改动重新运行了同样的确定性门禁，别的没有。它没有运行服务器、模型 provider 或浏览器，因此插件列表、文件提供、挂载/卸载循环和宿主侧拆卸都不声称为端到端已验证。这些测试覆盖了跳过目录的报告、规范化之后以及解析符号链接之后的边界检查、扩展名拒绝、宿主移除 `unmount` 抛错的容器，以及 `web/app.test.cjs` 中的启用/停用循环。
 
-The tool-refusal change is covered by the same gates on this tree, and no provider was called for it. It came out of the user's first acceptance pass: asking for a file that is not there ended the whole run with the host's raw error and no answer, and the message a missing file produced read as an internal phrase rather than a reason. The tests now pin both halves — a refusal becomes the call's result so the run still answers, and an infrastructure failure still ends the run — and each half was checked from the defect side by restoring the previous behaviour in a copy of the tree and confirming the new tests fail there. Nothing beyond the deterministic gates was run.
+工具拒绝改动由这棵树上的同样门禁覆盖，没有为它调用 provider。它来自用户的第一次验收：请求一个不存在的文件会让整轮以宿主的原始错误结束、没有任何回答，缺失文件产生的消息读起来像内部短语而不是原因。现在的测试固定了两半——拒绝成为调用结果，因此运行仍然给出回答；基础设施故障仍然结束整轮——并且每一半都从缺陷侧验证过：在一份树的副本里恢复先前的行为，确认新测试在那里失败。除确定性门禁之外没有运行任何东西。
 
-The memory view and retraction change is covered by the same gates on this tree, and no provider was called for it. Those tests pin the fold (a retraction takes exactly one fact out of the effective set, matched by text and timestamp together), the refusal to retract a fact that is not in effect, survival across a reopen, the byte cap counting retraction records so retracting in a loop cannot grow the file, and a rewrite compacting a retraction away together with the fact it removed; the endpoint tests pin the view shape, the `400`, `404` and Origin cases, and that a corrupt memory file is reported rather than shown as an empty one.
+记忆视图与撤回改动由这棵树上的同样门禁覆盖，没有为它调用 provider。这些测试固定了折叠（一次撤回按文本和时间戳共同匹配，把恰好一条事实移出生效集合）、拒绝撤回不在生效集合中的事实、跨重开后的存续、字节上限计入撤回记录从而使反复撤回也不能让文件增长，以及重写把一条撤回连同它移除的事实一起压缩掉；接口测试固定了视图形状、`400`、`404` 和 Origin 情形，以及损坏的记忆文件会被报告而不是显示为空。
 
-No API key appeared in the retained evidence. This is point-in-time validation of the described local architecture, not a guarantee for every OpenAI-compatible provider or browser and not a complete accessibility, load, or production-security assessment.
+留存证据中没有出现 API key。这是对所描述本地架构的时点验证，不是对每个 OpenAI 兼容 provider 或浏览器的保证，也不是完整的可访问性、负载或生产安全评估。
 
-## Non-goals
+## 非目标
 
-This slice intentionally excludes:
+本切片有意排除：
 
-- multi-agent orchestration;
-- long-term memory in the sense of retrieval, embedding, ranking, or automatic extraction: memory exists only in the bounded form described above, an append-only fact file the model appends to through `luna_remember` and the system prompt injects under its own caps;
-- summarization or retrieval over a session's history, and any search over stored facts;
-- arbitrary shell, filesystem, or network tools;
-- browser-provided plugin code or paths: UI plugins are served from `plugins/ui/`, an allowlisted directory the host reads, and a plugin is enabled by name from the list the host produced;
-- a plugin marketplace, or any installation path that would add a plugin from the browser;
-- production authentication, authorization, tenant isolation, or public deployment (memory is single-user state with no per-user isolation, which is the same boundary);
-- any memory UI that could author or change a fact: nothing adds, edits or rewrites one from the browser, and the model side keeps no read, list or retract path at all — the browser can only take a fact out of the effective set, by appending a retraction;
-- persisting UI plugin enablement, or any server-side view of which UI plugins are on;
-- cross-origin API access;
-- hidden chain-of-thought capture or display;
-- retries that could duplicate model/tool effects;
-- a public cancellation API;
-- claims of provider connectivity before a successful run.
+- 多 agent 编排；
+- 检索、向量嵌入、排序或自动抽取意义上的长期记忆：记忆只以上文描述的有界形式存在，即一个仅追加的事实文件，模型通过 `luna_remember` 追加，系统提示词在各自的上限下注入；
+- 对会话历史的摘要或检索，以及对已存储事实的任何搜索；
+- 任意 shell、文件系统或网络工具；
+- 浏览器提供的插件代码或路径：界面插件从 `plugins/ui/` 提供，那是宿主读取的白名单目录，插件按宿主产出的列表中的名称启用；
+- 插件市场，或任何会从浏览器添加插件的安装路径；
+- 生产环境认证、授权、租户隔离或公网部署（记忆是单用户状态，没有按用户隔离，属于同一条边界）；
+- 任何能创建或修改事实的记忆界面：从浏览器无法新增、编辑或重写一条事实，模型侧也完全没有读取、列出或撤回的路径——浏览器只能通过追加一条撤回记录把事实移出生效集合；
+- 持久化界面插件的启用状态，或服务器侧任何关于哪些界面插件已启用的视图；
+- 跨源 API 访问；
+- 隐藏推理链的捕获或展示；
+- 可能重复模型/工具效果的自动重试；
+- 公开的取消接口；
+- 在成功运行之前声称 provider 连通。
 
-The UI phrase “真实模型” describes the configured runtime path. The verification above separately establishes one successful live-provider and real-browser run; it does not turn that label into a general connectivity or production-readiness guarantee.
+界面中的“真实模型”一词描述的是已配置的运行时路径。上面的验证另外确立了一次成功的真实 provider 和真实浏览器运行；它不会把这个标签变成通用的连通性或生产就绪保证。

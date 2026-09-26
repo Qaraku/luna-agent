@@ -1,102 +1,101 @@
-# Luna Agent roadmap
+# Luna Agent 路线图
 
-## Destination
+## 目标
 
-A local agent worth using every day: more than one real tool, conversations that survive a restart,
-an explicit context strategy, and a browser front end that can be extended at runtime.
+一个值得每天使用的本地 agent：不止一个真实工具，重启后仍然存在的对话，
+明确的上下文策略，以及一个可以在运行时扩展的浏览器前端。
 
-## Version numbers
+## 版本号
 
-Releases stay in `0.x` while this is an experimental, single-user kernel whose interfaces can still
-change. `1.0.0` is deliberately unscheduled: nothing here is a stable-interface promise, and the
-README's boundaries — loopback only, one run at a time, no authentication or tenant isolation — are
-as much part of the current version as its features are.
+在它还是一个实验性的、单用户内核、接口仍可能变化期间，版本停留在 `0.x`。
+`1.0.0` 被有意排除在计划之外：这里没有任何内容构成稳定接口的承诺，README 划定的边界——仅监听回环地址、一次只运行一个任务、没有认证或租户隔离——和它的功能一样，
+都是当前版本的一部分。
 
-| Version | What it contains |
+| 版本 | 包含内容 |
 |---|---|
-| `v0.1.0` | the plugin kernel slice: subprocess tools, validated reload, drain and rollback. It shipped before this roadmap's slices and is no longer tracked here |
-| `v0.2.0` | S1–S5 below, plus the defects the first acceptance pass found. Each slice's introducing commits are recorded in the scope table below |
-| `v0.2.1` | the usability pass over the browser surface, and the memory-guidance fix that follows from it. No new capability and no contract change; see `## v0.2.1 scope` |
+| `v0.1.0` | 插件内核切片：子进程工具、经过验证的重载、drain 与回滚。它早于本路线图的各个切片发布，不再在此跟踪 |
+| `v0.2.0` | 下面的 S1–S5，加上第一次验收发现的问题。各切片的引入提交记录在下面的范围表中 |
+| `v0.2.1` | 对浏览器界面的一次可用性梳理，以及由此而来的记忆引导修正。不新增能力、不改动契约；见 `## v0.2.1 范围` |
 
-## v0.2.0 scope
+## v0.2.0 范围
 
-| Slice | Content | Depends on | Introduced by | Status |
+| 切片 | 内容 | 依赖 | 引入提交 | 状态 |
 |---|---|---|---|---|
-| S1 | A second tool plugin: bounded file reading | — | `55a64e6` (core), `3372ce6` (web) | in `v0.2.0` |
-| S2 | Persistent sessions and run history | — | `60de6ff` (core), `85a441d` (web) | in `v0.2.0` |
-| S3 | Context and memory strategy | S2 | `6629806` (core) | in `v0.2.0` |
-| S4 | Runtime UI plugin loading | — | `5508cfb` (core), `edce312` (web) | in `v0.2.0` |
-| S5 | Memory you can see and retract | S3 | `c037517` (core), `99e321a` (web) | in `v0.2.0` |
+| S1 | 第二个工具插件：有界文件读取 | — | `55a64e6`（核心）、`3372ce6`（前端） | 包含在 `v0.2.0` |
+| S2 | 持久化会话与运行历史 | — | `60de6ff`（核心）、`85a441d`（前端） | 包含在 `v0.2.0` |
+| S3 | 上下文与记忆策略 | S2 | `6629806`（核心） | 包含在 `v0.2.0` |
+| S4 | 运行时加载界面插件 | — | `5508cfb`（核心）、`edce312`（前端） | 包含在 `v0.2.0` |
+| S5 | 可以查看与撤回的记忆 | S3 | `c037517`（核心）、`99e321a`（前端） | 包含在 `v0.2.0` |
 
-`v0.2.0` also carries the fixes the first acceptance pass produced: `6ed5315` (classify plugin
-infrastructure failures by sentinel), `f1839ed` (return a tool refusal to the model instead of ending
-the run) and `9b39721` (the memory copy claiming a fact can never be removed). `v0.1.0` shipped one
-plugin-backed tool — `text_transform`, from a flat `plugins/<candidate>/` layout — so
-`luna_read_file`, sessions, memory and runtime UI plugins are all `v0.2.0` additions.
+`v0.2.0` 还包含第一次验收产生的修复：`6ed5315`（按哨兵错误标记区分插件
+基础设施故障）、`f1839ed`（把工具拒绝作为调用结果返回模型，而不是结束整轮）
+和 `9b39721`（声称事实永远无法删除的记忆文案）。`v0.1.0` 只发布了一个由插件
+支撑的工具——`text_transform`，来自扁平的 `plugins/<candidate>/` 布局——
+所以 `luna_read_file`、会话、记忆和运行时界面插件都是 `v0.2.0` 的新增内容。
 
-### Slice acceptance
+### 切片验收
 
-- **S1** — a second model-visible tool, `luna_read_file`, bounded by a read root: absolute paths,
-  traversal, escapes outside the root, and symlink escapes are rejected on the host side; there is a
-  single-read size cap; only text is returned. The allowlist holds two tools, and reload,
-  generation pinning, drain and rollback all work for both of them.
-- **S2** — conversations and run records survive a process restart and a page reload.
-- **S3** — the rules that decide what enters the model's context are explicit and unit-tested.
-- **S4** — front-end contribution points register, mount, unmount, and release their resources.
-- **S5** — `GET /api/memory` lists the facts in effect and the facts that were retracted, and
-  `POST /api/memory/retract` takes exactly the fact named by its text and its timestamp out of the
-  effective set, refusing one that is not in effect. Retraction is an appended record, so the store
-  stays append-only, the file stays bounded even when facts are retracted in a loop, and the model's
-  own rights are unchanged: it can still add a fact and nothing else.
+- **S1** —— 第二个模型可见工具 `luna_read_file`，以读取根目录为界：绝对路径、
+  路径穿越、越出根目录的逃逸和符号链接逃逸都在宿主侧被拒绝；单次读取有
+  大小上限；只返回文本。白名单中有两个工具，重载、
+  generation 固定、drain 和回滚对两者都有效。
+- **S2** —— 对话和运行记录在进程重启和页面刷新后依然存在。
+- **S3** —— 决定什么进入模型上下文的规则是明确的，并有单元测试覆盖。
+- **S4** —— 前端扩展点的注册、挂载、卸载和资源释放都有效。
+- **S5** —— `GET /api/memory` 列出生效中的事实和被撤回的事实，
+  `POST /api/memory/retract` 按事实的文本和时间戳精确地把它移出
+  生效集合，并拒绝一条不在生效集合中的事实。撤回是一条追加记录，因此存储
+  保持仅追加，即使反复撤回文件也保持有界，模型自身的权限不变：
+  它仍然只能追加事实，别的都不行。
 
-## v0.2.1 scope
+## v0.2.1 范围
 
-One pass over the front end rather than a new capability. The browser surface had
-accumulated three entries on a single diagnostic drawer, per-component radii and control
-heights, and a sidebar that could not be put away while reading.
+对前端的一次梳理，而不是新增能力。浏览器界面此前把
+三条入口挤在同一个诊断抽屉里，圆角和控件高度由各组件自行确定，
+侧栏在阅读时无法收起。
 
-| Change | Introduced by |
+| 变更 | 引入提交 |
 |---|---|
-| Sessions, memory and extensions get their own entries; the runtime drawer keeps diagnostics | `92c54b9` |
-| Topbar, transcript and composer share one content container and one token set for colour, radius, control height, type and spacing | `92c54b9` |
-| Appearance: light, dark or follow-the-system, stored per browser and applied without remounting anything | `92c54b9` |
-| Sidebar: collapses to zero width and drags between 200 and 420 px; a long title ellipsises and the time column stays fixed, so the list never scrolls sideways | `92c54b9` |
-| Settings becomes a centred modal with its own category navigation instead of a side drawer | `92c54b9` |
-| The example UI plugins use the published `.luna-*` controls, so they follow the theme | `8bc5007` |
-| The instruction and the tool description name the page-header Memory panel, where retraction moved | `168a887` |
-| README, architecture.md and the contributor rules describe the shipped behaviour | `299f341`, `1b06067` |
+| 会话、记忆和扩展各自拥有入口；运行时抽屉保留诊断信息 | `92c54b9` |
+| 顶栏、记录流和输入区共用同一个内容容器，以及同一套颜色、圆角、控件高度、字体和间距 token | `92c54b9` |
+| 外观：浅色、深色或跟随系统，按浏览器保存，应用时不重新挂载任何内容 | `92c54b9` |
+| 侧栏：折叠到零宽度，并可在 200 到 420 px 之间拖拽；长标题省略，时间列固定，因此列表永远不会横向滚动 | `92c54b9` |
+| 设置从侧边抽屉改为中心模态，并带有自己的分类导航 | `92c54b9` |
+| 示例界面插件使用已发布的 `.luna-*` 控件，因此跟随主题 | `8bc5007` |
+| 指令和工具描述改指页头的记忆面板，撤回已移至该处 | `168a887` |
+| README、architecture.md 和贡献规则描述已发布的行为 | `299f341`、`1b06067` |
 
-### v0.2.1 acceptance
+### v0.2.1 验收
 
-- The gate set in `AGENTS.md` — Go race tests, `go vet`, the root build, `gofmt`, the
-  browser-JavaScript syntax and test runs, and `git diff --check` — runs on a clean
-  extraction of this release commit.
-- The isolated Chromium pass runs against that same extraction: appearance selection and its
-  fallbacks, sidebar collapse and width with both bounds, a long-title sidebar that never
-  scrolls sideways, and the settings modal.
-- No live provider run belongs to this version: nothing here touches the model path, and the
-  memory-copy change is covered by its own unit test.
-- These checks show that no behaviour broke. They are not a claim about visual quality: that
-  judgement is the user's, made from screenshots of the running interface.
+- `AGENTS.md` 中的门禁集合——Go race 测试、`go vet`、根应用构建、`gofmt`、
+  浏览器 JavaScript 语法与测试运行，以及 `git diff --check`——在本发布提交的
+  干净提取副本上运行。
+- 隔离 Chromium 验证针对同一份提取副本运行：外观选择及其
+  回退、侧栏折叠与两端的宽度、长标题侧栏
+  不横向滚动，以及设置模态。
+- 本次版本不包含真实 provider 运行：这里没有任何内容触及模型路径，
+  记忆文案改动由它自己的单元测试覆盖。
+- 这些检查表明没有行为被破坏。它们不是对视觉质量的断言：那个
+  判断属于用户，依据是运行中界面的截图。
 
-### What v0.2.1 does not include
+### v0.2.1 不包含的内容
 
-Streaming or execution feedback beyond the current transcript updates, tool-activity panels,
-run cancellation, attachments, a model picker, a plugin marketplace, or any change to the
-HTTP/SSE contract, the session and memory formats, and the tools the model can call. Memory
-still has no retrieval, and the model still cannot read, list, edit or retract a fact.
+超出当前记录流更新的流式或执行反馈、工具活动面板、
+运行取消、附件、模型选择器、插件市场，以及对
+HTTP/SSE 契约、会话与记忆格式、模型可调用工具的任何改动。记忆
+仍然没有检索，模型仍然不能读取、列出、编辑或撤回一条事实。
 
-## How this is being built
+## 构建方式
 
-One slice at a time. A slice is verified by compilation plus focused unit tests; the end-to-end pass
-against a live provider, and the browser, happen at the boundary of a tagged release rather than per
-slice, so a tag points at the tree the acceptance actually ran against. An unreleased intermediate
-slice that fails end to end is corrected by the slices that follow it rather than by stopping the
-line. At that boundary the gates and the browser pass always run on a clean extraction of the
-release commit; a live-provider run belongs to it only when the release changes the model path.
+一次一个切片。切片通过编译加上聚焦的单元测试来验证；针对真实 provider 的端到端验证
+和浏览器验证发生在打标签发布的边界，而不是每个
+切片，因此标签指向验收实际运行的那棵树。一个尚未发布的中间
+切片如果在端到端上失败，由后续切片修正，而不是停下整条
+线。在那个边界上，门禁和浏览器验证总是在发布提交的干净提取副本上运行；
+只有当本次发布改动了模型路径时，才包含真实 provider 运行。
 
-## Non-goals
+## 非目标
 
-Multi-agent orchestration, arbitrary shell execution, unbounded filesystem access, a plugin
-marketplace, production authentication, tenant isolation, public deployment, cross-origin API
-access, hidden reasoning capture, and retries that could duplicate model or tool effects.
+多 agent 编排、任意 shell 执行、无界文件系统访问、插件
+市场、生产环境认证、租户隔离、公网部署、跨源 API
+访问、隐藏推理捕获，以及可能重复模型或工具效果的自动重试。
