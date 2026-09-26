@@ -372,8 +372,14 @@ func TestReadRootDefaultsToTheRepositoryRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("default read root cannot read the repository: %v", err)
 	}
-	if !strings.Contains(out.Result, "# Luna Agent architecture") {
-		t.Fatalf("unexpected content: %.60q", out.Result)
+	// 断言读取的是仓库里那个文件本身，而不是它的开头一行写死在测试里：
+	// 后者会让这条测试随文档语言变化而失败，与读取根目录无关。
+	want, err := os.ReadFile(filepath.Join(testRoot(t), "docs", "architecture.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Result, string(want)) {
+		t.Fatalf("content differs from the file on disk: %.60q", out.Result)
 	}
 	narrowed := testHost(t, Options{ReadRoot: t.TempDir()})
 	if _, err := narrowed.ReadFile(context.Background(), ReadRequest{Path: "docs/architecture.md"}); !errors.Is(err, fileread.ErrNotFound) {

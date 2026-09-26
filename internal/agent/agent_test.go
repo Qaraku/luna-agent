@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -633,8 +634,17 @@ func TestFakeModelReadsAFileThroughEinoEndToEnd(t *testing.T) {
 		t.Fatalf("started=%+v", started)
 	}
 	finished := sink.events[2].Data.(ToolFinished)
-	if finished.Name != ReadFileToolName || !strings.Contains(finished.Result, "# Luna Agent architecture") {
+	if finished.Name != ReadFileToolName {
 		t.Fatalf("finished=%+v", finished)
+	}
+	// 同样与磁盘上的文件比对：这条断言要证明的是整轮读回了那个文件，
+	// 不应该因为它被译成另一种语言而失败。
+	onDisk, err := os.ReadFile(filepath.Join(root, "docs", "architecture.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(finished.Result, string(onDisk)) {
+		t.Fatalf("finished.Result differs from the file on disk=%+v", finished)
 	}
 	if finished.Generation != 1 || finished.Version != "v1" || finished.PluginPID <= 0 {
 		t.Fatalf("finished identity=%+v", finished)
