@@ -30,7 +30,7 @@ const (
 	ContextReference ContextKind = "reference"
 	// ContextInstruction 是项目规则：模型应当遵循，但不能改写系统指令。
 	ContextInstruction ContextKind = "instruction"
-	// ContextSkill 是程序性知识（尚未渲染）。
+	// ContextSkill 是程序性知识：做某类事的方式，按需取用，不是参考数据也不是项目规则。
 	ContextSkill ContextKind = "skill"
 )
 
