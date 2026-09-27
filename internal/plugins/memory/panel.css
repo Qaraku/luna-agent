@@ -6,6 +6,12 @@
  * uses them, is what makes disabling the capability take the panel's look away
  * with its content.
  *
+ * Two layers, not one list. The facts in effect are the surface — the group
+ * heading is the first piece of information on the screen and each card carries
+ * its own action as a quiet footnote. The retracted facts are an archive behind
+ * a single summary line: their entries stay visually secondary (dashed, muted,
+ * no action) and only appear when the toggle asks for them.
+ *
  * Every --luna-* token named below is defined in the host stylesheet; a name
  * that is not defined there is silently dropped by the browser, so the
  * references are checked against web/style.css by a test.
@@ -15,15 +21,49 @@
 /* 生效中与已撤回是同一套卡片的两组：分组标题是二级信息，条目才是内容。 */
 .memory-panel-group { display: grid; gap: var(--luna-space-2); margin: 0 0 var(--luna-space-4); }
 .memory-panel-group-retracted { margin-bottom: 0; }
-.memory-panel-heading { margin: 0; font-size: var(--luna-font-label); font-weight: 600; color: var(--luna-text-subtle); }
+.memory-panel-heading { margin: 0; font-size: var(--luna-font-ui); font-weight: 600; color: var(--luna-text-subtle); }
+/* 主体那一组的标题读起来是这一屏的标题，摘要那一组的标题读起来只是索引。 */
+.memory-panel-heading-active { color: var(--luna-text); }
+/* 已撤回的展开开关：文字按钮，靠箭头表示状态，不抢主体的注意力。 */
+.memory-panel-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--luna-space-1);
+  margin: 0;
+  padding: var(--luna-space-1) 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.memory-panel-toggle:hover { color: var(--luna-text-muted); }
+.memory-panel-toggle::before { content: '▸'; font-size: var(--luna-font-meta); line-height: 1; }
+.memory-panel-toggle[aria-expanded="true"]::before { content: '▾'; }
+.memory-panel-toggle:focus-visible { outline: 2px solid var(--luna-focus); outline-offset: 2px; border-radius: var(--luna-radius-xs); }
 .memory-panel-list, .memory-panel-retracted { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--luna-space-2); }
 .memory-panel-item { display: grid; gap: var(--luna-space-1); padding: var(--luna-space-2) var(--luna-space-3); border: 1px solid var(--luna-border-weak); border-radius: var(--luna-radius-sm); background: var(--luna-surface); }
 .memory-panel-text { margin: 0; overflow-wrap: anywhere; }
+/* 每张卡片的下沿：来源与时间在左，唯一可点的动作在右，且比正文弱一档。 */
+.memory-panel-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--luna-space-2) var(--luna-space-3); }
+/* 撤回是偶尔用的动作，不是每行的主体：去掉按钮外观，只留一行小字，指向它时才明显。 */
+.memory-panel-retract.luna-button {
+  flex: 0 0 auto;
+  min-height: 0;
+  padding: var(--luna-space-1) var(--luna-space-2);
+  border-color: transparent;
+  background: transparent;
+  color: var(--luna-text-muted);
+  font-size: var(--luna-font-meta);
+  font-weight: 400;
+}
+.memory-panel-retract.luna-button:hover { background: var(--luna-hover); color: var(--luna-text); }
+.memory-panel-retract.luna-button:active { background: var(--luna-active); }
+.memory-panel-retract.luna-button:disabled { color: var(--luna-text-subtle); }
 /* 已撤回的条目不再生效：整块降到次要色，且没有可点的动作，与生效中的卡片一眼可分。 */
 .memory-panel-item-retracted { background: transparent; border-style: dashed; }
 .memory-panel-item-retracted .memory-panel-text { color: var(--luna-text-muted); }
 .memory-panel-meta { margin: 0; font-size: var(--luna-font-meta); color: var(--luna-text-muted); }
-.memory-panel-retract { justify-self: start; }
 .memory-panel-empty, .memory-panel-status { margin: var(--luna-space-2) 0 0; font-size: var(--luna-font-meta); color: var(--luna-text-muted); }
 .memory-panel-group > .memory-panel-empty { margin: 0; }
 .memory-panel-status.failure { color: var(--luna-danger); }

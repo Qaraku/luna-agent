@@ -9,9 +9,13 @@
 //
 // The panel is a product surface, not a lifecycle log: mounting, unmounting and
 // how many requests went out are things the module knows and the user does not
-// need. What it shows is the two halves of the store that actually differ for a
-// reader — the facts in effect and the facts that were retracted — with where
-// each one came from and when, plus the one thing the reader can do about it.
+// need. It has two layers instead of one flat list. The facts in effect are the
+// surface: each one carries its text, where it came from, when it was recorded,
+// and the one action that changes anything — retracting it, kept visually
+// secondary because it is the exception, not the point of the row. Retracted
+// facts are the archive behind that surface: one summary line by default, the
+// entries only when asked for, because a store's internal shape is not what the
+// reader opened the panel to see.
 //
 // It uses the same mount(target, api) / unmount(target) contract as every other
 // browser module, and the host's own classes for the shared look; its layout
@@ -35,6 +39,12 @@ const STYLE_URL = new URL('panel.css', import.meta.url).href;
 // retracted list) is already visible in the lists, so it is not repeated here.
 const STATUS_LINGER = 6000;
 
+// The retracted section's toggle points at its own list with aria-controls, so
+// every mount needs its own id: mounting twice on one page is a host behaviour
+// (re-enabling the capability), and a fixed id would address the other panel's
+// list.
+let mountSeq = 0;
+
 // One mount's state. A module instance lives in the container the host created,
 // so the state is keyed by that container and released on unmount.
 const states = new WeakMap();
@@ -50,11 +60,11 @@ export function mount(target, api) {
 
   const hint = document.createElement('p');
   hint.className = 'memory-panel-hint';
-  hint.textContent = '这些是 Luna 正在使用的记忆。撤回会把一条事实移出生效集合，记录仍留在本地文件里；要让它重新生效，只能由模型再记录一次。';
+  hint.textContent = '这些是 Luna 会在之后的对话里用到的事实。撤回会把一条移出生效集合，记录仍留在本地文件里；要让它重新生效，只能由模型再记录一次。';
 
-  // 生效中：当前真的会进入对话的那些事实，每条都能就地撤回。
+  // 生效中：当前真的会进入对话的那些事实，每条都能就地撤回。这是面板的主体。
   const activeHeading = document.createElement('h3');
-  activeHeading.className = 'memory-panel-heading';
+  activeHeading.className = 'memory-panel-heading memory-panel-heading-active';
   const activeList = document.createElement('ul');
   activeList.className = 'memory-panel-list';
   const activeEmpty = document.createElement('p');
@@ -63,12 +73,22 @@ export function mount(target, api) {
   activeGroup.className = 'memory-panel-group';
   activeGroup.append(activeHeading, activeList, activeEmpty);
 
-  // 已撤回：还在文件里、但不再生效的那些。整组在没有撤回记录时不出现，
-  // 所以第一次使用的面板就是一个安静的初始态。
+  // 已撤回：还在文件里、但不再生效的那些。默认只占一行摘要，点开才列出；
+  // 没有撤回记录时整组不出现，所以第一次使用的面板就是一个安静的初始态。
+  // 展开状态只活在这一次挂载里（state 随容器建、随容器销毁），所以它不会
+  // 被持久化成某种"用户偏好"，也不会在重新打开面板时莫名其妙地记着。
   const goneHeading = document.createElement('h3');
   goneHeading.className = 'memory-panel-heading';
+  const goneToggle = document.createElement('button');
+  goneToggle.type = 'button';
+  goneToggle.className = 'memory-panel-toggle';
+  goneToggle.setAttribute('aria-expanded', 'false');
+  goneToggle.setAttribute('aria-controls', `luna-memory-retracted-${(mountSeq += 1)}`);
+  goneHeading.append(goneToggle);
   const goneList = document.createElement('ul');
-  goneList.className = 'memory-panel-retracted';
+  goneList.className = 'memory-panel-list memory-panel-retracted';
+  goneList.id = goneToggle.getAttribute('aria-controls');
+  goneList.hidden = true;
   const goneGroup = document.createElement('section');
   goneGroup.className = 'memory-panel-group memory-panel-group-retracted';
   goneGroup.append(goneHeading, goneList);
@@ -84,18 +104,27 @@ export function mount(target, api) {
     activeHeading,
     activeList,
     activeEmpty,
-    goneHeading,
+    goneToggle,
     goneList,
     goneGroup,
     status,
     facts: [],
     retracted: [],
+    // 展开状态是按挂载算的视图状态，不是数据：draw 每次重绘都读它，但从不写它。
+    goneOpen: false,
     busy: false,
     pending: null,
     controller: null,
   };
   states.set(target, state);
   draw(state);
+
+  // 展开与收起只改这一段的可访问状态和可见性：不重画条目，也就不发请求，
+  // 点开已撤回不会让面板闪一下。
+  goneToggle.addEventListener('click', () => {
+    state.goneOpen = !state.goneOpen;
+    syncGone(state);
+  });
 
   load(state);
 }
@@ -134,15 +163,27 @@ function draw(state) {
   // 生效中
   state.activeList.replaceChildren();
   state.facts.forEach((fact, index) => state.activeList.append(factNode(state, fact, index)));
-  state.activeHeading.textContent = `生效中 · ${state.facts.length} 条`;
+  state.activeHeading.textContent = `Luna 记得的 · ${state.facts.length} 条`;
   state.activeEmpty.hidden = state.facts.length > 0;
-  state.activeEmpty.textContent = state.retracted.length > 0 ? '没有生效中的记忆。' : '还没有记录任何事实。';
+  state.activeEmpty.textContent =
+    state.retracted.length > 0
+      ? '没有生效中的记忆：都已经撤回。展开下面的「已撤回」可以看到它们。'
+      : '还没有记录任何事实。Luna 在对话里记下一条时（它调用 luna_remember），那条事实会出现在这里。';
 
-  // 已撤回
+  // 已撤回：一行摘要加一组默认收起的条目，展开状态由 state.goneOpen 决定。
   state.goneList.replaceChildren();
   state.retracted.forEach((entry) => state.goneList.append(retractedNode(entry)));
-  state.goneHeading.textContent = `已撤回 · ${state.retracted.length} 条`;
   state.goneGroup.hidden = state.retracted.length === 0;
+  state.goneToggle.textContent = `已撤回 · ${state.retracted.length} 条`;
+  syncGone(state);
+}
+
+// syncGone is the whole of the collapse behaviour: the button says whether the
+// list is showing, and the list follows. It is deliberately not part of draw —
+// toggling must not rebuild rows or touch the network.
+function syncGone(state) {
+  state.goneToggle.setAttribute('aria-expanded', state.goneOpen ? 'true' : 'false');
+  state.goneList.hidden = !state.goneOpen;
 }
 
 function factNode(state, fact, index) {
@@ -160,16 +201,22 @@ function factNode(state, fact, index) {
     textOf(fact.source_session) ? `来自会话 ${textOf(fact.source_session)}` : '',
     `记录于 ${whenOf(fact.at)}`,
   ]);
-  item.append(meta);
 
-  // 这一条能做什么：只有生效中的记忆有可点的动作；已撤回的没有。
+  // 这一条能做什么：只有生效中的记忆有可点的动作；已撤回的没有。按钮和来源、
+  // 时间同处一行，读起来是这张卡片的脚注而不是主体。
   const button = document.createElement('button');
   button.type = 'button';
   button.className = 'memory-panel-retract luna-button';
   button.textContent = '撤回';
+  // 每行的按钮文字都一样，读屏时它们会变成一串"撤回"；标签把这条事实带上。
+  button.setAttribute('aria-label', `撤回这条记忆${labelOf(fact.text)}`);
   button.disabled = state.busy;
   button.addEventListener('click', () => retract(state, index));
-  item.append(button);
+
+  const foot = document.createElement('div');
+  foot.className = 'memory-panel-foot';
+  foot.append(meta, button);
+  item.append(foot);
 
   return item;
 }
@@ -249,6 +296,14 @@ function joinMeta(parts) {
 
 function textOf(value) {
   return typeof value === 'string' ? value : '';
+}
+
+// labelOf turns a fact into the tail of a retract button's label: enough to
+// tell two rows apart, short enough not to read out a whole paragraph.
+function labelOf(value) {
+  const text = textOf(value).trim().replace(/\s+/g, ' ');
+  if (!text) return '';
+  return `：${text.length > 40 ? `${text.slice(0, 40)}…` : text}`;
 }
 
 function whenOf(value) {
