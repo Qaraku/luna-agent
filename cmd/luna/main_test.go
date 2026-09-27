@@ -5,8 +5,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Qaraku/luna-agent/internal/config"
+	"github.com/Qaraku/luna-agent/internal/httpapi"
 	"github.com/Qaraku/luna-agent/internal/layout"
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
@@ -462,5 +464,18 @@ func TestSkillsDirMayBeRepeatedAndRejectsAnEmptyValue(t *testing.T) {
 	}
 	if !strings.Contains(dirs.String(), "/one") {
 		t.Fatalf("String()=%q, want it to report what was set", dirs.String())
+	}
+}
+
+// The write deadline has to sit above the run budget: while it was the shorter of the two
+// (a fixed 70 seconds against a 15-minute budget), a run that streamed past 70 seconds was
+// cut at the socket — the client got no terminal event, and the dead connection cancelled
+// the run, so the budget never got to end it.
+func TestWriteDeadlineSitsAboveTheRunBudget(t *testing.T) {
+	budgets := []time.Duration{httpapi.DefaultRunTimeout, 90 * time.Second, 20 * time.Minute, time.Hour}
+	for _, budget := range budgets {
+		if got := writeDeadlineFor(budget); got <= budget {
+			t.Fatalf("write deadline %s must exceed the run budget %s", got, budget)
+		}
 	}
 }

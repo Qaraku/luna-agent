@@ -782,3 +782,17 @@ func TestReloadAcceptsExactlyTheAllowlistedCandidates(t *testing.T) {
 		t.Fatalf("refusal should name the allowlist's candidates: %s", w.Body.String())
 	}
 }
+
+// 预算只解析一次：调用方（装配根）要按同一个数决定 HTTP 写入截止时间，
+// 两边各自解析默认值就会让"运行预算"和"能不能活到预算用完"这两个数对不上。
+func TestRunTimeoutForResolvesTheBudgetOnce(t *testing.T) {
+	if got := RunTimeoutFor(0); got != DefaultRunTimeout {
+		t.Fatalf("unset budget resolved to %s, want the default %s", got, DefaultRunTimeout)
+	}
+	if got := RunTimeoutFor(-time.Second); got != DefaultRunTimeout {
+		t.Fatalf("negative budget resolved to %s, want the default", got)
+	}
+	if got := RunTimeoutFor(20 * time.Minute); got != 20*time.Minute {
+		t.Fatalf("configured budget resolved to %s, want 20m", got)
+	}
+}

@@ -304,6 +304,17 @@ func stateRoot(root, explicit string) string {
 	return root
 }
 
+// writeDeadlineFor places the HTTP write deadline above the run budget.
+//
+// The budget, not the connection, has to be what ends a run. When the deadline is the
+// shorter of the two, a run that streams past it is cut at the socket: the browser gets
+// no terminal event, and it cannot tell a cut stream from a hang — and the run itself is
+// cancelled by the dead connection, so the budget never gets its say. The margin covers
+// the last flush and the terminal event written once the budget does fire.
+func writeDeadlineFor(runTimeout time.Duration) time.Duration {
+	return runTimeout + 30*time.Second
+}
+
 // uiPluginsDir resolves the runtime UI plugin directory. It always lives under
 // the resolved root and has no flag: a browser is only ever served plugins from
 // the checkout that is running, never from a path a request asked for.
@@ -501,8 +512,11 @@ func run() error {
 	for _, model := range cfg.Models {
 		models = append(models, httpapi.ModelRef{Name: model.Name, Provider: model.Provider})
 	}
-	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(newSkillCatalog(skillSet, settingsPath, userSettings)), httpapi.WithWorkspaces(workspaceStore), httpapi.WithRunTimeout(cfg.RunTimeout))
-	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: 70 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
+	// 运行预算与 HTTP 写入截止时间必须互相说得通：一次运行有权用到它自己的预算为止，
+	// 所以写入截止时间要**高于**预算，而不是替预算结束运行（见 writeDeadlineFor）。
+	runTimeout := httpapi.RunTimeoutFor(cfg.RunTimeout)
+	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(newSkillCatalog(skillSet, settingsPath, userSettings)), httpapi.WithWorkspaces(workspaceStore), httpapi.WithRunTimeout(runTimeout))
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: writeDeadlineFor(runTimeout), IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() {
 		err := server.Serve(listener)

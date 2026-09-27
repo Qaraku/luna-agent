@@ -245,14 +245,24 @@ func Listen(addr string) (net.Listener, error) {
 	}
 	return net.Listen("tcp", addr)
 }
+
+// RunTimeoutFor resolves the run budget a server built with d enforces: what the caller
+// configured, or this package's default. A caller that also owns the HTTP server needs the
+// resolved value, because the write deadline has to sit above the budget a run may spend
+// streaming — resolving it twice would let the two numbers disagree.
+func RunTimeoutFor(d time.Duration) time.Duration {
+	if d <= 0 {
+		return DefaultRunTimeout
+	}
+	return d
+}
+
 func New(p PluginManager, r Runner, sessions Sessions, info Info, opts ...Option) http.Handler {
 	s := &Server{plugins: p, runner: r, sessions: sessions, info: info, started: time.Now(), runTimeout: DefaultRunTimeout}
 	for _, opt := range opts {
 		opt(s)
 	}
-	if s.runTimeout <= 0 {
-		s.runTimeout = DefaultRunTimeout
-	}
+	s.runTimeout = RunTimeoutFor(s.runTimeout)
 	return http.HandlerFunc(s.serveHTTP)
 }
 func send(w http.ResponseWriter, status int, v any) {
