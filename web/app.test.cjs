@@ -1775,9 +1775,10 @@ test('words spoken before a tool call become a run note, not part of the answer'
   const notes = view.notes();
   assert.equal(notes.length, 1);
   assert.match(notes[0].textContent, /运行说明：我先读一下这个文件。/);
-  assert.deepEqual(view.phases().map((node) => node.textContent), ['第 1 段回应'], '阶段行在说明之前');
-  assert.deepEqual(view.order(), ['run-phase', 'run-note', 'tool-row running', 'assistant-body placeholder'],
-    '时间线按真实顺序排列：阶段行 → 运行说明 → 工具卡片 → 回答（这一轮还没写出回答）');
+  // 第一段不给阶段行：一次运行的第一段没有上一段可对照，那一行对短运行只是噪声。
+  assert.equal(view.phases().length, 0, '第一段不出现阶段行');
+  assert.deepEqual(view.order(), ['run-note', 'tool-row running', 'assistant-body placeholder'],
+    '时间线按真实顺序排列：运行说明 → 工具卡片 → 回答（这一轮还没写出回答）');
   assert.equal(view.statusLabel.textContent, '正在使用工具：读取文件');
   const running = view.cards()[0];
   assert.equal(running.getAttribute('class'), 'tool-row running');
@@ -1791,7 +1792,8 @@ test('words spoken before a tool call become a run note, not part of the answer'
   await h.settle();
   assert.equal(view.body.textContent, '读完了。');
   assert.equal(view.notes().length, 1, '运行说明只有一条，也没有被复制进回答');
-  assert.deepEqual(view.phases().map((node) => node.textContent), ['第 1 段回应', '第 2 段回应']);
+  assert.deepEqual(view.phases().map((node) => node.textContent), ['第 2 段回应'],
+    '工具之后模型又接着说，只有这一次续写带阶段行');
   assert.equal(view.cards().length, 1);
   assert.equal(view.cards()[0].querySelector('.tool-name').textContent, '读取文件完成');
   assert.equal(view.cards()[0].querySelector('.tool-meta').textContent, '420ms');
@@ -1835,16 +1837,20 @@ test('assistant.reasoning streams into its own entry and never into the answer',
   await h.settle();
   assert.equal(view.body.textContent, '它在做两件事。');
   assert.equal(view.body.textContent.includes('先看'), false, '答案对齐不会把推理带进来');
-  assert.deepEqual(view.order(), ['run-phase', 'run-reasoning', 'assistant-body'], '阶段行 → 推理 → 回答');
+  assert.deepEqual(view.order(), ['run-reasoning', 'assistant-body'], '第一段推理直接跟在回合里，回答收尾');
 
-  // 预览是纯函数：只取最近到达的一段，换行压成空格，超长从前面省略。
+  // 预览是纯函数：换行压成空格，方向按这一段是否还在产生取。进行中给最新到达的
+  // 一段（前面省略），已经结束的条目给开头（后面省略）——不再都是前省略。
   assert.equal(reasoningPreview(undefined), '');
   assert.equal(reasoningPreview(''), '');
   assert.equal(reasoningPreview(7), '');
   assert.equal(reasoningPreview('  短的  '), '短的');
   assert.equal(reasoningPreview('第一行\n第二行'), '第一行 第二行');
   const wide = 'x'.repeat(REASONING_PREVIEW_CHARS + 10);
-  assert.equal(reasoningPreview(wide), `…${'x'.repeat(REASONING_PREVIEW_CHARS)}`, '预览有界，只留最近的一段');
+  assert.equal(reasoningPreview(wide, true), `…${'x'.repeat(REASONING_PREVIEW_CHARS)}`,
+    '流式进行中：预览有界，只留最新到达的一段');
+  assert.equal(reasoningPreview(wide), `${'x'.repeat(REASONING_PREVIEW_CHARS)}…`,
+    '已经结束的条目：预览有界，给开头而不是一段残片');
   stream.end();
   await h.settle();
 });
@@ -1891,15 +1897,44 @@ test('each model leg gets its own reasoning entry behind its continuation phase 
   await h.settle();
 
   assert.deepEqual(view.order(), [
-    'run-phase', 'run-reasoning', 'run-note', 'tool-row ok', 'run-phase', 'run-reasoning', 'assistant-body'
-  ], '时间线按真实顺序：这一段的开始 → 推理 → 说明 → 工具 → 继续 → 回答');
-  assert.deepEqual(view.phases().map((node) => node.textContent), ['第 1 段回应', '第 2 段回应']);
+    'run-reasoning', 'run-note', 'tool-row ok', 'run-phase', 'run-reasoning', 'assistant-body'
+  ], '时间线按真实顺序：推理 → 说明 → 工具 → 续写 → 第二段推理 → 回答');
+  assert.deepEqual(view.phases().map((node) => node.textContent), ['第 2 段回应'],
+    '第一段没有阶段行，续写的那一段才有');
   assert.equal(view.reasoningText().length, 2, '每一段模型输出有自己的推理条目');
   assert.equal(view.reasoning()[1].open, true, '展开过一次后，后面的推理条目沿用同一个选择');
   assert.equal(view.reasoningText()[0].textContent, '得先看文件');
   assert.equal(view.reasoningText()[1].textContent, '文件里写着 ok，直接回答就行', '第二段的推理不会并进第一条');
   assert.equal(view.body.textContent, '文件里写着 ok。');
   assert.equal(view.notes()[0].textContent.includes('得先看文件'), false, '推理不混进运行说明');
+  stream.end();
+  await h.settle();
+});
+
+test('a running reasoning entry previews its latest text, a finished one previews its opening', async () => {
+  const { REASONING_PREVIEW_CHARS, RUN_ANSWER_LABEL } = require('./app.js');
+  const h = runHarness();
+  await h.settle();
+  await h.startRun('讲一段很长的推理');
+  const view = runView(h);
+  const stream = h.stream();
+  const reasoning = `${'甲'.repeat(REASONING_PREVIEW_CHARS + 20)}尾`;
+  stream.push(sse('run.started', { run_id: 'run-1', session_id: 'aaaaaaaa' }));
+  stream.push(sse('assistant.reasoning', { text: reasoning }));
+  await h.settle();
+  const preview = () => view.reasoning()[0].querySelector('.run-reasoning-preview').textContent;
+  assert.equal(preview(), `…${reasoning.slice(reasoning.length - REASONING_PREVIEW_CHARS)}`,
+    '还在流式：预览给最新到达的一段（前面省略），折起来也看得出它在长');
+
+  stream.push(sse('assistant.delta', { text: '好。' }));
+  stream.push(sse('run.finished', { run_id: 'run-1', answer: '好。' }));
+  await h.settle();
+  assert.equal(preview(), `${reasoning.slice(0, REASONING_PREVIEW_CHARS)}…`,
+    '已经结束：预览给开头（后面省略），不再是一段看起来被切掉开头的残片');
+
+  // 回答有自己的容器标注：标注挂在容器上，答案文本里一个字都不多。
+  assert.equal(view.body.dataset.label, RUN_ANSWER_LABEL);
+  assert.equal(view.body.textContent, '好。', '标注不是答案文本的一部分');
   stream.end();
   await h.settle();
 });
@@ -2029,6 +2064,24 @@ test('a cancel is answered by the server, not invented by the page', async () =>
   assert.equal(failed.statusLabel.textContent, 'Luna 正在回应…', '下一个真实事件覆盖那句话');
   brokenStream.end();
   await broken.settle();
+});
+
+test('a run that fails before any answer leaves no empty answer container', async () => {
+  const h = runHarness();
+  await h.settle();
+  await h.startRun('会失败的一轮');
+  const view = runView(h);
+  const stream = h.stream();
+  stream.push(sse('run.started', { run_id: 'run-1', session_id: 'aaaaaaaa' }));
+  stream.push(sse('run.failed', { run_id: 'run-1', error: '模型不可用' }));
+  await h.settle();
+  // 没有答案时"回答"这一格不应该留下：标注只标真的答案。
+  assert.equal(view.timelineBody(), null, '失败且没有答案时不留下空的回答容器');
+  assert.match(view.turn.querySelector('.error-copy').textContent, /没能完成这次回应/);
+  assert.match(view.turn.querySelector('.run-error-detail').textContent, /模型不可用/);
+  assert.equal(view.status.hidden, true, '终止事件一到就退出运行状态');
+  stream.end();
+  await h.settle();
 });
 
 test('a tool card bounds long arguments and results and keeps identity secondary', async () => {
@@ -2162,7 +2215,9 @@ test('the run process stays inline in one timeline while usage is secondary info
   assert.equal(view.meta.textContent.includes('缓存'), false, '没给的字段不显示');
   assert.equal(view.timeline.querySelector('.run-usage'), null, '时间线里没有用量这一条');
   // 条目按发生顺序，回答留在最后（这一轮还没有写出回答，所以它还是占位状态）。
-  assert.deepEqual(view.order(), ['run-phase', 'tool-row ok', 'assistant-body placeholder']);
+  // 这一轮只有一次调用，所以没有"第 N 段回应"那种标号，只有一张工具卡片。
+  assert.deepEqual(view.order(), ['tool-row ok', 'assistant-body placeholder']);
+  assert.equal(view.phases().length, 0, '只有一次调用时不给阶段行');
 
   second.push(sse('usage.updated', { run_id: 'run-2', input_tokens: 1234, output_tokens: 320, cached_tokens: 64 }));
   second.push(sse('run.finished', { run_id: 'run-2', answer: '文件内容是 ok' }));
@@ -2196,7 +2251,7 @@ test('the run process stays inline in one timeline while usage is secondary info
 
 test('run phase and usage copy is read from events only', () => {
   const {
-    runPhaseText, runPhaseEntryText, runOutcomeLabel, runTraceMeta, replayRunState, usageText, formatTokenCount
+    runPhaseText, runPhaseEntryText, runPhaseVisible, runOutcomeLabel, runTraceMeta, replayRunState, usageText, formatTokenCount
   } = require('./app.js');
   assert.equal(runPhaseText('connecting'), '正在连接…');
   assert.equal(runPhaseText('waiting'), '已开始，等待模型回应…');
@@ -2214,6 +2269,12 @@ test('run phase and usage copy is read from events only', () => {
   assert.equal(runPhaseEntryText(1), '第 2 段回应');
   assert.equal(runPhaseEntryText(2), '第 3 段回应');
   assert.equal(runPhaseEntryText(undefined), '第 1 段回应', '拿不到段号时按第一段，不编一个别的数字');
+  // 阶段行只在真的多段时出现：第一段没有上一段可对照，标号只是噪声。
+  assert.equal(runPhaseVisible(0), false, '第一段不给阶段行');
+  assert.equal(runPhaseVisible(1), true, '续写的那一段才给');
+  assert.equal(runPhaseVisible(5), true);
+  assert.equal(runPhaseVisible(undefined), false, '拿不到段号时不凭空加一行');
+  assert.equal(runPhaseVisible('1'), false);
   assert.equal(runOutcomeLabel('ok'), '已完成');
   assert.equal(runOutcomeLabel('cancelled'), '已取消');
   assert.equal(runOutcomeLabel('failed'), '失败');
@@ -2342,9 +2403,26 @@ test('every run observability style the script builds a class for exists in the 
   // 推理正文同样有界：一次很长的推理不能把回答主体顶出视野。
   assert.match(css, /\.run-reasoning-body\s*\{[^}]*max-height/s);
   assert.match(css, /\.run-reasoning\s*>\s*summary\s*\{[^}]*min-height:\s*var\(--luna-control-sm\)/s, '推理那一行沿用控件高度');
-  // 回答主体是视觉主体：与过程条目之间有一档更大的间距与一条分隔线，两者都用 token。
-  assert.match(css, /\.run-timeline\s*>\s*\*\s*\+\s*\.assistant-body\s*\{[^}]*margin-top:\s*var\(--luna-space-4\)/s);
-  assert.match(css, /\.run-timeline\s*>\s*\*\s*\+\s*\.assistant-body\s*\{[^}]*border-top:\s*1px solid var\(--luna-border-weak\)/s);
+  // 回答主体是视觉主体：它有自己的容器（raised 表面 + 边框 + 尺度 token 的圆角与
+  // 内边距）、顶上一行标注、比过程条目大一档的字号，并与过程条目之间留出一档更大
+  // 的空白（容器的边框已经划出边界，所以不再另加一条分隔线）。
+  assert.match(css, /\.assistant-body\s*\{[^}]*background:\s*var\(--luna-raised\)/s);
+  assert.match(css, /\.assistant-body\s*\{[^}]*border:\s*1px solid var\(--luna-border\)/s);
+  assert.match(css, /\.assistant-body\s*\{[^}]*border-radius:\s*var\(--luna-radius-lg\)/s);
+  assert.match(css, /\.assistant-body\s*\{[^}]*padding:\s*var\(--luna-space-4\)/s);
+  assert.match(css, /\.assistant-body\s*\{[^}]*font-size:\s*var\(--luna-font-display\)/s, '回答比过程条目大一档');
+  assert.match(css, /\.assistant-body::before\s*\{[^}]*content:\s*attr\(data-label\)/s, '回答的标注来自容器自己的 data-label');
+  assert.match(css, /\.assistant-body\.placeholder::before[^{]*\{[^}]*content:\s*none/s, '还没有答案时不出标注');
+  assert.match(css, /\.run-timeline\s*>\s*\*\s*\+\s*\.assistant-body\s*\{[^}]*margin-top:\s*var\(--luna-space-5\)/s);
+  // 工具卡片有可辨的卡片感：surface 表面 + 弱边框 + 尺度 token 的圆角，和"不加容器
+  // 的推理条目"一眼分得开，但文字仍是 12px muted。
+  assert.match(css, /\.tool-row\s*\{[^}]*background:\s*var\(--luna-surface\)/s);
+  assert.match(css, /\.tool-row\s*\{[^}]*border:\s*1px solid var\(--luna-border-weak\)/s);
+  assert.match(css, /\.tool-row\s*\{[^}]*border-radius:\s*var\(--luna-radius-md\)/s);
+  // 阶段行只是标点级的标号：比过程条目还小一档，不再占一个控件高度。
+  assert.match(css, /\.run-phase\s*\{[^}]*font-size:\s*var\(--luna-font-label\)/s);
+  assert.match(css, /\.run-phase\s*\{[^}]*color:\s*var\(--luna-text-subtle\)/s);
+  assert.doesNotMatch(css, /\.run-phase\s*\{[^}]*min-height/s, '阶段行不再占一个控件高度');
   // 折叠时那一行的实时预览是可见内容；展开后正文已经给出全文，预览不再重复一遍。
   assert.match(css, /\.run-reasoning\[open\][^{]*\.run-reasoning-preview\s*\{\s*display:\s*none/s);
   assert.equal(/gradient\s*\(/i.test(css), false);

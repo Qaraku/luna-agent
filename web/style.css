@@ -367,19 +367,38 @@ body {
 }
 .assistant-body {
   margin: 0;
+  padding: var(--luna-space-4);
+  border: 1px solid var(--luna-border);
+  border-radius: var(--luna-radius-lg);
+  background: var(--luna-raised);
   color: var(--luna-text);
-  font-size: var(--luna-font-body);
-  line-height: 1.78;
+  font-size: var(--luna-font-display);
+  line-height: 1.7;
   overflow-wrap: anywhere;
 }
+/* 回答的标注：文本由脚本放在容器的 data-label 上，这里只负责显示它。标注不是答案
+   正文的一部分——答案自己的文本节点不因为这一行而多出任何字。 */
+.assistant-body::before {
+  content: attr(data-label);
+  display: block;
+  margin-bottom: var(--luna-space-3);
+  color: var(--luna-accent);
+  font-size: var(--luna-font-label);
+  font-weight: 600;
+  letter-spacing: .08em;
+}
+/* 还没有答案时这一格只是"答案会落在这里"，不是一条已经给出的回答：标注不出。 */
+.assistant-body.placeholder::before, .assistant-body.failed::before { content: none; }
 .assistant-body > :first-child { margin-top: 0; }
 .assistant-body > :last-child { margin-bottom: 0; }
 .assistant-body > p { margin: 0 0 var(--luna-space-3); white-space: pre-wrap; }
 .assistant-body > ul, .assistant-body > ol { margin: 0 0 var(--luna-space-3); padding-left: 1.4em; }
 .assistant-body li + li { margin-top: var(--luna-space-1); }
+/* 答案里的标题只比答案自己的正文重一档（不比自己小）：尺度里的上一级就是正文用的
+   那一级，所以这里靠字重区分，不引入 token 之外的号数。 */
 .assistant-body h3, .assistant-body h4, .assistant-body h5 {
   margin: var(--luna-space-5) 0 var(--luna-space-2);
-  font-size: var(--luna-font-title);
+  font-size: var(--luna-font-display);
   font-weight: 600;
 }
 .assistant-body code {
@@ -404,16 +423,23 @@ body {
   font: 12.5px/1.7 var(--luna-font-mono);
 }
 .assistant-body strong { font-weight: 700; }
-.assistant-body.placeholder { color: var(--luna-text-muted); }
+/* 还没有答案：这一格只是"答案会落在这里"的位置，字号回到正文尺度。 */
+.assistant-body.placeholder { color: var(--luna-text-muted); font-size: var(--luna-font-body); }
 
-/* 工具调用默认是一行次要信息，展开后才给出细节。 */
-.tool-row { border: 0; background: transparent; }
+/* 工具卡片是一张可展开的卡片：surface 表面 + 弱边框 + 尺度 token 的圆角与内边距，
+   所以它和"不加容器的推理条目"一眼就分得开。摘要仍然只有一行 12px muted 的文字；
+   展开后才给出这次调用的事实与次级详情。 */
+.tool-row {
+  border: 1px solid var(--luna-border-weak);
+  border-radius: var(--luna-radius-md);
+  background: var(--luna-surface);
+}
 .tool-row summary {
   display: flex;
   align-items: center;
   gap: var(--luna-space-2);
   min-height: var(--luna-control-sm);
-  padding: 0 var(--luna-space-2);
+  padding: 0 var(--luna-space-3);
   border-radius: var(--luna-radius-sm);
   color: var(--luna-text-muted);
   font-size: var(--luna-font-meta);
@@ -446,7 +472,7 @@ body {
 /* 工具名自己吃掉剩余宽度，耗时与右侧的折叠箭头才不会被长名字挤走。 */
 .tool-name { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .tool-meta { flex: 0 0 auto; color: var(--luna-text-subtle); font-size: var(--luna-font-label); font-variant-numeric: tabular-nums; }
-.tool-detail { padding: var(--luna-space-3) var(--luna-space-2) var(--luna-space-2); }
+.tool-detail { padding: var(--luna-space-3); }
 /* 事实行（`.tool-detail`）与卡片的次级层（`.tool-more`）用同一套 dt/dd 尺度，
    两者是兄弟：前者只放工具、参数、结果/错误，后者只放诊断详情。 */
 .tool-detail dl, .tool-more dl {
@@ -476,7 +502,7 @@ body {
 /* 卡片里的次级层：展开的全文与"详情"。同一套外观，不引入第二种折叠语言。 */
 .tool-more, .value-more { margin-top: var(--luna-space-2); color: var(--luna-text-muted); font-size: var(--luna-font-meta); }
 /* 详情层挂在卡片上而不是事实行里，内边距与事实行对齐，不被卡片边缘切掉。 */
-.tool-row > .tool-more { padding: 0 var(--luna-space-2) var(--luna-space-2); }
+.tool-row > .tool-more { padding: 0 var(--luna-space-3) var(--luna-space-3); }
 .tool-more > summary, .value-more > summary {
   display: flex;
   align-items: center;
@@ -540,10 +566,12 @@ body {
 }
 
 /* --- 一次运行的内联时间线 ---------------------------------------------------
-   运行中的每一步按它真实发生的顺序排在这条时间线里：阶段行（模型这一段开始）、
+   运行中的每一步按它真实发生的顺序排在这条时间线里：阶段行（从第二段起才给）、
    推理（provider 给了才有）、运行说明、工具卡片，回答主体永远收尾。
-   过程条目一律紧凑、次级（12px 及以下、文字用 muted），推理默认折叠成一行；
-   回答主体保持自己的字号与行距，并与过程之间隔开，仍是这个回合的视觉主体。
+   过程条目保持次级：文本一律 12px 及以下、用 muted 或 subtle，推理默认折叠成一行，
+   工具卡片是一张 surface 卡片，阶段行只有标点级的标号。回答主体有自己的容器、
+   顶上一行标注、大一档的字号，并与过程之间留出一档更大的空白，所以它是这个回合
+   一眼就能认出的视觉主体。
    用量属于整轮，落在标题那一行的元信息里，不在这条时间线中间。 */
 
 .run-meta {
@@ -558,21 +586,20 @@ body {
 .run-meta[data-state="failed"] { color: var(--luna-danger); }
 .run-timeline { display: flex; flex-direction: column; min-width: 0; }
 .run-timeline > * + * { margin-top: var(--luna-space-1); }
-/* 回答主体是时间线的最后一条，也是这个回合的视觉主体：与上面的过程条目之间用
-   一档更大的间距加一条分隔线分开，字号与行距保持正文尺度（过程条目一律 12px
-   及以下、muted）。一次直接回答没有过程条目，这里的分隔与内边距不生效。 */
+/* 回答主体是时间线的最后一条，也是这个回合的视觉主体：它有自己的容器，所以这里
+   只要一档更大的留白把它和上面的过程条目分开，不再另加一条分隔线（容器的边框已经
+   划出边界）。一次直接回答没有过程条目，这里的留白不生效。 */
 .run-timeline > * + .assistant-body {
-  margin-top: var(--luna-space-4);
-  padding-top: var(--luna-space-3);
-  border-top: 1px solid var(--luna-border-weak);
+  margin-top: var(--luna-space-5);
 }
+/* 阶段行只在真的多段时出现（见 app.js 的 runPhaseVisible）。它只是一枚标点级的
+   标号：比过程条目还小一档、用最弱的文字色，也不再占一个控件高度。 */
 .run-phase {
   display: flex;
   align-items: center;
-  min-height: var(--luna-control-sm);
   padding: 0 var(--luna-space-2);
-  color: var(--luna-text-muted);
-  font-size: var(--luna-font-meta);
+  color: var(--luna-text-subtle);
+  font-size: var(--luna-font-label);
 }
 /* 推理条目：一行标号 + 折叠时的实时预览 + 展开后的全文。默认折叠，所以这个回合
    的主体始终是回答；折叠时那一行仍然跟着事件增长，用户看得到推理在长。全文有界、

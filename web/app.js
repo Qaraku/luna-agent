@@ -614,16 +614,20 @@ function runPayload(message, sessionID) {
 const TOOL_TEXT_MAX_CHARS = 1200;
 const TOOL_TEXT_MAX_LINES = 16;
 
-// 内联时间线里那几行标号：阶段行、运行说明、推理条目。
+// 内联时间线里那几行标号：阶段行、运行说明、推理条目、回答。
 // 推理条目只在 assistant.reasoning 真的到达时才出现，没有这个事件时界面上不会
-// 出现任何相关文案，也不预留位置。
+// 出现任何相关文案，也不预留位置。回答那一行的标注挂在答案容器自己的 data-label
+// 上（见 style.css 的 .assistant-body::before），所以答案正文里仍然只有渲染出来
+// 的那些节点，标注不会混进它的文本。
 const RUN_NOTE_LABEL = '运行说明';
 const RUN_REASONING_LABEL = '推理';
+const RUN_ANSWER_LABEL = '回答';
 const RUN_CANCELLED_COPY = '这次运行被取消了，上面的内容没有写完。';
 
-// 推理默认折叠（回答才是这个回合的主体），折叠时那一行给最近到达的一段文字做
-// 实时预览：预览跟着事件滑动，用户仍然看得到推理在长。这个数是"默认看多少"，
-// 不是业务判断。
+// 推理默认折叠（回答才是这个回合的主体），折叠时那一行给一段有界的文字做预览。
+// 预览的方向跟着"这一段是否还在产生"取：进行中给最新到达的一段（前面省略），所以
+// 它一直滑向最新内容，用户折起来也看得出推理在长；已经结束的条目给开头（后面省略），
+// 不再看起来像被切掉两头的残片。这个数是"默认看多少"，不是业务判断。
 const REASONING_PREVIEW_CHARS = 72;
 
 // 工具拒绝某次调用与工具失败在事件上都是 tool.failed，唯一区别是错误前缀。
@@ -726,6 +730,13 @@ function runPhaseEntryText(leg) {
   return `第 ${index} 段回应`;
 }
 
+// 阶段行只在真的多段时出现：一次运行的第一段没有上一段可对照，它是不是"第 1 段"
+// 这件事由它自己的推理、说明、工具条目说明就够了，那一行对一次短运行只是噪声。
+// 从第二段起才给标号（"第 2 段回应"），把"模型在工具之后又接着说"这件事留在字面上。
+function runPhaseVisible(leg) {
+  return typeof leg === 'number' && Number.isFinite(leg) && leg >= 1;
+}
+
 function runOutcomeLabel(state) {
   return {
     ok: '已完成',
@@ -778,13 +789,16 @@ function usageText(data) {
   return parts.length ? `tokens：${parts.join(' · ')}` : '';
 }
 
-// 折叠的推理那一行里的实时预览：只取最近到达的一段，换行压成空格，所以流式期间
-// 它会一直滑动——用户看得到推理在长，而一行就够了。没有文本时给空串。
-function reasoningPreview(value, max = REASONING_PREVIEW_CHARS) {
+// 折叠的推理那一行里的预览：一段有界的文字，换行压成空格，所以一行就够。方向按
+// 这一段是否还在产生取——进行中给最新到达的一段（前面省略），它会一直滑动，折起来
+// 也看得到推理在长；已经结束的条目给开头（后面省略），不再像一段被切掉两头的残片。
+// 没有文本时给空串。
+function reasoningPreview(value, streaming = false, max = REASONING_PREVIEW_CHARS) {
   const text = typeof value === 'string' ? value : '';
   const flat = text.replace(/\s+/g, ' ').trim();
   if (!flat) return '';
-  return flat.length <= max ? flat : `…${flat.slice(flat.length - max)}`;
+  if (flat.length <= max) return flat;
+  return streaming ? `…${flat.slice(flat.length - max)}` : `${flat.slice(0, max)}…`;
 }
 
 function parseInline(text) {
@@ -888,10 +902,10 @@ if (typeof module !== 'undefined') {
     isSessionID, parseSessionHash, sessionHash, sessionTitle, sessionTime, relativeTime, runCountLabel,
     runStatusLabel, sessionRows, argumentsText, toolCallFacts, replaySession, runPayload,
     clipText, toolArgumentsText, toolResultText, formatElapsed, formatDuration, toolFailureKind,
-    toolRefusalReason, toolRefusedLabel, toolStateLabel, runPhaseText, runPhaseEntryText,
+    toolRefusalReason, toolRefusedLabel, toolStateLabel, runPhaseText, runPhaseEntryText, runPhaseVisible,
     runOutcomeLabel, runTraceMeta, replayRunState, formatTokenCount, usageText, reasoningPreview,
     TOOL_TEXT_MAX_CHARS, TOOL_TEXT_MAX_LINES, TOOL_REFUSAL_PREFIX,
-    RUN_NOTE_LABEL, RUN_REASONING_LABEL, RUN_CANCELLED_COPY, REASONING_PREVIEW_CHARS,
+    RUN_NOTE_LABEL, RUN_REASONING_LABEL, RUN_ANSWER_LABEL, RUN_CANCELLED_COPY, REASONING_PREVIEW_CHARS,
     uiPluginText, uiPluginNameValid, uiPluginEntrySafe, uiPluginEntryURL, uiPluginRows, uiPluginMissingExports,
     uiPluginErrorDetail, uiPluginImportError, uiPluginMissingExportError, uiPluginMountError, uiPluginUnmountError,
     uiPluginState, uiPluginInitialState, uiPluginTransition, uiPluginEnableFailureEvent, uiPluginDisableEvent,
@@ -1114,6 +1128,9 @@ if (typeof document !== 'undefined') {
     head.append(make('span', 'assistant-label', 'Luna'), meta);
     const timeline = make('div', 'run-timeline');
     const body = make('div', 'assistant-body placeholder', 'Luna 正在回应…');
+    // 回答有自己的一行标注。标注是容器上的 data-label，由样式用 attr() 取出来，
+    // 所以答案正文里仍然只有渲染出来的节点，标注不会混进它的文本。
+    body.dataset.label = RUN_ANSWER_LABEL;
     timeline.append(body);
     turn.append(head, timeline);
     return { turn, timeline, meta, body };
@@ -1307,9 +1324,12 @@ if (typeof document !== 'undefined') {
     contentChanged(stick);
   }
 
-  // 阶段行：这一刻模型又开始输出了。它只标边界，不描述模型在想什么。
+  // 阶段行：这一刻模型又开始输出了。它只标边界，不描述模型在想什么。第一段不给
+  // 阶段行（见 runPhaseVisible）：那一段没有上一段可对照，标号只是噪声；从第二段
+  // 起才给，把"模型在工具之后又接着说"留在字面上。
   function appendPhaseRow(turnState) {
     turnState.legPhase = turnState.leg;
+    if (!runPhaseVisible(turnState.leg)) return;
     turnState.timeline.insertBefore(
       make('div', 'run-phase', runPhaseEntryText(turnState.leg)),
       stepAnchor(turnState)
@@ -1324,14 +1344,23 @@ if (typeof document !== 'undefined') {
   }
 
   // 工具返回之后的第一段输出属于模型的下一段：新的一段有自己的阶段行，推理也
-  // 另起一条，不跟上一条混在一起。
+  // 另起一条，不跟上一条混在一起。上一段的推理到这里结束，它的预览换成开头一段。
   function beginModelLeg(turnState) {
     if (!turnState.awaitingModel) return;
     turnState.awaitingModel = false;
     turnState.leg += 1;
+    settleReasoningPreview(turnState);
     turnState.reasoning = '';
     turnState.reasoningEntry = null;
     appendPhaseRow(turnState);
+  }
+
+  // 一段模型输出结束时（工具返回后的下一段，或整轮终止）它的推理条目就定型了：
+  // 预览从"最新到达的一段"换成"开头的一段"，所以一个已经结束的条目不会看起来
+  // 像被切掉了开头的残片。流式期间反过来，始终给最新内容。
+  function settleReasoningPreview(turnState) {
+    if (!turnState.reasoningEntry) return;
+    turnState.reasoningEntry.preview.textContent = reasoningPreview(turnState.reasoning);
   }
 
   // 时间线里除回答之外的条目：一次直接回答的运行没有过程可概括。
@@ -1412,8 +1441,8 @@ if (typeof document !== 'undefined') {
     const follow = body.scrollHeight - body.scrollTop - body.clientHeight < 24;
     body.textContent = currentTurn.reasoning;
     if (follow) body.scrollTop = body.scrollHeight;
-    // 折叠时那一行的预览跟着同一份文本走：折起来也看得到它在长。
-    currentTurn.reasoningEntry.preview.textContent = reasoningPreview(currentTurn.reasoning);
+    // 折叠时那一行的预览跟着同一份文本走，而且是"进行中"的读法：给最新到达的一段。
+    currentTurn.reasoningEntry.preview.textContent = reasoningPreview(currentTurn.reasoning, true);
     updateRunMeta(currentTurn);
     contentChanged(stick);
   }
@@ -1472,6 +1501,8 @@ if (typeof document !== 'undefined') {
     turnState.finishedAt = Date.now();
     turnState.outcome = state;
     resolveTurnTools(turnState);
+    // 这一轮到此为止：还在折着的那一条推理预览换成开头读法，不再像残片。
+    settleReasoningPreview(turnState);
     updateRunMeta(turnState);
   }
 
@@ -1480,10 +1511,8 @@ if (typeof document !== 'undefined') {
     const stick = nearBottom();
     currentTurn.failed = true;
     resolveOpenTools();
-    if (!currentTurn.hasAnswer) {
-      currentTurn.body.textContent = '';
-      currentTurn.body.classList.remove('placeholder');
-    }
+    // 还没有写出答案时这一格不是回答：移除它，而不是在"回答"标注下留一个空容器。
+    if (!currentTurn.hasAnswer) currentTurn.body.remove();
     const block = make('div', 'error-block');
     block.append(make('p', 'error-copy', copy));
     const retryMessage = currentTurn.message;
