@@ -30,6 +30,7 @@
 package fileread
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -88,8 +89,22 @@ var (
 	ErrNotDir        = errors.New("path is not a directory")
 	ErrTooLarge      = errors.New("file exceeds the single-read limit")
 	ErrBinary        = errors.New("file is not text")
-	ErrNotReadable   = errors.New("file cannot be read")
-	ErrNotListable   = errors.New("directory cannot be listed")
+	// ErrRangeInvalid reports a line range that is not a range: a negative
+	// start_line or max_lines. Zero is not a range either — it is how the
+	// protocol says "not asked for" — so a negative value is refused and
+	// explained rather than guessed at.
+	ErrRangeInvalid = errors.New("the line range is not valid")
+	// ErrStartLinePastEnd reports a start_line beyond the last line of the
+	// file. It is a refusal, not an empty result: the caller asked for a part
+	// of a file that does not exist, and what it gets instead is the length of
+	// the file it was wrong about.
+	ErrStartLinePastEnd = errors.New("start_line is past the last line of the file")
+	// ErrLineTooLarge reports a range whose very first line does not fit
+	// inside the byte limit on its own. No line is ever returned cut, so there
+	// is no honest partial answer here: the call is refused.
+	ErrLineTooLarge = errors.New("the first line of the range is longer than the single-read limit")
+	ErrNotReadable  = errors.New("file cannot be read")
+	ErrNotListable  = errors.New("directory cannot be listed")
 	// ErrNotSearchable reports a search whose starting path is neither a
 	// regular file nor a directory — or is a symbolic link, which a search
 	// never follows.
@@ -109,16 +124,9 @@ var (
 // absolute path of the regular file to read. root is a directory; requested is
 // the raw, model-supplied path.
 func Resolve(root, requested string, limit int) (string, error) {
-	resolved, err := resolveWithinRoot(root, requested)
+	resolved, info, err := resolveRegularFile(root, requested)
 	if err != nil {
 		return "", err
-	}
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return "", fmt.Errorf("%w: %q", ErrNotFound, requested)
-	}
-	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("%w: %q", ErrNotRegular, requested)
 	}
 	if limit <= 0 {
 		limit = DefaultLimit
@@ -127,6 +135,38 @@ func Resolve(root, requested string, limit int) (string, error) {
 		return "", fmt.Errorf("%w: %q is %d bytes, over the %d-byte limit", ErrTooLarge, requested, info.Size(), limit)
 	}
 	return resolved, nil
+}
+
+// ResolveRange validates a requested file path for a range read. It resolves,
+// contains and symbolic-link-resolves the path with exactly the code Resolve
+// uses, so a range read cannot reach anywhere a whole-file read could not;
+// what differs is only that the size of the file is not a refusal here. A range
+// read exists because a file can be too large to read whole, and what bounds
+// the answer is the byte limit of the window that comes back, not the size of
+// the file being looked at.
+func ResolveRange(root, requested string) (string, error) {
+	resolved, _, err := resolveRegularFile(root, requested)
+	return resolved, err
+}
+
+// resolveRegularFile is the part of a read that only says where the path is:
+// normalize, contain and resolve symbolic links (resolveWithinRoot), then
+// require an existing regular file. Every file-read entry point is built on it
+// so that no two reads can be looking at different files, and a new entry point
+// cannot quietly get a weaker boundary by writing its own.
+func resolveRegularFile(root, requested string) (string, os.FileInfo, error) {
+	resolved, err := resolveWithinRoot(root, requested)
+	if err != nil {
+		return "", nil, err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", nil, fmt.Errorf("%w: %q", ErrNotFound, requested)
+	}
+	if !info.Mode().IsRegular() {
+		return "", nil, fmt.Errorf("%w: %q", ErrNotRegular, requested)
+	}
+	return resolved, info, nil
 }
 
 // ResolveDir validates a requested directory path against the read root and
@@ -194,6 +234,16 @@ func ResolveInRoots(roots []string, requested string, limit int) (Resolved, erro
 func ResolveDirInRoots(roots []string, requested string) (Resolved, error) {
 	return resolveInRoots(roots, requested, func(root string) (string, error) {
 		return ResolveDir(root, requested)
+	})
+}
+
+// ResolveRangeInRoots is ResolveRange against several roots, on the same terms
+// as ResolveInRoots: the first root that holds the path wins, and every root is
+// checked by the code a single-root call uses, so a range read and a whole-file
+// read cannot disagree about where the roots end.
+func ResolveRangeInRoots(roots []string, requested string) (Resolved, error) {
+	return resolveInRoots(roots, requested, func(root string) (string, error) {
+		return ResolveRange(root, requested)
 	})
 }
 
@@ -344,6 +394,196 @@ func Read(path string, limit int) (string, error) {
 		return "", fmt.Errorf("%w: it contains a NUL byte", ErrBinary)
 	}
 	return string(data), nil
+}
+
+// lineScanBuffer is the size of the buffer one range read walks a file with. A
+// line longer than it is read in as many pieces as it takes; nothing is decided
+// about a line until its end is seen.
+const lineScanBuffer = 64 << 10
+
+// RangeOptions carries one bounded line-range read of a file. A zero StartLine
+// means the first line, a zero MaxLines means every line from there on, and a
+// zero MaxBytes means DefaultLimit.
+//
+// These bounds are on the result, not on the file. A range read exists so that
+// a file too large to read whole can still be read in part, so the size of the
+// file is deliberately not a refusal here: what comes back is at most MaxBytes
+// of at most MaxLines lines, and it says which lines it covers and what it left
+// unread.
+type RangeOptions struct {
+	// StartLine is the 1-based number of the first line to return.
+	StartLine int
+	// MaxLines is the largest number of lines to return.
+	MaxLines int
+	// MaxBytes is the largest number of bytes to return.
+	MaxBytes int
+}
+
+// asksRange reports whether these options ask for a part of the file at all.
+// With neither counter set the call is a whole-file read and is answered with
+// exactly what Read returns.
+func (o RangeOptions) asksRange() bool { return o.StartLine > 0 || o.MaxLines > 0 }
+
+// ValidateRange checks the two optional line-range parameters before any work is
+// done with them. Zero means "not asked for" in the plugin protocol, so a
+// negative counter is a malformed call and is refused with the value it was
+// given; a caller is never left to guess what a negative start_line meant.
+func ValidateRange(startLine, maxLines int) error {
+	if startLine < 0 {
+		return fmt.Errorf("%w: start_line must be 1 or greater, or 0 for the whole file (got %d)", ErrRangeInvalid, startLine)
+	}
+	if maxLines < 0 {
+		return fmt.Errorf("%w: max_lines must be 1 or greater, or 0 for every line from start_line on (got %d)", ErrRangeInvalid, maxLines)
+	}
+	return nil
+}
+
+// ReadRange reads a range of path and returns the model-visible result: a
+// header line stating which lines the text covers, followed by those lines.
+// A call that asks for no range returns the whole file with no header, exactly
+// as Read does.
+func ReadRange(path string, opts RangeOptions) (string, error) {
+	header, text, err := ReadRangeParts(path, opts)
+	if err != nil {
+		return "", err
+	}
+	return header + text, nil
+}
+
+// ReadRangeParts is ReadRange split into its two halves, so a candidate that
+// rewrites the file text — v2 normalizes line endings — can rewrite that half
+// without touching the header that states the range. The criteria for "a text
+// file that may be read" are Read's criteria, applied by the same scan: at most
+// the byte limit of content comes back, and any NUL byte in the file refuses the
+// whole call as binary, so a file the model could not read whole is not one it
+// can read in part either.
+//
+// The scan is bounded in memory, never in reads. One fixed buffer holds the
+// bytes coming off the file, one holds the line being appended to — a line is
+// kept whole or left out whole, never cut — and one grows to at most MaxBytes
+// and holds the answer. The file itself is never held: it is walked one line at
+// a time to the end, because the number of lines is what the header has to
+// state and a NUL byte anywhere is what refuses the call. What that costs is a
+// full read of the file; what it buys is an honest answer about a file that is
+// larger than the single-read limit.
+func ReadRangeParts(path string, opts RangeOptions) (header, text string, err error) {
+	if err := ValidateRange(opts.StartLine, opts.MaxLines); err != nil {
+		return "", "", err
+	}
+	if opts.MaxBytes <= 0 {
+		opts.MaxBytes = DefaultLimit
+	}
+	if !opts.asksRange() {
+		text, err = Read(path, opts.MaxBytes)
+		return "", text, err
+	}
+	start := opts.StartLine
+	if start == 0 {
+		start = 1
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", "", fmt.Errorf("%w: %s", ErrNotReadable, pathError(err))
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return "", "", fmt.Errorf("%w: %s", ErrNotReadable, pathError(err))
+	}
+	if !info.Mode().IsRegular() {
+		return "", "", fmt.Errorf("%w: %s", ErrNotRegular, filepath.Base(path))
+	}
+
+	reader := bufio.NewReaderSize(f, lineScanBuffer)
+	window := make([]byte, 0, 64<<10)
+	pending := make([]byte, 0, 256)
+	lines := 0 // completed lines: the length of the file in lines
+	kept := 0  // lines held in window
+	first, last := 0, 0
+	keep := true  // whether the line being read may still be kept
+	over := false // the line being read does not fit in what is left of the limit
+	stoppedLines, stoppedBytes := false, false
+
+	// closeLine ends the line being read: it counts it, and either keeps it
+	// whole or states why the read stops before it.
+	closeLine := func() error {
+		lines++
+		if keep && lines >= start {
+			switch {
+			case opts.MaxLines > 0 && kept >= opts.MaxLines:
+				keep, stoppedLines = false, true
+			case over && kept == 0:
+				return fmt.Errorf("%w: line %d alone is longer than the %d-byte limit", ErrLineTooLarge, lines, opts.MaxBytes)
+			case over:
+				keep, stoppedBytes = false, true
+			default:
+				if kept == 0 {
+					first = lines
+				}
+				window = append(window, pending...)
+				last = lines
+				kept++
+			}
+		}
+		pending = pending[:0]
+		over = false
+		return nil
+	}
+
+	walk := func() error {
+		for {
+			chunk, readErr := reader.ReadSlice('\n')
+			if len(chunk) > 0 {
+				if bytes.IndexByte(chunk, 0) >= 0 {
+					return fmt.Errorf("%w: it contains a NUL byte", ErrBinary)
+				}
+				if keep && !over {
+					if len(pending)+len(chunk) > opts.MaxBytes-len(window) {
+						over = true
+					} else {
+						pending = append(pending, chunk...)
+					}
+				}
+			}
+			switch readErr {
+			case nil:
+				if err := closeLine(); err != nil {
+					return err
+				}
+			case bufio.ErrBufferFull:
+				// The line is longer than the scan buffer: keep reading it.
+				// Nothing about it is decided until its end is reached.
+			case io.EOF:
+				if len(chunk) > 0 {
+					// The file does not end with a newline, so its last line
+					// ends here.
+					return closeLine()
+				}
+				return nil
+			default:
+				return fmt.Errorf("%w: %s", ErrNotReadable, pathError(readErr))
+			}
+		}
+	}
+	if err := walk(); err != nil {
+		return "", "", err
+	}
+
+	if start > lines {
+		return "", "", fmt.Errorf("%w: start_line %d is past the end of the file, which has %s", ErrStartLinePastEnd, start, plural(lines, "line"))
+	}
+	text = string(window)
+	if remaining := lines - last; remaining > 0 {
+		note := "the read stopped before the end of the file"
+		switch {
+		case stoppedLines:
+			note = fmt.Sprintf("%s stopped the read", plural(opts.MaxLines, "line"))
+		case stoppedBytes:
+			note = fmt.Sprintf("the %d-byte limit stopped the read", opts.MaxBytes)
+		}
+		return fmt.Sprintf("lines %d-%d of %d (%s; the remaining %s were not read)\n", first, last, lines, note, plural(remaining, "line")), text, nil
+	}
+	return fmt.Sprintf("lines %d-%d of %d\n", first, last, lines), text, nil
 }
 
 // ListOptions carries the host's caps for one listing. A non-positive cap falls

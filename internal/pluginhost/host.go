@@ -161,6 +161,16 @@ type ReadRequest struct {
 	// a range and not a permission: a root that is not an absolute directory
 	// can only make a call refuse, because no path is contained in one.
 	Roots []string
+	// StartLine and MaxLines are the optional line range of the read, passed
+	// through from the call and validated here: StartLine is the 1-based
+	// number of the first line to return and MaxLines the largest number of
+	// lines to return, and 0 means the call named neither. A negative value is
+	// refused before any work is done. A range read is also why a path may be
+	// a file that is over the read limit: the limit bounds what comes back,
+	// and being able to read a part of a file that cannot be read whole is the
+	// point of naming a range.
+	StartLine int
+	MaxLines  int
 	// DelayMS is an operations and test knob for holding an RPC in flight. It
 	// is never exposed to the model.
 	DelayMS int
@@ -438,7 +448,16 @@ func (h *Host) Invoke(ctx context.Context, in Input) (Output, error) {
 
 // ReadFile calls the file-read tool. The requested path is validated here, on
 // the host side, against the roots this call names; the plugin is handed only
-// the resolved absolute path and the cap.
+// the resolved absolute path, the cap and the optional line range.
+//
+// Two things the call may ask for change what the path check means. The two
+// range counters are validated first, so a negative one is refused before any
+// path is resolved. And a call that names a range resolves its path with
+// fileread.ResolveRange, which applies the same normalization, containment and
+// symbolic-link checks as fileread.Resolve but does not refuse a file over the
+// read limit — reading a part of such a file is exactly what a range is for.
+// The limit still bounds the bytes that come back, and the candidate states
+// what it left unread.
 func (h *Host) ReadFile(ctx context.Context, req ReadRequest) (Output, error) {
 	if len(req.Path) > 4096 {
 		return Output{}, fmt.Errorf("path must not exceed 4096 bytes")
@@ -446,11 +465,20 @@ func (h *Host) ReadFile(ctx context.Context, req ReadRequest) (Output, error) {
 	if req.DelayMS < 0 || req.DelayMS > pluginprotocol.MaxDelayMS {
 		return Output{}, fmt.Errorf("delay_ms must be 0..%d", pluginprotocol.MaxDelayMS)
 	}
-	resolved, err := fileread.ResolveInRoots(h.readRoots(req.Roots), req.Path, h.opts.ReadLimit)
+	if err := fileread.ValidateRange(req.StartLine, req.MaxLines); err != nil {
+		return Output{}, err
+	}
+	var resolved fileread.Resolved
+	var err error
+	if req.StartLine > 0 || req.MaxLines > 0 {
+		resolved, err = fileread.ResolveRangeInRoots(h.readRoots(req.Roots), req.Path)
+	} else {
+		resolved, err = fileread.ResolveInRoots(h.readRoots(req.Roots), req.Path, h.opts.ReadLimit)
+	}
 	if err != nil {
 		return Output{}, err
 	}
-	return h.invoke(ctx, ToolReadFile, Input{Path: resolved.Path, MaxBytes: h.opts.ReadLimit, DelayMS: req.DelayMS})
+	return h.invoke(ctx, ToolReadFile, Input{Path: resolved.Path, MaxBytes: h.opts.ReadLimit, StartLine: req.StartLine, MaxLines: req.MaxLines, DelayMS: req.DelayMS})
 }
 
 // ListDir calls the directory-listing tool. The requested path is validated here,

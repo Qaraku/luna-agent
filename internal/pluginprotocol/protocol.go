@@ -9,7 +9,9 @@ var Handshake = plugin.HandshakeConfig{ProtocolVersion: 1, MagicCookieKey: "LUNA
 
 // Input is the plugin RPC request. Text/DelayMS serve the text-transform
 // plugin; Path/MaxBytes serve the file-read plugin, where Path is an absolute
-// path the host has already validated against the read root. Path/MaxEntries/
+// path the host has already validated against the read root, MaxBytes bounds
+// the bytes returned and StartLine/MaxLines bound which lines of the file are
+// returned. Path/MaxEntries/
 // MaxLineBytes serve the directory-listing plugin, where Path is the same kind
 // of validated absolute path — a directory — and the two caps bound how much of
 // it one listing renders. Path/Query/MaxMatches/MaxFiles/MaxFileBytes serve the
@@ -22,6 +24,17 @@ type Input struct {
 	Text     string `json:"text"`
 	Path     string `json:"path"`
 	MaxBytes int    `json:"max_bytes"`
+	// StartLine and MaxLines carry the optional line range of a file read:
+	// StartLine is the 1-based number of the first line to return and
+	// MaxLines is the largest number of lines to return. Zero means the
+	// request did not name one — StartLine 0 is the first line and MaxLines 0
+	// is every line from there on — so a request with both at zero is the
+	// whole-file read it has always been, and a negative value is a malformed
+	// call the plugin refuses instead of guessing at. A plugin sent a range
+	// states the lines it returned and the lines it did not read; it never
+	// answers a range read with a silently cut result.
+	StartLine int `json:"start_line"`
+	MaxLines  int `json:"max_lines"`
 	// Query is the literal a search looks for. It is data, not a pattern: the
 	// plugin passes it to fileread.Search, which matches it with a substring
 	// test, so nothing in it is interpreted.

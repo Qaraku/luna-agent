@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -1148,5 +1149,309 @@ func TestResolveInRootsRefusesAnEmptyRootList(t *testing.T) {
 	}
 	if _, err := ResolveSearchInRoots([]string{}, "a.txt"); !errors.Is(err, ErrNoRoot) {
 		t.Fatalf("ResolveSearchInRoots(empty) err = %v, want ErrNoRoot", err)
+	}
+}
+
+// linesFile writes a file whose every line names itself, so a test can say
+// exactly which lines came back and in which order.
+func linesFile(t *testing.T, path string, count int) string {
+	t.Helper()
+	var b strings.Builder
+	for number := 1; number <= count; number++ {
+		fmt.Fprintf(&b, "line-%d\n", number)
+	}
+	mustWrite(t, path, b.String())
+	return path
+}
+
+// lineMarks lists the line numbers of a range read's text, so a test states
+// what came back rather than how it was joined.
+func lineMarks(t *testing.T, text string) []int {
+	t.Helper()
+	var marks []int
+	for _, line := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
+		var number int
+		if _, err := fmt.Sscanf(line, "line-%d", &number); err != nil {
+			t.Fatalf("unexpected line %q", line)
+		}
+		marks = append(marks, number)
+	}
+	return marks
+}
+
+func TestReadRangeReturnsTheLinesItNames(t *testing.T) {
+	path := linesFile(t, filepath.Join(t.TempDir(), "lines.txt"), 200)
+	result, err := ReadRange(path, RangeOptions{StartLine: 100, MaxLines: 50})
+	if err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	header, text, _ := strings.Cut(result, "\n")
+	// The result has to say which lines it covers, not only which range was
+	// asked for: 100-149 of a 200-line file is something the model cannot derive
+	// from the range alone, and the 51 lines that were left have to be stated
+	// rather than dropped quietly.
+	if header != "lines 100-149 of 200 (50 lines stopped the read; the remaining 51 lines were not read)" {
+		t.Fatalf("header = %q, want the range it covers and what it left", header)
+	}
+	marks := lineMarks(t, text)
+	if len(marks) != 50 || marks[0] != 100 || marks[49] != 149 {
+		t.Fatalf("marks = %v, want 100..149", marks)
+	}
+	var want strings.Builder
+	for n := 100; n <= 149; n++ {
+		fmt.Fprintf(&want, "line-%d\n", n)
+	}
+	if text != want.String() {
+		t.Fatalf("text = %q, want exactly lines 100..149", text)
+	}
+}
+
+func TestReadRangeFromTheMiddleToTheEnd(t *testing.T) {
+	path := linesFile(t, filepath.Join(t.TempDir(), "lines.txt"), 12)
+	result, err := ReadRange(path, RangeOptions{StartLine: 10})
+	if err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	header, text, _ := strings.Cut(result, "\n")
+	if header != "lines 10-12 of 12" {
+		t.Fatalf("header = %q, want %q", header, "lines 10-12 of 12")
+	}
+	if marks := lineMarks(t, text); len(marks) != 3 || marks[0] != 10 || marks[2] != 12 {
+		t.Fatalf("marks = %v, want 10..12", marks)
+	}
+	// Nothing was left out, so the result must not claim anything was.
+	if strings.Contains(result, "not read") {
+		t.Fatalf("result = %q, want no note about lines not read", result)
+	}
+}
+
+func TestReadRangeStatesTheLinesLeftWhenMaxLinesStopsIt(t *testing.T) {
+	path := linesFile(t, filepath.Join(t.TempDir(), "lines.txt"), 5000)
+	result, err := ReadRange(path, RangeOptions{StartLine: 100, MaxLines: 5})
+	if err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	header, text, _ := strings.Cut(result, "\n")
+	want := "lines 100-104 of 5000 (5 lines stopped the read; the remaining 4896 lines were not read)"
+	if header != want {
+		t.Fatalf("header = %q, want %q", header, want)
+	}
+	// The cap is on what comes back: the sixth line is not in the result and
+	// is not hidden inside the text either.
+	if marks := lineMarks(t, text); len(marks) != 5 || marks[4] != 104 {
+		t.Fatalf("marks = %v, want 100..104", marks)
+	}
+	if strings.Contains(text, "line-105") {
+		t.Fatalf("text = %q, want no line past the cap", text)
+	}
+}
+
+func TestReadRangeStatesTheLinesLeftWhenTheByteLimitStopsIt(t *testing.T) {
+	path := linesFile(t, filepath.Join(t.TempDir(), "lines.txt"), 400)
+	// "line-1" is 7 bytes and "line-10" is 8, so a 100-byte window holds lines
+	// 1..13 — 9×7 + 4×8 = 95 bytes — and stops: line 14 would need 103. The
+	// byte counter is what stops it, so no max_lines is asked for.
+	result, err := ReadRange(path, RangeOptions{StartLine: 1, MaxBytes: 100})
+	if err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	header, text, _ := strings.Cut(result, "\n")
+	want := "lines 1-13 of 400 (the 100-byte limit stopped the read; the remaining 387 lines were not read)"
+	if header != want {
+		t.Fatalf("header = %q, want %q", header, want)
+	}
+	if len(text) != 95 {
+		t.Fatalf("len(text) = %d, want 95: the window stops before the line that would not fit", len(text))
+	}
+	// A line is kept whole or left out whole: no cut line is ever returned.
+	if marks := lineMarks(t, text); len(marks) != 13 || marks[12] != 13 {
+		t.Fatalf("marks = %v, want 1..13", marks)
+	}
+}
+
+func TestReadRangeRefusesAStartLinePastTheEnd(t *testing.T) {
+	path := linesFile(t, filepath.Join(t.TempDir(), "lines.txt"), 42)
+	_, err := ReadRange(path, RangeOptions{StartLine: 43, MaxLines: 10})
+	if !errors.Is(err, ErrStartLinePastEnd) {
+		t.Fatalf("err = %v, want ErrStartLinePastEnd", err)
+	}
+	// The refusal says how long the file is, which is the number the caller
+	// was wrong about.
+	if !strings.Contains(err.Error(), "42 lines") || !strings.Contains(err.Error(), "43") {
+		t.Fatalf("err = %v, want the start_line and the line count", err)
+	}
+}
+
+func TestReadRangeRefusesAnEmptyFileForLineOne(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "empty.txt")
+	mustWrite(t, path, "")
+	if _, err := ReadRange(path, RangeOptions{StartLine: 1}); !errors.Is(err, ErrStartLinePastEnd) {
+		t.Fatalf("err = %v, want ErrStartLinePastEnd", err)
+	} else if !strings.Contains(err.Error(), "0 lines") {
+		t.Fatalf("err = %v, want the line count of an empty file", err)
+	}
+}
+
+func TestReadRangeRefusesNegativeCounters(t *testing.T) {
+	path := linesFile(t, filepath.Join(t.TempDir(), "lines.txt"), 3)
+	if _, err := ReadRange(path, RangeOptions{StartLine: -1}); !errors.Is(err, ErrRangeInvalid) {
+		t.Fatalf("start_line -1 err = %v, want ErrRangeInvalid", err)
+	}
+	if _, err := ReadRange(path, RangeOptions{MaxLines: -5}); !errors.Is(err, ErrRangeInvalid) {
+		t.Fatalf("max_lines -5 err = %v, want ErrRangeInvalid", err)
+	}
+	if err := ValidateRange(-1, 0); !errors.Is(err, ErrRangeInvalid) {
+		t.Fatalf("ValidateRange(-1, 0) = %v, want ErrRangeInvalid", err)
+	}
+	if err := ValidateRange(0, 0); err != nil {
+		t.Fatalf("ValidateRange(0, 0) = %v, want nil", err)
+	}
+}
+
+// A range read is a text read: the criteria for what may be read are the ones
+// Read applies, not a second set.
+func TestReadRangeRefusesBinaryContent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "binary.txt")
+	mustWrite(t, path, "line-1\nline-2\x00\nline-3\n")
+	// The NUL is past the requested window, and the call is still refused: a
+	// binary file is not one the model may read in part either.
+	if _, err := ReadRange(path, RangeOptions{StartLine: 1, MaxLines: 1}); !errors.Is(err, ErrBinary) {
+		t.Fatalf("err = %v, want ErrBinary", err)
+	}
+}
+
+func TestReadRangeRefusesAFirstLineLongerThanTheLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "long.txt")
+	mustWrite(t, path, strings.Repeat("a", 200)+"\nsecond\n")
+	// No line is ever returned cut, so the first line not fitting is a refusal
+	// rather than a one-line prefix of it.
+	if _, err := ReadRange(path, RangeOptions{StartLine: 1, MaxBytes: 100}); !errors.Is(err, ErrLineTooLarge) {
+		t.Fatalf("err = %v, want ErrLineTooLarge", err)
+	}
+	// A later line not fitting is a stated stop instead, because the lines
+	// before it are a truthful answer.
+	result, err := ReadRange(path, RangeOptions{StartLine: 2, MaxBytes: 20})
+	if err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	if !strings.HasPrefix(result, "lines 2-2 of 2") {
+		t.Fatalf("result = %q, want lines 2-2 of 2", result)
+	}
+}
+
+// Without either counter the call is a whole-file read, on the whole-file
+// terms: a file over the limit is refused, not returned in part.
+func TestReadRangeWithoutARangeIsAWholeFileRead(t *testing.T) {
+	root, _ := testRoot(t)
+	result, err := ReadRange(filepath.Join(root, "exact.txt"), RangeOptions{})
+	if err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	if len(result) != DefaultLimit {
+		t.Fatalf("len(result) = %d, want %d", len(result), DefaultLimit)
+	}
+	if _, err := ReadRange(filepath.Join(root, "big.txt"), RangeOptions{}); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("err = %v, want ErrTooLarge", err)
+	}
+	// That a file is over the limit is exactly when a range is the only way to
+	// read it, so the same file can be read in part.
+	oversized := linesFile(t, filepath.Join(root, "many.txt"), 40000)
+	if info, err := os.Stat(oversized); err != nil || info.Size() <= DefaultLimit {
+		t.Fatalf("fixture is %v bytes, want more than %d", info, DefaultLimit)
+	}
+	result, err = ReadRange(oversized, RangeOptions{StartLine: 1, MaxLines: 1})
+	if err != nil {
+		t.Fatalf("ReadRange of an oversized file: %v", err)
+	}
+	if !strings.HasPrefix(result, "lines 1-1 of 40000 (") {
+		t.Fatalf("result = %q, want the first line of a 40000-line file", firstLine(result))
+	}
+}
+
+// A range read works from every root the same way a whole-file read does, and
+// the resolver is the same one: the size cap is what a range read lifts, not
+// the boundary.
+func TestResolveRangeSharesTheSameBoundary(t *testing.T) {
+	root, outside := testRoot(t)
+	resolved, err := ResolveRangeInRoots([]string{root}, "big.txt")
+	if err != nil {
+		t.Fatalf("ResolveRangeInRoots: %v", err)
+	}
+	if !strings.HasPrefix(resolved.Path, resolvedRoot(t, root)) {
+		t.Fatalf("path = %q, want it under the root", resolved.Path)
+	}
+	if _, err := ResolveRangeInRoots([]string{root}, filepath.Join(outside, "secret.txt")); !errors.Is(err, ErrPathAbsolute) {
+		t.Fatalf("err = %v, want ErrPathAbsolute", err)
+	}
+	if _, err := ResolveRangeInRoots([]string{root}, "docs/../../secret.txt"); !errors.Is(err, ErrPathEscape) {
+		t.Fatalf("err = %v, want ErrPathEscape", err)
+	}
+	if _, err := ResolveRangeInRoots([]string{root}, "link-outside"); !errors.Is(err, ErrSymlinkEscape) {
+		t.Fatalf("err = %v, want ErrSymlinkEscape", err)
+	}
+	// Two roots: the first that holds the path wins, on the same terms.
+	second := t.TempDir()
+	linesFile(t, filepath.Join(second, "lines.txt"), 7)
+	resolved, err = ResolveRangeInRoots([]string{root, second}, "lines.txt")
+	if err != nil {
+		t.Fatalf("ResolveRangeInRoots(two roots): %v", err)
+	}
+	if resolved.Root != second {
+		t.Fatalf("root = %q, want %q", resolved.Root, second)
+	}
+	if _, err := ResolveRangeInRoots(nil, "lines.txt"); !errors.Is(err, ErrNoRoot) {
+		t.Fatalf("err = %v, want ErrNoRoot", err)
+	}
+}
+
+// The point of a range read is a file too large to hold, so the scan must not
+// hold it: what it allocates while reading a small window of a file far larger
+// than that window is bounded by the window, not by the file. TotalAlloc is
+// cumulative, so this measures every byte the scan ever allocated, whatever the
+// collector did with them.
+func TestReadRangeDoesNotHoldTheWholeFile(t *testing.T) {
+	const lines = 400_000
+	path := filepath.Join(t.TempDir(), "huge.txt")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	line := strings.Repeat("x", 39) + "\n"
+	for i := 0; i < lines; i++ {
+		if _, err := file.WriteString(line); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Size() < 8<<20 {
+		t.Fatalf("fixture is %d bytes, too small to tell reading it from not reading it", info.Size())
+	}
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	result, err := ReadRange(path, RangeOptions{StartLine: 100_000, MaxLines: 3, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("ReadRange: %v", err)
+	}
+	runtime.ReadMemStats(&after)
+	// The window is the answer, and the header states the whole file's length
+	// and what was left, which is why the scan has to reach the end without
+	// holding it.
+	vary := fmt.Sprintf(" (3 lines stopped the read; the remaining %d lines were not read)", lines-100_002)
+	if want := fmt.Sprintf("lines 100000-100002 of %d%s", lines, vary); !strings.HasPrefix(result, want) {
+		t.Fatalf("result = %q, want %q", firstLine(result), want)
+	}
+	// Reading the file whole would allocate its size; walking it line by line
+	// allocates a buffer and three lines. The bound is far below the file and
+	// far above what the scan needs, so it cannot pass by luck.
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 2<<20 {
+		t.Fatalf("scan allocated %d bytes for a %d-byte file, want it bounded by the window", grew, info.Size())
 	}
 }
