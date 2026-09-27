@@ -17,7 +17,7 @@ Luna Agent 是一个有边界的本地预览（preview），由三个刻意分�
 根 Go 进程拥有全部应用事实：
 
 - 启动配置和 OpenAI 兼容模型的构建；
-- 运行 ID、一次只运行一个任务（single-run admission）的准入规则、默认 60 秒的整轮运行上下文截止时间、HTTP 请求与断连取消，以及 Eino 的六次迭代上限；
+- 运行 ID、一次只运行一个任务（single-run admission）的准入规则、默认 15 分钟的整轮截止时间（`run_timeout` 可改）、HTTP 请求与断连取消，以及默认 64 回合的模型回合上限（`max_iterations` 可改）；
 - 把 Eino 的输出和工具回调映射为 Luna 自有的事件；
 - 事件顺序与 SSE 分帧；
 - 每个白名单插件工具当前生效的 generation（运行代次）、对整个插件工具集合的整体发布替换、退役，以及自有进程的清理；
@@ -30,7 +30,7 @@ Eino 拥有内部的模型/工具循环。它是实现依赖，不是 Luna 的�
 
 核心只允许一个活动运行。第二次 `POST /api/runs` 会收到 `409`，而不是共享一个可变的事件出口。准入前的失败保留各自的状态：请求体或消息格式错误是 `400`，会话 ID 未知是 `404`，两者都在忙碌检查之前判定。运行局部上下文携带事件出口和运行 ID，防止事件跨运行。客户端断连或 SSE 写入失败会取消该上下文。随后 HTTP 处理器会等待 runner 结束——在不继续写入的情况下继续排空其事件通道——再清除忙碌状态，因此被取消的运行不会与它的后继重叠。没有公开的取消接口时，停止一个运行只能靠断开连接；现在有了 `POST /api/runs/{id}/cancel`，它只停止由该 id 命名的活动运行——id 不匹配或没有活动运行时是 `404`，从不猜测——重复调用在运行结束后同样得到 `404`，运行中重复调用得到相同的 `202`。
 
-当前根应用用一个显式的、默认 60 秒的 `context.WithTimeout` 包裹每个通过准入的模型运行。这个整轮截止时间低于服务器 70 秒的 HTTP 写入截止时间。组件自身的截止时间保持为插件构建 60 秒、插件启动/RPC 5 秒；更早的父级截止时间仍可能更早结束其中任何一项工作。
+当前根应用用一个显式的、默认 15 分钟的 `context.WithTimeout` 包裹每个通过准入的模型运行（`run_timeout` 可改）。**HTTP 写入截止时间必须高于这个整轮预算**：预算先到，客户端收到的是一条终止事件（`run.cancelled{reason:"timeout"}`）；写入截止时间先到，连接被直接切断，客户端既拿不到终止事件，也分不清它与一次挂起，而死掉的连接还会顺手取消这次运行。这一条曾经真的错了：预算从 60 秒提到 15 分钟之后，固定的 70 秒写入截止时间成了结束运行的那一个（>70 秒的运行在 70.0s 处被截断）。现在装配根按同一个解析过的预算把它抬到预算之上（`cmd/luna/main.go` 的 `writeDeadlineFor`，`httpapi.RunTimeoutFor` 保证两侧解析的是同一个数）。组件自身的截止时间保持为插件构建 60 秒、插件启动/RPC 5 秒；更早的父级截止时间仍可能更早结束其中任何一项工作。
 
 ### 能力模型
 
@@ -79,7 +79,7 @@ Eino 拥有内部的模型/工具循环。它是实现依赖，不是 Luna 的�
 
 ### 能力：Memory
 
-Memory 是官方内置能力（`internal/plugins/memory`），不再属于内核业务：`fact`、`remember`、`retract`、注入块的渲染、存储上限、接口形状与面板文案都由它自己决定与测试。它贡献四样东西——写工具 `luna_remember`、一个上下文块、三条路由（`GET /api/memory`、`POST /api/memory/retract`，以及面板自己的两个资产：`GET /api/memory/panel.js` 与 `GET /api/memory/panel.css`）与一个浏览器面板——外加一个状态命名空间 `.runtime`。面板的样式表走它自己的路由而不是注入 `<style>`：服务的 CSP 是 `default-src 'self'` 且没有 `style-src 'unsafe-inline'`，注入的样式表会被浏览器拒绝。模块用自己 URL 推导样式表地址，卸载时把 `<link>` 一并摘掉。
+Memory 是官方内置能力（`internal/plugins/memory`），不再属于内核业务：`fact`、`remember`、`retract`、注入块的渲染、存储上限、接口形状与面板文案都由它自己决定与测试。它贡献四样东西——写工具 `luna_remember`、一个上下文块、四条路由（`GET /api/memory`、`POST /api/memory/retract`，以及面板自己的两个资产：`GET /api/memory/panel.js` 与 `GET /api/memory/panel.css`）与一个浏览器面板——外加一个状态命名空间 `.runtime`。面板的样式表走它自己的路由而不是注入 `<style>`：服务的 CSP 是 `default-src 'self'` 且没有 `style-src 'unsafe-inline'`，注入的样式表会被浏览器拒绝。模块用自己 URL 推导样式表地址，卸载时把 `<link>` 一并摘掉。
 
 内核看到的只有这些贡献：包装工具、按预算注入块、挂上路由、把面板入口交给宿主，并对 `POST /api/memory/retract` 施加与其它变更相同的 Origin 要求。停用这个能力会同时拿掉这四样；数据留在原处。
 
@@ -245,7 +245,7 @@ Eino 的 `ToolsNode` 配置为 `ExecuteSequentially: true`。如果一个模型�
 
 - 提交一次对话运行，并渲染助手增量；
 - 在可展开卡片中渲染工具参数、服务该调用的 generation/版本/PID，以及它自己的逐工具文案；
-- 为侧边检查器轮询不含秘密的状态，它按插件记录逐行列出：工具名、状态、版本、generation 和 PID；
+- 为设置里的「诊断」页轮询不含秘密的状态，该页按插件记录逐行列出：工具名、状态、版本、generation 和 PID；
 - 请求重载一个白名单内的候选；
 - 保持运行与重载两种忙碌状态彼此独立；
 - 使用 DOM API 和 `textContent`，不加载远程资源，也没有隐藏推理视图。
@@ -306,6 +306,7 @@ Eino 的 `ToolsNode` 配置为 `ExecuteSequentially: true`。如果一个模型�
 - 不能用的一律拒绝而不是当零：`max_iterations: 0`、负数、非数字、`run_timeout: later` 都会在启动时报错并指出是哪个键，因为被静默读成零的预算等于不存在。
 - 触到回合上限时整轮以 `run.failed` 结束，错误里**点名这个数字与要改的开关**：Eino 自己的 sentinel 只说 "exceeds max iterations"，不说数字从哪来，而一个可以改的原因必须说出要改什么。判定按标记（`errors.Is(err, adk.ErrExceedMaxIterations)`），不匹配报错文字。触到截止时间则是 `run.cancelled{reason:"timeout"}`——那不是失败。
 - `/api/state` 如实报告这两个数字（`max_iterations`、`run_timeout_ms`），界面在运行详情与“模型服务”两处转述它读到的值；服务端没有报告时界面说“没有报告”，不猜一个。
+- **写入截止时间跟着预算走，而不是自己结束运行。** 装配根用同一个解析过的预算（`httpapi.RunTimeoutFor`）把 HTTP `WriteTimeout` 抬到预算之上（`cmd/luna/main.go` 的 `writeDeadlineFor`，预算 + 30 秒）。固定在 70 秒上时，任何长于 70 秒的运行都会在套接字处被切断：客户端拿不到终止事件，也分不清它与挂起，而死掉的连接还会取消这次运行——预算再宽也用不上。
 
 ## 请求与事件流
 
