@@ -7,9 +7,11 @@ import (
 	"testing"
 
 	"github.com/Qaraku/luna-agent/internal/config"
+	"github.com/Qaraku/luna-agent/internal/layout"
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	"github.com/Qaraku/luna-agent/internal/plugins/workspace"
+	"github.com/Qaraku/luna-agent/internal/skills"
 )
 
 func TestRootFromExecutableRuntimeBinary(t *testing.T) {
@@ -410,5 +412,55 @@ func TestAMissingUserConfigIsNotAProblem(t *testing.T) {
 	}
 	if file == nil || file.Model != "demo-model" {
 		t.Fatalf("file = %#v, want the file that was there", file)
+	}
+}
+
+// The roots discovery reads are the user's own directories: the one under the
+// data root, plus whatever -skills-dir added. The working directory and the
+// resolved installation root are not roots — where Luna was started must not
+// change which skills exist.
+func TestSkillRootsAreTheUsersOwnDirectories(t *testing.T) {
+	paths := layout.Paths{Install: "/srv/luna", Data: "/home/someone/.local/share/luna"}
+	extra := repeatedPath{"/home/someone/team-skills", "/tmp/one-off"}
+
+	roots := skillRoots(paths, extra)
+	want := []skills.Root{
+		{Path: "/home/someone/.local/share/luna/skills", Scope: skills.ScopeUser},
+		{Path: "/home/someone/team-skills", Scope: skills.ScopeUser},
+		{Path: "/tmp/one-off", Scope: skills.ScopeUser},
+	}
+	if len(roots) != len(want) {
+		t.Fatalf("roots=%+v, want %+v", roots, want)
+	}
+	for i := range want {
+		if roots[i] != want[i] {
+			t.Fatalf("roots[%d]=%+v, want %+v", i, roots[i], want[i])
+		}
+	}
+	for _, root := range roots {
+		if strings.Contains(root.Path, paths.Install) {
+			t.Fatalf("root %q comes from the installation", root.Path)
+		}
+	}
+}
+
+func TestSkillsDirMayBeRepeatedAndRejectsAnEmptyValue(t *testing.T) {
+	var dirs repeatedPath
+	for _, value := range []string{"/one", " /two "} {
+		if err := dirs.Set(value); err != nil {
+			t.Fatalf("set %q: %v", value, err)
+		}
+	}
+	if len(dirs) != 2 || dirs[0] != "/one" || dirs[1] != "/two" {
+		t.Fatalf("dirs=%v, want two trimmed entries in order", dirs)
+	}
+	if err := dirs.Set("   "); err == nil {
+		t.Fatal("an empty directory was accepted")
+	}
+	if len(dirs) != 2 {
+		t.Fatalf("dirs=%v, want the rejected value left out", dirs)
+	}
+	if !strings.Contains(dirs.String(), "/one") {
+		t.Fatalf("String()=%q, want it to report what was set", dirs.String())
 	}
 }

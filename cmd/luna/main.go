@@ -25,7 +25,9 @@ import (
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
+	skillsplugin "github.com/Qaraku/luna-agent/internal/plugins/skills"
 	"github.com/Qaraku/luna-agent/internal/plugins/workspace"
+	"github.com/Qaraku/luna-agent/internal/skills"
 	"github.com/Qaraku/luna-agent/internal/store"
 	"github.com/Qaraku/luna-agent/internal/uiplugin"
 )
@@ -245,6 +247,36 @@ func uiPluginsDir(root string) string {
 	return filepath.Join(root, "plugins", uiplugin.Dir)
 }
 
+// repeatedPath is a flag that may be given more than once: each value is one more
+// directory to look for skills in, so a user can keep several sets apart without
+// a separator convention for a path that may itself contain one.
+type repeatedPath []string
+
+func (p *repeatedPath) String() string { return strings.Join(*p, ",") }
+
+func (p *repeatedPath) Set(value string) error {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return errors.New("a skills directory cannot be empty")
+	}
+	*p = append(*p, trimmed)
+	return nil
+}
+
+// skillRoots is every directory discovery reads, in priority order: the
+// user-level directory under the data root first, then whatever the command line
+// added. The flag adds more of the user's own directories — it is user scope, not
+// a project scope, because this version has no source that could establish one.
+// The working directory and the installation are deliberately not roots: which
+// skills exist must not depend on where Luna was started from.
+func skillRoots(paths layout.Paths, extra repeatedPath) []skills.Root {
+	roots := []skills.Root{{Path: filepath.Join(paths.Data, "skills"), Scope: skills.ScopeUser}}
+	for _, dir := range extra {
+		roots = append(roots, skills.Root{Path: dir, Scope: skills.ScopeUser})
+	}
+	return roots
+}
+
 func run() error {
 	addr := flag.String("addr", "127.0.0.1:0", "literal loopback listen address")
 	rootFlag := flag.String("root", "", "repository root holding web/ and plugins/ (default: auto-detect)")
@@ -254,6 +286,8 @@ func run() error {
 	stateFlag := flag.String("state-dir", "", "root directory holding capability state (default: <root>)")
 	rulesFlag := flag.String("rules-file", "", "file holding the project rules the workspace capability contributes (default: none)")
 	configFlag := flag.String("config-file", "", "user configuration file to read (default: <config-dir>/config.yaml)")
+	skillDirs := repeatedPath{}
+	flag.Var(&skillDirs, "skills-dir", "extra directory to discover skills in (may be repeated; the user-level <data-dir>/skills is always read)")
 	flag.Parse()
 	// Where the user's own files live is a different question from where this
 	// copy of Luna is installed. The first follows the XDG directories, the
@@ -325,6 +359,21 @@ func run() error {
 	}
 	if err := registry.Enable(workspace.PluginID); err != nil {
 		return fmt.Errorf("enable workspace capability: %w", err)
+	}
+	// Skills are files the user owns and Luna only reads. Discovery happens once,
+	// here, and what it could not accept is reported rather than hidden: a skill
+	// that was rejected or shadowed is exactly the thing its author needs to hear
+	// about. The capability owns the manifest and the tool that reads one skill.
+	discovered, skillProblems := skills.Discover(skillRoots(paths, skillDirs))
+	for _, problem := range skillProblems {
+		log.Printf("luna: skill %s", problem)
+	}
+	skillSet := skillsplugin.New(discovered)
+	if err := registry.Register(skillSet); err != nil {
+		return fmt.Errorf("register skills capability: %w", err)
+	}
+	if err := registry.Enable(skillsplugin.PluginID); err != nil {
+		return fmt.Errorf("enable skills capability: %w", err)
 	}
 	listener, err := httpapi.Listen(*addr)
 	if err != nil {

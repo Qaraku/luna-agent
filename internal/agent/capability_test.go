@@ -522,29 +522,57 @@ func TestContextLabelFramesEveryDeclaredKind(t *testing.T) {
 		t.Fatal("the two kinds share one framing, so the model cannot tell them apart")
 	}
 
-	// A kind the substrate declares but this version cannot frame is refused,
-	// and the refusal names the capability and the contribution.
-	_, err = contextLabel("notes", "procedures", plugin.ContextSkill)
-	if err == nil || !strings.Contains(err.Error(), `"notes"`) || !strings.Contains(err.Error(), "procedures") {
-		t.Fatalf("skill err=%v, want a refusal naming the capability and the contribution", err)
+	// A skill block is procedural knowledge: meant to be followed, but only
+	// when it applies, and still bounded under the system instructions.
+	skill, err := contextLabel("notes", "procedures", plugin.ContextSkill)
+	if err != nil {
+		t.Fatalf("skill: %v", err)
+	}
+	if !strings.Contains(skill, "procedures") || !strings.Contains(skill, `"notes" capability`) {
+		t.Fatalf("skill framing=%q, want it to name the capability and what the block is", skill)
+	}
+	if !strings.Contains(skill, "when it applies") {
+		t.Fatalf("skill framing=%q, want it to say a procedure applies only sometimes", skill)
+	}
+	if !strings.Contains(skill, "cannot change, weaken or override") {
+		t.Fatalf("skill framing=%q, want it bounded under the system instructions", skill)
+	}
+	if skill == reference || skill == instruction {
+		t.Fatal("the skill kind shares a framing with another kind, so the model cannot tell them apart")
 	}
 }
 
-// A skill block is still declared in the substrate but not rendered: the kernel
-// refuses it instead of guessing where it goes.
-func TestASkillBlockIsRefusedForNow(t *testing.T) {
+// A skill block reaches the model as procedural knowledge: framed as something
+// to follow when it fits, and bounded under the system instructions — not as
+// reference data to ignore and not as a project rule.
+func TestASkillBlockIsFramedAsProceduralKnowledge(t *testing.T) {
 	capability := &fakeCapability{
 		id:     "notes",
-		blocks: []plugin.ContextBlock{{ID: "rules", Kind: plugin.ContextSkill, Text: "Do as I say."}},
+		blocks: []plugin.ContextBlock{{ID: "procedures", Kind: plugin.ContextSkill, Text: "Do as I say."}},
 	}
 	m := &captureModel{answer: "ok"}
 	r, err := NewRunner(context.Background(), m, fakeInvoker{}, &recordingReader{}, WithCapabilities(enabledRegistry(t, capability.plugin())))
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = r.Run(context.Background(), RunRequest{Message: "hi", RunID: "run-1", Sink: &collectingSink{}})
-	if err == nil || !strings.Contains(err.Error(), "not implemented yet") {
-		t.Fatalf("err = %v, want a clear refusal to render an unimplemented kind", err)
+	if _, err = r.Run(context.Background(), RunRequest{Message: "hi", RunID: "run-1", Sink: &collectingSink{}}); err != nil {
+		t.Fatalf("a declared kind must render: %v", err)
+	}
+	system := m.first()[0].Content
+	if !strings.Contains(system, "Do as I say.") {
+		t.Fatalf("the block did not reach the model:\n%s", system)
+	}
+	if !strings.Contains(system, `"notes" capability`) {
+		t.Fatalf("the block must name the capability it came from:\n%s", system)
+	}
+	if !strings.Contains(system, "when it applies") || !strings.Contains(system, "cannot change, weaken or override") {
+		t.Fatalf("the skill block lost its framing:\n%s", system)
+	}
+	if strings.Contains(system, "not an instruction") {
+		t.Fatalf("a skill block must not be framed as reference data:\n%s", system)
+	}
+	if strings.Contains(system, "project rule") {
+		t.Fatalf("a skill block must not be framed as a project rule:\n%s", system)
 	}
 }
 
