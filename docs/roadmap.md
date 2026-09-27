@@ -157,18 +157,17 @@ Terminal / Shell 执行、MCP、RAG 与检索式记忆、附件、多 agent 编�
 
 **第二次：提交 `6dc5264`。** 第一次记录（`c0affab`）之后仓库又前进了一批提交，`git diff --stat b293c8a..6dc5264`
 可以复核那段差异：`docs/` 之外还动了 `web/app.test.cjs`、`internal/httpapi`、`internal/pluginhost` 与 `cmd/luna`
-——两条测试、一次重构、**一次产品缺陷修复**（见下）。所以「跑在 `b293c8a` 上」不再等于「跑在当前 HEAD 上」——于是对 `6dc5264`
+——两条测试、一次重构、**一次产品缺陷修复**（见下）。所以「跑在 `b293c8a` 上」不再等于「跑在后来那棵树上」——于是对 `6dc5264`
 重跑了门禁（全绿，`node --test` 103 项，并在副本上核对了「副本内容 == 该提交的树」）与全部可跑的
 夹具共 18 个，结论与第一次相同。另有一个文档语言核对夹具（`.evidence/docs-cn/verify-docs-cn.py`）
 必须在有 git 历史的仓库里跑，它对 `docs/roadmap.md` 与 `docs/architecture.md` 的结果是 **24/25**：
 唯一失败的一项是它自己的前提失效（它拿 `HEAD:` 与工作区版本对照，服务于当年「英文 HEAD → 中文工作区」
 的那次中文化，而两者现在都是中文版）。那次运行顺带查出文档里一处真正的缺陷（版本表引用的
-`` `## v0.3.0 范围` `` 与实际标题不一致），已修。两次之间到底差了什么，`git diff --stat b293c8a..HEAD` 可以复核：
-`docs/` 之外还动了 `web/app.test.cjs`、`internal/httpapi`、`internal/pluginhost` 与 `cmd/luna`。
+`` `## v0.3.0 范围` `` 与实际标题不一致），已修。
 
 | 检查 | 结果 |
 |---|---|
-| `AGENTS.md` 的六条门禁加工作树空白检查（`go test -race`、`go vet`、构建、`gofmt`、`node --check`、`node --test` 的 101 项） | 全部通过 |
+| `AGENTS.md` 的六条门禁加工作树空白检查（`go test -race`、`go vet`、构建、`gofmt`、`node --check`，以及 `node --test` 在 `b293c8a` 上的 101 项） | 全部通过 |
 | 前端交互：会话、命令表、能力与技能行、窄屏抽屉（隔离夹具 + 真 Chromium） | 25 项通过 |
 | 界面与主题：命中区、对比度、越界、存储异常、计数插件（隔离夹具 + 真 Chromium） | 13 项通过 |
 | 侧栏折叠与宽度、窄屏设置模态的边界 | 通过 |
