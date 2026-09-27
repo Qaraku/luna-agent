@@ -604,6 +604,173 @@ function runPayload(message, sessionID) {
   return payload;
 }
 
+// --- 一次运行的展示语义 -----------------------------------------------------
+//
+// 前端只从真实事件派生状态：等待模型、生成回答、正在使用工具、正在取消。
+// 它不推断模型在想什么，也不为没有发生的事写一行字。
+
+// 参数与结果可能很长，卡片默认只给一段有界的预览，全文放在可展开的次级层里。
+// 这两个数是"默认看多少"，不是业务判断。
+const TOOL_TEXT_MAX_CHARS = 1200;
+const TOOL_TEXT_MAX_LINES = 16;
+
+// 内联时间线里那几行标号：阶段行、运行说明、推理条目。
+// 推理条目只在 assistant.reasoning 真的到达时才出现，没有这个事件时界面上不会
+// 出现任何相关文案，也不预留位置。
+const RUN_NOTE_LABEL = '运行说明';
+const RUN_REASONING_LABEL = '推理';
+const RUN_CANCELLED_COPY = '这次运行被取消了，上面的内容没有写完。';
+
+// 工具拒绝某次调用与工具失败在事件上都是 tool.failed，唯一区别是错误前缀。
+// 拒绝是一次正常答复，不是崩溃，所以界面上它们是两档，不共用一句话。
+const TOOL_REFUSAL_PREFIX = 'the tool refused this call: ';
+
+// clipText gives the bounded preview a card starts with, and says whether
+// anything was left out, so the caller can offer the full text.
+function clipText(value, maxChars = TOOL_TEXT_MAX_CHARS, maxLines = TOOL_TEXT_MAX_LINES) {
+  const text = typeof value === 'string' ? value : value === undefined || value === null ? '' : String(value);
+  const lines = text.split(/\r?\n/);
+  let preview = lines.slice(0, maxLines).join('\n');
+  let clipped = lines.length > maxLines;
+  if (preview.length > maxChars) {
+    preview = preview.slice(0, maxChars);
+    clipped = true;
+  }
+  return { text: clipped ? `${preview.replace(/\s+$/, '')}…` : text, clipped };
+}
+
+// 参数可能是 JSON 对象（后端直接给出）或原始字符串，两者都要如实展示。
+function toolArgumentsText(value) {
+  if (typeof value === 'string') return argumentsText(value);
+  if (value && typeof value === 'object') {
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch (_) {
+      return '—';
+    }
+  }
+  return '—';
+}
+
+function toolResultText(value) {
+  if (typeof value === 'string') return value === '' ? '—' : value;
+  if (value === undefined || value === null) return '—';
+  if (typeof value === 'object') {
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch (_) {
+      return '—';
+    }
+  }
+  return String(value);
+}
+
+// 运行状态条的计时：不足一分钟给秒，再长给 m:ss。
+function formatElapsed(ms) {
+  const total = Math.max(0, Math.floor((typeof ms === 'number' && Number.isFinite(ms) ? ms : 0) / 1000));
+  if (total < 60) return `${total}s`;
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+
+// 工具耗时由 Runtime 给出（duration_ms）：毫秒级给 ms，秒级给一位小数。
+// 没有这个字段时返回空串，不编一个数字出来。
+function formatDuration(ms) {
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return '';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  return formatElapsed(ms);
+}
+
+function toolFailureKind(error) {
+  return typeof error === 'string' && error.startsWith(TOOL_REFUSAL_PREFIX) ? 'refused' : 'failed';
+}
+
+// 拒绝的原因就在前缀之后；这一句是给用户看的，原始错误另行保留。
+function toolRefusalReason(error) {
+  return toolFailureKind(error) === 'refused' ? error.slice(TOOL_REFUSAL_PREFIX.length) : '';
+}
+
+function toolRefusedLabel(name) {
+  return `${toolLabel(name).noun}被拒绝`;
+}
+
+// 事件用的是结果词汇（`ok`），文案表用的是活动词汇（`finished`）：
+// 两个词汇表在这一处对齐，别处不再各自翻译。
+const TOOL_STATE_ACTIVITY = { ok: 'finished', running: 'running', failed: 'failed', refused: 'refused' };
+
+// 每个工具状态一档文案：运行中/完成/失败沿用按工具写好的那套，拒绝另说一句。
+function toolStateLabel(name, state) {
+  if (state === 'refused') return toolRefusedLabel(name);
+  return toolActivityLabel(name, TOOL_STATE_ACTIVITY[state] || state);
+}
+
+// 状态条的文案只由真实事件派生：还没受理 / 已开始等待模型 / 生成中 / 正在用工具 / 正在取消。
+function runPhaseText(state, toolName = '') {
+  if (state === 'connecting') return '正在连接…';
+  if (state === 'waiting') return '已开始，等待模型回应…';
+  if (state === 'streaming') return 'Luna 正在回应…';
+  if (state === 'tool') return `正在使用工具：${toolLabel(toolName).noun}`;
+  if (state === 'cancelling') return '正在取消…';
+  return '';
+}
+
+// 轨迹里的模型阶段行标的是"模型这一段输出开始了"，不是模型想了什么。
+function runPhaseEntryText(leg) {
+  return leg === 0 ? '模型开始回应' : '模型继续回应';
+}
+
+function runOutcomeLabel(state) {
+  return {
+    ok: '已完成',
+    failed: '失败',
+    cancelled: '已取消',
+    interrupted: '已中断',
+    running: '进行中'
+  }[state] || '结果未知';
+}
+
+// 折叠时那一行的概况：工具调用数、总耗时、最终状态。只写真实拿到的东西。
+function runTraceMeta(tools, durationMs, state) {
+  const parts = [];
+  if (typeof tools === 'number' && tools > 0) parts.push(`${tools} 次工具调用`);
+  if (state !== 'running' && typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs >= 0) {
+    parts.push(formatElapsed(durationMs));
+  }
+  parts.push(runOutcomeLabel(state));
+  return parts.join(' · ');
+}
+
+// 回放的一条 run 记录只在 status 上说明结果；没有记录时不给结论。
+function replayRunState(status) {
+  return { ok: 'ok', error: 'failed', cancelled: 'cancelled', interrupted: 'interrupted' }[status] || '';
+}
+
+// 用量只在服务端给出来时显示：拿不到就不显示，不写 0，也不留占位。
+const USAGE_FIELDS = [
+  ['input_tokens', '输入'],
+  ['output_tokens', '输出'],
+  ['cached_tokens', '缓存'],
+  ['reasoning_tokens', '推理']
+];
+
+function formatTokenCount(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return '';
+  if (value < 1000) return String(Math.round(value));
+  const thousands = value / 1000;
+  return `${thousands >= 100 ? Math.round(thousands) : thousands.toFixed(1).replace(/\.0$/, '')}k`;
+}
+
+// usageText 是一行次级信息（轨迹里），不是独立面板：只列出这次真的收到的字段。
+function usageText(data) {
+  const source = data && typeof data === 'object' ? data : {};
+  const parts = [];
+  for (const [key, label] of USAGE_FIELDS) {
+    const text = formatTokenCount(source[key]);
+    if (text) parts.push(`${label} ${text}`);
+  }
+  return parts.length ? `tokens：${parts.join(' · ')}` : '';
+}
+
 function parseInline(text) {
   const source = String(text ?? '');
   const runs = [];
@@ -704,6 +871,11 @@ if (typeof module !== 'undefined') {
     pluginStatusLabel, pluginRows, parseInline, parseMarkdownBlocks,
     isSessionID, parseSessionHash, sessionHash, sessionTitle, sessionTime, relativeTime, runCountLabel,
     runStatusLabel, sessionRows, argumentsText, toolCallFacts, replaySession, runPayload,
+    clipText, toolArgumentsText, toolResultText, formatElapsed, formatDuration, toolFailureKind,
+    toolRefusalReason, toolRefusedLabel, toolStateLabel, runPhaseText, runPhaseEntryText,
+    runOutcomeLabel, runTraceMeta, replayRunState, formatTokenCount, usageText,
+    TOOL_TEXT_MAX_CHARS, TOOL_TEXT_MAX_LINES, TOOL_REFUSAL_PREFIX,
+    RUN_NOTE_LABEL, RUN_REASONING_LABEL, RUN_CANCELLED_COPY,
     uiPluginText, uiPluginNameValid, uiPluginEntrySafe, uiPluginEntryURL, uiPluginRows, uiPluginMissingExports,
     uiPluginErrorDetail, uiPluginImportError, uiPluginMissingExportError, uiPluginMountError, uiPluginUnmountError,
     uiPluginState, uiPluginInitialState, uiPluginTransition, uiPluginEnableFailureEvent, uiPluginDisableEvent,
@@ -785,7 +957,6 @@ if (typeof document !== 'undefined') {
   let running = false;
   let reloading = false;
   let currentTurn = null;
-  let openTools = [];
   let lastFocused = null;
   let activePanel = null;
   // switching guards a session replay in flight; sessionsPayload is the last
@@ -912,16 +1083,60 @@ if (typeof document !== 'undefined') {
     contentChanged(stick);
   }
 
-  // The three parts of an assistant turn are built in one place so a live turn
-  // and a replayed one are the same DOM shape.
+  // 一个 assistant 回合只有两块：一行标题（模型名 + 这次运行的概况），以及一条
+  // 内联的时间线。时间线里的条目按它们真实发生的顺序出现；回答主体永远是最后
+  // 一条，也是这个回合的视觉主体。
   function assistantTurnNode() {
     const turn = make('article', 'turn assistant');
     turn.setAttribute('aria-label', 'Luna');
-    turn.append(make('span', 'assistant-label', 'Luna'));
-    const tools = make('div', 'tool-list');
+    const head = make('div', 'assistant-head');
+    const meta = make('span', 'run-meta');
+    meta.hidden = true;
+    head.append(make('span', 'assistant-label', 'Luna'), meta);
+    const timeline = make('div', 'run-timeline');
     const body = make('div', 'assistant-body placeholder', 'Luna 正在回应…');
-    turn.append(tools, body);
-    return { turn, tools, body };
+    timeline.append(body);
+    turn.append(head, timeline);
+    return { turn, timeline, meta, body };
+  }
+
+  // 每一步都插在回答主体之前，所以时间线里的顺序就是事情发生的顺序，回答永远
+  // 收尾。withPhase 为真时这一步同时说明"模型这一段输出开始了"：阶段行先补上，
+  // 于是它总在它这一段的第一条条目之前。
+  function appendStep(turnState, node, withPhase = true) {
+    if (withPhase) ensureLegPhase(turnState);
+    turnState.timeline.insertBefore(node, stepAnchor(turnState));
+    updateRunMeta(turnState);
+    return node;
+  }
+
+  // 回答主体被移除之后（取消或空答案）没有锚点，剩下的条目直接接在后面。
+  function stepAnchor(turnState) {
+    return turnState.body.parentElement === turnState.timeline ? turnState.body : null;
+  }
+
+  // 一次运行的界面状态，只从真实事件推进。它同时是回答主体和这条时间线的来源。
+  function newRunTurn(message) {
+    return {
+      message,
+      answer: '',
+      hasAnswer: false,
+      terminal: false,
+      failed: false,
+      runID: '',
+      startedAt: 0,
+      finishedAt: 0,
+      outcome: '',
+      leg: 0,
+      legPhase: -1,
+      awaitingModel: false,
+      toolCount: 0,
+      openCards: [],
+      // provider 自愿暴露的推理内容只累积在这里，绝不写进 answer，也不参与对齐。
+      reasoning: '',
+      reasoningEntry: null,
+      usage: null
+    };
   }
 
   function addAssistantTurn(message) {
@@ -930,7 +1145,7 @@ if (typeof document !== 'undefined') {
     const node = assistantTurnNode();
     conversation.append(node.turn);
     contentChanged(stick);
-    return { turn: node.turn, tools: node.tools, body: node.body, message, answer: '', hasAnswer: false, failed: false, terminal: false };
+    return Object.assign(node, newRunTurn(message));
   }
 
   function appendDefinition(list, label, value) {
@@ -939,50 +1154,245 @@ if (typeof document !== 'undefined') {
     list.append(row);
   }
 
-  function formatValue(value) {
-    if (typeof value === 'string') return value;
-    if (value === undefined) return '—';
-    return JSON.stringify(value, null, 2);
+  // 参数与结果默认有界：卡片先给一段预览，被截断的值下面接一个可展开的全文，
+  // 展开时的高度再由样式兜住，页面不会被一次读取拉爆。
+  // 预览单独成一个元素：量「默认给多少」时量的是它本身，而不是整行——整行的
+  // textContent 也包含折叠层里的全文（真实 DOM 与适配器都如此）。
+  function appendBoundedValue(list, label, value) {
+    const full = typeof value === 'string' ? value : value === undefined || value === null ? '' : String(value);
+    const text = full === '' ? '—' : full;
+    const clip = clipText(text);
+    const row = make('div');
+    const dd = make('dd');
+    dd.append(make('span', 'value-preview', clip.text));
+    if (clip.clipped) {
+      const more = make('details', 'value-more');
+      more.append(make('summary', '', `展开全文（${text.length} 字符）`), make('pre', '', text));
+      dd.append(more);
+    }
+    row.append(make('dt', '', label), dd);
+    list.append(row);
   }
 
-  function addToolRow(data) {
-    const stick = nearBottom();
-    const details = make('details', 'tool-row running');
-    details.open = true;
-    const summary = make('summary', '', toolActivityLabel(data.name, 'running'));
+  // 执行身份（generation / version / plugin_pid）与原始错误是开发诊断信息，
+  // 只在卡片的次级层里出现，不做主视觉。它是卡片的第二层，挂在事实行旁边，
+  // 不混进 `.tool-detail` 的那份事实清单里（那里只有工具、参数、结果/错误）。
+  function toolDetailNode(tool) {
+    if (!tool.identity && !tool.rawError) return null;
+    const more = make('details', 'tool-more');
+    const list = make('dl');
+    if (tool.identity) appendDefinition(list, '执行身份', tool.identity);
+    more.append(make('summary', '', '详情'), list);
+    if (tool.rawError) more.append(make('pre', '', tool.rawError));
+    return more;
+  }
+
+  function toolIdentityText(data) {
+    if (!data || (data.generation === undefined && data.version === undefined && data.plugin_pid === undefined)) return '';
+    return toolSummary(data);
+  }
+
+  // 卡片的事实行来自同一个读法：参数是字符串或 JSON 对象，结果/错误只出现一个。
+  // 拒绝与失败都只是错误，区别在前缀，所以拒绝那一行另起一个说法。
+  function toolCardFacts(tool) {
+    return toolCallFacts({
+      name: tool.name,
+      arguments: tool.arguments,
+      result: tool.result,
+      error: tool.error
+    }).map((fact) => (fact.label === '错误' && tool.state === 'refused'
+      ? { label: '拒绝原因', value: toolRefusalReason(tool.error) || fact.value }
+      : fact));
+  }
+
+  // 一张工具卡片：一行摘要（状态点、工具、耗时）+ 可展开的细节。
+  // 成功、失败、拒绝用语义色与文案区分，拒绝不会被写成一次崩溃。
+  function toolCardRecord(tool) {
+    const card = make('details', `tool-row ${tool.state}`);
+    const dot = make('span', 'tool-state');
+    dot.dataset.state = tool.state;
+    dot.setAttribute('aria-hidden', 'true');
+    const name = make('span', 'tool-name', toolStateLabel(tool.name, tool.state));
+    const meta = make('span', 'tool-meta', tool.meta || '');
+    const summary = make('summary');
+    summary.append(dot, name, meta);
     const detail = make('div', 'tool-detail');
     const list = make('dl');
-    appendDefinition(list, '工具', valueOrDash(data.name));
-    appendDefinition(list, '参数', formatValue(data.arguments));
+    for (const fact of toolCardFacts(tool)) {
+      // 运行中的调用还没有结果或错误：那一行在它结束时才补上。
+      if (tool.state === 'running' && fact.label !== '工具' && fact.label !== '参数') continue;
+      appendBoundedValue(list, fact.label, fact.value);
+    }
     detail.append(list);
-    details.append(summary, detail);
-    currentTurn.tools.append(details);
-    const record = { details, summary, list, name: data.name, complete: false };
-    openTools.push(record);
+    card.append(summary, detail);
+    return { card, dot, name, meta, detail, list, toolName: typeof tool.name === 'string' ? tool.name : '', arguments: tool.arguments, state: tool.state };
+  }
+
+  function applyToolCardState(record, state) {
+    record.state = state;
+    record.card.className = `tool-row ${state}`;
+    record.dot.dataset.state = state;
+    record.name.textContent = toolStateLabel(record.toolName, state);
+  }
+
+  function startToolCard(turnState, data) {
+    const stick = nearBottom();
+    // 顺序就是事情发生的顺序：阶段行 → 运行说明 → 工具卡片。
+    ensureLegPhase(turnState);
+    demoteRunNote(turnState);
+    const record = toolCardRecord({
+      name: data.name,
+      state: 'running',
+      arguments: toolArgumentsText(data.arguments)
+    });
+    appendStep(turnState, record.card, false);
+    turnState.toolCount += 1;
+    turnState.openCards.push(record);
+    updateRunMeta(turnState);
     contentChanged(stick);
     return record;
   }
 
-  function nextOpenTool(name) {
-    return openTools.find((tool) => !tool.complete && (!name || !tool.name || tool.name === name));
+  function finishToolCard(turnState, data, state) {
+    const stick = nearBottom();
+    const toolName = typeof data.name === 'string' ? data.name : '';
+    const record = turnState.openCards.find((item) => item.state === 'running' && (!toolName || !item.toolName || item.toolName === toolName))
+      || turnState.openCards.find((item) => item.state === 'running')
+      || null;
+    // 没有对应的开始事件时补一张完整的卡片，而不是把这次调用丢掉。
+    if (!record) turnState.toolCount += 1;
+    const target = record || toolCardRecord({ name: data.name, state: 'running', arguments: toolArgumentsText(data.arguments) });
+    if (!record) appendStep(turnState, target.card);
+    const facts = toolCardFacts({
+      name: target.toolName,
+      arguments: target.arguments,
+      result: toolResultText(data.result),
+      error: typeof data.error === 'string' ? data.error : '',
+      state
+    });
+    const outcome = facts[facts.length - 1];
+    if (outcome) appendBoundedValue(target.list, outcome.label, outcome.value);
+    const more = toolDetailNode({
+      identity: toolIdentityText(data),
+      // 拒绝的原始错误带着协议前缀，它是权威原文，放在次级层里。
+      rawError: state === 'refused' ? data.error : ''
+    });
+    if (more) target.card.append(more);
+    target.meta.textContent = formatDuration(data.duration_ms);
+    applyToolCardState(target, state);
+    turnState.openCards = turnState.openCards.filter((item) => item !== target);
+    // 工具返回之后，接下来的一段输出属于模型的下一段。
+    turnState.awaitingModel = true;
+    updateRunMeta(turnState);
+    contentChanged(stick);
   }
 
-  function finishTool(data, failed) {
+  // 阶段行：这一刻模型又开始输出了。它只标边界，不描述模型在想什么。
+  function appendPhaseRow(turnState) {
+    turnState.legPhase = turnState.leg;
+    turnState.timeline.insertBefore(
+      make('div', 'run-phase', runPhaseEntryText(turnState.leg)),
+      stepAnchor(turnState)
+    );
+    updateRunMeta(turnState);
+  }
+
+  // 有过程可看时，当前这一段的第一条条目之前先补上它的阶段行。
+  function ensureLegPhase(turnState) {
+    if (turnState.legPhase === turnState.leg) return;
+    appendPhaseRow(turnState);
+  }
+
+  // 工具返回之后的第一段输出属于模型的下一段：新的一段有自己的阶段行，推理也
+  // 另起一条，不跟上一条混在一起。
+  function beginModelLeg(turnState) {
+    if (!turnState.awaitingModel) return;
+    turnState.awaitingModel = false;
+    turnState.leg += 1;
+    turnState.reasoning = '';
+    turnState.reasoningEntry = null;
+    appendPhaseRow(turnState);
+  }
+
+  // 时间线里除回答之外的条目：一次直接回答的运行没有过程可概括。
+  function hasRunSteps(turnState) {
+    return turnState.timeline.children.length > 1;
+  }
+
+  // 标题那一行上的概况：工具调用数、总耗时（结束时才有）、最终状态。只写真实
+  // 拿到的东西；没有过程要看时它不出现，一次直接回答不顶着这一行。
+  function updateRunMeta(turnState) {
+    const state = turnState.outcome || 'running';
+    const durationMs = state === 'running' || !turnState.startedAt ? null : turnState.finishedAt - turnState.startedAt;
+    turnState.meta.textContent = runTraceMeta(turnState.toolCount, durationMs, state);
+    turnState.meta.dataset.state = state;
+    turnState.meta.hidden = !hasRunSteps(turnState);
+  }
+
+  // 模型在调工具前说的话不是回答，而是"运行说明"：从消息主体移到时间线里保留，
+  // 位置就在它真实发生的地方——阶段行之后、它引出的工具卡片之前。
+  function demoteRunNote(turnState) {
+    if (!turnState.answer) return;
+    const note = make('p', 'run-note');
+    note.append(make('span', 'run-note-label', RUN_NOTE_LABEL), document.createTextNode(`：${turnState.answer}`));
+    appendStep(turnState, note);
+    turnState.answer = '';
+    turnState.hasAnswer = false;
+    turnState.body.textContent = 'Luna 正在回应…';
+    turnState.body.classList.add('placeholder');
+  }
+
+  // 用量是可选的：只在服务端给出来时作为时间线里的一行次级信息显示，
+  // 拿不到就不显示，不写 0，也不为它单开一块面板。
+  function applyUsage(turnState, data) {
+    const text = usageText(data);
+    if (!text) return;
+    if (!turnState.usage) turnState.usage = appendStep(turnState, make('p', 'run-usage'), false);
+    turnState.usage.textContent = text;
+    updateRunMeta(turnState);
+  }
+
+  // 推理条目：一行标号 + 正文。provider 给了推理才有这一条，正文随事件逐步增长。
+  // 默认展开，因为用户要能看到它长到了哪里；整条可以折起来，正文高度也有界、
+  // 自己滚动，一次很长的推理不会把回答顶出视野。
+  function reasoningEntryNode() {
+    const entry = make('details', 'run-reasoning');
+    const summary = make('summary');
+    summary.append(make('span', 'run-reasoning-label', RUN_REASONING_LABEL));
+    const text = make('pre', 'run-reasoning-body');
+    entry.append(summary, text);
+    entry.open = true;
+    return { entry, text };
+  }
+
+  // assistant.reasoning 是 provider 自愿暴露的推理增量。它只在自己那一条条目里
+  // 增长，绝不写进回答主体，也不参与终态答案对齐；整轮都没有这个事件时，界面上
+  // 不出现任何相关文案，也不留占位。
+  function appendReasoning(text) {
+    if (!currentTurn) return;
+    const chunk = typeof text === 'string' ? text : '';
+    if (!chunk) return;
     const stick = nearBottom();
-    const tool = nextOpenTool(data.name) || addToolRow({ name: data.name, arguments: {} });
-    tool.complete = true;
-    tool.details.classList.remove('running');
-    tool.details.classList.toggle('failed', failed);
-    tool.summary.textContent = toolActivityLabel(tool.name, failed ? 'failed' : 'finished');
-    appendDefinition(tool.list, failed ? '错误' : '结果', failed ? (data.error || '未知错误') : formatValue(data.result));
-    appendDefinition(tool.list, '执行身份', toolSummary(data));
-    tool.details.open = false;
+    beginModelLeg(currentTurn);
+    currentTurn.reasoning += chunk;
+    if (!currentTurn.reasoningEntry) {
+      currentTurn.reasoningEntry = reasoningEntryNode();
+      appendStep(currentTurn, currentTurn.reasoningEntry.entry);
+    }
+    const body = currentTurn.reasoningEntry.text;
+    // 正文自己滚动时跟着最新一行走；用户往回翻过就不再打断他。
+    const follow = body.scrollHeight - body.scrollTop - body.clientHeight < 24;
+    body.textContent = currentTurn.reasoning;
+    if (follow) body.scrollTop = body.scrollHeight;
+    updateRunMeta(currentTurn);
     contentChanged(stick);
   }
 
   function appendAnswer(text) {
     if (!currentTurn || !text) return;
     const stick = nearBottom();
+    // 工具返回之后的第一次输出属于模型的下一段：阶段行与推理条目都从这里另起。
+    beginModelLeg(currentTurn);
     if (!currentTurn.hasAnswer) {
       currentTurn.body.textContent = '';
       currentTurn.body.classList.remove('placeholder');
@@ -993,16 +1403,46 @@ if (typeof document !== 'undefined') {
     contentChanged(stick);
   }
 
-  function resolveOpenTools() {
-    for (const tool of openTools) {
-      if (tool.complete) continue;
-      tool.complete = true;
-      tool.details.classList.remove('running');
-      tool.details.classList.add('failed');
-      tool.summary.textContent = toolActivityLabel(tool.name, 'failed');
-      appendDefinition(tool.list, '错误', '工具在完成前中断。');
-      tool.details.open = false;
+  // 终态时还没有结束的调用不能停在"运行中"，也不能被说成完成。
+  function resolveTurnTools(turnState) {
+    for (const record of turnState.openCards) {
+      if (record.state !== 'running') continue;
+      appendBoundedValue(record.list, '错误', '工具在完成前中断。');
+      applyToolCardState(record, 'failed');
     }
+    turnState.openCards = [];
+  }
+
+  function resolveOpenTools() {
+    if (currentTurn) resolveTurnTools(currentTurn);
+  }
+
+  // 终止时用 run.finished.answer 对齐已经渲染的文本：替换而不是追加，
+  // 所以一段回答不会出现两遍。答案为空时保留已渲染的部分，不凭空清空。
+  function alignAnswer(answer) {
+    if (!currentTurn || typeof answer !== 'string' || answer === '') return;
+    const stick = nearBottom();
+    currentTurn.answer = answer;
+    currentTurn.hasAnswer = true;
+    currentTurn.body.classList.remove('placeholder');
+    renderMarkdown(currentTurn.body, currentTurn.answer);
+    contentChanged(stick);
+  }
+
+  // 取消时已经渲染的部分文本保留，并说清楚它没有写完。
+  function markCancelled() {
+    if (!currentTurn) return;
+    const stick = nearBottom();
+    if (!currentTurn.hasAnswer) currentTurn.body.remove();
+    currentTurn.turn.append(make('p', 'run-incomplete', RUN_CANCELLED_COPY));
+    contentChanged(stick);
+  }
+
+  function finishRunTurn(turnState, state) {
+    turnState.finishedAt = Date.now();
+    turnState.outcome = state;
+    resolveTurnTools(turnState);
+    updateRunMeta(turnState);
   }
 
   function showRunFailure(error, copy = 'Luna 没能完成这次回应。') {
@@ -1027,37 +1467,232 @@ if (typeof document !== 'undefined') {
     contentChanged(stick);
   }
 
-  function setRunStatus(text) {
-    runStatus.textContent = text;
-    runStatus.hidden = !text;
+  // --- 状态条、Stop 与一次运行的生命周期 -------------------------------------
+  //
+  // 状态条复用标记里已有的 #run-status：当前状态文案 + 已运行时长。
+  // 时长由前端计时（起点是收到的事件），它只用来显示，不参与判断状态。
+
+  let liveRun = null;
+  let statusTicker = null;
+  let statusNodes = null;
+
+  function buildStatusNodes() {
+    const dot = make('span', 'run-status-dot');
+    dot.setAttribute('aria-hidden', 'true');
+    const label = make('span', 'run-status-label');
+    // 秒表每秒都在变，不该被读屏一次次播报。
+    const elapsed = make('span', 'run-status-elapsed');
+    elapsed.setAttribute('aria-hidden', 'true');
+    runStatus.replaceChildren(dot, label, elapsed);
+    return { dot, label, elapsed };
   }
 
+  function applyRunStatus() {
+    if (!liveRun) {
+      runStatus.hidden = true;
+      return;
+    }
+    statusNodes = statusNodes || buildStatusNodes();
+    statusNodes.label.textContent = liveRun.notice || runPhaseText(liveRun.state, liveRun.toolName);
+    statusNodes.elapsed.textContent = liveRun.startedAt ? formatElapsed(Date.now() - liveRun.startedAt) : '';
+    runStatus.dataset.state = liveRun.state;
+    runStatus.hidden = false;
+  }
+
+  function tickRunStatus() {
+    if (!liveRun) {
+      stopStatusTicker();
+      return;
+    }
+    applyRunStatus();
+  }
+
+  function startStatusTicker() {
+    if (statusTicker !== null) return;
+    statusTicker = setInterval(tickRunStatus, 1000);
+  }
+
+  function stopStatusTicker() {
+    if (statusTicker === null) return;
+    clearInterval(statusTicker);
+    statusTicker = null;
+  }
+
+  function clearRunStatus() {
+    runStatus.hidden = true;
+    runStatus.replaceChildren();
+    statusNodes = null;
+  }
+
+  // 运行期间发送按钮就是 Stop：同一个控件、同一个位置，不再另起一套控制栏。
+  const sendIcon = send.querySelector('svg');
+
+  function stopIconNode() {
+    const svg = document.createElementNS(SVG_NAMESPACE, 'svg');
+    svg.setAttribute('class', 'ui-icon stop-icon');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('fill', 'currentColor');
+    svg.setAttribute('aria-hidden', 'true');
+    const square = document.createElementNS(SVG_NAMESPACE, 'rect');
+    square.setAttribute('x', '7');
+    square.setAttribute('y', '7');
+    square.setAttribute('width', '10');
+    square.setAttribute('height', '10');
+    square.setAttribute('rx', '2');
+    svg.append(square);
+    return svg;
+  }
+
+  function setSendAction(action) {
+    const label = action === 'send' ? '发送' : action === 'cancelling' ? '正在取消' : '停止';
+    send.dataset.action = action;
+    send.setAttribute('aria-label', label);
+    send.setAttribute('title', label);
+    send.replaceChildren(action === 'send' ? sendIcon : stopIconNode());
+  }
+
+  function beginRun() {
+    running = true;
+    liveRun = { runID: '', state: 'connecting', toolName: '', startedAt: 0, notice: '', cancelling: false };
+    applyRunStatus();
+    startStatusTicker();
+    setSendAction('cancel');
+    setSessionControls();
+  }
+
+  // 收到终止事件就立刻退出运行状态，不留一个还在转的 loading。
+  function endRun() {
+    if (!running && !liveRun) return;
+    running = false;
+    liveRun = null;
+    stopStatusTicker();
+    clearRunStatus();
+    setSendAction('send');
+    setSessionControls();
+  }
+
+  // 取消入口：POST /api/runs/{run_id}/cancel。重复点击不再发请求；
+  // 404 表示这次运行已经结束，按"已经结束"处理，而不是报一次错。
+  async function cancelRun() {
+    if (!liveRun || liveRun.cancelling) return;
+    const runID = typeof liveRun.runID === 'string' ? liveRun.runID : '';
+    // 这一次运行还没被受理时没有可取消的对象。
+    if (!runID) return;
+    const previous = liveRun.state;
+    liveRun.cancelling = true;
+    liveRun.state = 'cancelling';
+    liveRun.notice = '';
+    applyRunStatus();
+    setSessionControls();
+    try {
+      const response = await fetch(`/api/runs/${runID}/cancel`, { method: 'POST' });
+      if (!response.ok && response.status !== 404) throw new Error(await errorMessage(response));
+    } catch (error) {
+      // 取消失败说一次就够，不当成取消成功；下一个真实事件会覆盖这句话。
+      if (liveRun) {
+        liveRun.cancelling = false;
+        liveRun.state = previous;
+        liveRun.notice = `取消失败：${error.message}`;
+        applyRunStatus();
+      }
+      setSessionControls();
+    }
+  }
+
+  // SSE 事件的唯一入口。界面状态只在这里推进，每一条都对应一个真实发生的事：
+  // 等待模型 / 生成回答 / 正在使用工具 / 正在取消，以及恰好一个终止事件。
   function handleEvent(event) {
     const data = event.data || {};
-    if (event.type === 'run.started') {
-      setRunStatus('Luna 正在回应…');
+    const type = event.type;
+    if (type === 'run.started') {
+      const startedAt = Date.now();
+      const runID = typeof data.run_id === 'string' ? data.run_id : '';
+      if (currentTurn) {
+        currentTurn.runID = runID;
+        currentTurn.startedAt = startedAt;
+      }
+      if (liveRun) {
+        liveRun.runID = runID;
+        liveRun.startedAt = startedAt;
+        liveRun.state = 'waiting';
+        liveRun.notice = '';
+      }
+      applyRunStatus();
       // A session that did not exist before this run is created by the server;
       // its id arrives here and goes into the hash, so the address bar names the
       // session the answer is being written into, and a refresh returns to it.
       adoptSession(data.session_id);
-    } else if (event.type === 'assistant.delta') {
+      return;
+    }
+    // 一条新的真实事件覆盖上一次取消失败留下的那句话。
+    if (liveRun) liveRun.notice = '';
+    if (type === 'assistant.delta') {
+      if (liveRun) {
+        liveRun.state = 'streaming';
+        liveRun.toolName = '';
+      }
+      applyRunStatus();
       appendAnswer(data.text);
-    } else if (event.type === 'tool.started') {
-      addToolRow(data);
-    } else if (event.type === 'tool.finished') {
-      finishTool(data, false);
-    } else if (event.type === 'tool.failed') {
-      finishTool(data, true);
-    } else if (event.type === 'run.finished') {
-      currentTurn.terminal = true;
-      resolveOpenTools();
-      if (!currentTurn.hasAnswer && data.answer) appendAnswer(data.answer);
-      if (!currentTurn.hasAnswer) currentTurn.body.remove();
-      setRunStatus('');
-    } else if (event.type === 'run.failed') {
-      currentTurn.terminal = true;
-      showRunFailure(data.error);
-      setRunStatus('');
+    } else if (type === 'assistant.reasoning') {
+      // provider 自愿暴露的推理增量：它有自己的条目，不是回答的一部分。
+      // 状态条跟着事实走——它到了就说明模型已经在产生输出，所以这里是"生成中"，
+      // 这个状态来自"收到了输出"，而不是来自推理里写了什么。
+      if (liveRun && liveRun.state !== 'tool') {
+        liveRun.state = 'streaming';
+        liveRun.toolName = '';
+      }
+      applyRunStatus();
+      appendReasoning(data.text);
+    } else if (type === 'tool.started') {
+      if (currentTurn) startToolCard(currentTurn, data);
+      if (liveRun) {
+        liveRun.state = 'tool';
+        liveRun.toolName = typeof data.name === 'string' ? data.name : '';
+      }
+      applyRunStatus();
+    } else if (type === 'tool.finished') {
+      if (currentTurn) finishToolCard(currentTurn, data, 'ok');
+      if (liveRun) {
+        liveRun.state = 'waiting';
+        liveRun.toolName = '';
+      }
+      applyRunStatus();
+    } else if (type === 'tool.failed') {
+      // 拒绝与失败都是 tool.failed，区别只在错误前缀：拒绝不是一次崩溃。
+      if (currentTurn) finishToolCard(currentTurn, data, toolFailureKind(data.error));
+      if (liveRun) {
+        liveRun.state = 'waiting';
+        liveRun.toolName = '';
+      }
+      applyRunStatus();
+    } else if (type === 'usage.updated') {
+      // 用量是可选的，不改变运行状态，只是轨迹里多一行事实。
+      if (currentTurn) applyUsage(currentTurn, data);
+      applyRunStatus();
+    } else if (type === 'run.finished') {
+      // 终止事件恰好一个。先用权威答案对齐已渲染的文本（替换，不追加），
+      // 再退出运行状态。
+      if (currentTurn) {
+        currentTurn.terminal = true;
+        finishRunTurn(currentTurn, 'ok');
+        alignAnswer(data.answer);
+        if (!currentTurn.hasAnswer) currentTurn.body.remove();
+      }
+      endRun();
+    } else if (type === 'run.failed') {
+      if (currentTurn) {
+        currentTurn.terminal = true;
+        finishRunTurn(currentTurn, 'failed');
+        showRunFailure(data.error);
+      }
+      endRun();
+    } else if (type === 'run.cancelled') {
+      if (currentTurn) {
+        currentTurn.terminal = true;
+        finishRunTurn(currentTurn, 'cancelled');
+        markCancelled();
+      }
+      endRun();
     }
   }
 
@@ -1106,26 +1741,20 @@ if (typeof document !== 'undefined') {
     let admitted = false;
     addUserTurn(message);
     currentTurn = addAssistantTurn(message);
-    openTools = [];
     input.value = '';
     resizeInput();
-    running = true;
-    setSessionControls();
-    setRunStatus('正在连接…');
+    beginRun();
     try {
       await streamRun(message, () => { admitted = true; });
     } catch (error) {
       if (!admitted) input.value = message;
       resizeInput();
       if (!currentTurn || !currentTurn.terminal) showRunFailure(error.message);
-      setRunStatus('');
     } finally {
       if (currentTurn && !currentTurn.terminal && !currentTurn.failed) {
         showRunFailure('SSE 流在收到终止事件前结束（未收到 run.finished 或 run.failed）。', '回应在完成前中断了。');
       }
-      setRunStatus('');
-      running = false;
-      setSessionControls();
+      endRun();
       input.focus();
       updateState();
       // The run changed the session's title, time and run count.
@@ -1136,6 +1765,13 @@ if (typeof document !== 'undefined') {
   form.addEventListener('submit', (event) => {
     event.preventDefault();
     submitMessage(input.value);
+  });
+
+  // 运行期间同一个发送按钮就是 Stop：点击它取消这次运行，而不是再发一条消息。
+  send.addEventListener('click', (event) => {
+    if (!liveRun) return;
+    event.preventDefault();
+    cancelRun();
   });
 
   input.addEventListener('keydown', (event) => {
@@ -1660,9 +2296,9 @@ if (typeof document !== 'undefined') {
 
   // A single place decides whether the composer and the session controls accept
   // input: a run and a replay in flight both block the controls that would mix
-  // two states.
+  // two states. 运行期间发送按钮是 Stop，它必须保持可点：取消就是它的用途。
   function setSessionControls() {
-    send.disabled = running || switching;
+    send.disabled = switching || Boolean(running && liveRun && liveRun.cancelling);
     sessionNew.disabled = running || switching;
     rerenderSessions();
   }
@@ -1681,25 +2317,31 @@ if (typeof document !== 'undefined') {
     emptyState.hidden = false;
     latest.hidden = true;
     currentTurn = null;
-    openTools = [];
-    setRunStatus('');
+    clearRunStatus();
   }
 
+  // 回放一个会话时读的是冻结的记录，和 live 的卡片共用同一套外观；
+  // 记录里没有耗时与执行身份，就不显示这两样。
   function toolRowNode(tool) {
-    const details = make('details', `tool-row${tool.failed ? ' failed' : ''}`);
-    const summary = make('summary', '', toolActivityLabel(tool.name, tool.failed ? 'failed' : 'finished'));
-    const detail = make('div', 'tool-detail');
-    const list = make('dl');
-    for (const fact of toolCallFacts(tool)) appendDefinition(list, fact.label, fact.value);
-    detail.append(list);
-    details.append(summary, detail);
-    return details;
+    return toolCardRecord({
+      name: tool.name,
+      state: tool.failed ? toolFailureKind(tool.error) : 'ok',
+      arguments: toolArgumentsText(tool.arguments),
+      result: toolResultText(tool.result),
+      error: typeof tool.error === 'string' ? tool.error : ''
+    });
   }
 
   function assistantReplayNode(record) {
     const node = assistantTurnNode();
-    for (const tool of record.tools) node.tools.append(toolRowNode(tool));
-    if (!record.tools.length) node.tools.remove();
+    for (const tool of record.tools) node.timeline.insertBefore(toolRowNode(tool).card, node.body);
+    if (record.tools.length) {
+      // 回放出来的调用也排在同一条时间线里：它同样是"过程"，不是回答。
+      const state = replayRunState(record.status);
+      node.meta.textContent = runTraceMeta(record.tools.length, null, state);
+      node.meta.dataset.state = state;
+      node.meta.hidden = false;
+    }
     node.body.classList.remove('placeholder');
     if (record.answer) {
       renderMarkdown(node.body, record.answer);
@@ -1731,7 +2373,6 @@ if (typeof document !== 'undefined') {
       else conversation.append(assistantReplayNode(turn));
     }
     currentTurn = null;
-    openTools = [];
     // The empty state is shown only when there is genuinely nothing to read.
     emptyState.hidden = sessionNotices.childElementCount > 0 || replay.turns.length > 0;
     latest.hidden = true;

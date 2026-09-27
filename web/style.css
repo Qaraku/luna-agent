@@ -191,6 +191,9 @@ body {
 .session-new:focus-visible,
 .sidebar-settings:focus-visible,
 .tool-row summary:focus-visible,
+.run-reasoning > summary:focus-visible,
+.tool-more > summary:focus-visible,
+.value-more > summary:focus-visible,
 .technical-detail summary:focus-visible,
 .lifecycle-detail summary:focus-visible,
 .run-error-detail summary:focus-visible,
@@ -348,9 +351,16 @@ body {
   overflow-wrap: anywhere;
 }
 .turn.assistant { min-width: 0; }
-.assistant-label {
-  display: block;
+/* 标题那一行：模型名 + 这次运行的概况。概况只在真的发生过过程时才出现。 */
+.assistant-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--luna-space-2);
+  min-width: 0;
   margin-bottom: var(--luna-space-2);
+}
+.assistant-label {
+  flex: 0 0 auto;
   color: var(--luna-text-muted);
   font-size: var(--luna-font-meta);
   font-weight: 600;
@@ -397,7 +407,6 @@ body {
 .assistant-body.placeholder { color: var(--luna-text-muted); }
 
 /* 工具调用默认是一行次要信息，展开后才给出细节。 */
-.tool-list { display: grid; gap: 2px; margin: 0 0 var(--luna-space-3); }
 .tool-row { border: 0; background: transparent; }
 .tool-row summary {
   display: flex;
@@ -418,29 +427,73 @@ body {
 .tool-row[open] summary::after { content: "▾"; }
 .tool-row.running summary { color: var(--luna-warning); }
 .tool-row.failed summary { color: var(--luna-danger); }
+.tool-row.ok summary { color: var(--luna-success); }
+/* 拒绝是一次正常答复，不是崩溃：它和"运行中"同一档色，文案也不共用一句话。 */
+.tool-row.refused summary { color: var(--luna-warning); }
+/* 卡片摘要里的状态点：颜色按状态取语义色，形状沿用同一颗圆点。 */
+.tool-state {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  color: var(--luna-text-subtle);
+}
+.tool-state[data-state="ok"] { color: var(--luna-success); }
+.tool-state[data-state="running"] { color: var(--luna-warning); }
+.tool-state[data-state="refused"] { color: var(--luna-warning); }
+.tool-state[data-state="failed"] { color: var(--luna-danger); }
+/* 工具名自己吃掉剩余宽度，耗时与右侧的折叠箭头才不会被长名字挤走。 */
+.tool-name { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.tool-meta { flex: 0 0 auto; color: var(--luna-text-subtle); font-size: var(--luna-font-label); font-variant-numeric: tabular-nums; }
 .tool-detail { padding: var(--luna-space-3) var(--luna-space-2) var(--luna-space-2); }
-.tool-detail dl {
+/* 事实行（`.tool-detail`）与卡片的次级层（`.tool-more`）用同一套 dt/dd 尺度，
+   两者是兄弟：前者只放工具、参数、结果/错误，后者只放诊断详情。 */
+.tool-detail dl, .tool-more dl {
   display: grid;
   grid-template-columns: 68px minmax(0, 1fr);
   gap: var(--luna-space-1) var(--luna-space-3);
   margin: 0;
 }
-.tool-detail div { display: contents; }
-.tool-detail dt { color: var(--luna-text-muted); font-size: var(--luna-font-label); }
-.tool-detail dd {
+.tool-detail div, .tool-more dl div { display: contents; }
+.tool-detail dt, .tool-more dt { color: var(--luna-text-muted); font-size: var(--luna-font-label); }
+.tool-detail dd, .tool-more dd {
   margin: 0;
   color: var(--luna-text);
   font: var(--luna-font-meta)/1.65 var(--luna-font-mono);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
-.tool-detail pre, .technical-detail pre {
+/* 默认展示的那一段有界预览；全文在它下面的 `.value-more` 里。 */
+.value-preview { display: block; }
+.tool-detail pre, .technical-detail pre, .tool-more > pre {
   margin: 0;
   color: var(--luna-text-muted);
   font: var(--luna-font-meta)/1.65 var(--luna-font-mono);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+/* 卡片里的次级层：展开的全文与"详情"。同一套外观，不引入第二种折叠语言。 */
+.tool-more, .value-more { margin-top: var(--luna-space-2); color: var(--luna-text-muted); font-size: var(--luna-font-meta); }
+/* 详情层挂在卡片上而不是事实行里，内边距与事实行对齐，不被卡片边缘切掉。 */
+.tool-row > .tool-more { padding: 0 var(--luna-space-2) var(--luna-space-2); }
+.tool-more > summary, .value-more > summary {
+  display: flex;
+  align-items: center;
+  min-height: var(--luna-control-sm);
+  cursor: pointer;
+  list-style: none;
+}
+.tool-more > summary::after, .value-more > summary::after {
+  content: "▸";
+  margin-left: var(--luna-space-2);
+  color: var(--luna-text-subtle);
+  font-size: 10px;
+}
+.tool-more[open] > summary::after, .value-more[open] > summary::after { content: "▾"; }
+.tool-more > summary::-webkit-details-marker, .value-more > summary::-webkit-details-marker { display: none; }
+/* 全文展开后自己滚动：一次长读取不会把对话拉成一条看不到底的 raw log。 */
+.value-more > pre { max-height: 40dvh; overflow-y: auto; }
 
 .error-block { margin-top: var(--luna-space-3); }
 .error-copy { margin: 0 0 var(--luna-space-2); color: var(--luna-danger); font-size: var(--luna-font-title); line-height: 1.7; }
@@ -458,7 +511,12 @@ body {
 .run-error-detail summary { display: flex; align-items: center; min-height: var(--luna-control-sm); cursor: pointer; }
 .run-error-detail pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 
+/* 运行状态条：复用标记里已有的 #run-status。只写当前状态与已运行时长；
+   Stop 就在输入区那个按钮上，所以这里不再另起一套控制栏。 */
 .run-status {
+  display: flex;
+  align-items: center;
+  gap: var(--luna-space-2);
   width: 100%;
   max-width: var(--luna-content-max);
   margin-inline: auto;
@@ -466,6 +524,98 @@ body {
   color: var(--luna-text-muted);
   font-size: var(--luna-font-meta);
 }
+.run-status-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--luna-warning);
+  animation: run-status-pulse 1.6s ease-in-out infinite;
+}
+.run-status-label { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.run-status-elapsed { flex: 0 0 auto; color: var(--luna-text-subtle); font-variant-numeric: tabular-nums; }
+@keyframes run-status-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .35; }
+}
+
+/* --- 一次运行的内联时间线 ---------------------------------------------------
+   运行中的每一步按它真实发生的顺序排在这条时间线里：阶段行（模型这一段开始）、
+   推理（provider 给了才有）、运行说明、工具卡片、用量，回答主体永远收尾。
+   条目一律紧凑、次级（12px 及以下、文字用 muted），回答主体保持自己的字号与
+   行距，仍是这个回合的视觉主体。 */
+
+.run-meta {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--luna-text-subtle);
+  font-size: var(--luna-font-label);
+  font-variant-numeric: tabular-nums;
+}
+.run-meta[data-state="failed"] { color: var(--luna-danger); }
+.run-timeline { display: flex; flex-direction: column; min-width: 0; }
+.run-timeline > * + * { margin-top: var(--luna-space-1); }
+/* 回答主体是时间线的最后一条，与前面的过程留一档间距。 */
+.run-timeline > * + .assistant-body { margin-top: var(--luna-space-3); }
+.run-phase {
+  display: flex;
+  align-items: center;
+  min-height: var(--luna-control-sm);
+  padding: 0 var(--luna-space-2);
+  color: var(--luna-text-muted);
+  font-size: var(--luna-font-meta);
+}
+/* 推理条目：一行标号 + 逐步增长的正文。正文高度有界、自己滚动，整条可折起来。 */
+.run-reasoning { margin: 0; }
+.run-reasoning > summary {
+  display: flex;
+  align-items: center;
+  gap: var(--luna-space-2);
+  min-height: var(--luna-control-sm);
+  padding: 0 var(--luna-space-2);
+  border-radius: var(--luna-radius-sm);
+  color: var(--luna-text-muted);
+  font-size: var(--luna-font-meta);
+  cursor: pointer;
+  list-style: none;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.run-reasoning > summary:hover { background: var(--luna-hover); color: var(--luna-text); }
+.run-reasoning > summary::-webkit-details-marker { display: none; }
+.run-reasoning > summary::after { content: "▸"; margin-left: auto; color: var(--luna-text-subtle); font-size: 10px; }
+.run-reasoning[open] > summary::after { content: "▾"; }
+.run-reasoning-label { flex: 0 0 auto; color: var(--luna-text-subtle); font-size: var(--luna-font-label); }
+.run-reasoning-body {
+  margin: 0;
+  max-height: 32dvh;
+  overflow-y: auto;
+  padding: var(--luna-space-1) var(--luna-space-2);
+  color: var(--luna-text-muted);
+  font-size: var(--luna-font-meta);
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.run-note {
+  margin: 0;
+  padding: var(--luna-space-1) var(--luna-space-2);
+  color: var(--luna-text-muted);
+  font-size: var(--luna-font-meta);
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.run-note-label { margin-right: var(--luna-space-1); color: var(--luna-text-subtle); font-size: var(--luna-font-label); }
+.run-usage {
+  margin: 0;
+  padding: var(--luna-space-1) var(--luna-space-2);
+  color: var(--luna-text-subtle);
+  font-size: var(--luna-font-label);
+  font-variant-numeric: tabular-nums;
+}
+.run-incomplete { margin: var(--luna-space-2) 0 0; color: var(--luna-text-muted); font-size: var(--luna-font-meta); line-height: 1.7; }
 .latest-button {
   position: absolute;
   z-index: 5;
@@ -531,6 +681,8 @@ body {
 }
 .send-button:hover { opacity: .88; }
 .send-button:disabled { opacity: .4; }
+/* 运行期间同一个按钮变成 Stop：方块比发送的箭头小一号，命中区域不变。 */
+.send-button .stop-icon { width: 12px; height: 12px; }
 .composer-hint {
   margin: 0;
   color: var(--luna-text-muted);

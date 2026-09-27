@@ -30,7 +30,6 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
       this.childNodes = [];
       this.parentElement = null;
       this.attributes = new Map();
-      this.dataset = {};
       // 真实 DOM 的 style 支持 setProperty；应用用 inline 变量驱动侧栏宽度。
       this.style = {
         setProperty(name, value) { this[name] = String(value); },
@@ -57,6 +56,26 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
         remove: (name) => this.classList.toggle(name, false)
       };
     }
+    // 真实 DOM 的 class 既是特性也是属性：className 赋值后 getAttribute('class')
+    // 也要读得到；没有 class 的元素不该凭空多出一个 class 特性（真 DOM 里是 null）。
+    get className() { return this.attributes.get('class') ?? ''; }
+    set className(value) {
+      const text = value === undefined || value === null ? '' : String(value);
+      if (text === '') this.attributes.delete('class');
+      else this.attributes.set('class', text);
+    }
+    // dataset 是 data-* 特性上的视图：两个方向都要通，删除也要落到特性上——
+    // 产品代码两种写法都用（`dataset.state = …` 与 `delete dataset.resizing`）。
+    get dataset() {
+      const element = this;
+      const attribute = (name) => `data-${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`;
+      return new Proxy({}, {
+        get: (_target, name) => (typeof name === 'string' ? element.attributes.get(attribute(name)) : undefined),
+        set: (_target, name, value) => { element.setAttribute(attribute(name), String(value)); return true; },
+        has: (_target, name) => typeof name === 'string' && element.attributes.has(attribute(name)),
+        deleteProperty: (_target, name) => { element.removeAttribute(attribute(name)); return true; }
+      });
+    }
     get children() { return this.childNodes.filter((child) => child.tagName !== '#TEXT'); }
     get childElementCount() { return this.children.length; }
     get firstElementChild() { return this.children[0]; }
@@ -72,10 +91,7 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
       this.attributes.set(name, String(value));
       if (name === 'class') this.className = value;
       if (name === 'id') this.id = value;
-      // 真实 DOM 把 data-* 映射到 dataset；分类导航靠 dataset.pane 找面板。
-      if (name.startsWith('data-')) {
-        this.dataset[name.slice(5).replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())] = String(value);
-      }
+      // data-* 不再额外存一份：dataset 只是 attributes 上的视图（见 dataset getter）。
       if (name === 'hidden' || name === 'inert' || name === 'disabled') this[name] = true;
     }
     getAttribute(name) { return this.attributes.get(name) ?? null; }
@@ -190,7 +206,14 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
     document, window, location, URLSearchParams, TextDecoder, console,
     history: { replaceState(_state, _title, url) { location._hash = url.includes('#') ? `#${url.split('#')[1]}` : ''; } },
     requestAnimationFrame: (fn) => frames.push(fn),
-    setTimeout: (fn) => frames.push(fn), clearTimeout() {}, setInterval: (fn) => intervals.push(fn),
+    // 间隔定时器一并登记回调本身，所以 clearInterval 能把它从 poll() 的名单里摘掉；
+    // 应用只在一次运行期间开一个秒表，结束时必须能停掉它。
+    setTimeout: (fn) => frames.push(fn), clearTimeout() {},
+    setInterval: (fn) => { intervals.push(fn); return fn; },
+    clearInterval: (fn) => {
+      const index = intervals.indexOf(fn);
+      if (index >= 0) intervals.splice(index, 1);
+    },
     fetch: async (url, options) => {
       calls.push({ url, options });
       const custom = respond && await respond(url, options, data);
@@ -1600,4 +1623,699 @@ test('every UI plugin style the script builds a class for exists in the styleshe
   const added = css.slice(css.indexOf('/* --- 界面插件'), css.indexOf('/* --- 记忆与回放提示'));
   assert.ok(added.length > 0, 'the UI plugin block must be present');
   assert.equal(/gradient\s*\(/i.test(added), false);
+});
+
+// --- Run observability: 一次运行在浏览器里可观、可理解、可控 ------------------
+// 这些用例驱动的是真实的 SSE 消费路径：事件逐块喂入，所以在流还没结束时就能
+// 检查界面，而不是只看终态。
+
+// 可逐块喂入的 SSE 响应；push 会在应用正等待下一块时立刻交付。
+function eventStream() {
+  const encoder = new TextEncoder();
+  const queue = [];
+  const waiting = [];
+  let ended = false;
+  return {
+    body: {
+      getReader: () => ({
+        read() {
+          if (queue.length) return Promise.resolve({ value: encoder.encode(queue.shift()), done: false });
+          if (ended) return Promise.resolve({ value: undefined, done: true });
+          return new Promise((resolve) => waiting.push(resolve));
+        }
+      })
+    },
+    push(text) {
+      if (waiting.length) waiting.shift()({ value: encoder.encode(text), done: false });
+      else queue.push(text);
+    },
+    end() {
+      ended = true;
+      while (waiting.length) waiting.shift()({ value: undefined, done: true });
+    }
+  };
+}
+
+function sse(type, data) {
+  return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+// 一次运行的夹具：每次 POST /api/runs 都给一条新的可喂入流；取消入口按用例给结果。
+function runHarness(options = {}) {
+  const streams = [];
+  const h = navigationHarness({
+    ...options,
+    respond: async (url, requestOptions, data) => {
+      if (url === '/api/runs') {
+        const stream = eventStream();
+        streams.push(stream);
+        return { ok: true, body: stream.body };
+      }
+      if (url.endsWith('/cancel')) return options.cancel ? options.cancel(url) : { ok: true, status: 202, json: async () => ({}) };
+      return options.respond ? options.respond(url, requestOptions, data) : undefined;
+    }
+  });
+  h.streams = streams;
+  h.stream = () => streams[streams.length - 1];
+  h.cancelCalls = () => h.calls.filter(({ url }) => url === '/api/runs/run-1/cancel' || url === '/api/runs/run-7/cancel');
+  h.startRun = async (message = '你好') => {
+    h.$('message').value = message;
+    h.$('chat-form').emit('submit');
+    await h.settle();
+  };
+  return h;
+}
+
+// 当前这一次运行留在对话区的节点。选择器只用单个类名：适配器只认简单选择器。
+function runView(h) {
+  const turn = h.$('conversation').children.at(-1);
+  const timeline = turn.querySelector('.run-timeline');
+  const body = () => turn.querySelector('.assistant-body');
+  return {
+    turn,
+    timeline,
+    timelineBody: body,
+    meta: turn.querySelector('.run-meta'),
+    body: body(),
+    // 时间线里除回答之外的条目，按它们在 DOM 里的顺序。
+    order: () => [...timeline.children].map((node) => node.getAttribute('class')),
+    steps: () => [...timeline.children].filter((node) => node !== body()),
+    cards: () => [...turn.querySelectorAll('.tool-row')],
+    notes: () => [...turn.querySelectorAll('.run-note')],
+    phases: () => [...turn.querySelectorAll('.run-phase')],
+    reasoning: () => [...turn.querySelectorAll('.run-reasoning')],
+    reasoningText: () => [...turn.querySelectorAll('.run-reasoning-body')],
+    status: h.$('run-status'),
+    statusLabel: h.$('run-status').querySelector('.run-status-label'),
+    statusElapsed: h.$('run-status').querySelector('.run-status-elapsed'),
+    send: h.$('send')
+  };
+}
+
+test('assistant text streams into the answer as it arrives', async () => {
+  const h = runHarness();
+  await h.settle();
+  await h.startRun('你好');
+  const view = runView(h);
+  assert.equal(view.status.hidden, false, '发出消息后状态条就在会话区');
+  assert.equal(view.statusLabel.textContent, '正在连接…');
+  assert.equal(view.statusElapsed.getAttribute('aria-hidden'), 'true', '秒表不该被逐秒播报');
+  assert.equal(view.send.dataset.action, 'cancel');
+  assert.equal(view.send.getAttribute('aria-label'), '停止');
+  assert.equal(view.send.disabled, false, '运行期间这个按钮必须可点：它就是 Stop');
+
+  h.stream().push(sse('run.started', { run_id: 'run-1', session_id: 'aaaaaaaa' }));
+  await h.settle();
+  assert.equal(view.statusLabel.textContent, '已开始，等待模型回应…');
+  assert.equal(view.statusElapsed.textContent, '0s');
+
+  h.stream().push(sse('assistant.delta', { text: '第一' }));
+  await h.settle();
+  assert.equal(view.body.textContent, '第一', '第一块到达就渲染，不等整轮结束');
+  assert.equal(view.statusLabel.textContent, 'Luna 正在回应…');
+
+  h.stream().push(sse('assistant.delta', { text: '段' }));
+  await h.settle();
+  assert.equal(view.body.textContent, '第一段', '增量累加，不是每块重画整轮');
+
+  h.stream().push(sse('run.finished', { run_id: 'run-1', answer: '第一段' }));
+  await h.settle();
+  assert.equal(view.body.textContent, '第一段');
+  assert.equal(view.send.getAttribute('aria-label'), '发送', '终止事件一到就退出运行状态');
+  assert.equal(view.send.dataset.action, 'send');
+  assert.equal(view.status.hidden, true);
+  assert.equal(h.$('session-new').disabled, false);
+  h.stream().end();
+  await h.settle();
+});
+
+test('words spoken before a tool call become a run note, not part of the answer', async () => {
+  const h = runHarness();
+  await h.settle();
+  await h.startRun('读一下 notes.md');
+  const view = runView(h);
+  const stream = h.stream();
+  stream.push(sse('run.started', { run_id: 'run-1', session_id: 'aaaaaaaa' }));
+  stream.push(sse('assistant.delta', { text: '我先读一下这个文件。' }));
+  await h.settle();
+  assert.equal(view.body.textContent, '我先读一下这个文件。');
+  assert.equal(view.phases().length, 0, '还没有过程可看时不出现过程条目');
+  assert.equal(view.meta.hidden, true, '没有过程可概括时标题那一行不显示概况');
+
+  stream.push(sse('tool.started', { run_id: 'run-1', name: 'luna_read_file', arguments: { path: 'notes.md' } }));
+  await h.settle();
+  assert.equal(view.meta.hidden, false, '有工具调用时这次运行的概况出现');
+  assert.match(view.meta.textContent, /1 次工具调用/);
+  assert.match(view.meta.textContent, /进行中/);
+  assert.equal(view.body.textContent, 'Luna 正在回应…', '运行说明已经离开消息主体');
+  const notes = view.notes();
+  assert.equal(notes.length, 1);
+  assert.match(notes[0].textContent, /运行说明：我先读一下这个文件。/);
+  assert.deepEqual(view.phases().map((node) => node.textContent), ['模型开始回应'], '阶段行在说明之前');
+  assert.deepEqual(view.order(), ['run-phase', 'run-note', 'tool-row running', 'assistant-body placeholder'],
+    '时间线按真实顺序排列：阶段行 → 运行说明 → 工具卡片 → 回答（这一轮还没写出回答）');
+  assert.equal(view.statusLabel.textContent, '正在使用工具：读取文件');
+  const running = view.cards()[0];
+  assert.equal(running.getAttribute('class'), 'tool-row running');
+  assert.match(running.querySelector('.tool-detail').textContent, /notes\.md/);
+
+  stream.push(sse('tool.finished', {
+    run_id: 'run-1', name: 'luna_read_file', result: '文件内容', duration_ms: 420, generation: 3, version: 'v2', plugin_pid: 91
+  }));
+  stream.push(sse('assistant.delta', { text: '读完了。' }));
+  stream.push(sse('run.finished', { run_id: 'run-1', answer: '读完了。' }));
+  await h.settle();
+  assert.equal(view.body.textContent, '读完了。');
+  assert.equal(view.notes().length, 1, '运行说明只有一条，也没有被复制进回答');
+  assert.deepEqual(view.phases().map((node) => node.textContent), ['模型开始回应', '模型继续回应']);
+  assert.equal(view.cards().length, 1);
+  assert.equal(view.cards()[0].querySelector('.tool-name').textContent, '读取文件完成');
+  assert.equal(view.cards()[0].querySelector('.tool-meta').textContent, '420ms');
+  assert.equal(view.notes()[0].parentElement, view.timeline, '说明与卡片都在同一条时间线里，按时间顺序');
+  assert.equal(view.order().at(-1), 'assistant-body', '回答永远是时间线的最后一条');
+  assert.match(view.meta.textContent, /已完成/);
+  stream.end();
+  await h.settle();
+});
+
+test('assistant.reasoning streams into its own entry and never into the answer', async () => {
+  const h = runHarness();
+  await h.settle();
+  await h.startRun('讲一下这个函数');
+  const view = runView(h);
+  const stream = h.stream();
+  stream.push(sse('run.started', { run_id: 'run-1', session_id: 'aaaaaaaa' }));
+  stream.push(sse('assistant.reasoning', { text: '先看' }));
+  await h.settle();
+  assert.equal(view.reasoning().length, 1, 'provider 给了推理才有这一条');
+  assert.equal(view.reasoningText()[0].textContent, '先看');
+  assert.equal(view.body.textContent, 'Luna 正在回应…', '推理不写进回答主体');
+  assert.equal(view.statusLabel.textContent, 'Luna 正在回应…', '推理到了就说明模型已经在产生输出');
+
+  stream.push(sse('assistant.reasoning', { text: '它的入参' }));
+  await h.settle();
+  assert.equal(view.reasoningText()[0].textContent, '先看它的入参', '推理条目随事件逐步增长');
+  assert.equal(view.reasoning()[0].open, true, '默认展开，用户看得到它长到了哪里');
+
+  stream.push(sse('assistant.delta', { text: '它在做两件事。' }));
+  await h.settle();
+  assert.equal(view.body.textContent, '它在做两件事。');
+  assert.equal(view.reasoningText()[0].textContent, '先看它的入参', '回答与推理互不覆盖');
+
+  stream.push(sse('run.finished', { run_id: 'run-1', answer: '它在做两件事。' }));
+  await h.settle();
+  assert.equal(view.body.textContent, '它在做两件事。');
+  assert.equal(view.body.textContent.includes('先看'), false, '答案对齐不会把推理带进来');
+  assert.deepEqual(view.order(), ['run-phase', 'run-reasoning', 'assistant-body'], '阶段行 → 推理 → 回答');
+  stream.end();
+  await h.settle();
+});
+
+test('a run without reasoning shows no reasoning entry and no placeholder for it', async () => {
+  const { RUN_REASONING_LABEL } = require('./app.js');
+  const h = runHarness();
+  await h.settle();
+  await h.startRun('不需要推理的一轮');
+  const view = runView(h);
+  const stream = h.stream();
+  stream.push(sse('run.started', { run_id: 'run-1', session_id: 'aaaaaaaa' }));
+  stream.push(sse('assistant.delta', { text: '好的。' }));
+  stream.push(sse('run.finished', { run_id: 'run-1', answer: '好的。' }));
+  await h.settle();
+  assert.equal(view.reasoning().length, 0, '没有 assistant.reasoning 就没有推理条目');
+  assert.equal(view.timeline.textContent.includes(RUN_REASONING_LABEL), false, '也不留占位或编一句话');
+  assert.deepEqual(view.order(), ['assistant-body'], '这一轮只有回答');
+  assert.equal(view.meta.hidden, true);
+  stream.end();
+  await h.settle();
+});
+
+test('each model leg gets its own reasoning entry behind its continuation phase row', async () => {
+  const h = runHarness();
+  await h.settle();
+  await h.startRun('读文件再总结');
+  const view = runView(h);
+  const stream = h.stream();
+  stream.push(sse('run.started', { run_id: 'run-1', session_id: 'aaaaaaaa' }));
+  stream.push(sse('assistant.reasoning', { text: '得先看文件' }));
+  stream.push(sse('assistant.delta', { text: '我读一下。' }));
+  stream.push(sse('tool.started', { run_id: 'run-1', name: 'luna_read_file', arguments: { path: 'notes.md' } }));
+  stream.push(sse('tool.finished', { run_id: 'run-1', name: 'luna_read_file', result: 'ok', duration_ms: 120 }));
+  stream.push(sse('assistant.reasoning', { text: '文件里写着 ok，' }));
+  stream.push(sse('assistant.reasoning', { text: '直接回答就行' }));
+  stream.push(sse('assistant.delta', { text: '文件里写着 ok。' }));
+  stream.push(sse('run.finished', { run_id: 'run-1', answer: '文件里写着 ok。' }));
+  await h.settle();
+
+  assert.deepEqual(view.order(), [
+    'run-phase', 'run-reasoning', 'run-note', 'tool-row ok', 'run-phase', 'run-reasoning', 'assistant-body'
+  ], '时间线按真实顺序：这一段的开始 → 推理 → 说明 → 工具 → 继续 → 回答');
+  assert.deepEqual(view.phases().map((node) => node.textContent), ['模型开始回应', '模型继续回应']);
+  assert.equal(view.reasoningText().length, 2, '每一段模型输出有自己的推理条目');
+  assert.equal(view.reasoningText()[0].textContent, '得先看文件');
+  assert.equal(view.reasoningText()[1].textContent, '文件里写着 ok，直接回答就行', '第二段的推理不会并进第一条');
+  assert.equal(view.body.textContent, '文件里写着 ok。');
+  assert.equal(view.notes()[0].textContent.includes('得先看文件'), false, '推理不混进运行说明');
+  stream.end();
+  await h.settle();
+});
+
+test('reasoning text reaches the timeline as text, never as markup', async () => {
+  const h = runHarness();
+  await h.settle();
+  await h.startRun('带标签的推理');
+  const view = runView(h);
+  const stream = h.stream();
+  const payload = '<img src=x onerror="boom"> & <script>bad()</script>';
+  stream.push(sse('run.started', { run_id: 'run-1', session_id: 'aaaaaaaa' }));
+  stream.push(sse('assistant.reasoning', { text: 7 }));
+  await h.settle();
+  assert.equal(view.reasoning().length, 0, '不是文本的推理不会编出一条来');
+  stream.push(sse('assistant.reasoning', { text: payload }));
+  await h.settle();
+  const entry = view.reasoning()[0];
+  assert.equal(entry.querySelector('.run-reasoning-body').textContent, payload);
+  assert.equal(entry.querySelector('.run-reasoning-body').childElementCount, 0, '推理正文只有一个文本节点');
+  assert.equal(entry.querySelector('img'), null);
+  assert.equal(entry.querySelector('script'), null);
+  stream.end();
+  await h.settle();
+});
+
+test('the terminal answer replaces the streamed text instead of being appended twice', async () => {
+  const h = runHarness();
+  await h.settle();
+  await h.startRun('给我一个结论');
+  const view = runView(h);
+  const stream = h.stream();
+  stream.push(sse('run.started', { run_id: 'run-1', session_id: 'aaaaaaaa' }));
+  stream.push(sse('assistant.delta', { text: '草稿' }));
+  stream.push(sse('assistant.delta', { text: '：一半' }));
+  await h.settle();
+  assert.equal(view.body.textContent, '草稿：一半');
+
+  stream.push(sse('run.finished', { run_id: 'run-1', answer: '最终回答。' }));
+  await h.settle();
+  assert.equal(view.body.textContent, '最终回答。', '终止时用权威答案对齐，替换而不是追加');
+  assert.equal(view.body.textContent.includes('草稿'), false);
+  stream.end();
+  await h.settle();
+
+  // 流式文本与权威答案相同时也不能出现两遍。
+  await h.startRun('再来一次');
+  const second = runView(h);
+  const again = h.stream();
+  again.push(sse('run.started', { run_id: 'run-2', session_id: 'aaaaaaaa' }));
+  again.push(sse('assistant.delta', { text: '同一句话' }));
+  again.push(sse('run.finished', { run_id: 'run-2', answer: '同一句话' }));
+  await h.settle();
+  assert.equal(second.body.textContent, '同一句话');
+  again.end();
+  await h.settle();
+});
+
+test('Stop cancels once, keeps the partial text and leaves the running state', async () => {
+  const h = runHarness();
+  await h.settle();
+  await h.startRun('写一段长文');
+  const view = runView(h);
+  const stream = h.stream();
+  stream.push(sse('run.started', { run_id: 'run-7', session_id: 'aaaaaaaa' }));
+  stream.push(sse('assistant.delta', { text: '写到一半' }));
+  await h.settle();
+
+  view.send.focus();
+  view.send.click();
+  await h.settle();
+  const cancels = h.calls.filter(({ url }) => url === '/api/runs/run-7/cancel');
+  assert.equal(cancels.length, 1, '点击 Stop 就是调用取消入口');
+  assert.equal(cancels[0].options.method, 'POST');
+  assert.equal(view.statusLabel.textContent, '正在取消…');
+
+  view.send.click();
+  view.send.click();
+  await h.settle();
+  assert.equal(h.calls.filter(({ url }) => url === '/api/runs/run-7/cancel').length, 1, '重复点击不再发请求，也不报错刷屏');
+
+  stream.push(sse('run.cancelled', { run_id: 'run-7', reason: 'user' }));
+  await h.settle();
+  assert.equal(view.send.getAttribute('aria-label'), '发送');
+  assert.equal(view.send.disabled, false);
+  assert.equal(h.$('session-new').disabled, false, '收到 run.cancelled 立刻退出运行状态');
+  assert.equal(view.status.hidden, true);
+  assert.equal(view.body.textContent, '写到一半', '已渲染的部分保留');
+  assert.match(view.turn.querySelector('.run-incomplete').textContent, /这次运行被取消了/);
+  assert.match(view.meta.textContent, /已取消/);
+  stream.end();
+  await h.settle();
+});
+
+test('a cancel is answered by the server, not invented by the page', async () => {
+  // 404：这次运行已经结束——按"已经结束"处理，不报错也不谎称取消成功。
+  const missing = runHarness({ cancel: async () => ({ ok: false, status: 404, json: async () => ({ error: 'not found' }) }) });
+  await missing.settle();
+  await missing.startRun('取消一个已经结束的运行');
+  const gone = runView(missing);
+  const goneStream = missing.stream();
+  goneStream.push(sse('run.started', { run_id: 'run-7', session_id: 'aaaaaaaa' }));
+  await missing.settle();
+  gone.send.click();
+  await missing.settle();
+  assert.equal(gone.statusLabel.textContent, '正在取消…', '404 不当成取消失败');
+  goneStream.push(sse('run.cancelled', { run_id: 'run-7', reason: 'user' }));
+  await missing.settle();
+  assert.equal(missing.$('send').getAttribute('aria-label'), '发送');
+  goneStream.end();
+  await missing.settle();
+
+  // 取消请求本身失败时只说一次，按钮回到可点状态，等下一个真实事件覆盖这句话。
+  const broken = runHarness({ cancel: async () => ({ ok: false, status: 500, json: async () => ({ error: '内部错误' }) }) });
+  await broken.settle();
+  await broken.startRun('取消失败的情形');
+  const failed = runView(broken);
+  const brokenStream = broken.stream();
+  brokenStream.push(sse('run.started', { run_id: 'run-7', session_id: 'aaaaaaaa' }));
+  await broken.settle();
+  failed.send.click();
+  await broken.settle();
+  assert.match(failed.statusLabel.textContent, /取消失败：内部错误/);
+  assert.equal(failed.send.disabled, false, '取消失败后仍然可以再停一次');
+  brokenStream.push(sse('assistant.delta', { text: '还在继续' }));
+  await broken.settle();
+  assert.equal(failed.statusLabel.textContent, 'Luna 正在回应…', '下一个真实事件覆盖那句话');
+  brokenStream.end();
+  await broken.settle();
+});
+
+test('a tool card bounds long arguments and results and keeps identity secondary', async () => {
+  const h = runHarness();
+  await h.settle();
+  await h.startRun('读一个大文件');
+  const view = runView(h);
+  const stream = h.stream();
+  const args = { path: `notes/${'a'.repeat(2000)}.md` };
+  const fullArguments = JSON.stringify(args, null, 2);
+  const fullResult = `${'一行内容\n'.repeat(40)}最后一行`;
+  stream.push(sse('run.started', { run_id: 'run-1', session_id: 'aaaaaaaa' }));
+  stream.push(sse('tool.started', { run_id: 'run-1', name: 'luna_read_file', arguments: args }));
+  stream.push(sse('tool.finished', {
+    run_id: 'run-1', name: 'luna_read_file', result: fullResult, duration_ms: 1200, generation: 4, version: 'v1', plugin_pid: 55
+  }));
+  await h.settle();
+
+  const card = view.cards()[0];
+  const summary = card.querySelector('summary');
+  assert.equal(card.getAttribute('class'), 'tool-row ok');
+  assert.equal(card.querySelector('.tool-name').textContent, '读取文件完成');
+  assert.equal(card.querySelector('.tool-meta').textContent, '1.2s');
+  assert.equal(summary.textContent.includes('generation'), false, '执行身份不做主视觉');
+  assert.equal(summary.textContent.includes('PID'), false);
+  assert.ok(!summary.textContent.includes('最后一行'), '结果不塞进那一行摘要');
+
+  const rows = card.querySelector('.tool-detail').querySelectorAll('dd');
+  assert.equal(rows.length, 3, '工具、参数、结果各一行');
+  const params = rows[1];
+  // 有界性按"默认展示的那一段预览"来量：闭合的 `.value-more` 里的全文也属于这一行
+  // 的 textContent（真实 DOM 与适配器都不排除折叠内容），拿整行去量量到的不是预览。
+  const paramPreview = params.querySelector('.value-preview');
+  assert.ok(paramPreview.textContent.length <= 1201, `参数默认有界，实际 ${paramPreview.textContent.length}`);
+  assert.ok(paramPreview.textContent.endsWith('…'), '被截断的预览要说明还有更多');
+  const paramMore = params.querySelector('.value-more');
+  assert.ok(!paramMore.open, '全文默认折叠');
+  assert.match(paramMore.querySelector('summary').textContent, /展开全文/);
+  assert.equal(paramMore.querySelector('pre').textContent, fullArguments, '展开看到的是全文');
+  paramMore.open = true;
+  assert.equal(paramMore.querySelector('pre').textContent.includes('…'), false);
+
+  const result = rows[2];
+  // 标签与值同属一行（`dl > div > dt + dd`），dt 是 dd 的兄弟而不是它的后代。
+  assert.equal(result.parentElement.querySelector('dt').textContent, '结果');
+  const resultPreview = result.querySelector('.value-preview');
+  assert.ok(resultPreview.textContent.length < fullResult.length, '长结果默认只给一段');
+  const resultMore = result.querySelector('.value-more');
+  assert.equal(resultMore.querySelector('pre').textContent, fullResult);
+
+  // 执行身份只在次级层里，而且是权威的同一份读法。
+  const detail = card.querySelector('.tool-more');
+  assert.ok(!detail.open, '详情默认折叠');
+  assert.equal(detail.querySelector('summary').textContent, '详情');
+  assert.match(detail.querySelector('dl').textContent, /generation 4 · v1 · PID 55/);
+  stream.push(sse('run.finished', { run_id: 'run-1', answer: '读完了。' }));
+  await h.settle();
+  stream.end();
+  await h.settle();
+});
+
+test('a refused call is shown as a refusal while a failure stays a failure', async () => {
+  const h = runHarness();
+  await h.settle();
+  await h.startRun('读一个越界的路径');
+  const view = runView(h);
+  const stream = h.stream();
+  const raw = 'the tool refused this call: 路径越出可读范围';
+  stream.push(sse('run.started', { run_id: 'run-1', session_id: 'aaaaaaaa' }));
+  stream.push(sse('tool.started', { run_id: 'run-1', name: 'luna_read_file', arguments: '{"path":"/etc/passwd"}' }));
+  stream.push(sse('tool.failed', { run_id: 'run-1', name: 'luna_read_file', error: raw, duration_ms: 3 }));
+  stream.push(sse('tool.started', { run_id: 'run-1', name: 'luna_text_transform', arguments: '{}' }));
+  stream.push(sse('tool.failed', { run_id: 'run-1', name: 'luna_text_transform', error: '插件已经不在', duration_ms: 8 }));
+  await h.settle();
+
+  const refused = view.cards()[0];
+  assert.equal(refused.getAttribute('class'), 'tool-row refused', '拒绝不是一次崩溃');
+  assert.equal(refused.querySelector('.tool-state').getAttribute('data-state'), 'refused');
+  assert.equal(refused.querySelector('.tool-name').textContent, '读取文件被拒绝');
+  const refusalDetail = refused.querySelector('.tool-detail').textContent;
+  assert.match(refusalDetail, /拒绝原因/);
+  assert.match(refusalDetail, /路径越出可读范围/);
+  assert.equal(refused.querySelector('.tool-more').querySelector('pre').textContent, raw, '协议前缀的原文留在次级层里');
+  assert.equal(refused.querySelector('summary').textContent.includes(raw), false);
+
+  const failed = view.cards()[1];
+  assert.equal(failed.getAttribute('class'), 'tool-row failed');
+  assert.equal(failed.querySelector('.tool-name').textContent, '文本转换失败');
+  assert.match(failed.querySelector('.tool-detail').textContent, /错误/);
+  assert.match(failed.querySelector('.tool-detail').textContent, /插件已经不在/);
+  stream.push(sse('run.finished', { run_id: 'run-1', answer: '这两次都没成。' }));
+  await h.settle();
+  stream.end();
+  await h.settle();
+});
+
+test('the run process stays inline in one timeline while usage is secondary info', async () => {
+  const h = runHarness();
+  await h.settle();
+  await h.startRun('直接回答就好');
+  const first = runView(h);
+  const stream = h.stream();
+  stream.push(sse('run.started', { run_id: 'run-1', session_id: 'aaaaaaaa' }));
+  stream.push(sse('assistant.delta', { text: '直接回答' }));
+  await h.settle();
+  assert.equal(first.steps().length, 0, '一次直接回答的运行没有过程条目');
+  stream.push(sse('run.finished', { run_id: 'run-1', answer: '直接回答' }));
+  await h.settle();
+  assert.equal(first.steps().length, 0);
+  assert.equal(first.meta.hidden, true, '没有过程可概括时标题那一行不显示概况');
+  assert.equal(first.body.textContent, '直接回答');
+  stream.end();
+  await h.settle();
+
+  await h.startRun('先读文件再回答');
+  const view = runView(h);
+  const second = h.stream();
+  second.push(sse('run.started', { run_id: 'run-2', session_id: 'aaaaaaaa' }));
+  second.push(sse('tool.started', { run_id: 'run-2', name: 'luna_read_file', arguments: '{}' }));
+  second.push(sse('tool.finished', { run_id: 'run-2', name: 'luna_read_file', result: 'ok', duration_ms: 300 }));
+  second.push(sse('usage.updated', { run_id: 'run-2', input_tokens: 1234, output_tokens: 320 }));
+  await h.settle();
+
+  assert.equal(view.timeline.tagName, 'DIV', '过程内联在回合里，不再是一个独立折叠块');
+  assert.equal(view.meta.hidden, false);
+  assert.match(view.meta.textContent, /1 次工具调用/);
+  assert.match(view.meta.textContent, /进行中/);
+  const usage = view.timeline.querySelector('.run-usage');
+  assert.match(usage.textContent, /输入 1.2k/);
+  assert.match(usage.textContent, /输出 320/);
+  assert.equal(usage.textContent.includes('缓存'), false, '没给的字段不显示');
+  assert.equal(usage.parentElement, view.timeline);
+  // 条目按发生顺序，回答留在最后（这一轮还没有写出回答，所以它还是占位状态）。
+  assert.deepEqual(view.order(), ['run-phase', 'tool-row ok', 'run-usage', 'assistant-body placeholder']);
+
+  second.push(sse('usage.updated', { run_id: 'run-2', input_tokens: 1234, output_tokens: 320, cached_tokens: 64 }));
+  second.push(sse('run.finished', { run_id: 'run-2', answer: '文件内容是 ok' }));
+  await h.settle();
+  assert.equal(view.timeline.querySelectorAll('.run-usage').length, 1, '用量只有一行，后来的更新覆盖它');
+  assert.match(view.timeline.querySelector('.run-usage').textContent, /缓存 64/);
+  assert.match(view.meta.textContent, /已完成/);
+  assert.equal(view.meta.textContent.includes('进行中'), false);
+  assert.equal(view.body.textContent, '文件内容是 ok');
+  second.end();
+  await h.settle();
+});
+
+test('run phase and usage copy is read from events only', () => {
+  const {
+    runPhaseText, runPhaseEntryText, runOutcomeLabel, runTraceMeta, replayRunState, usageText, formatTokenCount
+  } = require('./app.js');
+  assert.equal(runPhaseText('connecting'), '正在连接…');
+  assert.equal(runPhaseText('waiting'), '已开始，等待模型回应…');
+  assert.equal(runPhaseText('streaming'), 'Luna 正在回应…');
+  assert.equal(runPhaseText('tool', 'luna_read_file'), '正在使用工具：读取文件');
+  assert.equal(runPhaseText('tool', 'luna_unknown'), '正在使用工具：工具调用');
+  assert.equal(runPhaseText('cancelling'), '正在取消…');
+  assert.equal(runPhaseText('nonsense'), '');
+  assert.equal(runPhaseText(undefined), '');
+  for (const text of [runPhaseText('waiting'), runPhaseText('streaming'), runPhaseText('cancelling')]) {
+    assert.equal(/思考|分析|意图|thinking/.test(text), false, '不写模型在想什么');
+  }
+
+  assert.equal(runPhaseEntryText(0), '模型开始回应');
+  assert.equal(runPhaseEntryText(1), '模型继续回应');
+  assert.equal(runOutcomeLabel('ok'), '已完成');
+  assert.equal(runOutcomeLabel('cancelled'), '已取消');
+  assert.equal(runOutcomeLabel('failed'), '失败');
+  assert.equal(runOutcomeLabel('running'), '进行中');
+  assert.equal(runOutcomeLabel(''), '结果未知');
+
+  assert.equal(runTraceMeta(0, null, 'running'), '进行中');
+  assert.equal(runTraceMeta(2, 6100, 'ok'), '2 次工具调用 · 6s · 已完成');
+  assert.equal(runTraceMeta(1, null, 'cancelled'), '1 次工具调用 · 已取消', '没有耗时就不写一个数字');
+  assert.equal(runTraceMeta(0, null, ''), '结果未知');
+
+  assert.equal(replayRunState('ok'), 'ok');
+  assert.equal(replayRunState('cancelled'), 'cancelled');
+  assert.equal(replayRunState('error'), 'failed');
+  assert.equal(replayRunState(''), '');
+  assert.equal(replayRunState(undefined), '');
+
+  assert.equal(usageText({ input_tokens: 1234, output_tokens: 320 }), 'tokens：输入 1.2k · 输出 320');
+  assert.equal(usageText({ input_tokens: 0 }), 'tokens：输入 0', '真实拿到的 0 照写');
+  assert.equal(usageText({ run_id: 'r1' }), '', '拿不到就不显示，也不留占位');
+  assert.equal(usageText(undefined), '');
+  assert.equal(usageText({ input_tokens: '1200' }), '', '不是数字就不猜');
+  assert.equal(formatTokenCount(999), '999');
+  assert.equal(formatTokenCount(1000), '1k');
+  assert.equal(formatTokenCount(1234), '1.2k');
+  assert.equal(formatTokenCount(123456), '123k');
+  assert.equal(formatTokenCount(-1), '');
+  assert.equal(formatTokenCount(undefined), '');
+});
+
+test('long tool text is clipped to a bounded preview and the full text is kept', () => {
+  const { clipText, TOOL_TEXT_MAX_CHARS, TOOL_TEXT_MAX_LINES } = require('./app.js');
+  assert.deepEqual(clipText('短文本'), { text: '短文本', clipped: false });
+  assert.deepEqual(clipText(''), { text: '', clipped: false });
+
+  const manyLines = Array.from({ length: TOOL_TEXT_MAX_LINES + 4 }, (_, index) => `第 ${index} 行`).join('\n');
+  const byLines = clipText(manyLines);
+  assert.equal(byLines.clipped, true);
+  assert.equal(byLines.text.endsWith('…'), true);
+  assert.equal(byLines.text.split('\n').length, TOOL_TEXT_MAX_LINES, '默认展示有行数上限');
+
+  const wide = 'x'.repeat(TOOL_TEXT_MAX_CHARS * 3);
+  const byChars = clipText(wide);
+  assert.equal(byChars.clipped, true);
+  assert.equal(byChars.text.length, TOOL_TEXT_MAX_CHARS + 1);
+  assert.equal(clipText(wide, 10).text, 'xxxxxxxxxx…');
+  assert.equal(clipText('a\n\n\n\nb').clipped, false, '少量换行不触发截断');
+  assert.equal(clipText(undefined).clipped, false);
+  assert.equal(clipText(7).text, '7');
+});
+
+test('tool arguments and results are read in both shapes the contract allows', () => {
+  const { toolArgumentsText, toolResultText } = require('./app.js');
+  assert.equal(toolArgumentsText('{"text":"moon"}'), '{\n  "text": "moon"\n}', '原始字符串按同一读法美化');
+  assert.equal(toolArgumentsText({ text: 'moon' }), '{\n  "text": "moon"\n}', 'JSON 对象直接给出时同样可读');
+  assert.equal(toolArgumentsText('not json'), 'not json');
+  assert.equal(toolArgumentsText(''), '—');
+  assert.equal(toolArgumentsText(undefined), '—');
+  assert.equal(toolArgumentsText(7), '—', '不是字符串也不是对象时不猜');
+
+  assert.equal(toolResultText('文件内容'), '文件内容');
+  assert.equal(toolResultText({ ok: true }), '{\n  "ok": true\n}');
+  assert.equal(toolResultText(12), '12');
+  assert.equal(toolResultText(''), '—');
+  assert.equal(toolResultText(null), '—');
+  assert.equal(toolResultText(undefined), '—');
+  assert.equal(toolResultText(undefined, 1), '—');
+});
+
+test('a refusal is told apart from a failure and neither is written as a crash', () => {
+  const { toolFailureKind, toolRefusalReason, toolRefusedLabel, toolStateLabel, TOOL_REFUSAL_PREFIX } = require('./app.js');
+  assert.equal(TOOL_REFUSAL_PREFIX, 'the tool refused this call: ');
+  const refused = 'the tool refused this call: 路径越出可读范围';
+  assert.equal(toolFailureKind(refused), 'refused');
+  assert.equal(toolFailureKind('插件已经不在'), 'failed');
+  assert.equal(toolFailureKind('the tool refused to do it'), 'failed', '前缀不同就不是拒绝');
+  assert.equal(toolFailureKind(''), 'failed');
+  assert.equal(toolFailureKind(undefined), 'failed');
+  assert.equal(toolRefusalReason(refused), '路径越出可读范围');
+  assert.equal(toolRefusalReason('插件已经不在'), '');
+  assert.equal(toolRefusedLabel('luna_read_file'), '读取文件被拒绝');
+  assert.equal(toolRefusedLabel('luna_unknown'), '工具调用被拒绝');
+  assert.equal(toolStateLabel('luna_read_file', 'refused'), '读取文件被拒绝');
+  assert.equal(toolStateLabel('luna_read_file', 'running'), '正在读取文件…');
+  assert.equal(toolStateLabel('luna_read_file', 'ok'), '读取文件完成');
+  assert.equal(toolStateLabel('luna_read_file', 'failed'), '读取文件失败');
+});
+
+test('elapsed and duration are read from what the runtime measured', () => {
+  const { formatElapsed, formatDuration } = require('./app.js');
+  assert.equal(formatElapsed(0), '0s');
+  assert.equal(formatElapsed(999), '0s');
+  assert.equal(formatElapsed(12300), '12s');
+  assert.equal(formatElapsed(59000), '59s');
+  assert.equal(formatElapsed(60000), '1:00');
+  assert.equal(formatElapsed(125000), '2:05');
+  assert.equal(formatElapsed(-5), '0s');
+  assert.equal(formatElapsed(undefined), '0s');
+
+  assert.equal(formatDuration(0), '0ms');
+  assert.equal(formatDuration(420), '420ms');
+  assert.equal(formatDuration(999.4), '999ms');
+  assert.equal(formatDuration(1200), '1.2s');
+  assert.equal(formatDuration(60500), '1:00');
+  assert.equal(formatDuration(undefined), '', 'Runtime 没给耗时就不写一个');
+  assert.equal(formatDuration(-1), '');
+  assert.equal(formatDuration('1200'), '');
+});
+
+test('every run observability style the script builds a class for exists in the stylesheet', () => {
+  const css = source('style.css');
+  const selectors = ['.run-status-dot', '.run-status-label', '.run-status-elapsed', '.assistant-head', '.run-meta',
+    '.run-timeline', '.run-reasoning', '.run-reasoning-label', '.run-reasoning-body', '.run-phase', '.run-note',
+    '.run-note-label', '.run-usage', '.run-incomplete', '.tool-state', '.tool-name', '.tool-meta', '.tool-more',
+    '.value-more', '.stop-icon', '.tool-row.ok', '.tool-row.refused'];
+  for (const selector of selectors) {
+    const escaped = selector.replace(/\./g, '\\.');
+    assert.match(css, new RegExp(`${escaped}(?=[\\s,{:.])`), `missing style ${selector}`);
+  }
+  for (const state of ['ok', 'running', 'refused', 'failed']) {
+    assert.ok(css.includes(`.tool-state[data-state="${state}"]`), `missing state colour ${state}`);
+  }
+  // 全文展开后必须自己滚动，否则一次长读取会把对话拉成一条看不到底的 log。
+  assert.match(css, /\.value-more\s*>\s*pre\s*\{[^}]*max-height/s);
+  // 推理正文同样有界：一次很长的推理不能把回答主体顶出视野。
+  assert.match(css, /\.run-reasoning-body\s*\{[^}]*max-height/s);
+  assert.match(css, /\.run-reasoning\s*>\s*summary\s*\{[^}]*min-height:\s*var\(--luna-control-sm\)/s, '推理那一行沿用控件高度');
+  assert.equal(/gradient\s*\(/i.test(css), false);
+  assert.doesNotMatch(css, /border-radius:\s*(?:1[0-9]|[2-9][0-9])px/, '圆角只来自尺度 token');
+});
+
+test('the run surface reuses the existing status element and invents no new state', () => {
+  const html = source('index.html');
+  const js = source('app.js');
+  // 状态条就是标记里已有的那一个；Stop 就是输入区那个按钮。
+  assert.match(html, /<div id="run-status" class="run-status" role="status" hidden><\/div>/);
+  assert.equal(/id="stop"|stop-button|run-controls/.test(html), false, '不再另起一套控制栏');
+  assert.match(js, /send\.addEventListener\('click'/);
+  assert.match(js, /\/api\/runs\/\$\{runID\}\/cancel/);
+  assert.match(js, /runStatus\.dataset\.state = liveRun\.state/);
+  for (const text of ['思考', '分析意图', 'thinking', 'reasoning 内容']) {
+    assert.equal(html.includes(text), false, `标记里不出现 ${text}`);
+    assert.equal(js.includes(text), false, `脚本里不出现 ${text}`);
+  }
+  assert.equal(js.includes('innerHTML'), false);
+  const storedKeys = new Set([...js.matchAll(/localStorage\.(?:getItem|setItem)\('([^']+)'/g)].map((match) => match[1]));
+  assert.deepEqual([...storedKeys].sort(), ['luna.sidebar', 'luna.sidebarWidth', 'luna.theme'],
+    '轨迹的折叠状态留在会话里，不新增持久化键');
 });
