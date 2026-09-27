@@ -2257,8 +2257,46 @@ if (typeof document !== 'undefined') {
   // A refused command is answered where the user is looking — the conversation
   // area's status line — and never as a turn: no message is added to the
   // transcript and no run is started.
+  // `/model` asks the server two questions or tells it one thing: what the
+  // models are, or which of them this session should use. The answer is a
+  // session record, so the choice survives a reload and travels with the
+  // session — the browser keeps no copy of it.
+  async function applyModelChoice(name) {
+    try {
+      if (!isSessionID(currentSessionID)) {
+        setConversationStatus('这个会话还没有消息，还没有可以记住选择的地方。先发一条消息，再用 /model 切换。', true);
+        return;
+      }
+      const query = `?session=${encodeURIComponent(currentSessionID)}`;
+      const response = await fetch(`/api/models${query}`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      const payload = await response.json();
+      const current = payload.current || {};
+      const names = (payload.models || []).map((model) => model.name);
+      if (!name) {
+        const origin = current.origin === 'session' ? '这个会话选的' : '配置里的默认';
+        setConversationStatus(`当前模型：${current.name}（${origin}）。可用：${names.join('、')||'无'}。`);
+        return;
+      }
+      const switchResponse = await fetch(`/api/sessions/${currentSessionID}/model`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: name })
+      });
+      if (!switchResponse.ok) throw new Error(await errorMessage(switchResponse));
+      const chosen = await switchResponse.json();
+      setConversationStatus(`已切换：这个会话的后续运行使用 ${chosen.model}。`);
+    } catch (error) {
+      // The server owns what is a valid model, so its refusal is the answer;
+      // saying anything else here would be this file guessing at the rules.
+      setConversationStatus(`切换失败：${error.message}`, true);
+    }
+  }
+
   function submitCommand(draft) {
-    const word = draft.slice(1).split(/\s+/)[0];
+    const parts = draft.slice(1).split(/\s+/);
+    const word = parts[0];
+    const argument = parts.slice(1).filter(Boolean).join(' ');
     const command = findCommand(commandTable, word);
     // `/help` is the composer's own answer; it needs no round trip even when
     // the table has not arrived yet.
@@ -2274,6 +2312,10 @@ if (typeof document !== 'undefined') {
     // 运行中的策略来自命令自己：标注 busy=reject 的命令在这时不执行。
     if (command.busy === 'reject' && (running || switching)) {
       setConversationStatus(`Luna 正在运行，/${command.name} 现在不能执行。等这次运行结束后再试。`, true);
+      return;
+    }
+    if (command.name === 'model') {
+      applyModelChoice(argument);
       return;
     }
     setConversationStatus(`/${command.name} 暂时还不能在这个界面上执行。`, true);
