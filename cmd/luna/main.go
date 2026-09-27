@@ -115,6 +115,34 @@ func sessionsDir(root, explicit string) string {
 	return filepath.Join(root, ".runtime", "sessions")
 }
 
+// defaultRulesName is the file a project keeps its own rules in, and therefore the
+// one the Workspace capability contributes when the operator did not name another.
+// Pointing -rules-file somewhere else stays possible; the point of the default is
+// that a project agent reads its project's rules without being told to.
+const defaultRulesName = "AGENTS.md"
+
+// fileExists reports whether a path is a regular file we could read rules from.
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
+}
+
+// resolveRulesFile decides which file to read the project's rules from. An
+// explicit -rules-file always wins; otherwise the project's own AGENTS.md is used
+// when it is there, because a project agent that does not read its project's rules
+// is a project agent in name only. Neither being present is not an error: it just
+// means there are no rules to contribute.
+func resolveRulesFile(explicit, root string) string {
+	if explicit != "" {
+		return explicit
+	}
+	candidate := filepath.Join(root, defaultRulesName)
+	if fileExists(candidate) {
+		return candidate
+	}
+	return ""
+}
+
 // loadRules reads the project-rule file the Workspace capability will
 // contribute.
 //
@@ -235,7 +263,8 @@ func run() error {
 	// root, so it claims no namespace and asks for no permission. The rules are
 	// read here and handed in as text — the capability opens no file, so it
 	// needs no permission the Kernel cannot yet enforce.
-	rules, rulesProblem := loadRules(*rulesFlag, workspace.MaxRulesTextBytes)
+	rulesFile := resolveRulesFile(*rulesFlag, projectRoot(root, *readRoot))
+	rules, rulesProblem := loadRules(rulesFile, workspace.MaxRulesTextBytes)
 	if rulesProblem != "" {
 		log.Printf("luna: %s; no project rules will be contributed", rulesProblem)
 	}

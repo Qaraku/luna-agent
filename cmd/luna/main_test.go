@@ -330,6 +330,33 @@ func TestTheRulesReadCeilingIsTheCapabilitysOwn(t *testing.T) {
 	}
 }
 
+// An explicit choice is never second-guessed, and the default is the project's own
+// rules file rather than nothing: a project agent that ignores the file its project
+// keeps its rules in is not reading the project. Neither case is an error.
+func TestTheRulesDefaultToTheProjectsOwnFile(t *testing.T) {
+	root := t.TempDir()
+	if got := resolveRulesFile("/somewhere/else.md", root); got != "/somewhere/else.md" {
+		t.Fatalf("explicit choice was overridden: %q", got)
+	}
+	if got := resolveRulesFile("", root); got != "" {
+		t.Fatalf("a project without a rules file named one anyway: %q", got)
+	}
+	rules := filepath.Join(root, defaultRulesName)
+	if err := os.WriteFile(rules, []byte("- be truthful\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolveRulesFile("", root); got != rules {
+		t.Fatalf("the project's own rules file was not picked up: %q", got)
+	}
+	// 目录同名不算规则文件：读它会得到一句无意义的错误。
+	if err := os.Mkdir(filepath.Join(root, "dir-"+defaultRulesName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolveRulesFile("", filepath.Join(root, "dir-"+defaultRulesName)); got != "" {
+		t.Fatalf("a directory was treated as a rules file: %q", got)
+	}
+}
+
 func TestWorkingDirOrEmptyWhenDirectoryIsRemoved(t *testing.T) {
 	original, err := os.Getwd()
 	if err != nil {
