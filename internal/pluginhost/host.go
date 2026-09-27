@@ -121,9 +121,10 @@ type Options struct {
 	StartTimeout time.Duration
 	RPCTimeout   time.Duration
 	// ReadRoot bounds luna_read_file, luna_list_dir and luna_search_files. It
-	// defaults to the repository root and is resolved once, at construction, so
-	// the containment check compares real directories rather than symbolic
-	// links.
+	// is the default root: a call that names no roots of its own is checked
+	// against it, and it defaults to the repository root. It is resolved once,
+	// at construction, so the containment check compares real directories
+	// rather than symbolic links.
 	ReadRoot string
 	// ReadLimit is the single-read size cap in bytes. It defaults to
 	// fileread.DefaultLimit (256 KiB).
@@ -151,6 +152,15 @@ type Options struct {
 // model-supplied path: the host validates it and the plugin never sees it.
 type ReadRequest struct {
 	Path string
+	// Roots are the directories this call may read from, in the order they are
+	// tried: the first root that holds Path wins. They are the working
+	// directories of the run that produced the call — a session's workspace —
+	// and they come from the core, never from the model. An empty list means
+	// the host's own ReadRoot, so a call from a run that names no working
+	// directories is checked exactly as it was before Roots existed. They are
+	// a range and not a permission: a root that is not an absolute directory
+	// can only make a call refuse, because no path is contained in one.
+	Roots []string
 	// DelayMS is an operations and test knob for holding an RPC in flight. It
 	// is never exposed to the model.
 	DelayMS int
@@ -158,11 +168,14 @@ type ReadRequest struct {
 
 // ListRequest is a directory-listing request from the core. Path is the raw,
 // model-supplied path, on the same terms as ReadRequest: the host validates it
-// against the read root and the plugin only ever sees the resolved absolute
-// path. There is deliberately no recursion knob: one listing is one level, and
-// no request can widen that.
+// against the roots the call names and the plugin only ever sees the resolved
+// absolute path. There is deliberately no recursion knob: one listing is one
+// level, and no request can widen that.
 type ListRequest struct {
 	Path string
+	// Roots are the directories this call may list from, on the same terms as
+	// ReadRequest.Roots.
+	Roots []string
 	// DelayMS is an operations and test knob for holding an RPC in flight. It
 	// is never exposed to the model.
 	DelayMS int
@@ -170,14 +183,17 @@ type ListRequest struct {
 
 // SearchRequest is a literal-search request from the core. Path is the raw,
 // model-supplied path, on the same terms as ReadRequest and ListRequest: the
-// host validates it against the read root and the plugin only ever sees the
-// resolved absolute path — of a file or of a directory. Query is the raw,
-// model-supplied literal, validated here as well, and there is deliberately no
-// pattern, depth or filter knob: a search walks below the path it was given and
-// stops at its caps, and no request can widen that.
+// host validates it against the roots the call names and the plugin only ever
+// sees the resolved absolute path — of a file or of a directory. Query is the
+// raw, model-supplied literal, validated here as well, and there is deliberately
+// no pattern, depth or filter knob: a search walks below the path it was given
+// and stops at its caps, and no request can widen that.
 type SearchRequest struct {
 	Path  string
 	Query string
+	// Roots are the directories this call may search, on the same terms as
+	// ReadRequest.Roots.
+	Roots []string
 	// DelayMS is an operations and test knob for holding an RPC in flight. It
 	// is never exposed to the model.
 	DelayMS int
@@ -421,8 +437,8 @@ func (h *Host) Invoke(ctx context.Context, in Input) (Output, error) {
 }
 
 // ReadFile calls the file-read tool. The requested path is validated here, on
-// the host side; the plugin is handed only the resolved absolute path and the
-// cap.
+// the host side, against the roots this call names; the plugin is handed only
+// the resolved absolute path and the cap.
 func (h *Host) ReadFile(ctx context.Context, req ReadRequest) (Output, error) {
 	if len(req.Path) > 4096 {
 		return Output{}, fmt.Errorf("path must not exceed 4096 bytes")
@@ -430,20 +446,20 @@ func (h *Host) ReadFile(ctx context.Context, req ReadRequest) (Output, error) {
 	if req.DelayMS < 0 || req.DelayMS > pluginprotocol.MaxDelayMS {
 		return Output{}, fmt.Errorf("delay_ms must be 0..%d", pluginprotocol.MaxDelayMS)
 	}
-	absolute, err := fileread.Resolve(h.opts.ReadRoot, req.Path, h.opts.ReadLimit)
+	resolved, err := fileread.ResolveInRoots(h.readRoots(req.Roots), req.Path, h.opts.ReadLimit)
 	if err != nil {
 		return Output{}, err
 	}
-	return h.invoke(ctx, ToolReadFile, Input{Path: absolute, MaxBytes: h.opts.ReadLimit, DelayMS: req.DelayMS})
+	return h.invoke(ctx, ToolReadFile, Input{Path: resolved.Path, MaxBytes: h.opts.ReadLimit, DelayMS: req.DelayMS})
 }
 
 // ListDir calls the directory-listing tool. The requested path is validated here,
 // on the host side, exactly as a read path is — same normalization, same
-// containment, same symbolic-link resolution — and the plugin is handed only the
-// resolved absolute directory path plus the two caps. A refusal (an absolute
-// path, a `..` escape, something that is not a directory, a nonexistent path) is
-// therefore made before any RPC, so no plugin process ever sees a path the
-// read root does not hold.
+// containment, same symbolic-link resolution, against the same roots — and the
+// plugin is handed only the resolved absolute directory path plus the two caps.
+// A refusal (an absolute path, a `..` escape, something that is not a
+// directory, a nonexistent path) is therefore made before any RPC, so no plugin
+// process ever sees a path none of the roots holds.
 func (h *Host) ListDir(ctx context.Context, req ListRequest) (Output, error) {
 	if len(req.Path) > 4096 {
 		return Output{}, fmt.Errorf("path must not exceed 4096 bytes")
@@ -451,27 +467,27 @@ func (h *Host) ListDir(ctx context.Context, req ListRequest) (Output, error) {
 	if req.DelayMS < 0 || req.DelayMS > pluginprotocol.MaxDelayMS {
 		return Output{}, fmt.Errorf("delay_ms must be 0..%d", pluginprotocol.MaxDelayMS)
 	}
-	absolute, err := fileread.ResolveDir(h.opts.ReadRoot, req.Path)
+	resolved, err := fileread.ResolveDirInRoots(h.readRoots(req.Roots), req.Path)
 	if err != nil {
 		return Output{}, err
 	}
-	return h.invoke(ctx, ToolListDir, Input{Path: absolute, MaxEntries: h.opts.ListMaxEntries, MaxLineBytes: h.opts.ListMaxLineBytes, DelayMS: req.DelayMS})
+	return h.invoke(ctx, ToolListDir, Input{Path: resolved.Path, MaxEntries: h.opts.ListMaxEntries, MaxLineBytes: h.opts.ListMaxLineBytes, DelayMS: req.DelayMS})
 }
 
 // SearchFiles calls the literal-search tool. The requested path is validated
 // here, on the host side, exactly as a read or a listing path is — same
 // normalization, same containment, same symbolic-link resolution, through
-// fileread.ResolveSearch — and so is the query, which is refused here if it is
-// empty or too long rather than reaching a plugin that would have to invent an
-// answer. The plugin is handed only the resolved absolute path, the literal and
-// the four caps.
+// fileread.ResolveSearchInRoots, against the same roots — and so is the query,
+// which is refused here if it is empty or too long rather than reaching a plugin
+// that would have to invent an answer. The plugin is handed only the resolved
+// absolute path, the literal and the four caps.
 //
-// A refusal (an absolute path, a `..` escape, a path outside the root, something
-// that exists as neither a file nor a directory, an empty query) is therefore
-// made before any RPC, so no plugin process ever sees a path the read root does
-// not hold. Where the search may look afterwards is bounded by the plugin's walk,
-// which follows no symbolic link at all, so the search cannot leave the read root
-// by another route either.
+// A refusal (an absolute path, a `..` escape, a path outside every root,
+// something that exists as neither a file nor a directory, an empty query) is
+// therefore made before any RPC, so no plugin process ever sees a path none of
+// the roots holds. Where the search may look afterwards is bounded by the
+// plugin's walk, which follows no symbolic link at all, so the search cannot
+// leave a root by another route either.
 func (h *Host) SearchFiles(ctx context.Context, req SearchRequest) (Output, error) {
 	if len(req.Path) > 4096 {
 		return Output{}, fmt.Errorf("path must not exceed 4096 bytes")
@@ -482,11 +498,27 @@ func (h *Host) SearchFiles(ctx context.Context, req SearchRequest) (Output, erro
 	if err := fileread.ValidateQuery(req.Query); err != nil {
 		return Output{}, err
 	}
-	absolute, err := fileread.ResolveSearch(h.opts.ReadRoot, req.Path)
+	resolved, err := fileread.ResolveSearchInRoots(h.readRoots(req.Roots), req.Path)
 	if err != nil {
 		return Output{}, err
 	}
-	return h.invoke(ctx, ToolSearchFiles, Input{Path: absolute, Query: req.Query, MaxMatches: h.opts.SearchMaxMatches, MaxLineBytes: h.opts.SearchMaxLineBytes, MaxFiles: h.opts.SearchMaxFiles, MaxFileBytes: h.opts.SearchMaxFileBytes, DelayMS: req.DelayMS})
+	return h.invoke(ctx, ToolSearchFiles, Input{Path: resolved.Path, Query: req.Query, MaxMatches: h.opts.SearchMaxMatches, MaxLineBytes: h.opts.SearchMaxLineBytes, MaxFiles: h.opts.SearchMaxFiles, MaxFileBytes: h.opts.SearchMaxFileBytes, DelayMS: req.DelayMS})
+}
+
+// readRoots is the set of roots one file call is checked against: the roots the
+// caller named for this call, or the host's configured ReadRoot when it named
+// none. The default is what keeps a run that works in no particular directory
+// reading exactly what it read before roots existed.
+//
+// Nothing here has to validate a named root against anything: a root that is
+// not an absolute existing directory contains no path at all, so withinRoot
+// refuses every request against it. A root can therefore only make a call
+// refuse, never make one wider than the roots it was given.
+func (h *Host) readRoots(roots []string) []string {
+	if len(roots) == 0 {
+		return []string{h.opts.ReadRoot}
+	}
+	return roots
 }
 func (h *Host) invoke(ctx context.Context, tool string, in Input) (Output, error) {
 	h.mu.Lock()

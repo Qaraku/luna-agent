@@ -654,10 +654,12 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, fmt.Errorf("message is required and must not exceed 16384 bytes"))
 		return
 	}
-	// A supplied session must exist, and a session's own choice of model travels
-	// with it. Both are read before admission, so an unknown id costs the caller
-	// a 4xx and not the single-run slot.
+	// A supplied session must exist, and a session's own choices travel with it:
+	// the model its runs use, and the directories they may read. Both are read
+	// before admission, so an unknown id costs the caller a 4xx and not the
+	// single-run slot.
 	runModel := ""
+	var runRoots []string
 	if in.SessionID != "" {
 		session, err := s.sessions.Read(in.SessionID)
 		if err != nil {
@@ -668,6 +670,20 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 		// configuration's default, which the runner resolves.
 		if session.Config != nil {
 			runModel = session.Config.Model
+		}
+		// A session bound to a workspace reads inside that workspace's
+		// directories. A binding that no longer names a workspace fails the run
+		// instead of falling back: the fallback is the configured root, which is
+		// a different and possibly wider place to read, and quietly handing the
+		// model more than the session asked for is worse than saying the binding
+		// is broken. The user can unbind it (or bind another) and run again.
+		if session.Config != nil && session.Config.Workspace != "" {
+			found, ok := s.workspaceDirs(session.Config.Workspace)
+			if !ok {
+				fail(w, 409, fmt.Errorf("this session works in workspace %q, which no longer exists; bind another workspace or unbind this one", session.Config.Workspace))
+				return
+			}
+			runRoots = found
 		}
 	}
 	// The run context carries both ends of the run: a deadline, and a cancel
@@ -729,7 +745,7 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	sink := &streamSink{ctx: runCtx, events: make(chan agent.Event, streamSinkCapacity)}
 	result := make(chan runResult, 1)
 	go func() {
-		answer, err := s.runner.Run(runCtx, agent.RunRequest{RunID: id, SessionID: sessionID, Message: in.Message, Model: runModel, Sink: sink})
+		answer, err := s.runner.Run(runCtx, agent.RunRequest{RunID: id, SessionID: sessionID, Message: in.Message, Model: runModel, Roots: runRoots, Sink: sink})
 		close(sink.events)
 		result <- runResult{answer, err}
 	}()

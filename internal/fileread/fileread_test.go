@@ -961,3 +961,192 @@ func TestResolveSearchRefusesSomethingThatIsNeitherFileNorDirectory(t *testing.T
 		t.Fatalf("ResolveSearch(pipe) error = %v, want ErrNotSearchable", err)
 	}
 }
+
+// siblingRoots builds the layout a multi-root call has to keep apart: two
+// sibling directories, each holding one file of its own, a file in their parent
+// that neither root holds, and a symbolic link inside the first root that leaves
+// it for the file in the parent.
+//
+//	<parent>/a/a.txt        "in a\n"
+//	<parent>/a/link-outside -> ../shared.txt
+//	<parent>/a/sub/a.txt
+//	<parent>/b/b.txt        "in b\n"
+//	<parent>/shared.txt     "in parent\n"
+func siblingRoots(t *testing.T) (parent, a, b string) {
+	t.Helper()
+	parent = t.TempDir()
+	a = filepath.Join(parent, "a")
+	b = filepath.Join(parent, "b")
+	mustWrite(t, filepath.Join(a, "a.txt"), "in a\n")
+	mustWrite(t, filepath.Join(a, "sub", "a.txt"), "deep in a\n")
+	mustWrite(t, filepath.Join(b, "b.txt"), "in b\n")
+	mustWrite(t, filepath.Join(parent, "shared.txt"), "in parent\n")
+	if err := os.Symlink(filepath.Join("..", "shared.txt"), filepath.Join(a, "link-outside")); err != nil {
+		t.Fatalf("symlink outside root a: %v", err)
+	}
+	return parent, a, b
+}
+
+// Every root given to a call is reachable, and the path that is accepted says
+// which root accepted it.
+func TestResolveInRootsReachesEveryRoot(t *testing.T) {
+	_, a, b := siblingRoots(t)
+	roots := []string{a, b}
+	cases := []struct {
+		requested string
+		wantRoot  string
+		wantPath  string
+	}{
+		{"a.txt", a, filepath.Join(a, "a.txt")},
+		{"sub/a.txt", a, filepath.Join(a, "sub", "a.txt")},
+		{"b.txt", b, filepath.Join(b, "b.txt")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.requested, func(t *testing.T) {
+			got, err := ResolveInRoots(roots, tc.requested, DefaultLimit)
+			if err != nil {
+				t.Fatalf("ResolveInRoots(%q) refused a path a root holds: %v", tc.requested, err)
+			}
+			if got.Root != tc.wantRoot {
+				t.Fatalf("ResolveInRoots(%q).Root = %q, want %q", tc.requested, got.Root, tc.wantRoot)
+			}
+			if got.Path != resolvedPath(t, tc.wantPath) {
+				t.Fatalf("ResolveInRoots(%q).Path = %q, want %q", tc.requested, got.Path, resolvedPath(t, tc.wantPath))
+			}
+		})
+	}
+	// The order the roots are given in decides which one wins when both hold
+	// the name; it never decides whether a root is reachable.
+	swapped, err := ResolveInRoots([]string{b, a}, "b.txt", DefaultLimit)
+	if err != nil || swapped.Root != b {
+		t.Fatalf("ResolveInRoots([b a], b.txt) = %+v, err = %v", swapped, err)
+	}
+	if list, err := ResolveDirInRoots(roots, "sub"); err != nil || list.Root != a {
+		t.Fatalf("ResolveDirInRoots(sub) = %+v, err = %v", list, err)
+	}
+	// A root is a whole directory, not just the prefix of a path: "." is the
+	// root itself, whichever root answers first.
+	if list, err := ResolveDirInRoots(roots, "."); err != nil || list.Root != a || list.Path != resolvedPath(t, a) {
+		t.Fatalf("ResolveDirInRoots(.) = %+v, err = %v", list, err)
+	}
+	if search, err := ResolveSearchInRoots(roots, "b.txt"); err != nil || search.Root != b {
+		t.Fatalf("ResolveSearchInRoots(b.txt) = %+v, err = %v", search, err)
+	}
+}
+
+// resolvedPath is the real path of a file the test just built, so an assertion
+// compares against what the boundary resolves rather than against the path the
+// temporary directory was named with (on macOS /tmp is itself a link).
+func resolvedPath(t *testing.T, path string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", path, err)
+	}
+	return resolved
+}
+
+// A file that only one root holds is reachable when that root is given and
+// refused when it is not: the check is per root and is not satisfied by another
+// root being present.
+func TestResolveInRootsRefusesAFileOnlyAnotherRootHolds(t *testing.T) {
+	_, a, b := siblingRoots(t)
+	for _, tc := range []struct {
+		requested string
+		roots     []string
+	}{
+		{"b.txt", []string{a}},
+		{"a.txt", []string{b}},
+		{"sub", []string{b}},
+	} {
+		if got, err := ResolveInRoots(tc.roots, tc.requested, DefaultLimit); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("ResolveInRoots(%v, %q) = %+v, err = %v, want ErrNotFound", tc.roots, tc.requested, got, err)
+		}
+		if got, err := ResolveDirInRoots(tc.roots, tc.requested); err == nil {
+			t.Fatalf("ResolveDirInRoots(%v, %q) = %+v, want a refusal", tc.roots, tc.requested, got)
+		}
+	}
+	// The refusals that are not about a missing name are per root too.
+	if _, err := ResolveInRoots([]string{b}, "a.txt", DefaultLimit); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if _, err := ResolveDirInRoots([]string{a}, "a.txt"); !errors.Is(err, ErrNotDir) {
+		t.Fatalf("err = %v, want ErrNotDir", err)
+	}
+}
+
+// A `..` that rises above a root is an escape, and it stays an escape when the
+// directory it lands in is another root of the same call. This is the case a
+// plain "first root that holds the path wins" loop gets wrong: the requested
+// path escapes root a and is refused there, but it is also a legal relative path
+// under root b, a sibling directory, so a loop that only keeps trying roots
+// would accept it as soon as it reached b — and the answer would depend on the
+// order the roots were listed in.
+func TestResolveInRootsRefusesAnEscapeIntoASiblingRoot(t *testing.T) {
+	_, a, b := siblingRoots(t)
+	for _, roots := range [][]string{{a, b}, {b, a}} {
+		for _, requested := range []string{"../b/b.txt", filepath.Join("..", filepath.Base(b), "b.txt"), "../shared.txt", "../../etc/passwd", "sub/../../b/b.txt"} {
+			if got, err := ResolveInRoots(roots, requested, DefaultLimit); !errors.Is(err, ErrPathEscape) {
+				t.Fatalf("ResolveInRoots(%v, %q) = %+v, err = %v, want ErrPathEscape", roots, requested, got, err)
+			}
+			if _, err := ResolveDirInRoots(roots, requested); !errors.Is(err, ErrPathEscape) {
+				t.Fatalf("ResolveDirInRoots(%v, %q) err = %v, want ErrPathEscape", roots, requested, err)
+			}
+			if _, err := ResolveSearchInRoots(roots, requested); !errors.Is(err, ErrPathEscape) {
+				t.Fatalf("ResolveSearchInRoots(%v, %q) err = %v, want ErrPathEscape", roots, requested, err)
+			}
+		}
+	}
+	// A `..` that stays inside its root is not an escape, exactly as it is not
+	// one for a single-root call.
+	if got, err := ResolveInRoots([]string{a, b}, "sub/../a.txt", DefaultLimit); err != nil || got.Root != a {
+		t.Fatalf("ResolveInRoots(sub/../a.txt) = %+v, err = %v", got, err)
+	}
+}
+
+// An absolute path is refused however many roots are given, including one that
+// names a file a root really does hold.
+func TestResolveInRootsRefusesAbsolutePaths(t *testing.T) {
+	_, a, b := siblingRoots(t)
+	for _, requested := range []string{"/etc/passwd", filepath.Join(a, "a.txt"), filepath.Join(b, "b.txt")} {
+		if got, err := ResolveInRoots([]string{a, b}, requested, DefaultLimit); !errors.Is(err, ErrPathAbsolute) {
+			t.Fatalf("ResolveInRoots(%q) = %+v, err = %v, want ErrPathAbsolute", requested, got, err)
+		}
+	}
+	if _, err := ResolveSearchInRoots([]string{a, b}, "/"); !errors.Is(err, ErrPathAbsolute) {
+		t.Fatalf("ResolveSearchInRoots(/) err = %v, want ErrPathAbsolute", err)
+	}
+}
+
+// A symbolic link that leaves the root it sits in is refused, as it is for a
+// single root. The refusal is not rescued by another root in the same call: the
+// other root is asked about a path inside itself, so nothing outside any root is
+// ever reachable.
+func TestResolveInRootsRefusesASymlinkThatLeavesARoot(t *testing.T) {
+	_, a, b := siblingRoots(t)
+	if got, err := ResolveInRoots([]string{a, b}, "link-outside", DefaultLimit); !errors.Is(err, ErrSymlinkEscape) {
+		t.Fatalf("ResolveInRoots(link-outside) = %+v, err = %v, want ErrSymlinkEscape", got, err)
+	}
+	if _, err := ResolveSearchInRoots([]string{a, b}, "link-outside"); !errors.Is(err, ErrSymlinkEscape) {
+		t.Fatalf("ResolveSearchInRoots(link-outside) err = %v, want ErrSymlinkEscape", err)
+	}
+	// The same link name under the other root is a different path, and it is
+	// not there at all.
+	if _, err := ResolveInRoots([]string{b}, "link-outside", DefaultLimit); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// An empty set of roots is a caller mistake and is stated as one: the boundary
+// never answers "no roots" by searching anywhere.
+func TestResolveInRootsRefusesAnEmptyRootList(t *testing.T) {
+	if _, err := ResolveInRoots(nil, "a.txt", DefaultLimit); !errors.Is(err, ErrNoRoot) {
+		t.Fatalf("ResolveInRoots(nil) err = %v, want ErrNoRoot", err)
+	}
+	if _, err := ResolveDirInRoots([]string{}, "."); !errors.Is(err, ErrNoRoot) {
+		t.Fatalf("ResolveDirInRoots(empty) err = %v, want ErrNoRoot", err)
+	}
+	if _, err := ResolveSearchInRoots([]string{}, "a.txt"); !errors.Is(err, ErrNoRoot) {
+		t.Fatalf("ResolveSearchInRoots(empty) err = %v, want ErrNoRoot", err)
+	}
+}

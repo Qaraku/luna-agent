@@ -73,11 +73,15 @@ const MaxQueryBytes = 256
 // Rejections are sentinel errors so callers and tests can classify a refusal
 // without matching on message text.
 var (
-	ErrPathEmpty     = errors.New("a path is required")
-	ErrPathInvalid   = errors.New("malformed path")
-	ErrPathAbsolute  = errors.New("absolute paths are not allowed; the path must be relative to the read root")
-	ErrPathEscape    = errors.New("path escapes the read root")
-	ErrPathOutside   = errors.New("path is outside the read root")
+	ErrPathEmpty    = errors.New("a path is required")
+	ErrPathInvalid  = errors.New("malformed path")
+	ErrPathAbsolute = errors.New("absolute paths are not allowed; the path must be relative to the read root")
+	ErrPathEscape   = errors.New("path escapes the read root")
+	ErrPathOutside  = errors.New("path is outside the read root")
+	// ErrNoRoot reports a multi-root check that was given no root at all. The
+	// caller decides what its default root is; an empty set reaching the
+	// boundary is a caller mistake, not a request to search everywhere.
+	ErrNoRoot        = errors.New("no read root was given")
 	ErrSymlinkEscape = errors.New("path leaves the read root through a symbolic link")
 	ErrNotFound      = errors.New("file not found")
 	ErrNotRegular    = errors.New("path is not a regular file")
@@ -165,6 +169,43 @@ func ResolveSearch(root, requested string) (string, error) {
 	return resolved, nil
 }
 
+// Resolved is a path a multi-root check accepted, together with the root that
+// accepted it. One request may serve several working directories, so a caller
+// that has to say where a path was found is told rather than left to guess.
+type Resolved struct {
+	// Path is the resolved absolute path: what Resolve, ResolveDir and
+	// ResolveSearch return for one root.
+	Path string
+	// Root is the root that admitted Path, exactly as it was given to the call.
+	Root string
+}
+
+// ResolveInRoots is Resolve against several roots: the first root that holds
+// the path wins. See resolveInRoots for what "first" and "holds" mean.
+func ResolveInRoots(roots []string, requested string, limit int) (Resolved, error) {
+	return resolveInRoots(roots, requested, func(root string) (string, error) {
+		return Resolve(root, requested, limit)
+	})
+}
+
+// ResolveDirInRoots is ResolveDir against several roots, on the same terms as
+// ResolveInRoots: every root is checked by the code a single-root call uses, so
+// a listing and a read cannot disagree about where the roots end.
+func ResolveDirInRoots(roots []string, requested string) (Resolved, error) {
+	return resolveInRoots(roots, requested, func(root string) (string, error) {
+		return ResolveDir(root, requested)
+	})
+}
+
+// ResolveSearchInRoots is ResolveSearch against several roots, on the same
+// terms as ResolveInRoots: a search cannot start anywhere a read or a listing
+// could not reach, under any of the roots it was given.
+func ResolveSearchInRoots(roots []string, requested string) (Resolved, error) {
+	return resolveInRoots(roots, requested, func(root string) (string, error) {
+		return ResolveSearch(root, requested)
+	})
+}
+
 // ValidateQuery checks one literal query before any work is done with it. It
 // lives here, next to the search that consumes it, so the host can refuse a
 // query on the same terms the plugin would: an empty literal matches every line
@@ -217,6 +258,52 @@ func resolveWithinRoot(root, requested string) (string, error) {
 		return "", fmt.Errorf("%w: %q", ErrSymlinkEscape, requested)
 	}
 	return resolved, nil
+}
+
+// resolveInRoots runs one single-root check against each root in turn and
+// returns the first root that accepts the path.
+//
+// It is a loop over the checks above and not a second boundary: every root is
+// checked by resolveWithinRoot, through Resolve, ResolveDir or ResolveSearch, so
+// normalization, the refusal of an absolute path and the symbolic-link
+// resolution are the same code a single-root call runs, and adding a root here
+// cannot make any of them looser. What differs is only which root is asked.
+//
+// The one decision made before the loop is the `..` climb, because it is the
+// only refusal that could be undone by trying another root. A path whose `..`
+// components rise above the root it is resolved against is an escape, and that
+// is a property of the requested path alone (see climbsAboveRoot) rather than of
+// any one root. Left inside the loop it would make the answer depend on the
+// order the roots were given: `../b/file` escapes root a with a `..` component
+// and is refused there, but it is also a legal relative path under root b — a
+// sibling directory — so the loop would accept it as soon as b was reached.
+// Decided once, a path that climbs above a root is refused even when another
+// root given in the same call would contain it. An absolute path needs no such
+// handling here: it is a refusal the per-root check makes for every root.
+//
+// The other refusals are per root and are simply moved past, so a name that
+// exists in one of the working directories is found rather than reported as
+// missing because a different directory was consulted first. When no root
+// accepts it, the first root's refusal is reported: it is the reading of the
+// call that was asked for first.
+func resolveInRoots(roots []string, requested string, check func(root string) (string, error)) (Resolved, error) {
+	if len(roots) == 0 {
+		return Resolved{}, ErrNoRoot
+	}
+	if !filepath.IsAbs(requested) && climbsAboveRoot(requested) {
+		return Resolved{}, fmt.Errorf("%w with a .. component: %q", ErrPathEscape, requested)
+	}
+	var firstErr error
+	for _, root := range roots {
+		resolved, err := check(root)
+		if err == nil {
+			return Resolved{Path: resolved, Root: root}, nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return Resolved{}, firstErr
 }
 
 // Read returns the text of an already-validated path. A path is never

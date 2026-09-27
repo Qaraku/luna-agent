@@ -37,6 +37,23 @@ func WithWorkspaces(workspaces WorkspaceStore) Option {
 	return func(s *Server) { s.workspaces = workspaces }
 }
 
+// workspaceDirs returns the directories a workspace makes readable.
+//
+// A server with no workspace store answers false, the same answer as a workspace
+// that is not there. That is deliberate: the caller fails the run rather than
+// falling back to the configured root, so a session can never end up reading
+// somewhere its binding did not name.
+func (s *Server) workspaceDirs(id string) ([]string, bool) {
+	if s.workspaces == nil || id == "" {
+		return nil, false
+	}
+	found, ok := s.workspaces.Get(id)
+	if !ok {
+		return nil, false
+	}
+	return found.Dirs, true
+}
+
 // workspaceView is one workspace as the browser reads it: the id it points with,
 // the name the user reads, and the directories. The directories are absolute
 // paths — the user gave them and the interface shows them back — while the text

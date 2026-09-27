@@ -40,7 +40,7 @@ const (
 // because a capability describes its own tool and contributes its own reference
 // block. Text that would have to change when a capability changes does not
 // belong here.
-const instruction = "You are Luna, a truthful local demo. Use luna_text_transform whenever the user explicitly requests text transformation or explicitly asks to call it; it returns exactly what the active candidate produced, so when the result equals the input, say so plainly instead of guessing that the plugin is broken. Use luna_list_dir to see what a directory contains — when the user asks what is in a directory or in the project, or when you need to discover a path before reading it; the path must be relative to the configured read root, and one call lists one level only: subdirectories are named but not entered, and there is no option to list a whole tree in one call, so walk a repository one directory per call. Use luna_search_files to find where something is written — when you need to locate text, a name or a definition rather than read a file you already know; the query is a literal string and never a pattern, because this tool has no pattern language, so a regular expression is searched as its own characters, and the path says where the search starts, a directory or one file, relative to the configured read root, which nothing outside may be searched. A search looks below the path you give and is bounded, so it can stop at one of its caps; when it does it states the cap it reached and that the remaining paths were not searched, and you must report that limit rather than describe the whole project as covered. Use luna_read_file when the user asks you to read a file; the path must be relative to the configured read root, which holds the local text files you may read. A tool that refuses a call returns a result that begins \"the tool refused this call:\" followed by the reason: report that reason in the user's own language, and do not retry the same call or describe the tool as unavailable. Do not claim tools or actions that were not observed."
+const instruction = "You are Luna, a truthful local demo. Use luna_text_transform whenever the user explicitly requests text transformation or explicitly asks to call it; it returns exactly what the active candidate produced, so when the result equals the input, say so plainly instead of guessing that the plugin is broken. Use luna_list_dir to see what a directory contains — when the user asks what is in a directory or in the project, or when you need to discover a path before reading it; the path must be relative to one of the directories this session works in (a single configured root when it works in none), and one call lists one level only: subdirectories are named but not entered, and there is no option to list a whole tree in one call, so walk a repository one directory per call. Use luna_search_files to find where something is written — when you need to locate text, a name or a definition rather than read a file you already know; the query is a literal string and never a pattern, because this tool has no pattern language, so a regular expression is searched as its own characters, and the path says where the search starts, a directory or one file, relative to one of the directories this session works in, which nothing outside may be searched. A search looks below the path you give and is bounded, so it can stop at one of its caps; when it does it states the cap it reached and that the remaining paths were not searched, and you must report that limit rather than describe the whole project as covered. Use luna_read_file when the user asks you to read a file; the path must be relative to one of the directories this session works in, which hold the local text files you may read. A tool that refuses a call returns a result that begins \"the tool refused this call:\" followed by the reason: report that reason in the user's own language, and do not retry the same call or describe the tool as unavailable. Do not claim tools or actions that were not observed."
 
 type Event struct {
 	Type string `json:"type"`
@@ -49,6 +49,7 @@ type Event struct {
 type Sink interface{ Emit(Event) }
 type sinkKey struct{}
 type runIDKey struct{}
+type rootsKey struct{}
 
 // RunRequest is one admitted run. RunID is core-owned; SessionID names the
 // durable session the run belongs to and is carried to the client on the
@@ -64,6 +65,14 @@ type RunRequest struct {
 	Message   string
 	Model     string
 	Sink      Sink
+	// Roots are the directories this run works in — the directories of the
+	// workspace its session is bound to — in the order the file tools try them.
+	// They are resolved by the caller, from the session's own configuration,
+	// and they are not model-visible: no tool argument can add one, and a tool
+	// call can only be checked against them. An empty list means the run works
+	// in no particular directory, and the file tools fall back to the host's
+	// single configured root, which is how every unbound session behaves.
+	Roots []string
 }
 
 // History is the read side of persisted conversation. The history of a run is
@@ -96,12 +105,25 @@ func WithRun(ctx context.Context, runID string, sink Sink) context.Context {
 	ctx = context.WithValue(ctx, sinkKey{}, sink)
 	return context.WithValue(ctx, runIDKey{}, runID)
 }
+
+// WithRoots puts the directories a run works in on its context, so the file
+// tools a capability contributed are checked against the run's own working
+// directories without being handed the session. An empty list is carried as an
+// empty list rather than replaced here: the host applies its default root, and
+// doing it twice would hide which layer decided the range.
+func WithRoots(ctx context.Context, roots []string) context.Context {
+	return context.WithValue(ctx, rootsKey{}, roots)
+}
 func emit(ctx context.Context, e Event) {
 	if s, ok := ctx.Value(sinkKey{}).(Sink); ok && s != nil {
 		s.Emit(e)
 	}
 }
 func runID(ctx context.Context) string { v, _ := ctx.Value(runIDKey{}).(string); return v }
+
+// roots is the set of directories the current run works in, and nil when the
+// run named none.
+func roots(ctx context.Context) []string { v, _ := ctx.Value(rootsKey{}).([]string); return v }
 
 type RunStarted struct {
 	RunID     string `json:"run_id"`
@@ -411,7 +433,7 @@ func (t *ReadFileTool) Info(context.Context) (*schema.ToolInfo, error) {
 
 func readFileSchema() *jsonschema.Schema {
 	type args struct {
-		Path string `json:"path" jsonschema_description:"Path of a text file, relative to the configured read root"`
+		Path string `json:"path" jsonschema_description:"Path of a text file, relative to one of the directories this session works in"`
 	}
 	r := jsonschema.Reflector{DoNotReference: true, AllowAdditionalProperties: false}
 	s := r.Reflect(args{})
@@ -438,7 +460,7 @@ func (t *ReadFileTool) InvokableRun(ctx context.Context, arguments string, _ ...
 	}
 	// The requested path is passed through unchanged: the host resolves and
 	// validates it against the read root before any plugin sees it.
-	out, err := t.reader.ReadFile(ctx, pluginhost.ReadRequest{Path: in.Path})
+	out, err := t.reader.ReadFile(ctx, pluginhost.ReadRequest{Path: in.Path, Roots: roots(ctx)})
 	if err != nil {
 		if stopped := ctx.Err(); stopped != nil {
 			return stopCall(ctx, ReadFileToolName, stopped, out, startedAt)
@@ -472,7 +494,7 @@ func (t *ListDirTool) Info(context.Context) (*schema.ToolInfo, error) {
 // schema offers no way to ask for one.
 func listDirSchema() *jsonschema.Schema {
 	type args struct {
-		Path string `json:"path" jsonschema_description:"Directory path, relative to the configured read root; use \".\" for the read root itself"`
+		Path string `json:"path" jsonschema_description:"Directory path, relative to one of the directories this session works in; use \".\" for the first of them"`
 	}
 	r := jsonschema.Reflector{DoNotReference: true, AllowAdditionalProperties: false}
 	s := r.Reflect(args{})
@@ -499,7 +521,7 @@ func (t *ListDirTool) InvokableRun(ctx context.Context, arguments string, _ ...t
 	}
 	// As with a read, the requested path is passed through unchanged: the host
 	// resolves and validates it against the read root before any plugin sees it.
-	out, err := t.lister.ListDir(ctx, pluginhost.ListRequest{Path: in.Path})
+	out, err := t.lister.ListDir(ctx, pluginhost.ListRequest{Path: in.Path, Roots: roots(ctx)})
 	if err != nil {
 		if stopped := ctx.Err(); stopped != nil {
 			return stopCall(ctx, ListDirToolName, stopped, out, startedAt)
@@ -518,14 +540,14 @@ func (t *ListDirTool) InvokableRun(ctx context.Context, arguments string, _ ...t
 // without entering them and offers no recursion, so a whole tree is walked one
 // directory at a time. It never carries the absolute host path.
 func listDirInfo() *schema.ToolInfo {
-	return &schema.ToolInfo{Name: ListDirToolName, Desc: "List the entries of one directory in the configured read root using the active local Luna subprocess plugin. The path must be relative to the read root, the directory this server was started in, and \".\" means the read root itself; an absolute path or one outside the read root is refused. Exactly one level is listed: a subdirectory appears as an entry and is not entered, and there is no recursion option. Each line gives the kind (dir, file, link, other), a size for regular files and the name; directories come first, then files and links, each sorted by name. A directory with more entries than one listing renders says how many were left out instead of dropping them silently.", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(listDirSchema())}
+	return &schema.ToolInfo{Name: ListDirToolName, Desc: "List the entries of one directory in one of the directories this session works in using the active local Luna subprocess plugin. The path must be relative to one of the directories this session works in (a single configured root when it works in none), and \".\" means the first of them; an absolute path or one outside them is refused. Exactly one level is listed: a subdirectory appears as an entry and is not entered, and there is no recursion option. Each line gives the kind (dir, file, link, other), a size for regular files and the name; directories come first, then files and links, each sorted by name. A directory with more entries than one listing renders says how many were left out instead of dropping them silently.", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(listDirSchema())}
 }
 
 // readFileInfo is the exact public schema of the file tool. The description
 // names the read root so the model does not have to guess what a relative path
 // is relative to; it never carries the absolute host path.
 func readFileInfo() *schema.ToolInfo {
-	return &schema.ToolInfo{Name: ReadFileToolName, Desc: "Read a text file from the configured read root using the active local Luna subprocess plugin. The path must be relative to the read root, the directory this server was started in; an absolute path or one outside the read root is refused.", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(readFileSchema())}
+	return &schema.ToolInfo{Name: ReadFileToolName, Desc: "Read a text file from one of the directories this session works in using the active local Luna subprocess plugin. The path must be relative to one of the directories this session works in (a single configured root when it works in none); an absolute path or one outside them is refused.", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(readFileSchema())}
 }
 
 // SearchFilesTool is the model-visible literal-search tool. It is the third
@@ -546,7 +568,7 @@ func (t *SearchFilesTool) Info(context.Context) (*schema.ToolInfo, error) {
 // for one.
 func searchFilesSchema() *jsonschema.Schema {
 	type args struct {
-		Path  string `json:"path" jsonschema_description:"Directory to search below, or one file to search, relative to the configured read root; use \".\" for the read root itself"`
+		Path  string `json:"path" jsonschema_description:"Directory to search below, or one file to search, relative to one of the directories this session works in; use \".\" for the first of them"`
 		Query string `json:"query" jsonschema_description:"Literal text to find inside single lines; nothing in it is interpreted, so a regular expression is only those characters"`
 	}
 	r := jsonschema.Reflector{DoNotReference: true, AllowAdditionalProperties: false}
@@ -579,7 +601,7 @@ func (t *SearchFilesTool) InvokableRun(ctx context.Context, arguments string, _ 
 	// As with a read or a listing, the requested path is passed through
 	// unchanged: the host resolves and validates it against the read root before
 	// any plugin sees it, and the literal is validated there too.
-	out, err := t.searcher.SearchFiles(ctx, pluginhost.SearchRequest{Path: in.Path, Query: in.Query})
+	out, err := t.searcher.SearchFiles(ctx, pluginhost.SearchRequest{Path: in.Path, Query: in.Query, Roots: roots(ctx)})
 	if err != nil {
 		if stopped := ctx.Err(); stopped != nil {
 			return stopCall(ctx, SearchFilesToolName, stopped, out, startedAt)
@@ -599,7 +621,7 @@ func (t *SearchFilesTool) InvokableRun(ctx context.Context, arguments string, _ 
 // says so when it stops, and a hit names its file relative to the path that was
 // searched. It never carries the absolute host path.
 func searchFilesInfo() *schema.ToolInfo {
-	return &schema.ToolInfo{Name: SearchFilesToolName, Desc: "Search the configured read root for a literal string, using the active local Luna subprocess plugin. Both arguments are required. path says where the search starts — a directory to search below, or one file — and must be relative to the read root, the directory this server was started in, where \".\" means the read root itself; an absolute path, a path outside the read root, or a path that is neither a file nor a directory is refused. query is the literal text to find, matched inside single lines exactly as written: there is no pattern language here, so a regular expression is searched as its own characters and a dot is a dot. A directory is walked below itself in path order, and a symbolic link is never followed, so a search cannot leave the read root. Each result line is <path>:<line>: <line text>, with <path> relative to the path that was searched. A search is bounded — how many matches are rendered, how long one line may be, how many files are read and how large a file may be all have caps — and when it stops at one it says which cap it reached and that the remaining paths were not searched, so a result that reports a cap has not seen the whole tree; content that is not text is counted rather than searched.", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(searchFilesSchema())}
+	return &schema.ToolInfo{Name: SearchFilesToolName, Desc: "Search one of the directories this session works in for a literal string, using the active local Luna subprocess plugin. Both arguments are required. path says where the search starts — a directory to search below, or one file — and must be relative to one of the directories this session works in (a single configured root when it works in none), where \".\" means the first of them; an absolute path, a path outside them, or a path that is neither a file nor a directory is refused. query is the literal text to find, matched inside single lines exactly as written: there is no pattern language here, so a regular expression is searched as its own characters and a dot is a dot. A directory is walked below itself in path order, and a symbolic link is never followed, so a search cannot leave them. Each result line is <path>:<line>: <line text>, with <path> relative to the path that was searched. A search is bounded — how many matches are rendered, how long one line may be, how many files are read and how large a file may be all have caps — and when it stops at one it says which cap it reached and that the remaining paths were not searched, so a result that reports a cap has not seen the whole tree; content that is not text is counted rather than searched.", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(searchFilesSchema())}
 }
 
 var (
@@ -975,7 +997,7 @@ func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err
 	recorder := newRecorder(req.Sink, r.transcript, req.SessionID, req.RunID)
 	// The run identity travels in the context so a capability's tools can
 	// attribute what they store without being handed the session themselves.
-	ctx := plugin.WithRun(WithRun(parent, req.RunID, recorder), plugin.RunInfo{RunID: req.RunID, SessionID: req.SessionID})
+	ctx := plugin.WithRun(WithRoots(WithRun(parent, req.RunID, recorder), req.Roots), plugin.RunInfo{RunID: req.RunID, SessionID: req.SessionID})
 	emit(ctx, Event{Type: "run.started", Data: RunStarted{RunID: req.RunID, SessionID: req.SessionID}})
 	defer func() {
 		status := runStatus(err)

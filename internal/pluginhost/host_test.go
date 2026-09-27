@@ -427,6 +427,87 @@ func TestReadRootDefaultsToTheRepositoryRoot(t *testing.T) {
 	}
 }
 
+// A file call is checked against the roots that call names, not against whatever
+// the host was built with: the working directories of the run decide what the
+// model may reach. A call that names none keeps the configured root, which is
+// what makes every run that works in no particular directory behave as before.
+func TestFileCallsUseTheRootsTheyName(t *testing.T) {
+	// The three directories are siblings under one temporary parent, so a `..`
+	// from one root really can reach another: that is the shape a workspace
+	// with several directories has, and the one an escape check is easiest to
+	// get wrong in.
+	defaultRoot := t.TempDir()
+	a := t.TempDir()
+	b := t.TempDir()
+	for _, f := range []struct{ dir, name, content string }{
+		{defaultRoot, "default.txt", "configured root\n"},
+		{a, "a.txt", "from a\n"},
+		{b, "b.txt", "from b\n"},
+	} {
+		if err := os.WriteFile(filepath.Join(f.dir, f.name), []byte(f.content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := testHost(t, Options{ReadRoot: defaultRoot, ReadLimit: 4096})
+	ctx := context.Background()
+
+	// Every named root is reachable, whichever one holds the path.
+	for _, tc := range []struct {
+		path string
+		want string
+	}{{"a.txt", "from a\n"}, {"b.txt", "from b\n"}} {
+		out, err := h.ReadFile(ctx, ReadRequest{Path: tc.path, Roots: []string{a, b}})
+		if err != nil {
+			t.Fatalf("read %q with roots a and b: %v", tc.path, err)
+		}
+		if out.Result != tc.want {
+			t.Fatalf("read %q = %q, want %q", tc.path, out.Result, tc.want)
+		}
+	}
+	// The listing and the search are checked against the same roots.
+	if out, err := h.ListDir(ctx, ListRequest{Path: ".", Roots: []string{b}}); err != nil || !strings.Contains(out.Result, "b.txt") {
+		t.Fatalf("list of root b = %q, err = %v", out.Result, err)
+	}
+	if out, err := h.SearchFiles(ctx, SearchRequest{Path: ".", Query: "from a", Roots: []string{a}}); err != nil || !strings.Contains(out.Result, "a.txt") {
+		t.Fatalf("search under root a = %q, err = %v", out.Result, err)
+	}
+
+	// A root that is not named is not reachable, even when another root is.
+	if out, err := h.ReadFile(ctx, ReadRequest{Path: "b.txt", Roots: []string{a}}); !errors.Is(err, fileread.ErrNotFound) {
+		t.Fatalf("read of b.txt with only root a = %q, err = %v, want ErrNotFound", out.Result, err)
+	}
+	if out, err := h.ListDir(ctx, ListRequest{Path: ".", Roots: []string{a}}); err != nil {
+		t.Fatalf("list of root a: %v", err)
+	} else if strings.Contains(out.Result, "b.txt") {
+		t.Fatalf("listing root a named a file of root b: %q", out.Result)
+	}
+
+	// A `..` out of one named root into another is refused: roots are tried in
+	// order, and the escape is not something a later root can legalize.
+	if out, err := h.ReadFile(ctx, ReadRequest{Path: "../" + filepath.Base(b) + "/b.txt", Roots: []string{a, b}}); !errors.Is(err, fileread.ErrPathEscape) {
+		t.Fatalf("read through a sibling root = %q, err = %v, want ErrPathEscape", out.Result, err)
+	}
+	if _, err := h.SearchFiles(ctx, SearchRequest{Path: "../" + filepath.Base(a), Query: "x", Roots: []string{a, b}}); !errors.Is(err, fileread.ErrPathEscape) {
+		t.Fatalf("search through a sibling root err = %v, want ErrPathEscape", err)
+	}
+	// An absolute path is refused however many roots are named, including one
+	// that names a file a root really holds.
+	if _, err := h.ReadFile(ctx, ReadRequest{Path: filepath.Join(b, "b.txt"), Roots: []string{a, b}}); !errors.Is(err, fileread.ErrPathAbsolute) {
+		t.Fatalf("absolute path err = %v, want ErrPathAbsolute", err)
+	}
+
+	// No roots named at all is the configured root, unchanged.
+	if out, err := h.ReadFile(ctx, ReadRequest{Path: "default.txt"}); err != nil || out.Result != "configured root\n" {
+		t.Fatalf("read with no roots = %q, err = %v", out.Result, err)
+	}
+	if out, err := h.ReadFile(ctx, ReadRequest{Path: "b.txt"}); !errors.Is(err, fileread.ErrNotFound) {
+		t.Fatalf("read of b.txt with no roots = %q, err = %v, want ErrNotFound", out.Result, err)
+	}
+	if _, err := h.ListDir(ctx, ListRequest{Path: "default.txt"}); !errors.Is(err, fileread.ErrNotDir) {
+		t.Fatalf("listing the configured root's file with no roots err = %v, want ErrNotDir", err)
+	}
+}
+
 func TestReadFilePinsInflightCallAndDrainsOnReload(t *testing.T) {
 	readRoot := t.TempDir()
 	if err := os.WriteFile(filepath.Join(readRoot, "notes.txt"), []byte("content\n"), 0o644); err != nil {

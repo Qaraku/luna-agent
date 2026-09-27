@@ -96,7 +96,7 @@ Memory 是官方内置能力（`internal/plugins/memory`），不再属于内核
 
 Workspace 是官方内置能力（`internal/plugins/workspace`），和 Memory 一样走同一套声明面，但它**没有工具、没有路由、没有面板，也不认领状态命名空间，更不要求任何权限**——它只贡献上下文，所以没有需要强制的东西可声明。
 
-**语义（用户确认）**：一个 Workspace 是**一组当前工作相关的目录**，可以一个也可以多个（例如同时包含 `luna-agent` 与 `luna-agent-dev`）。它不是"全局当前项目"，也不是权限范围：进程启动的 cwd 不是 Workspace，也**不定义**任何会话的工作目录。它服务于四件事——项目上下文发现、文件工具的默认范围（W2，尚未做）、项目级 instructions/config/skills 的查找、以及以后 terminal 之类能力的工作上下文。数据模型与存储在 `internal/workspace`（`{id, name, dirs}`，落在用户级数据目录的 `workspaces.json`，整体原子重写；名字重复会被拒并指出占用它的那个 id）。
+**语义（用户确认）**：一个 Workspace 是**一组当前工作相关的目录**，可以一个也可以多个（例如同时包含 `luna-agent` 与 `luna-agent-dev`）。它不是"全局当前项目"，也不是权限范围：进程启动的 cwd 不是 Workspace，也**不定义**任何会话的工作目录。它服务于四件事——项目上下文发现、文件工具的默认范围（已做）、项目级 instructions/config/skills 的查找、以及以后 terminal 之类能力的工作上下文。数据模型与存储在 `internal/workspace`（`{id, name, dirs}`，落在用户级数据目录的 `workspaces.json`，整体原子重写；名字重复会被拒并指出占用它的那个 id）。
 
 会话与 Workspace 的关联**复用会话自己的 `config` 记录**（与模型选择同一条记录、同一套"最后一条生效"语义），不新开第二种记录类型。**写入必须是合并**：只带 workspace 的记录会被读成"这条会话也没有模型"，下一次运行就静默回退到默认——反过来只带模型的记录会解绑 workspace。两个写入者各自只改自己那个字段、把另一个带过去，两侧都有测试钉住。
 
@@ -150,7 +150,7 @@ Skills 是**程序性知识**：做某类事的方式。它由内置的 `skills`
   "properties": {
     "path": {
       "type": "string",
-      "description": "Path of a text file, relative to the configured read root"
+      "description": "Path of a text file, relative to one of the directories this session works in"
     }
   },
   "required": ["path"],
@@ -166,7 +166,7 @@ Skills 是**程序性知识**：做某类事的方式。它由内置的 `skills`
   "properties": {
     "path": {
       "type": "string",
-      "description": "Directory path, relative to the configured read root; use \".\" for the read root itself"
+      "description": "Directory path, relative to one of the directories this session works in; use \".\" for the first of them"
     }
   },
   "required": ["path"],
@@ -178,9 +178,9 @@ Skills 是**程序性知识**：做某类事的方式。它由内置的 `skills`
 
 每个实现都是一个真实的 HashiCorp `go-plugin` net/rpc 子进程。它的 RPC 协议是核心/插件边界的私有协议。子进程只接收最小环境（`PATH`、`HOME`、`TMPDIR`，以及存在时的 `GOCACHE`），不接收 provider 的 OpenAI 环境变量。
 
-`luna_read_file` 把它的边界分成两半。`internal/fileread.Resolve` 在宿主上运行，是唯一解释模型提供的路径的地方：它规范化路径、拒绝绝对路径和 `..` 越界、解析符号链接，并拒绝任何不是仍位于读取根目录内的普通文件。随后插件拿到的是已解析的绝对路径加上大小上限，它自己从不解释路径。超过上限（默认 256 KiB，`-read-limit`）的读取和包含 NUL 字节的内容都会被明确报错拒绝，而不是被截断或猜测，错误字符串绝不携带宿主绝对路径。文件不存在时报告为 `file not found: "<the path the model asked for>"`；宿主说明发生了什么，而不说明路径越过了哪个内部边界。读取根目录默认为解析出的仓库根目录，由 `-read-root` 设置。上述每一种拒绝都以调用结果的形式到达模型，而不是让运行失败——见 SSE 契约中的 `tool.failed` 条目。
+`luna_read_file` 把它的边界分成两半。`internal/fileread.Resolve` 在宿主上运行，是唯一解释模型提供的路径的地方：它规范化路径、拒绝绝对路径和 `..` 越界、解析符号链接，并拒绝任何不是仍位于读取根目录内的普通文件。随后插件拿到的是已解析的绝对路径加上大小上限，它自己从不解释路径。超过上限（默认 256 KiB，`-read-limit`）的读取和包含 NUL 字节的内容都会被明确报错拒绝，而不是被截断或猜测，错误字符串绝不携带宿主绝对路径。文件不存在时报告为 `file not found: "<the path the model asked for>"`；宿主说明发生了什么，而不说明路径越过了哪个内部边界。**可读范围按会话决定**：会话绑定了 Workspace 时，范围就是那个 Workspace 的目录集合，按顺序尝试、第一个包含该路径的目录胜出；**一个目录里逃出去的路径不会被旁边的兄弟目录救回来**（多根不等于放宽检查，绝对路径与 `..` 越界在任何一根下都仍然被拒）。没有绑定的会话回退到单一读根（默认为解析出的仓库根，`-read-root` 可改），这正是 Workspace 存在之前每个会话的行为。**绑定的 workspace 已经不存在时这次运行直接失败**（`409`，并说明绑的是哪个），而不是回退到配置的根：回退会是一个不同、可能更宽的地方——静默让模型读到比会话要求更多的东西，比说清绑定坏了更糟。上述每一种拒绝都以调用结果的形式到达模型，而不是让运行失败——见 SSE 契约中的 `tool.failed` 条目。
 
-`luna_list_dir` 复用同一套边界，而不是另写一套。`internal/fileread.ResolveDir` 与 `Resolve` 走同一次规范化、同一次越界拒绝和同一次符号链接解析（两者共用的 `resolveWithinRoot`），差别只在解析结果要满足什么：读要求普通文件，列举要求目录。读根也只有一个——宿主级 `Options.ReadRoot`（`-read-root`），所以列举永远到不了读取到不了的地方；绝对路径、`..` 越界、不存在的路径和不是目录的路径都在任何 RPC 之前被拒绝。插件拿到的是已校验的绝对目录路径与两个上限（条目数默认 200、单行默认 160 字节，两者目前没有对应的命令行开关），自己从不解释路径。列举刻意只有一层：子目录作为条目出现而不进入，一次列举也不会跟随符号链接，因此它不可能长成对整个读取根的无界遍历。每行给出类型（`dir` / `file` / `link` / `other`）、普通文件的大小和名字；目录排在文件与链接之前，各组内按名字保持稳定顺序；命中条目数上限或单行上限时，结果会说明被留下的条目、或被截断的名字及其真实长度，而不是静默返回一个前缀。这些拒绝与读取的一样，以调用结果的形式到达模型，而不是让运行失败。
+`luna_list_dir` 复用同一套边界，而不是另写一套。`internal/fileread.ResolveDir` 与 `Resolve` 走同一次规范化、同一次越界拒绝和同一次符号链接解析（两者共用的 `resolveWithinRoot`），差别只在解析结果要满足什么：读要求普通文件，列举要求目录。**与读取用的是同一组根**（同一次多根解析，`ResolveDirInRoots` 与 `ResolveInRoots` 共用一套检查），所以列举永远到不了读取到不了的地方；绝对路径、`..` 越界、不存在的路径和不是目录的路径都在任何 RPC 之前被拒绝。插件拿到的是已校验的绝对目录路径与两个上限（条目数默认 200、单行默认 160 字节，两者目前没有对应的命令行开关），自己从不解释路径。列举刻意只有一层：子目录作为条目出现而不进入，一次列举也不会跟随符号链接，因此它不可能长成对整个读取根的无界遍历。每行给出类型（`dir` / `file` / `link` / `other`）、普通文件的大小和名字；目录排在文件与链接之前，各组内按名字保持稳定顺序；命中条目数上限或单行上限时，结果会说明被留下的条目、或被截断的名字及其真实长度，而不是静默返回一个前缀。这些拒绝与读取的一样，以调用结果的形式到达模型，而不是让运行失败。
 
 允许的候选从 `plugins/<tool>/<candidate>/` 编译，全部来自根应用源码：
 
@@ -431,6 +431,8 @@ Skills 改动由确定性门禁覆盖，并做了一次**不需要凭据的进�
 Skill 启停改动由确定性门禁覆盖，并做了一次**不需要凭据的进程级验证**（假 provider 扮演"见到 skill 就想读"的模型，于是三个层面各自被证明）：停用前清单在系统消息里、停用后不在；`GET /api/skills` 如实报告 `enabled=false` 与理由；被停用的名字再被调用时**被拒**，且拒的是"它在设置里被关掉了"而**不是**"没有这个 skill"——后者是错误信息，会让人去找一个明明装着的 skill。两次运行都正常结束。界面那一侧由隔离 Chromium 覆盖（打开设置 → 技能页 → 看到行 → 点停用 → 断言真的发了请求、且按服务端答复重绘）。**未验证**：真实模型对停用前后行为差异的观察、以及项目级 skill 来源（`project` scope 仍无生产者）。
 
 Workspace 数据模型改动由确定性门禁覆盖，并做了一次**不需要凭据的进程级验证**：两个临时目录各放一个带标记的 `AGENTS.md`，用接口建一个包含这两个目录的 Workspace、把它关联到一个会话，再跑一次看假 provider 收到的系统消息。四项判据：两个目录名都进了上下文；两个目录的规则文本都进了上下文；**宿主绝对路径没有进入系统消息**；没有关联 Workspace 的会话走回退（那两个标记都不出现）。界面一侧由隔离 Chromium 覆盖（切到有关联的会话看到标识、切到无关联的标识消失、390 px 不溢出）。跨字段合并由两条接口测试分别钉住：绑定 workspace 不丢模型、选模型不解绑 workspace。**未验证**：多目录时真的把预算顶到上限后的裁剪行为（只断言了内容进与不进）、以及文件工具的实际范围按 Workspace 收缩（那是 W2，尚未做）。
+
+文件工具范围改动由确定性门禁覆盖，并做了一次**不需要凭据的进程级验证**：建一个含两个目录的 Workspace 并绑定到一个会话，让假 provider 依次要求读 `a.txt`、`b.txt`、`../outside/o.txt`。四项判据：第一个目录里的文件读得到；**第二个目录里的文件也读得到**（多根不是只认第一个）；越界路径被拒（理由是 `path escapes the read root with a .. component`）；**未绑定 Workspace 的会话读同一个相对路径得到 `file not found`**——回退到配置的根，不是读得更多。多根那一层另有缺陷侧验证：把"只检查第一个根"或某处 `..` 检查去掉时，对应用例变红。
 
 ## 非目标
 
