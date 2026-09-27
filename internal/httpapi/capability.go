@@ -92,7 +92,17 @@ type capabilityView struct {
 	Contributions []contributionView `json:"contributions"`
 	Claims        []claimView        `json:"claims"`
 	Permissions   []permissionView   `json:"permissions"`
+	Panels        []panelView        `json:"panels"`
 	Error         string             `json:"error,omitempty"`
+}
+
+// panelView is a browser panel a capability contributes: what the host needs to
+// render an entry for it and mount the module behind it. The module itself comes
+// from the capability's own route.
+type panelView struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	Entry string `json:"entry"`
 }
 
 type contributionView struct {
@@ -141,6 +151,12 @@ func capabilityViewOf(entry plugin.Entry) capabilityView {
 	}
 	for _, p := range entry.Descriptor.Permissions {
 		view.Permissions = append(view.Permissions, permissionView{Kind: string(p.Kind)})
+	}
+	view.Panels = make([]panelView, 0, len(entry.Descriptor.Contributions))
+	if provider, ok := entry.Plugin.(plugin.PanelProvider); ok {
+		for _, panel := range provider.Panels() {
+			view.Panels = append(view.Panels, panelView{ID: panel.ID, Title: panel.Title, Entry: panel.Entry})
+		}
 	}
 	if entry.Err != nil {
 		view.Error = entry.Err.Error()

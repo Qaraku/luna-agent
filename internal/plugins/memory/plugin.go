@@ -30,6 +30,13 @@ const (
 	// RetractRoutePath retracts one fact, named by its text and its timestamp.
 	RetractRoutePath = "/api/memory/retract"
 
+	// PanelID, PanelTitle and PanelEntryPath are the browser panel this
+	// capability contributes. The entry is served by the capability's own route,
+	// which is why it sits under the route prefix the capability claims.
+	PanelID        = "memory"
+	PanelTitle     = "记忆"
+	PanelEntryPath = "/api/memory/panel.js"
+
 	// stateNamespace is the state directory the plugin writes into. It is the
 	// repository's existing convention: the default state root is the repository
 	// root and the plugin's own file inside it keeps the name memory.jsonl, so
@@ -87,6 +94,8 @@ func Descriptor() plugin.Descriptor {
 			{Kind: plugin.ContributionContext, ID: FactsContextID, BudgetBytes: FactsBudgetBytes},
 			{Kind: plugin.ContributionRoute, ID: MemoryRoutePath},
 			{Kind: plugin.ContributionRoute, ID: RetractRoutePath},
+			{Kind: plugin.ContributionRoute, ID: PanelEntryPath},
+			{Kind: plugin.ContributionPanel, ID: PanelID},
 		},
 		Claims: []plugin.Claim{
 			{Kind: plugin.ClaimRoutePrefix, ID: MemoryRoutePath},
@@ -114,14 +123,22 @@ func (p *Plugin) Routes() []plugin.Route {
 	return []plugin.Route{
 		factsRoute{store: p.store},
 		retractRoute{store: p.store},
+		panelRoute{},
 	}
 }
 
-// The three provider interfaces the descriptor declares. Contexts renders the
+// Panels is the browser surface this capability contributes: one panel, whose
+// content the host never has to know about.
+func (p *Plugin) Panels() []plugin.Panel {
+	return []plugin.Panel{{ID: PanelID, Title: PanelTitle, Entry: PanelEntryPath}}
+}
+
+// The four provider interfaces the descriptor declares. Contexts renders the
 // injected facts block and lives in context.go; the compile-time assertions make
 // a drift between the descriptor and the implementation impossible to miss.
 var (
 	_ plugin.ToolProvider    = (*Plugin)(nil)
 	_ plugin.ContextProvider = (*Plugin)(nil)
 	_ plugin.RouteProvider   = (*Plugin)(nil)
+	_ plugin.PanelProvider   = (*Plugin)(nil)
 )
