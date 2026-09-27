@@ -113,9 +113,17 @@ HTTP/SSE 契约、会话与记忆格式、模型可调用工具的任何改动�
 | T1 | 文件工具补齐：列目录、字面量内容搜索、按行范围读、按名字 glob 查找 | `822550f`、`df9828f`、`777c858`、`e177fb3` | 包含在 `v0.3.0` |
 | U1 | 界面收口：界面只呈现运行事实而不是内部状态、侧栏只做导航、设置里能看到能力 | `e7a854a`、`ef9074f`、`23d8af5` | 包含在 `v0.3.0` |
 
+### v0.3.0 验收
+
+- 门禁在发布提交的**干净提取副本**（`git archive`，不含 `.evidence/` 与 `.runtime/`）上运行：`go test -race -count=1 ./...`（18 个包全过）、`go vet ./...`、`go build -o .runtime/luna ./cmd/luna`、`gofmt -l internal cmd plugins`（无输出）、`node --check web/app.js`、`node --test web/app.test.cjs`（98/98）、`git diff --check`。
+- 隔离 Chromium 在同一份副本上运行：前端假 SSE 夹具 23/23（会话与工作区标识、记忆面板的查看与撤回、命令表与 `/model`、设置里的能力行与 Skills 行、窄屏与键盘），页面壳 7/7（CSP 下无违规、首帧主题在应用脚本之前生效、除 favicon 外无 404）。
+- **真实 provider 运行**（`deepseek-flash` / `api.deepseek.com`）：凭据只经子 shell 的 `source` 注入，从不打印、复制或写入仓库；会话、记忆、状态与 XDG 根都指向临时目录。接口在这一棵树上确实在答（`/api/state` 报告五个插件工具各自的代次与三个能力、`/api/models` 报告当前模型与来源、`/api/commands` 报告 `/help` 与 `/model`）；一次真实运行里模型调用 `luna_find_files` 与 `luna_read_file` 后作答（1325 个 `assistant.delta`，首块 0.44s、末块 5.36s，`usage.updated` 报告 1490 输出 token），答案引用的是工具返回的真实路径与字节数；一次真实运行被 Stop 停止，恰好一个 `run.cancelled{reason:"user"}`（取消请求得到其冻结的 `202`）；一次多步调查在 36 次工具调用之后被 `exceeds max iterations` 中止——那正是上面记下的已知限制，本轮不修。
+- 验收过程本身的一处副作用，如实记录：第一轮用 `zsh -lc` 启动服务，登录 shell 会把 `XDG_DATA_HOME` 重新指回 `$HOME/.local/share`，于是那次运行把一个指向临时目录的 workspace 写进了用户真实的 `~/.local/share/luna/`。该文件已移到 `.evidence/v0.3.0/side-effect-user-data/`，随之产生的空目录已删除；从第二轮起改为在登录初始化**之后**再 `export` 隔离根，隔离才真正生效（workspace 落在临时 XDG 目录，用户目录未被再次触碰）。结论：用登录 shell 跑隔离验证时，环境变量必须在 `source` 之后导出。
+- 未验证：真实 provider 上的长任务质量（正是会被上限截断的那一类）；记忆检索、Terminal、MCP 等尚未实现的能力；模型在真实 provider 上对 Skills 的选择（只有假 provider 的证据）。
+
 ### v0.3.0 已知限制
 
-- **一次运行能进行的工具调用轮次仍被一个固定的低上限截断**：正常的多步任务（例如让 Luna 调查自身的实现）会在十几次工具调用后被 `exceeds max iterations` 中止。这是下一步要修的真实缺陷，本版本如实记录，不声称长任务可用。
+- **一次运行能进行的工具调用轮次仍被一个固定的低上限截断**：正常的多步任务会在十几次到几十次工具调用之后被 `run node[ChatModel] pre processor fail: exceeds max iterations` 中止（用户在自己界面里的一次自我调查是 13 次工具调用，本版验收里的一次多步调查是 36 次）。这是下一步要修的真实缺陷，本版本如实记录，不声称长任务可用。
 - 用户级目录中只有 **config 根有使用者**（`config.yaml` / `settings.yaml` / `data/skills` / `data/workspaces.json`）；数据、状态、缓存与 runtime 四个根只有解析与测试，会话与记忆仍写在仓库根下，**没有搬迁**。
 - 项目级 skills（每个 Workspace 目录的 `.luna/skills`）与 Workspace 的项目结构块尚未实现。
 - `README.md` 以英文为主（新增内容按所在章节的语言写），语言统一是独立决定。
