@@ -20,6 +20,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/agent"
 	"github.com/Qaraku/luna-agent/internal/config"
 	"github.com/Qaraku/luna-agent/internal/httpapi"
+	"github.com/Qaraku/luna-agent/internal/layout"
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
@@ -195,6 +196,35 @@ func fileReason(err error) string {
 	return err.Error()
 }
 
+// configFileFor decides which configuration file to read: an explicit
+// -config-file always wins, otherwise the file lives in the user's own
+// configuration directory, which is the one place a user can edit without
+// knowing anything about where Luna is installed.
+func configFileFor(explicit, configDir string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return filepath.Join(configDir, config.FileName)
+}
+
+// userConfig reads the user's configuration file and returns it, or nil when
+// there is none. A missing file is not an error: the environment alone is a
+// complete configuration, and it is the only one Luna had for a long time.
+//
+// Which file was read is reported, because a user who edited the file and sees
+// no effect needs to know whether Luna looked at it at all.
+func userConfig(path string) (*config.File, error) {
+	file, found, err := config.LoadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, nil
+	}
+	log.Printf("luna: reading user configuration from %s", path)
+	return &file, nil
+}
+
 // stateRoot resolves where capabilities keep their state: an explicit directory
 // wins, otherwise state lives under the resolved root next to the sessions. A
 // capability then claims a namespace inside it, and the kernel resolves that
@@ -222,8 +252,25 @@ func run() error {
 	sessionsFlag := flag.String("sessions-dir", "", "directory holding the append-only session files (default: <root>/.runtime/sessions/)")
 	stateFlag := flag.String("state-dir", "", "root directory holding capability state (default: <root>)")
 	rulesFlag := flag.String("rules-file", "", "file holding the project rules the workspace capability contributes (default: none)")
+	configFlag := flag.String("config-file", "", "user configuration file to read (default: <config-dir>/config.yaml)")
 	flag.Parse()
-	cfg, err := config.Load(os.Getenv)
+	// Where the user's own files live is a different question from where this
+	// copy of Luna is installed. The first follows the XDG directories, the
+	// second is found next to the executable; resolving them together is what
+	// made "the project" and "the installation" the same thing.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("locate the home directory: %w", err)
+	}
+	paths, err := layout.Resolve(os.Getenv, home)
+	if err != nil {
+		return err
+	}
+	configFile, err := userConfig(configFileFor(*configFlag, paths.Config))
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(os.Getenv, configFile)
 	if err != nil {
 		return err
 	}

@@ -42,55 +42,110 @@ func ParseReasoningEffort(value string) (string, error) {
 			return trimmed, nil
 		}
 	}
-	return "", fmt.Errorf("%s must be one of %s, or empty to send no reasoning_effort at all",
-		ReasoningEffortEnv, strings.Join(ReasoningEffortLevels, ", "))
+	return "", fmt.Errorf("reasoning effort must be one of %s, or empty to send no reasoning_effort at all (set %s, or reasoning_effort in the user configuration file)",
+		strings.Join(ReasoningEffortLevels, ", "), ReasoningEffortEnv)
 }
 
-func Load(getenv func(string) string) (Config, error) {
-	var missing []string
+// APIKeyEnv is the environment variable the key is read from when the
+// configuration file does not name another one.
+const APIKeyEnv = "OPENAI_API_KEY"
+
+// ModelEnvNames are the environment variables a model may be named by, tried in
+// this order. They are aliases of one another, not a precedence chain: two that
+// disagree are refused, because which one a launcher meant is not something this
+// package can know.
+var ModelEnvNames = []string{"OPENAI_MODEL_NAME", "OPENAI_MODEL", "OPENAI_MODEL_ID"}
+
+// Load resolves the configuration from its two sources: the environment, and
+// the user's configuration file. file may be nil, and then this is the
+// environment alone, which is how Luna has always been configured.
+//
+// Where the file states a value it wins, and the environment fills whatever it
+// leaves out. The order is that way round because the file is the more specific
+// statement: it is written for this user, while the environment may come from a
+// shell profile or a launcher shared with other tools.
+func Load(getenv func(string) string, file *File) (Config, error) {
 	base := strings.TrimSpace(getenv("OPENAI_BASE_URL"))
-	key := strings.TrimSpace(getenv("OPENAI_API_KEY"))
+	keyEnv := APIKeyEnv
+	key := strings.TrimSpace(getenv(keyEnv))
+	effort := strings.TrimSpace(getenv(ReasoningEffortEnv))
+	model, _, modelErr := modelFromEnv(getenv)
+	modelSource := strings.Join(ModelEnvNames, "/")
+
+	if file != nil {
+		stated := file.trimmed()
+		if stated.BaseURL != "" {
+			base = stated.BaseURL
+		}
+		if stated.ReasoningEffort != "" {
+			effort = stated.ReasoningEffort
+		}
+		if stated.APIKeyEnv != "" {
+			// The file names the variable, never the key itself; reading it is
+			// the same lookup the default goes through.
+			keyEnv = stated.APIKeyEnv
+			key = strings.TrimSpace(getenv(keyEnv))
+		}
+		if stated.Model != "" {
+			// A model stated by name settles it: the environment's aliases are
+			// no longer being asked.
+			model, modelErr = stated.Model, nil
+			modelSource = "model in the configuration file"
+		}
+	}
+	if modelErr != nil {
+		return Config{}, modelErr
+	}
+
+	var missing []string
 	if base == "" {
 		missing = append(missing, "OPENAI_BASE_URL")
 	}
 	if key == "" {
-		missing = append(missing, "OPENAI_API_KEY")
+		missing = append(missing, keyEnv)
+	}
+	if model == "" {
+		missing = append(missing, modelSource)
+	}
+	if len(missing) > 0 {
+		return Config{}, fmt.Errorf("missing required configuration: %s (set it in the environment, or in the user configuration file)", strings.Join(missing, ", "))
 	}
 
-	aliases := []string{"OPENAI_MODEL_NAME", "OPENAI_MODEL", "OPENAI_MODEL_ID"}
+	u, err := url.Parse(base)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return Config{}, fmt.Errorf("the provider base URL must be an absolute http(s) URL (set OPENAI_BASE_URL, or base_url in the user configuration file)")
+	}
+	level, err := ParseReasoningEffort(effort)
+	if err != nil {
+		return Config{}, err
+	}
+	return Config{BaseURL: base, APIKey: key, Model: model, ProviderHost: u.Hostname(), ReasoningEffort: level}, nil
+}
+
+// modelFromEnv reads the model from whichever alias is set. The second return
+// value names the aliases that were set, for a caller that has to say what it
+// looked for.
+func modelFromEnv(getenv func(string) string) (string, []string, error) {
 	values := map[string]string{}
-	for _, name := range aliases {
+	for _, name := range ModelEnvNames {
 		if value := strings.TrimSpace(getenv(name)); value != "" {
 			values[name] = value
 		}
 	}
-	if len(values) == 0 {
-		missing = append(missing, "OPENAI_MODEL_NAME/OPENAI_MODEL/OPENAI_MODEL_ID")
-	}
-	if len(missing) > 0 {
-		return Config{}, fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
-	}
-
 	var model string
 	var used []string
-	for _, name := range aliases {
-		if value, ok := values[name]; ok {
-			used = append(used, name)
-			if model == "" {
-				model = value
-			} else if model != value {
-				sort.Strings(used)
-				return Config{}, fmt.Errorf("conflicting model environment variables: %s", strings.Join(used, ", "))
-			}
+	for _, name := range ModelEnvNames {
+		value, ok := values[name]
+		if !ok {
+			continue
+		}
+		used = append(used, name)
+		if model == "" {
+			model = value
+		} else if model != value {
+			sort.Strings(used)
+			return "", nil, fmt.Errorf("conflicting model environment variables: %s", strings.Join(used, ", "))
 		}
 	}
-	u, err := url.Parse(base)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
-		return Config{}, fmt.Errorf("OPENAI_BASE_URL must be an absolute http(s) URL")
-	}
-	effort, err := ParseReasoningEffort(getenv(ReasoningEffortEnv))
-	if err != nil {
-		return Config{}, err
-	}
-	return Config{BaseURL: base, APIKey: key, Model: model, ProviderHost: u.Hostname(), ReasoningEffort: effort}, nil
+	return model, used, nil
 }

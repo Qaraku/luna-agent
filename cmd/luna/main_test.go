@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Qaraku/luna-agent/internal/config"
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	"github.com/Qaraku/luna-agent/internal/plugins/workspace"
@@ -372,5 +373,42 @@ func TestWorkingDirOrEmptyWhenDirectoryIsRemoved(t *testing.T) {
 	}
 	if got := workingDirOrEmpty(); got != "" {
 		t.Fatalf("got %q, want an empty string when the working directory is gone", got)
+	}
+}
+
+// The user's configuration file has one default location, under the user's own
+// configuration directory, and -config-file overrides it. Getting this wrong
+// would mean a user edits a file Luna never reads.
+func TestConfigFileDefaultsToTheUserConfigDirectory(t *testing.T) {
+	configDir := "/home/someone/.config/luna"
+	if got, want := configFileFor("", configDir), filepath.Join(configDir, config.FileName); got != want {
+		t.Fatalf("default = %q, want %q", got, want)
+	}
+	if got := configFileFor("/tmp/mine.yaml", configDir); got != "/tmp/mine.yaml" {
+		t.Fatalf("an explicit file must win, got %q", got)
+	}
+}
+
+// A missing file is the state most installations are in, so it must not be
+// reported as a problem; a file that exists is reported as read.
+func TestAMissingUserConfigIsNotAProblem(t *testing.T) {
+	file, err := userConfig(filepath.Join(t.TempDir(), config.FileName))
+	if err != nil {
+		t.Fatalf("a file that is not there is not an error: %v", err)
+	}
+	if file != nil {
+		t.Fatalf("file = %#v, want nil", file)
+	}
+
+	path := filepath.Join(t.TempDir(), config.FileName)
+	if err := os.WriteFile(path, []byte("model: demo-model\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err = userConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file == nil || file.Model != "demo-model" {
+		t.Fatalf("file = %#v, want the file that was there", file)
 	}
 }

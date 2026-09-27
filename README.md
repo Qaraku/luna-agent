@@ -146,11 +146,34 @@ Runtime candidate builds need the Go toolchain on `PATH`, because each reload co
 
 ### Configuration
 
+Settings come from two places: the environment, and a user configuration file.
+The file wins where it states a value and the environment fills in the rest, so
+a Luna that has always been configured by environment variables stays configured
+exactly as before, while one whose launcher cannot export variables can be
+configured by the file instead.
+
+The file is read from `$XDG_CONFIG_HOME/luna/config.yaml`
+(`~/.config/luna/config.yaml` by default), and `-config-file` points somewhere
+else. Luna only reads it: a file the user owns is not rewritten by the program,
+comments included.
+
+```yaml
+# ~/.config/luna/config.yaml
+model: your-model
+base_url: https://your-provider.example/v1
+api_key_env: OPENAI_API_KEY   # names the variable holding the key, never the key
+reasoning_effort: high
+```
+
+A missing file is not an error, an empty file is an empty configuration, and an
+unknown key is refused rather than ignored — a misspelled setting that does
+nothing is worse than one that fails to load. Startup says which file it read.
+
 | Variable | Required | Notes |
 |---|---|---|
-| `OPENAI_BASE_URL` | yes | OpenAI-compatible endpoint |
-| `OPENAI_API_KEY` | yes | Environment only; there is no browser or file path to it |
-| `OPENAI_MODEL_NAME` | yes | Canonical name |
+| `OPENAI_BASE_URL` | yes | OpenAI-compatible endpoint. `base_url` in the file overrides it |
+| `OPENAI_API_KEY` | yes | Environment only; there is no browser or file path to it. The file names the variable to read (`api_key_env`), never the value |
+| `OPENAI_MODEL_NAME` | yes | Canonical name. `model` in the file overrides it |
 | `OPENAI_MODEL` / `OPENAI_MODEL_ID` | no | Accepted aliases; if several are set their non-empty values must agree, otherwise startup fails with a clear error |
 | `LUNA_REASONING_EFFORT` | no | How hard the model should think before it answers, sent as the API's own `reasoning_effort`. One of `minimal`, `low`, `medium`, `high`, `none`. Unset means the field is not sent at all, so a provider that does not define it is unaffected. Whether a level changes anything is the provider's business: against `api.deepseek.com` it is accepted and makes no measurable difference |
 

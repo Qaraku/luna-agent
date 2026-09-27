@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -16,7 +18,7 @@ func TestLoadAcceptsAgreeingModelAliases(t *testing.T) {
 		"OPENAI_MODEL_NAME": "demo",
 		"OPENAI_MODEL":      "demo",
 		"OPENAI_MODEL_ID":   "demo",
-	}))
+	}), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,7 +31,7 @@ func TestLoadRejectsConflictingAliasesWithoutValues(t *testing.T) {
 	_, err := Load(env(map[string]string{
 		"OPENAI_BASE_URL": "https://example.test/v1", "OPENAI_API_KEY": "top-secret",
 		"OPENAI_MODEL_NAME": "model-a", "OPENAI_MODEL": "model-b",
-	}))
+	}), nil)
 	if err == nil {
 		t.Fatal("expected conflict")
 	}
@@ -45,7 +47,7 @@ func TestLoadRejectsConflictingAliasesWithoutValues(t *testing.T) {
 }
 
 func TestLoadReportsMissingNamesOnly(t *testing.T) {
-	_, err := Load(env(map[string]string{}))
+	_, err := Load(env(map[string]string{}), nil)
 	if err == nil {
 		t.Fatal("expected missing error")
 	}
@@ -66,7 +68,7 @@ func effortEnv(level string) func(string) string {
 }
 
 func TestLoadCarriesTheChosenReasoningEffort(t *testing.T) {
-	cfg, err := Load(effortEnv("  High "))
+	cfg, err := Load(effortEnv("  High "), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +78,7 @@ func TestLoadCarriesTheChosenReasoningEffort(t *testing.T) {
 }
 
 func TestLoadSendsNoReasoningEffortByDefault(t *testing.T) {
-	cfg, err := Load(effortEnv(""))
+	cfg, err := Load(effortEnv(""), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +89,7 @@ func TestLoadSendsNoReasoningEffortByDefault(t *testing.T) {
 
 func TestLoadRejectsALevelTheAPIDoesNotDefine(t *testing.T) {
 	for _, level := range []string{"ultra", "xhigh", "max"} {
-		_, err := Load(effortEnv(level))
+		_, err := Load(effortEnv(level), nil)
 		if err == nil {
 			t.Fatalf("%q was accepted", level)
 		}
@@ -97,5 +99,167 @@ func TestLoadRejectsALevelTheAPIDoesNotDefine(t *testing.T) {
 		if strings.Contains(err.Error(), level) {
 			t.Fatalf("%q: the error quotes the rejected value: %v", level, err)
 		}
+	}
+}
+
+// fileEnv is an environment that is complete on its own, so a test can show what
+// the file changes rather than what it fills in.
+func fileEnv() func(string) string {
+	return env(map[string]string{
+		"OPENAI_BASE_URL":   "https://env.example.test/v1",
+		"OPENAI_API_KEY":    "env-key",
+		"OPENAI_MODEL_NAME": "env-model",
+	})
+}
+
+func TestTheFileOverridesTheEnvironment(t *testing.T) {
+	cfg, err := Load(fileEnv(), &File{
+		Model:           "file-model",
+		BaseURL:         "https://file.example.test/v1",
+		ReasoningEffort: "high",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Model != "file-model" || cfg.ProviderHost != "file.example.test" || cfg.ReasoningEffort != "high" {
+		t.Fatalf("the environment won where the file stated a value: %#v", cfg)
+	}
+	if cfg.APIKey != "env-key" {
+		t.Fatal("the key must still come from the environment variable the file names")
+	}
+}
+
+// The point of the file is that a user can configure Luna without a launcher
+// that exports variables.
+func TestTheFileSuppliesWhatTheEnvironmentLacks(t *testing.T) {
+	cfg, err := Load(env(map[string]string{"OPENAI_API_KEY": "only-key"}), &File{
+		Model:   "file-model",
+		BaseURL: "https://file.example.test/v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Model != "file-model" || cfg.ProviderHost != "file.example.test" || cfg.APIKey != "only-key" {
+		t.Fatalf("unexpected config: %#v", cfg)
+	}
+}
+
+// Naming the variable keeps the key out of the file, and the error for a key
+// that is not set must name the variable the user chose.
+func TestTheFileNameWhichVariableHoldsTheKey(t *testing.T) {
+	cfg, err := Load(env(map[string]string{
+		"OPENAI_BASE_URL": "https://example.test/v1",
+		"MY_PROVIDER_KEY": "chosen-name-key",
+	}), &File{Model: "m", APIKeyEnv: "MY_PROVIDER_KEY"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.APIKey != "chosen-name-key" {
+		t.Fatal("the named variable was not read")
+	}
+
+	_, err = Load(env(map[string]string{
+		"OPENAI_BASE_URL": "https://example.test/v1",
+		"OPENAI_API_KEY":  "unused-default",
+	}), &File{Model: "m", APIKeyEnv: "MY_PROVIDER_KEY"})
+	if err == nil {
+		t.Fatal("a named variable that is not set must be reported")
+	}
+	if !strings.Contains(err.Error(), "MY_PROVIDER_KEY") {
+		t.Fatalf("the error must name the variable the file chose: %v", err)
+	}
+}
+
+// A launcher that exports two different model aliases is a conflict worth
+// reporting — unless the file settles the question, in which case the
+// environment is no longer being asked.
+func TestAFileModelSettlesAConflictingEnvironment(t *testing.T) {
+	conflicting := env(map[string]string{
+		"OPENAI_BASE_URL":   "https://example.test/v1",
+		"OPENAI_API_KEY":    "key",
+		"OPENAI_MODEL_NAME": "model-a",
+		"OPENAI_MODEL":      "model-b",
+	})
+	if _, err := Load(conflicting, nil); err == nil {
+		t.Fatal("the conflict must be reported when nothing else decides it")
+	}
+	cfg, err := Load(conflicting, &File{Model: "file-model"})
+	if err != nil {
+		t.Fatalf("a model stated in the file must settle it: %v", err)
+	}
+	if cfg.Model != "file-model" {
+		t.Fatalf("model = %q", cfg.Model)
+	}
+}
+
+func TestAMissingFileIsNotAnError(t *testing.T) {
+	file, found, err := LoadFile(filepath.Join(t.TempDir(), FileName))
+	if err != nil || found {
+		t.Fatalf("found=%v err=%v; a file that is not there is not a problem", found, err)
+	}
+	if file != (File{}) {
+		t.Fatalf("file = %#v, want the zero value", file)
+	}
+}
+
+func TestAnEmptyFileIsAnEmptyConfiguration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	if err := os.WriteFile(path, []byte("   \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, found, err := LoadFile(path)
+	if err != nil || !found || file != (File{}) {
+		t.Fatalf("found=%v err=%v file=%#v", found, err, file)
+	}
+}
+
+// A misspelled key that is ignored would leave the user with no effect and no
+// reason, which is the one outcome a configuration file must not produce.
+func TestAnUnknownKeyIsRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	if err := os.WriteFile(path, []byte("modell: demo\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := LoadFile(path); err == nil {
+		t.Fatal("an unknown key was accepted")
+	}
+}
+
+func TestAFileIsReadWithItsValuesTrimmed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	body := "model: \"  spaced-model  \"\nbase_url: \" https://example.test/v1 \"\nreasoning_effort: \" High \"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, found, err := LoadFile(path)
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	cfg, err := Load(env(map[string]string{"OPENAI_API_KEY": "k"}), &file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Model != "spaced-model" || cfg.ReasoningEffort != "high" || cfg.ProviderHost != "example.test" {
+		t.Fatalf("unexpected config: %#v", cfg)
+	}
+}
+
+// An error about a configuration file is read by someone who knows where their
+// own files are; the host's directory layout does not belong in it.
+func TestAFileErrorNamesTheFileNameOnly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, FileName)
+	if err := os.WriteFile(path, []byte("model: [unclosed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := LoadFile(path)
+	if err == nil {
+		t.Fatal("expected a parse error")
+	}
+	if strings.Contains(err.Error(), dir) {
+		t.Fatalf("the error leaks the absolute path: %v", err)
+	}
+	if !strings.Contains(err.Error(), FileName) {
+		t.Fatalf("the error does not name the file: %v", err)
 	}
 }
