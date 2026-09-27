@@ -9,7 +9,7 @@ const source = (name) => fs.readFileSync(path.join(root, name), 'utf8');
 
 // 无外部依赖的 DOM 适配器：执行完整 app.js 与真实页面结构，不模拟被测导航逻辑。
 // 几何、CSS 与浏览器原生 Tab 顺序仍由隔离浏览器验收负责。
-function navigationHarness({ narrow = false, hash = '', respond, dark = false, storage = new Map(), storageError = '' } = {}) {
+function navigationHarness({ narrow = false, hash = '', respond, dark = false, storage = new Map(), storageError = '', panelModules = {} } = {}) {
   const vm = require('node:vm');
   const listeners = () => ({
     handlers: new Map(),
@@ -205,6 +205,14 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
   };
   const context = vm.createContext({
     document, window, location, URLSearchParams, TextDecoder, console,
+    // 基座跑在 vm 里，而 vm 的动态导入回调需要 `--experimental-vm-modules`（门禁命令里没有这个
+    // 开关），所以能力面板那一处 `await import(url)` 在求值前被换成这个函数（见下面的替换与断言）。
+    // 没注册模块时按"加载失败"拒绝：与浏览器里模块拉不回来时的表现一致，现有的失败路径用例照旧。
+    importPanelModule: async (url) => {
+      const registered = panelModules[url];
+      if (!registered) throw new Error(`failed to fetch dynamically imported module: ${url}`);
+      return registered;
+    },
     history: { replaceState(_state, _title, url) { location._hash = url.includes('#') ? `#${url.split('#')[1]}` : ''; } },
     requestAnimationFrame: (fn) => { const frame = { run: fn }; frames.push(frame); return frame; },
     // 间隔定时器一并登记回调本身，所以 clearInterval 能把它从 poll() 的名单里摘掉；
@@ -241,7 +249,17 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
   const bootstrap = linked ? source('theme.js') : undefined;
   if (bootstrap) vm.runInContext(bootstrap, context, { filename: 'theme.js' });
   const bootstrapTheme = document.documentElement.dataset.theme;
-  vm.runInContext(source('app.js'), context, { filename: 'app.js' });
+  // 能力面板的模块加载在基座里换成注入的 importPanelModule（vm 的动态导入需要
+  // --experimental-vm-modules）。替换点必须**恰好一处**：app.js 里另一处动态导入是 UI 插件那条
+  // 路径（`await import(node.row.url)`），指名 `url` 才只命中能力面板这一处；数量不对就直接抛错，
+  // 否则这条缝会在某次改名后悄悄失效，而用它写的行为用例会变成空过。
+  const appSource = source('app.js');
+  const capabilityImport = 'await import(url)';
+  const importSites = appSource.split(capabilityImport).length - 1;
+  if (importSites !== 1) {
+    throw new Error(`navigationHarness: 期望 app.js 里恰好一处 "${capabilityImport}"，实际 ${importSites} 处`);
+  }
+  vm.runInContext(appSource.replace(capabilityImport, 'await importPanelModule(url)'), context, { filename: 'app.js' });
   const settle = async () => {
     await new Promise((resolve) => setImmediate(resolve));
     while (frames.length) frames.shift().run();
@@ -3400,6 +3418,44 @@ test('every shipped UI plugin module is a valid manifest and exports the host co
       assert.equal(typeof module[exportName], 'function', `${name} 必须导出 ${exportName} 函数`);
     }
   }
+});
+
+test('a capability panel mounts and its container is removed even when unmount throws', async () => {
+  // 这条覆盖的是能力面板的**行为**，不是文案：模块真的被 import 进来、mount 拿到宿主造的容器、
+  // 内容出现在面板里；关闭时模块的 unmount 抛错，容器仍然必须被移除（app.js 的
+  // teardownCapabilityPanel 先 try/catch 再 remove），并在面板日志里留下原因。
+  const mounted = [];
+  const unmounted = [];
+  const h = capabilityHarness({
+    panelModules: {
+      '/api/memory/panel.js': {
+        mount(target) { mounted.push(target); target.append(h.document.createTextNode('模块渲染的内容')); },
+        unmount(target) { unmounted.push(target); throw new Error('boom'); },
+      },
+    },
+  });
+  await h.settle();
+  const entry = h.capabilityToggle();
+  const drawer = h.$('capability-panel-memory');
+  assert.equal(drawer.querySelector('.capability-panel-target'), null, '打开前不预挂容器');
+
+  entry.click();
+  await h.settle();
+  assert.equal(drawer.hidden, false);
+  assert.equal(mounted.length, 1, '模块的 mount 被调用一次');
+  const target = drawer.querySelector('.capability-panel-target');
+  assert.ok(target, '宿主为模块准备了一个容器');
+  assert.equal(target, mounted[0], '挂载的就是宿主交给它的那个容器');
+  assert.match(target.textContent, /模块渲染的内容/, '面板里是模块渲染的东西');
+  assert.equal(drawer.querySelector('.capability-panel-error'), null, '挂载成功就没有错误行');
+
+  h.key('Escape');
+  await h.settle();
+  assert.equal(drawer.hidden, true);
+  assert.equal(unmounted.length, 1, '模块的 unmount 被调用一次');
+  assert.equal(drawer.querySelector('.capability-panel-target'), null, 'unmount 抛错也要把容器移除');
+  assert.match(drawer.querySelector('.ui-plugin-log').textContent, /关闭时清理失败，容器已移除：boom/,
+    '失败原因写在面板自己的日志里，而不是整页报错');
 });
 
 test('a capability panel that fails keeps its own message, unmount failure included', () => {
