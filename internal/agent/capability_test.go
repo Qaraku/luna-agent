@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/Qaraku/luna-agent/internal/plugin"
+	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 	jsonschema "github.com/eino-contrib/jsonschema"
@@ -136,6 +137,8 @@ func offeredNames(m *toolListModel) []string {
 
 // The core assembles the model's tools from two sources: the process-backed
 // wrappers it owns, and one wrapper per tool an enabled capability contributes.
+// luna_list_dir is offered here too: a tool the host is asked to serve must be
+// visible to the model, not merely registered somewhere.
 func TestTheModelSeesProcessToolsAndContributedTools(t *testing.T) {
 	m := &toolListModel{captureModel: captureModel{answer: "ok"}}
 	capability := &fakeCapability{id: "notes", tool: &fakeCapabilityTool{name: "notes_write", result: "written"}}
@@ -146,7 +149,7 @@ func TestTheModelSeesProcessToolsAndContributedTools(t *testing.T) {
 	if _, err := r.Run(context.Background(), RunRequest{Message: "hi", RunID: "run-1", Sink: &collectingSink{}}); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{ToolName, ReadFileToolName, "notes_write"}
+	want := []string{ToolName, ReadFileToolName, ListDirToolName, "notes_write"}
 	got := offeredNames(m)
 	if len(got) != len(want) {
 		t.Fatalf("offered tools = %v, want %v", got, want)
@@ -282,8 +285,22 @@ func TestADisabledCapabilityContributesNothing(t *testing.T) {
 	if _, err := r.Run(context.Background(), RunRequest{Message: "hi", RunID: "run-1", Sink: &collectingSink{}}); err != nil {
 		t.Fatal(err)
 	}
-	if got := offeredNames(m); len(got) != 2 {
-		t.Fatalf("offered tools = %v, want only the two process tools", got)
+	// A disabled capability contributes nothing, so exactly the tools the core runs
+	// itself are offered. Derived from the allowlist rather than counted by hand: a
+	// number that has to be edited whenever a tool is added stops testing "only the
+	// core's own tools" and starts testing "three".
+	want := map[string]bool{}
+	for _, spec := range pluginhost.Allowlist {
+		want[spec.Tool] = true
+	}
+	got := offeredNames(m)
+	if len(got) != len(want) {
+		t.Fatalf("offered tools = %v, want exactly the core's own tools", got)
+	}
+	for _, name := range got {
+		if !want[name] {
+			t.Fatalf("offered %q, which the core does not run itself: %v", name, got)
+		}
 	}
 	if system := m.first()[0].Content; strings.Contains(system, "Existing notes.") {
 		t.Fatalf("a disabled capability reached the prompt: %.160q", system)

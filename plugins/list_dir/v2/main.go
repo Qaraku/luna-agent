@@ -1,0 +1,34 @@
+// Command v2 is the directory-listing plugin candidate that reports exact byte
+// counts.
+//
+// It shares v1's boundary — one level only, no path is interpreted, no symbolic
+// link is followed, every cap is stated — and changes one thing in the returned
+// text so a replacement is observable in the tool result: a file's size is the
+// raw byte count instead of a human-readable unit.
+package main
+
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/Qaraku/luna-agent/internal/fileread"
+	"github.com/Qaraku/luna-agent/internal/pluginprotocol"
+	"github.com/hashicorp/go-plugin"
+)
+
+type tool struct{}
+
+func (tool) Metadata() (pluginprotocol.Metadata, error) {
+	return pluginprotocol.Metadata{Version: "v2", PID: os.Getpid(), Protocol: 1}, nil
+}
+func (tool) Invoke(in pluginprotocol.Input) (string, error) {
+	if in.DelayMS < 0 || in.DelayMS > 3000 {
+		return "", fmt.Errorf("delay_ms must be 0..3000")
+	}
+	time.Sleep(time.Duration(in.DelayMS) * time.Millisecond)
+	return fileread.List(in.Path, fileread.ListOptions{MaxEntries: in.MaxEntries, MaxLineBytes: in.MaxLineBytes, ExactBytes: true})
+}
+func main() {
+	plugin.Serve(&plugin.ServeConfig{HandshakeConfig: pluginprotocol.Handshake, Plugins: map[string]plugin.Plugin{"tool": &pluginprotocol.ToolPlugin{Impl: tool{}}}})
+}

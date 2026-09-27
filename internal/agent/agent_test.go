@@ -31,18 +31,28 @@ func (f fakeInvoker) Invoke(context.Context, pluginhost.Input) (pluginhost.Outpu
 	return f.out, f.err
 }
 
-// recordingReader captures the read request the tool wrapper produced, so a
-// test can prove the wrapper forwards the raw model-supplied path instead of
-// validating it itself.
+// recordingReader captures the read and list requests the tool wrappers
+// produced, so a test can prove a wrapper forwards the raw model-supplied path
+// instead of validating it itself. Reads and listings are recorded and can fail
+// separately: a test that makes one refuse must not accidentally make the other
+// refuse too.
 type recordingReader struct {
-	requests []pluginhost.ReadRequest
-	out      pluginhost.Output
-	err      error
+	requests     []pluginhost.ReadRequest
+	out          pluginhost.Output
+	err          error
+	listRequests []pluginhost.ListRequest
+	listOut      pluginhost.Output
+	listErr      error
 }
 
 func (r *recordingReader) ReadFile(_ context.Context, req pluginhost.ReadRequest) (pluginhost.Output, error) {
 	r.requests = append(r.requests, req)
 	return r.out, r.err
+}
+
+func (r *recordingReader) ListDir(_ context.Context, req pluginhost.ListRequest) (pluginhost.Output, error) {
+	r.listRequests = append(r.listRequests, req)
+	return r.listOut, r.listErr
 }
 
 type collectingSink struct {
@@ -250,7 +260,7 @@ func newNonStreamingTestRunner(t *testing.T, m model.ToolCallingChatModel, invok
 		Name:          "luna-test",
 		Instruction:   instruction,
 		Model:         m,
-		ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: []tool.BaseTool{NewTextTransformTool(invoker), NewReadFileTool(&recordingReader{})}}},
+		ToolsConfig:   adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: []tool.BaseTool{NewTextTransformTool(invoker), NewReadFileTool(&recordingReader{}), NewListDirTool(&recordingReader{})}}},
 		MaxIterations: 6,
 	})
 	if err != nil {
@@ -371,9 +381,9 @@ func TestRunnerExecutesMultipleToolCallsSequentially(t *testing.T) {
 
 type fakeModel struct{}
 
-// The core registers the two process-backed wrappers itself and adds one
+// The core registers the three process-backed wrappers itself and adds one
 // wrapper per contributed tool. With no capability registry configured that is
-// exactly two tools, and nothing else. This Eino version passes the tool list
+// exactly three tools, and nothing else. This Eino version passes the tool list
 // to the model as a model option rather than calling this method, so the live
 // observation of the offered set lives in
 // TestTheModelSeesProcessToolsAndContributedTools; this stays as the contract
@@ -383,7 +393,7 @@ func (fakeModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatModel
 	for _, t := range tools {
 		names = append(names, t.Name)
 	}
-	if len(names) != 2 || names[0] != ToolName || names[1] != ReadFileToolName {
+	if len(names) != 3 || names[0] != ToolName || names[1] != ReadFileToolName || names[2] != ListDirToolName {
 		return nil, io.ErrUnexpectedEOF
 	}
 	return fakeModel{}, nil
@@ -565,6 +575,135 @@ func TestReadFileToolHandsAHostRefusalToTheModel(t *testing.T) {
 	}
 }
 
+// The listing wrapper is the twin of the read wrapper: the call is announced,
+// the serving generation stays in the event stream, and only the rendered list
+// reaches the model.
+func TestListDirToolEmitsStartedThenFinishedAndHidesIdentityFromTheModel(t *testing.T) {
+	sink := &collectingSink{}
+	ctx := WithRun(context.Background(), "run-1", sink)
+	lister := &recordingReader{listOut: pluginhost.Output{Result: "2 entries: 1 dir, 1 file\n", Generation: 9, Version: "v1", PluginPID: 77}}
+	got, err := NewListDirTool(lister).InvokableRun(ctx, `{"path":"docs"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "2 entries: 1 dir, 1 file\n" {
+		t.Fatalf("model-visible tool output must be the rendered listing, got %q", got)
+	}
+	// The wrapper forwards the raw requested path; resolving it is the host's
+	// job, never the wrapper's and never the plugin's.
+	if len(lister.listRequests) != 1 || lister.listRequests[0].Path != "docs" {
+		t.Fatalf("wrapper requests=%+v", lister.listRequests)
+	}
+	for _, leak := range []string{"77", "v1", "Generation", "generation", "PluginPID", "plugin_pid", "PID", "9"} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("model-visible tool output leaked plugin identity %q: %q", leak, got)
+		}
+	}
+	if len(sink.events) != 2 || sink.events[0].Type != "tool.started" || sink.events[1].Type != "tool.finished" {
+		t.Fatalf("event order: %+v", sink.events)
+	}
+	started, ok := sink.events[0].Data.(ToolStarted)
+	if !ok || started.Name != ListDirToolName {
+		t.Fatalf("started payload: %#v", sink.events[0].Data)
+	}
+	args, ok := started.Arguments.(map[string]any)
+	if !ok || args["path"] != "docs" {
+		t.Fatalf("started arguments must carry the requested path: %#v", started.Arguments)
+	}
+	finished, ok := sink.events[1].Data.(ToolFinished)
+	if !ok || finished.Name != ListDirToolName {
+		t.Fatalf("finished payload: %#v", sink.events[1].Data)
+	}
+	if finished.Result != got || finished.Generation != 9 || finished.Version != "v1" || finished.PluginPID != 77 {
+		t.Fatalf("plugin identity must stay exact in the UI event: %+v", finished)
+	}
+}
+
+// A listing takes one path and nothing else. The recursion a model will reach
+// for first — a depth — is refused before the host sees it, because one listing
+// is one level by design.
+func TestListDirToolRejectsMalformedOrWideningArgumentsBeforeTheHost(t *testing.T) {
+	for _, arguments := range []string{`{}`, `{"path":""}`, `{"path":"."}{"path":"."}`, `{"path":".","depth":2}`, `{"path":".","recursive":true}`, `{"path":".","glob":"**/*.go"}`, `not json`, ``} {
+		sink := &collectingSink{}
+		ctx := WithRun(context.Background(), "run-1", sink)
+		lister := &recordingReader{listOut: pluginhost.Output{Result: "should not be reached"}}
+		got, err := NewListDirTool(lister).InvokableRun(ctx, arguments)
+		if err != nil {
+			t.Fatalf("arguments %q became a run error instead of a refusal: %v", arguments, err)
+		}
+		if !strings.HasPrefix(got, refusalPrefix) {
+			t.Fatalf("arguments %q refusal = %q", arguments, got)
+		}
+		if len(lister.listRequests) != 0 {
+			t.Fatalf("arguments %q reached the host: %+v", arguments, lister.listRequests)
+		}
+		if len(sink.events) != 2 || sink.events[0].Type != "tool.started" || sink.events[1].Type != "tool.failed" {
+			t.Fatalf("arguments %q events=%+v", arguments, sink.events)
+		}
+		failed := sink.events[1].Data.(ToolFailed)
+		if failed.Name != ListDirToolName || failed.Error == "" {
+			t.Fatalf("arguments %q failed payload=%+v", arguments, failed)
+		}
+	}
+}
+
+func TestListDirSchemaIsStrictAndOffersNoRecursion(t *testing.T) {
+	info, err := NewListDirTool(&recordingReader{}).Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Name != ListDirToolName {
+		t.Fatalf("tool name = %q", info.Name)
+	}
+	if !strings.Contains(info.Desc, "one level") || !strings.Contains(info.Desc, "recursion") {
+		t.Fatalf("the description must say that one call is one level and that there is no recursion option: %q", info.Desc)
+	}
+	s, err := info.ParamsOneOf.ToJSONSchema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(s)
+	var raw map[string]any
+	_ = json.Unmarshal(b, &raw)
+	if raw["type"] != "object" || raw["additionalProperties"] != false {
+		t.Fatalf("schema is not strict: %s", b)
+	}
+	req := raw["required"].([]any)
+	if len(req) != 1 || req[0] != "path" {
+		t.Fatalf("the schema required list must be exactly the path: %s", b)
+	}
+	properties, _ := raw["properties"].(map[string]any)
+	if len(properties) != 1 {
+		t.Fatalf("the listing offers more than a path: %s", b)
+	}
+}
+
+// A refusal by the host (here: a path that is not a directory) is handed to the
+// model as the tool's result, so the run continues and the user gets an
+// explanation instead of a failed run.
+func TestListDirToolHandsAHostRefusalToTheModel(t *testing.T) {
+	sink := &collectingSink{}
+	ctx := WithRun(context.Background(), "run-1", sink)
+	lister := &recordingReader{listErr: fmt.Errorf("%w: %q", fileread.ErrNotDir, "go.mod")}
+	got, err := NewListDirTool(lister).InvokableRun(ctx, `{"path":"go.mod"}`)
+	if err != nil {
+		t.Fatalf("a refused listing must not become a run error: %v", err)
+	}
+	if !strings.HasPrefix(got, refusalPrefix) || !strings.Contains(got, fileread.ErrNotDir.Error()) {
+		t.Fatalf("model-visible refusal = %q", got)
+	}
+	if !strings.Contains(got, "go.mod") {
+		t.Fatalf("the refusal must name the path the model asked for: %q", got)
+	}
+	if len(sink.events) != 2 || sink.events[0].Type != "tool.started" || sink.events[1].Type != "tool.failed" {
+		t.Fatalf("events=%+v", sink.events)
+	}
+	failed := sink.events[1].Data.(ToolFailed)
+	if failed.Name != ListDirToolName || failed.Error == "" {
+		t.Fatalf("failed payload=%+v", failed)
+	}
+}
+
 // Infrastructure failures still fail the run: the tool never ran, so the model
 // has nothing to explain and the failure belongs to the system rather than to
 // the call the model made.
@@ -574,6 +713,9 @@ func TestPluginBackedToolsKeepInfrastructureFailuresFatal(t *testing.T) {
 		ctx := WithRun(context.Background(), "run-1", sink)
 		if _, err := NewReadFileTool(&recordingReader{err: infra}).InvokableRun(ctx, `{"path":"docs/architecture.md"}`); !errors.Is(err, infra) {
 			t.Fatalf("read_file error = %v, want %v to stay fatal", err, infra)
+		}
+		if _, err := NewListDirTool(&recordingReader{listErr: infra}).InvokableRun(ctx, `{"path":"."}`); !errors.Is(err, infra) {
+			t.Fatalf("list_dir error = %v, want %v to stay fatal", err, infra)
 		}
 		if _, err := NewTextTransformTool(fakeInvoker{err: infra}).InvokableRun(ctx, `{"text":"x"}`); !errors.Is(err, infra) {
 			t.Fatalf("text_transform error = %v, want %v to stay fatal", err, infra)
@@ -686,6 +828,106 @@ func (m *refusalAwareModel) Stream(ctx context.Context, input []*schema.Message,
 		return nil, err
 	}
 	return schema.StreamReaderFromArray([]*schema.Message{msg}), nil
+}
+
+// listModel calls the listing tool once and then answers, recording the tool
+// result the model actually saw so a test can assert on the listing text rather
+// than on the model's prose.
+type listModel struct {
+	path       string
+	toolResult string
+}
+
+func (m *listModel) WithTools([]*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+	return m, nil
+}
+func (m *listModel) Generate(_ context.Context, input []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+	for _, msg := range input {
+		if msg.Role == schema.Tool {
+			m.toolResult = msg.Content
+			return schema.AssistantMessage("Listed the directory.", nil), nil
+		}
+	}
+	return schema.AssistantMessage("", []schema.ToolCall{{ID: "call-1", Type: "function", Function: schema.FunctionCall{Name: ListDirToolName, Arguments: fmt.Sprintf(`{"path":%q}`, m.path)}}}), nil
+}
+func (m *listModel) Stream(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	msg, err := m.Generate(ctx, input, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return schema.StreamReaderFromArray([]*schema.Message{msg}), nil
+}
+
+// The listing tool runs through the real subprocess plugin behind Eino, against
+// the repository root, and the model receives the rendered listing: the entries
+// of the read root, with a kind and a size each.
+func TestFakeModelListsTheReadRootThroughEinoEndToEnd(t *testing.T) {
+	root, _ := filepath.Abs("../..")
+	h, err := pluginhost.New(context.Background(), root, pluginhost.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	m := &listModel{path: "."}
+	r, err := NewRunner(context.Background(), m, h, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &collectingSink{}
+	answer, err := r.Run(context.Background(), RunRequest{Message: "what is in this project", RunID: "run-list", Sink: sink})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer != "Listed the directory." {
+		t.Fatalf("answer=%q", answer)
+	}
+	types := []string{}
+	for _, e := range sink.events {
+		types = append(types, e.Type)
+	}
+	want := []string{"run.started", "tool.started", "tool.finished", "assistant.delta", "run.finished"}
+	if strings.Join(types, ",") != strings.Join(want, ",") {
+		t.Fatalf("events=%v", types)
+	}
+	started := sink.events[1].Data.(ToolStarted)
+	if started.Name != ListDirToolName {
+		t.Fatalf("started=%+v", started)
+	}
+	finished := sink.events[2].Data.(ToolFinished)
+	if finished.Name != ListDirToolName {
+		t.Fatalf("finished=%+v", finished)
+	}
+	if finished.Generation != 1 || finished.Version != "v1" || finished.PluginPID <= 0 {
+		t.Fatalf("finished identity=%+v", finished)
+	}
+	if m.toolResult != finished.Result {
+		t.Fatalf("the model did not receive the listing the tool produced: model=%q tool=%q", m.toolResult, finished.Result)
+	}
+	// The read root really does hold these, and the listing has to name each one
+	// with its kind: the point of the tool is that a model can tell a directory
+	// from a file without reading anything, and the whole point of the tool is
+	// that this happens on real repository contents.
+	lines := strings.Split(strings.TrimRight(finished.Result, "\n"), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("the listing has no entries:\n%s", finished.Result)
+	}
+	kinds := map[string]string{}
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		if len(fields) > 0 {
+			kinds[fields[len(fields)-1]] = fields[0]
+		}
+	}
+	for name, wantKind := range map[string]string{"cmd": "dir", "internal": "dir", "docs": "dir", "go.mod": "file", "README.md": "file"} {
+		if kinds[name] != wantKind {
+			t.Fatalf("%q was listed as %q, want %q:\n%s", name, kinds[name], wantKind, finished.Result)
+		}
+	}
+	// The listing is not a recursive dump: it reports the entries of the root
+	// itself, so a path that only exists below it must not appear.
+	if strings.Contains(finished.Result, "internal/agent") || strings.Contains(finished.Result, "app.js") {
+		t.Fatalf("the listing went below one level:\n%s", finished.Result)
+	}
 }
 
 // The user-visible defect this guards: asking for a file that is not there used

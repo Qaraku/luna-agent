@@ -50,6 +50,18 @@ func pluginState(tools ...string) pluginhost.State {
 	return state
 }
 
+// everyAllowlistedTool builds a state in which each tool the core may run is
+// active. It is derived from the allowlist instead of naming the tools by hand: a
+// test that has to be edited whenever a tool is added stops checking that every
+// tool is reported and starts checking that some strings were typed again.
+func everyAllowlistedTool() pluginhost.State {
+	tools := make([]string, 0, len(pluginhost.Allowlist))
+	for _, spec := range pluginhost.Allowlist {
+		tools = append(tools, spec.Tool)
+	}
+	return pluginState(tools...)
+}
+
 // newTestStore is a real session store in a temporary directory, so the session
 // API is exercised through its real implementation rather than a stub.
 func newTestStore(t *testing.T) *store.Store {
@@ -68,7 +80,7 @@ func testHandler(t *testing.T, r Runner) http.Handler {
 
 func handlerWithStore(t *testing.T, r Runner, sessions Sessions) http.Handler {
 	t.Helper()
-	p := &fakePlugins{state: pluginState(pluginhost.ToolTextTransform, pluginhost.ToolReadFile)}
+	p := &fakePlugins{state: everyAllowlistedTool()}
 	return New(p, r, sessions, Info{BoundHost: "127.0.0.1:43210", Model: "fake-model", ProviderHost: "provider.test", WebDir: "../../web"})
 }
 

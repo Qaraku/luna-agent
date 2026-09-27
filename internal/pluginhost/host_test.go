@@ -127,8 +127,9 @@ func TestRealSubprocessReplacementPinsInflightAndRollsBack(t *testing.T) {
 		t.Fatalf("bad replacement: %+v", second)
 	}
 	// The pinned transform generation is retained; the reader's old generation
-	// had nothing in flight and is already gone.
-	if len(h.State().Plugins) != 3 {
+	// had nothing in flight and is already gone. One record per tool, plus the one
+	// generation that is still serving the call it started.
+	if len(h.State().Plugins) != len(Allowlist)+1 {
 		t.Fatalf("old generation not retained exactly once: %+v", h.State().Plugins)
 	}
 	if reader := active(t, h, ToolReadFile); reader.Version != "v2" || reader.Generation != second.Generation {
@@ -146,7 +147,7 @@ func TestRealSubprocessReplacementPinsInflightAndRollsBack(t *testing.T) {
 		t.Fatalf("lost pin: %+v", out1)
 	}
 	waitFor(t, func() bool {
-		return len(h.State().Plugins) == 2 && syscall.Kill(first.PluginPID, 0) == syscall.ESRCH
+		return len(h.State().Plugins) == len(Allowlist) && syscall.Kill(first.PluginPID, 0) == syscall.ESRCH
 	})
 	before := map[string]Record{}
 	for _, tool := range []string{ToolTextTransform, ToolReadFile} {

@@ -9,13 +9,23 @@ var Handshake = plugin.HandshakeConfig{ProtocolVersion: 1, MagicCookieKey: "LUNA
 
 // Input is the plugin RPC request. Text/DelayMS serve the text-transform
 // plugin; Path/MaxBytes serve the file-read plugin, where Path is an absolute
-// path the host has already validated against the read root. A plugin never
-// receives a model- or browser-supplied path in Path.
+// path the host has already validated against the read root. Path/MaxEntries/
+// MaxLineBytes serve the directory-listing plugin, where Path is the same kind
+// of validated absolute path — a directory — and the two caps bound how much of
+// it one listing renders. A plugin never receives a model- or browser-supplied
+// path in Path.
 type Input struct {
 	Text     string `json:"text"`
 	Path     string `json:"path"`
 	MaxBytes int    `json:"max_bytes"`
-	DelayMS  int    `json:"delay_ms"`
+	// MaxEntries and MaxLineBytes carry the listing caps: at most that many
+	// entries are rendered, and one rendered line is at most that many bytes.
+	// A plugin that is sent no cap falls back to its own default rather than
+	// rendering an unbounded listing, and it states the cap it hit in the
+	// result instead of cutting the list silently.
+	MaxEntries   int `json:"max_entries"`
+	MaxLineBytes int `json:"max_line_bytes"`
+	DelayMS      int `json:"delay_ms"`
 }
 type Metadata struct {
 	Version  string

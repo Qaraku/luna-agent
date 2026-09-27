@@ -24,11 +24,13 @@ import (
 )
 
 const (
-	// ToolName and ReadFileToolName are the model-visible names of the two
-	// allowlisted tools. The names come from the plugin host's allowlist, so the
-	// core cannot register a tool the host cannot route or replace.
+	// ToolName, ReadFileToolName and ListDirToolName are the model-visible names
+	// of the plugin-backed tools. The names come from the plugin host's
+	// allowlist, so the core cannot register a tool the host cannot route or
+	// replace.
 	ToolName         = pluginhost.ToolTextTransform
 	ReadFileToolName = pluginhost.ToolReadFile
+	ListDirToolName  = pluginhost.ToolListDir
 )
 
 // instruction is the whole system instruction the core owns. It states how to
@@ -36,7 +38,7 @@ const (
 // because a capability describes its own tool and contributes its own reference
 // block. Text that would have to change when a capability changes does not
 // belong here.
-const instruction = "You are Luna, a truthful local demo. Use luna_text_transform whenever the user explicitly requests text transformation or explicitly asks to call it; it returns exactly what the active candidate produced, so when the result equals the input, say so plainly instead of guessing that the plugin is broken. Use luna_read_file when the user asks you to read a file; the path must be relative to the configured read root, which holds the local text files you may read. A tool that refuses a call returns a result that begins \"the tool refused this call:\" followed by the reason: report that reason in the user's own language, and do not retry the same call or describe the tool as unavailable. Do not claim tools or actions that were not observed."
+const instruction = "You are Luna, a truthful local demo. Use luna_text_transform whenever the user explicitly requests text transformation or explicitly asks to call it; it returns exactly what the active candidate produced, so when the result equals the input, say so plainly instead of guessing that the plugin is broken. Use luna_list_dir to see what a directory contains — when the user asks what is in a directory or in the project, or when you need to discover a path before reading it; the path must be relative to the configured read root, and one call lists one level only: subdirectories are named but not entered, and there is no option to list a whole tree in one call, so walk a repository one directory per call. Use luna_read_file when the user asks you to read a file; the path must be relative to the configured read root, which holds the local text files you may read. A tool that refuses a call returns a result that begins \"the tool refused this call:\" followed by the reason: report that reason in the user's own language, and do not retry the same call or describe the tool as unavailable. Do not claim tools or actions that were not observed."
 
 type Event struct {
 	Type string `json:"type"`
@@ -299,11 +301,14 @@ func emitMessageUsage(ctx context.Context, runID string, message *schema.Message
 	emitUsage(ctx, runID, message.ResponseMeta.Usage)
 }
 
-// FileReader is the host-side file tool. The wrapper hands it the raw path from
-// the model; validating that path against the read root is the host's job, not
-// the tool wrapper's and never the plugin's.
-type FileReader interface {
+// FileTools is the host-side file capability the core's plugin-backed file tools
+// depend on: reading one file, and listing one directory. Both wrappers hand it
+// the raw path from the model; validating that path against the read root is the
+// host's job, not the tool wrapper's and never the plugin's. Listing carries no
+// recursion knob, so the interface cannot ask for more than one level.
+type FileTools interface {
 	ReadFile(context.Context, pluginhost.ReadRequest) (pluginhost.Output, error)
+	ListDir(context.Context, pluginhost.ListRequest) (pluginhost.Output, error)
 }
 
 type TextTransformTool struct{ invoker Invoker }
@@ -374,9 +379,9 @@ func (t *TextTransformTool) InvokableRun(ctx context.Context, arguments string, 
 	return out.Result, nil
 }
 
-type ReadFileTool struct{ reader FileReader }
+type ReadFileTool struct{ reader FileTools }
 
-func NewReadFileTool(r FileReader) *ReadFileTool { return &ReadFileTool{reader: r} }
+func NewReadFileTool(r FileTools) *ReadFileTool { return &ReadFileTool{reader: r} }
 func (t *ReadFileTool) Info(context.Context) (*schema.ToolInfo, error) {
 	return readFileInfo(), nil
 }
@@ -428,6 +433,71 @@ func toolInfo() *schema.ToolInfo {
 	return &schema.ToolInfo{Name: ToolName, Desc: "Transform text using the active local Luna subprocess plugin.", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(strictToolSchema())}
 }
 
+// ListDirTool is the model-visible directory-listing tool. It is the listing
+// twin of ReadFileTool: the wrapper refuses a malformed call, the host refuses a
+// path the read root does not hold, and the plugin only ever renders a directory
+// the host resolved.
+type ListDirTool struct{ lister FileTools }
+
+func NewListDirTool(l FileTools) *ListDirTool { return &ListDirTool{lister: l} }
+func (t *ListDirTool) Info(context.Context) (*schema.ToolInfo, error) {
+	return listDirInfo(), nil
+}
+
+// listDirSchema is deliberately one parameter. A recursion depth, a glob or a
+// filter would turn one listing into an unbounded walk of the read root, so the
+// schema offers no way to ask for one.
+func listDirSchema() *jsonschema.Schema {
+	type args struct {
+		Path string `json:"path" jsonschema_description:"Directory path, relative to the configured read root; use \".\" for the read root itself"`
+	}
+	r := jsonschema.Reflector{DoNotReference: true, AllowAdditionalProperties: false}
+	s := r.Reflect(args{})
+	s.Required = []string{"path"}
+	return s
+}
+
+func (t *ListDirTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.Option) (string, error) {
+	var raw any
+	if err := json.Unmarshal([]byte(arguments), &raw); err != nil {
+		raw = arguments
+	}
+	startedAt := time.Now()
+	emit(ctx, Event{Type: "tool.started", Data: ToolStarted{RunID: runID(ctx), Name: ListDirToolName, Arguments: raw}})
+	var in struct {
+		Path string `json:"path"`
+	}
+	err := decodeOne(arguments, &in)
+	if err != nil || in.Path == "" {
+		if err == nil {
+			err = fmt.Errorf("path is required")
+		}
+		return refuse(ctx, ListDirToolName, pluginhost.Output{}, err, startedAt)
+	}
+	// As with a read, the requested path is passed through unchanged: the host
+	// resolves and validates it against the read root before any plugin sees it.
+	out, err := t.lister.ListDir(ctx, pluginhost.ListRequest{Path: in.Path})
+	if err != nil {
+		if stopped := ctx.Err(); stopped != nil {
+			return stopCall(ctx, ListDirToolName, stopped, out, startedAt)
+		}
+		return refuse(ctx, ListDirToolName, out, err, startedAt)
+	}
+	emit(ctx, Event{Type: "tool.finished", Data: ToolFinished{RunID: runID(ctx), Name: ListDirToolName, Result: out.Result, DurationMS: callDurationMS(startedAt), Generation: out.Generation, Version: out.Version, PluginPID: out.PluginPID}})
+	// Only the rendered listing is model-visible; the serving generation,
+	// version and process identity stay in the event stream for the UI.
+	return out.Result, nil
+}
+
+// listDirInfo is the exact public schema of the listing tool. The description
+// states the two things a model gets wrong about a directory tool: the path is
+// relative to the read root, and one call is one level — it names subdirectories
+// without entering them and offers no recursion, so a whole tree is walked one
+// directory at a time. It never carries the absolute host path.
+func listDirInfo() *schema.ToolInfo {
+	return &schema.ToolInfo{Name: ListDirToolName, Desc: "List the entries of one directory in the configured read root using the active local Luna subprocess plugin. The path must be relative to the read root, the directory this server was started in, and \".\" means the read root itself; an absolute path or one outside the read root is refused. Exactly one level is listed: a subdirectory appears as an entry and is not entered, and there is no recursion option. Each line gives the kind (dir, file, link, other), a size for regular files and the name; directories come first, then files and links, each sorted by name. A directory with more entries than one listing renders says how many were left out instead of dropping them silently.", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(listDirSchema())}
+}
+
 // readFileInfo is the exact public schema of the file tool. The description
 // names the read root so the model does not have to guess what a relative path
 // is relative to; it never carries the absolute host path.
@@ -438,6 +508,7 @@ func readFileInfo() *schema.ToolInfo {
 var (
 	_ tool.InvokableTool = (*TextTransformTool)(nil)
 	_ tool.InvokableTool = (*ReadFileTool)(nil)
+	_ tool.InvokableTool = (*ListDirTool)(nil)
 )
 
 type Runner struct {
@@ -451,14 +522,14 @@ type Runner struct {
 }
 
 // NewRunner builds the agent and its tool set. Every model-visible tool is
-// registered here, by the core: the two plugin-backed wrappers, and one wrapper
+// registered here, by the core: the three plugin-backed wrappers, and one wrapper
 // per tool contributed by an enabled capability.
-func NewRunner(ctx context.Context, m model.ToolCallingChatModel, invoker Invoker, reader FileReader, opts ...Option) (*Runner, error) {
+func NewRunner(ctx context.Context, m model.ToolCallingChatModel, invoker Invoker, files FileTools, opts ...Option) (*Runner, error) {
 	r := &Runner{}
 	for _, opt := range opts {
 		opt(r)
 	}
-	tools := []tool.BaseTool{NewTextTransformTool(invoker), NewReadFileTool(reader)}
+	tools := []tool.BaseTool{NewTextTransformTool(invoker), NewReadFileTool(files), NewListDirTool(files)}
 	for _, contributed := range r.capabilityTools() {
 		tools = append(tools, contributed)
 	}
@@ -470,7 +541,7 @@ func NewRunner(ctx context.Context, m model.ToolCallingChatModel, invoker Invoke
 	return r, nil
 }
 
-func NewOpenAIRunner(ctx context.Context, cfg config.Config, invoker Invoker, reader FileReader, opts ...Option) (*Runner, error) {
+func NewOpenAIRunner(ctx context.Context, cfg config.Config, invoker Invoker, files FileTools, opts ...Option) (*Runner, error) {
 	modelConfig := &openai.ChatModelConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL, Model: cfg.Model}
 	if cfg.ReasoningEffort != "" {
 		// Only set when a level was chosen: the field is then left out of the
@@ -484,7 +555,7 @@ func NewOpenAIRunner(ctx context.Context, cfg config.Config, invoker Invoker, re
 	if err != nil {
 		return nil, err
 	}
-	return NewRunner(ctx, m, invoker, reader, opts...)
+	return NewRunner(ctx, m, invoker, files, opts...)
 }
 
 // The history cap is stated here, in the S2a spec's terms: a run's model input

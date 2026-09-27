@@ -25,6 +25,7 @@ import (
 const (
 	ToolTextTransform = "luna_text_transform"
 	ToolReadFile      = "luna_read_file"
+	ToolListDir       = "luna_list_dir"
 )
 
 // ToolSpec is one allowlisted tool: its model-visible name, the directory under
@@ -52,6 +53,7 @@ func (s ToolSpec) allows(candidate string) bool {
 var Allowlist = []ToolSpec{
 	{Tool: ToolTextTransform, Dir: "text_transform", Candidates: []string{"v1", "v2", "broken"}},
 	{Tool: ToolReadFile, Dir: "read_file", Candidates: []string{"v1", "v2", "broken"}},
+	{Tool: ToolListDir, Dir: "list_dir", Candidates: []string{"v1", "v2", "broken"}},
 }
 
 // Infrastructure failures mean the tool never ran because its owned plugin
@@ -116,18 +118,37 @@ type Options struct {
 	BuildTimeout time.Duration
 	StartTimeout time.Duration
 	RPCTimeout   time.Duration
-	// ReadRoot bounds luna_read_file. It defaults to the repository root and is
-	// resolved once, at construction, so the containment check compares real
-	// directories rather than symbolic links.
+	// ReadRoot bounds luna_read_file and luna_list_dir. It defaults to the
+	// repository root and is resolved once, at construction, so the containment
+	// check compares real directories rather than symbolic links.
 	ReadRoot string
 	// ReadLimit is the single-read size cap in bytes. It defaults to
 	// fileread.DefaultLimit (256 KiB).
 	ReadLimit int
+	// ListMaxEntries and ListMaxLineBytes are the two listing caps: at most this
+	// many entries are rendered, and one rendered line is at most this many
+	// bytes. They default to fileread.DefaultListEntries and
+	// fileread.DefaultListLineBytes, and each is stated in the result when it is
+	// reached.
+	ListMaxEntries   int
+	ListMaxLineBytes int
 }
 
 // ReadRequest is a file-read request from the core. Path is the raw,
 // model-supplied path: the host validates it and the plugin never sees it.
 type ReadRequest struct {
+	Path string
+	// DelayMS is an operations and test knob for holding an RPC in flight. It
+	// is never exposed to the model.
+	DelayMS int
+}
+
+// ListRequest is a directory-listing request from the core. Path is the raw,
+// model-supplied path, on the same terms as ReadRequest: the host validates it
+// against the read root and the plugin only ever sees the resolved absolute
+// path. There is deliberately no recursion knob: one listing is one level, and
+// no request can widen that.
+type ListRequest struct {
 	Path string
 	// DelayMS is an operations and test knob for holding an RPC in flight. It
 	// is never exposed to the model.
@@ -175,6 +196,12 @@ func (h *Host) withDefaults() {
 	}
 	if o.ReadLimit <= 0 {
 		o.ReadLimit = fileread.DefaultLimit
+	}
+	if o.ListMaxEntries <= 0 {
+		o.ListMaxEntries = fileread.DefaultListEntries
+	}
+	if o.ListMaxLineBytes <= 0 {
+		o.ListMaxLineBytes = fileread.DefaultListLineBytes
 	}
 	if o.ReadRoot == "" {
 		o.ReadRoot = h.root
@@ -368,6 +395,27 @@ func (h *Host) ReadFile(ctx context.Context, req ReadRequest) (Output, error) {
 		return Output{}, err
 	}
 	return h.invoke(ctx, ToolReadFile, Input{Path: absolute, MaxBytes: h.opts.ReadLimit, DelayMS: req.DelayMS})
+}
+
+// ListDir calls the directory-listing tool. The requested path is validated here,
+// on the host side, exactly as a read path is — same normalization, same
+// containment, same symbolic-link resolution — and the plugin is handed only the
+// resolved absolute directory path plus the two caps. A refusal (an absolute
+// path, a `..` escape, something that is not a directory, a nonexistent path) is
+// therefore made before any RPC, so no plugin process ever sees a path the
+// read root does not hold.
+func (h *Host) ListDir(ctx context.Context, req ListRequest) (Output, error) {
+	if len(req.Path) > 4096 {
+		return Output{}, fmt.Errorf("path must not exceed 4096 bytes")
+	}
+	if req.DelayMS < 0 || req.DelayMS > 3000 {
+		return Output{}, fmt.Errorf("delay_ms must be 0..3000")
+	}
+	absolute, err := fileread.ResolveDir(h.opts.ReadRoot, req.Path)
+	if err != nil {
+		return Output{}, err
+	}
+	return h.invoke(ctx, ToolListDir, Input{Path: absolute, MaxEntries: h.opts.ListMaxEntries, MaxLineBytes: h.opts.ListMaxLineBytes, DelayMS: req.DelayMS})
 }
 func (h *Host) invoke(ctx context.Context, tool string, in Input) (Output, error) {
 	h.mu.Lock()

@@ -38,7 +38,7 @@ type fakePluginManager struct{ state pluginhost.State }
 func (m fakePluginManager) State() pluginhost.State              { return m.state }
 func (m fakePluginManager) Reload(context.Context, string) error { return nil }
 
-// stubInvoker and stubReader fill the two process-backed tools the Kernel owns.
+// stubInvoker and stubReader fill the process-backed tools the Kernel owns.
 // No test here reaches them: the model below never calls a tool.
 type stubInvoker struct{}
 
@@ -49,6 +49,10 @@ func (stubInvoker) Invoke(context.Context, pluginhost.Input) (pluginhost.Output,
 type stubReader struct{}
 
 func (stubReader) ReadFile(context.Context, pluginhost.ReadRequest) (pluginhost.Output, error) {
+	return pluginhost.Output{}, nil
+}
+
+func (stubReader) ListDir(context.Context, pluginhost.ListRequest) (pluginhost.Output, error) {
 	return pluginhost.Output{}, nil
 }
 
