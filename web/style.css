@@ -541,9 +541,10 @@ body {
 
 /* --- 一次运行的内联时间线 ---------------------------------------------------
    运行中的每一步按它真实发生的顺序排在这条时间线里：阶段行（模型这一段开始）、
-   推理（provider 给了才有）、运行说明、工具卡片、用量，回答主体永远收尾。
-   条目一律紧凑、次级（12px 及以下、文字用 muted），回答主体保持自己的字号与
-   行距，仍是这个回合的视觉主体。 */
+   推理（provider 给了才有）、运行说明、工具卡片，回答主体永远收尾。
+   过程条目一律紧凑、次级（12px 及以下、文字用 muted），推理默认折叠成一行；
+   回答主体保持自己的字号与行距，并与过程之间隔开，仍是这个回合的视觉主体。
+   用量属于整轮，落在标题那一行的元信息里，不在这条时间线中间。 */
 
 .run-meta {
   min-width: 0;
@@ -557,8 +558,14 @@ body {
 .run-meta[data-state="failed"] { color: var(--luna-danger); }
 .run-timeline { display: flex; flex-direction: column; min-width: 0; }
 .run-timeline > * + * { margin-top: var(--luna-space-1); }
-/* 回答主体是时间线的最后一条，与前面的过程留一档间距。 */
-.run-timeline > * + .assistant-body { margin-top: var(--luna-space-3); }
+/* 回答主体是时间线的最后一条，也是这个回合的视觉主体：与上面的过程条目之间用
+   一档更大的间距加一条分隔线分开，字号与行距保持正文尺度（过程条目一律 12px
+   及以下、muted）。一次直接回答没有过程条目，这里的分隔与内边距不生效。 */
+.run-timeline > * + .assistant-body {
+  margin-top: var(--luna-space-4);
+  padding-top: var(--luna-space-3);
+  border-top: 1px solid var(--luna-border-weak);
+}
 .run-phase {
   display: flex;
   align-items: center;
@@ -567,7 +574,9 @@ body {
   color: var(--luna-text-muted);
   font-size: var(--luna-font-meta);
 }
-/* 推理条目：一行标号 + 逐步增长的正文。正文高度有界、自己滚动，整条可折起来。 */
+/* 推理条目：一行标号 + 折叠时的实时预览 + 展开后的全文。默认折叠，所以这个回合
+   的主体始终是回答；折叠时那一行仍然跟着事件增长，用户看得到推理在长。全文有界、
+   自己滚动，一次很长的推理不会把回答顶出视野。 */
 .run-reasoning { margin: 0; }
 .run-reasoning > summary {
   display: flex;
@@ -587,6 +596,17 @@ body {
 .run-reasoning > summary::after { content: "▸"; margin-left: auto; color: var(--luna-text-subtle); font-size: 10px; }
 .run-reasoning[open] > summary::after { content: "▾"; }
 .run-reasoning-label { flex: 0 0 auto; color: var(--luna-text-subtle); font-size: var(--luna-font-label); }
+/* 折叠时的实时预览：只占一行，随最新到达的文字滑动，所以折起来也看得出它在长。 */
+.run-reasoning-preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--luna-text-muted);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+/* 展开后正文已经给出全文，那一行不再重复一遍预览。 */
+.run-reasoning[open] > summary .run-reasoning-preview { display: none; }
 .run-reasoning-body {
   margin: 0;
   max-height: 32dvh;
@@ -608,13 +628,6 @@ body {
   overflow-wrap: anywhere;
 }
 .run-note-label { margin-right: var(--luna-space-1); color: var(--luna-text-subtle); font-size: var(--luna-font-label); }
-.run-usage {
-  margin: 0;
-  padding: var(--luna-space-1) var(--luna-space-2);
-  color: var(--luna-text-subtle);
-  font-size: var(--luna-font-label);
-  font-variant-numeric: tabular-nums;
-}
 .run-incomplete { margin: var(--luna-space-2) 0 0; color: var(--luna-text-muted); font-size: var(--luna-font-meta); line-height: 1.7; }
 .latest-button {
   position: absolute;

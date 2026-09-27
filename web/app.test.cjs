@@ -223,8 +223,12 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
       return { ok: true, json: async () => payload };
     }
   });
-  const bootstrap = source('index.html').match(/<script id="theme-bootstrap">([\s\S]*?)<\/script>/)?.[1];
-  if (bootstrap) vm.runInContext(bootstrap, context, { filename: 'theme-bootstrap' });
+  // 首帧主题现在是一个外置脚本（内联脚本会被服务的 CSP 拒绝），所以从 theme.js 取源码，
+  // 而 index.html 只负责在样式表之前引用它——这条断言同时守住"必须是同步引用"。
+  const linked = source('index.html').match(/<script src="\/theme\.js"><\/script>/);
+  assert.ok(linked, 'index.html 必须在样式表之前同步引用 /theme.js');
+  const bootstrap = linked ? source('theme.js') : undefined;
+  if (bootstrap) vm.runInContext(bootstrap, context, { filename: 'theme.js' });
   const bootstrapTheme = document.documentElement.dataset.theme;
   vm.runInContext(source('app.js'), context, { filename: 'app.js' });
   const settle = async () => {
@@ -1771,7 +1775,7 @@ test('words spoken before a tool call become a run note, not part of the answer'
   const notes = view.notes();
   assert.equal(notes.length, 1);
   assert.match(notes[0].textContent, /运行说明：我先读一下这个文件。/);
-  assert.deepEqual(view.phases().map((node) => node.textContent), ['模型开始回应'], '阶段行在说明之前');
+  assert.deepEqual(view.phases().map((node) => node.textContent), ['第 1 段回应'], '阶段行在说明之前');
   assert.deepEqual(view.order(), ['run-phase', 'run-note', 'tool-row running', 'assistant-body placeholder'],
     '时间线按真实顺序排列：阶段行 → 运行说明 → 工具卡片 → 回答（这一轮还没写出回答）');
   assert.equal(view.statusLabel.textContent, '正在使用工具：读取文件');
@@ -1787,7 +1791,7 @@ test('words spoken before a tool call become a run note, not part of the answer'
   await h.settle();
   assert.equal(view.body.textContent, '读完了。');
   assert.equal(view.notes().length, 1, '运行说明只有一条，也没有被复制进回答');
-  assert.deepEqual(view.phases().map((node) => node.textContent), ['模型开始回应', '模型继续回应']);
+  assert.deepEqual(view.phases().map((node) => node.textContent), ['第 1 段回应', '第 2 段回应']);
   assert.equal(view.cards().length, 1);
   assert.equal(view.cards()[0].querySelector('.tool-name').textContent, '读取文件完成');
   assert.equal(view.cards()[0].querySelector('.tool-meta').textContent, '420ms');
@@ -1799,6 +1803,7 @@ test('words spoken before a tool call become a run note, not part of the answer'
 });
 
 test('assistant.reasoning streams into its own entry and never into the answer', async () => {
+  const { reasoningPreview, REASONING_PREVIEW_CHARS } = require('./app.js');
   const h = runHarness();
   await h.settle();
   await h.startRun('讲一下这个函数');
@@ -1811,22 +1816,35 @@ test('assistant.reasoning streams into its own entry and never into the answer',
   assert.equal(view.reasoningText()[0].textContent, '先看');
   assert.equal(view.body.textContent, 'Luna 正在回应…', '推理不写进回答主体');
   assert.equal(view.statusLabel.textContent, 'Luna 正在回应…', '推理到了就说明模型已经在产生输出');
+  assert.equal(view.reasoning()[0].open, false, '推理默认折叠：回答才是这个回合的主体');
+  const preview = () => view.reasoning()[0].querySelector('.run-reasoning-preview').textContent;
+  assert.equal(preview(), '先看', '折叠时那一行给出实时预览');
 
   stream.push(sse('assistant.reasoning', { text: '它的入参' }));
   await h.settle();
   assert.equal(view.reasoningText()[0].textContent, '先看它的入参', '推理条目随事件逐步增长');
-  assert.equal(view.reasoning()[0].open, true, '默认展开，用户看得到它长到了哪里');
+  assert.equal(preview(), '先看它的入参', '预览跟着同一份文本一起长，折起来也看得到它在长');
 
   stream.push(sse('assistant.delta', { text: '它在做两件事。' }));
   await h.settle();
   assert.equal(view.body.textContent, '它在做两件事。');
   assert.equal(view.reasoningText()[0].textContent, '先看它的入参', '回答与推理互不覆盖');
+  assert.equal(preview(), '先看它的入参');
 
   stream.push(sse('run.finished', { run_id: 'run-1', answer: '它在做两件事。' }));
   await h.settle();
   assert.equal(view.body.textContent, '它在做两件事。');
   assert.equal(view.body.textContent.includes('先看'), false, '答案对齐不会把推理带进来');
   assert.deepEqual(view.order(), ['run-phase', 'run-reasoning', 'assistant-body'], '阶段行 → 推理 → 回答');
+
+  // 预览是纯函数：只取最近到达的一段，换行压成空格，超长从前面省略。
+  assert.equal(reasoningPreview(undefined), '');
+  assert.equal(reasoningPreview(''), '');
+  assert.equal(reasoningPreview(7), '');
+  assert.equal(reasoningPreview('  短的  '), '短的');
+  assert.equal(reasoningPreview('第一行\n第二行'), '第一行 第二行');
+  const wide = 'x'.repeat(REASONING_PREVIEW_CHARS + 10);
+  assert.equal(reasoningPreview(wide), `…${'x'.repeat(REASONING_PREVIEW_CHARS)}`, '预览有界，只留最近的一段');
   stream.end();
   await h.settle();
 });
@@ -1861,6 +1879,11 @@ test('each model leg gets its own reasoning entry behind its continuation phase 
   stream.push(sse('assistant.delta', { text: '我读一下。' }));
   stream.push(sse('tool.started', { run_id: 'run-1', name: 'luna_read_file', arguments: { path: 'notes.md' } }));
   stream.push(sse('tool.finished', { run_id: 'run-1', name: 'luna_read_file', result: 'ok', duration_ms: 120 }));
+  await h.settle();
+  assert.equal(view.reasoning()[0].open, false, '推理默认折叠：回答才是这个回合的主体');
+  // 用户自己展开一条：后面的推理条目沿用同一个选择（只在会话内记住，不落盘）。
+  view.reasoning()[0].open = true;
+  view.reasoning()[0].emit('toggle');
   stream.push(sse('assistant.reasoning', { text: '文件里写着 ok，' }));
   stream.push(sse('assistant.reasoning', { text: '直接回答就行' }));
   stream.push(sse('assistant.delta', { text: '文件里写着 ok。' }));
@@ -1870,8 +1893,9 @@ test('each model leg gets its own reasoning entry behind its continuation phase 
   assert.deepEqual(view.order(), [
     'run-phase', 'run-reasoning', 'run-note', 'tool-row ok', 'run-phase', 'run-reasoning', 'assistant-body'
   ], '时间线按真实顺序：这一段的开始 → 推理 → 说明 → 工具 → 继续 → 回答');
-  assert.deepEqual(view.phases().map((node) => node.textContent), ['模型开始回应', '模型继续回应']);
+  assert.deepEqual(view.phases().map((node) => node.textContent), ['第 1 段回应', '第 2 段回应']);
   assert.equal(view.reasoningText().length, 2, '每一段模型输出有自己的推理条目');
+  assert.equal(view.reasoning()[1].open, true, '展开过一次后，后面的推理条目沿用同一个选择');
   assert.equal(view.reasoningText()[0].textContent, '得先看文件');
   assert.equal(view.reasoningText()[1].textContent, '文件里写着 ok，直接回答就行', '第二段的推理不会并进第一条');
   assert.equal(view.body.textContent, '文件里写着 ok。');
@@ -2114,7 +2138,7 @@ test('the run process stays inline in one timeline while usage is secondary info
   stream.push(sse('run.finished', { run_id: 'run-1', answer: '直接回答' }));
   await h.settle();
   assert.equal(first.steps().length, 0);
-  assert.equal(first.meta.hidden, true, '没有过程可概括时标题那一行不显示概况');
+  assert.equal(first.meta.hidden, true, '没有过程可概括、也没有用量时，标题那一行不显示概况');
   assert.equal(first.body.textContent, '直接回答');
   stream.end();
   await h.settle();
@@ -2132,23 +2156,41 @@ test('the run process stays inline in one timeline while usage is secondary info
   assert.equal(view.meta.hidden, false);
   assert.match(view.meta.textContent, /1 次工具调用/);
   assert.match(view.meta.textContent, /进行中/);
-  const usage = view.timeline.querySelector('.run-usage');
-  assert.match(usage.textContent, /输入 1.2k/);
-  assert.match(usage.textContent, /输出 320/);
-  assert.equal(usage.textContent.includes('缓存'), false, '没给的字段不显示');
-  assert.equal(usage.parentElement, view.timeline);
+  // 用量属于整轮，落在标题那一行的元信息里：它不再夹在推理与工具卡片之间，也不再
+  // 是一条会随事件插进时间线中间的行。
+  assert.match(view.meta.textContent, /tokens：输入 1.2k · 输出 320/);
+  assert.equal(view.meta.textContent.includes('缓存'), false, '没给的字段不显示');
+  assert.equal(view.timeline.querySelector('.run-usage'), null, '时间线里没有用量这一条');
   // 条目按发生顺序，回答留在最后（这一轮还没有写出回答，所以它还是占位状态）。
-  assert.deepEqual(view.order(), ['run-phase', 'tool-row ok', 'run-usage', 'assistant-body placeholder']);
+  assert.deepEqual(view.order(), ['run-phase', 'tool-row ok', 'assistant-body placeholder']);
 
   second.push(sse('usage.updated', { run_id: 'run-2', input_tokens: 1234, output_tokens: 320, cached_tokens: 64 }));
   second.push(sse('run.finished', { run_id: 'run-2', answer: '文件内容是 ok' }));
   await h.settle();
-  assert.equal(view.timeline.querySelectorAll('.run-usage').length, 1, '用量只有一行，后来的更新覆盖它');
-  assert.match(view.timeline.querySelector('.run-usage').textContent, /缓存 64/);
+  assert.match(view.meta.textContent, /tokens：输入 1.2k · 输出 320 · 缓存 64/, '后来的用量更新覆盖同一行');
+  assert.equal(view.meta.textContent.split('tokens：').length - 1, 1, '用量在同一行上只出现一次');
   assert.match(view.meta.textContent, /已完成/);
   assert.equal(view.meta.textContent.includes('进行中'), false);
   assert.equal(view.body.textContent, '文件内容是 ok');
   second.end();
+  await h.settle();
+
+  // 一次直接回答的运行也如实报出它真的收到的用量：元信息行只因为有量而出现，
+  // 但它仍然不是时间线里的条目。
+  await h.startRun('直接回答也要报用量');
+  const third = runView(h);
+  const again = h.stream();
+  again.push(sse('run.started', { run_id: 'run-3', session_id: 'aaaaaaaa' }));
+  again.push(sse('assistant.delta', { text: '好。' }));
+  again.push(sse('usage.updated', { run_id: 'run-3', input_tokens: 40, output_tokens: 8 }));
+  await h.settle();
+  assert.equal(third.steps().length, 0, '用量不是时间线里的条目');
+  assert.equal(third.meta.hidden, false, '有用量时标题那一行出现');
+  assert.match(third.meta.textContent, /tokens：输入 40 · 输出 8/);
+  again.push(sse('run.finished', { run_id: 'run-3', answer: '好。' }));
+  await h.settle();
+  assert.match(third.meta.textContent, /tokens：输入 40 · 输出 8/);
+  again.end();
   await h.settle();
 });
 
@@ -2168,8 +2210,10 @@ test('run phase and usage copy is read from events only', () => {
     assert.equal(/思考|分析|意图|thinking/.test(text), false, '不写模型在想什么');
   }
 
-  assert.equal(runPhaseEntryText(0), '模型开始回应');
-  assert.equal(runPhaseEntryText(1), '模型继续回应');
+  assert.equal(runPhaseEntryText(0), '第 1 段回应', '阶段行给出段号，不写开始/继续这类冗余措辞');
+  assert.equal(runPhaseEntryText(1), '第 2 段回应');
+  assert.equal(runPhaseEntryText(2), '第 3 段回应');
+  assert.equal(runPhaseEntryText(undefined), '第 1 段回应', '拿不到段号时按第一段，不编一个别的数字');
   assert.equal(runOutcomeLabel('ok'), '已完成');
   assert.equal(runOutcomeLabel('cancelled'), '已取消');
   assert.equal(runOutcomeLabel('failed'), '失败');
@@ -2282,8 +2326,9 @@ test('elapsed and duration are read from what the runtime measured', () => {
 test('every run observability style the script builds a class for exists in the stylesheet', () => {
   const css = source('style.css');
   const selectors = ['.run-status-dot', '.run-status-label', '.run-status-elapsed', '.assistant-head', '.run-meta',
-    '.run-timeline', '.run-reasoning', '.run-reasoning-label', '.run-reasoning-body', '.run-phase', '.run-note',
-    '.run-note-label', '.run-usage', '.run-incomplete', '.tool-state', '.tool-name', '.tool-meta', '.tool-more',
+    '.run-timeline', '.run-reasoning', '.run-reasoning-label', '.run-reasoning-preview', '.run-reasoning-body',
+    '.run-phase', '.run-note',
+    '.run-note-label', '.run-incomplete', '.tool-state', '.tool-name', '.tool-meta', '.tool-more',
     '.value-more', '.stop-icon', '.tool-row.ok', '.tool-row.refused'];
   for (const selector of selectors) {
     const escaped = selector.replace(/\./g, '\\.');
@@ -2297,6 +2342,11 @@ test('every run observability style the script builds a class for exists in the 
   // 推理正文同样有界：一次很长的推理不能把回答主体顶出视野。
   assert.match(css, /\.run-reasoning-body\s*\{[^}]*max-height/s);
   assert.match(css, /\.run-reasoning\s*>\s*summary\s*\{[^}]*min-height:\s*var\(--luna-control-sm\)/s, '推理那一行沿用控件高度');
+  // 回答主体是视觉主体：与过程条目之间有一档更大的间距与一条分隔线，两者都用 token。
+  assert.match(css, /\.run-timeline\s*>\s*\*\s*\+\s*\.assistant-body\s*\{[^}]*margin-top:\s*var\(--luna-space-4\)/s);
+  assert.match(css, /\.run-timeline\s*>\s*\*\s*\+\s*\.assistant-body\s*\{[^}]*border-top:\s*1px solid var\(--luna-border-weak\)/s);
+  // 折叠时那一行的实时预览是可见内容；展开后正文已经给出全文，预览不再重复一遍。
+  assert.match(css, /\.run-reasoning\[open\][^{]*\.run-reasoning-preview\s*\{\s*display:\s*none/s);
   assert.equal(/gradient\s*\(/i.test(css), false);
   assert.doesNotMatch(css, /border-radius:\s*(?:1[0-9]|[2-9][0-9])px/, '圆角只来自尺度 token');
 });

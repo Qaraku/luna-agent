@@ -621,6 +621,11 @@ const RUN_NOTE_LABEL = '运行说明';
 const RUN_REASONING_LABEL = '推理';
 const RUN_CANCELLED_COPY = '这次运行被取消了，上面的内容没有写完。';
 
+// 推理默认折叠（回答才是这个回合的主体），折叠时那一行给最近到达的一段文字做
+// 实时预览：预览跟着事件滑动，用户仍然看得到推理在长。这个数是"默认看多少"，
+// 不是业务判断。
+const REASONING_PREVIEW_CHARS = 72;
+
 // 工具拒绝某次调用与工具失败在事件上都是 tool.failed，唯一区别是错误前缀。
 // 拒绝是一次正常答复，不是崩溃，所以界面上它们是两档，不共用一句话。
 const TOOL_REFUSAL_PREFIX = 'the tool refused this call: ';
@@ -714,9 +719,11 @@ function runPhaseText(state, toolName = '') {
   return '';
 }
 
-// 轨迹里的模型阶段行标的是"模型这一段输出开始了"，不是模型想了什么。
+// 轨迹里的模型阶段行标的是"模型这一段输出开始了"。它只给段号，不写"开始/继续"
+// 这类冗余措辞，但"这是第几段"必须留在字面上。
 function runPhaseEntryText(leg) {
-  return leg === 0 ? '模型开始回应' : '模型继续回应';
+  const index = typeof leg === 'number' && Number.isFinite(leg) && leg >= 0 ? Math.floor(leg) + 1 : 1;
+  return `第 ${index} 段回应`;
 }
 
 function runOutcomeLabel(state) {
@@ -760,7 +767,7 @@ function formatTokenCount(value) {
   return `${thousands >= 100 ? Math.round(thousands) : thousands.toFixed(1).replace(/\.0$/, '')}k`;
 }
 
-// usageText 是一行次级信息（轨迹里），不是独立面板：只列出这次真的收到的字段。
+// usageText 是一行次级信息（本轮元信息行），不是独立面板：只列出这次真的收到的字段。
 function usageText(data) {
   const source = data && typeof data === 'object' ? data : {};
   const parts = [];
@@ -769,6 +776,15 @@ function usageText(data) {
     if (text) parts.push(`${label} ${text}`);
   }
   return parts.length ? `tokens：${parts.join(' · ')}` : '';
+}
+
+// 折叠的推理那一行里的实时预览：只取最近到达的一段，换行压成空格，所以流式期间
+// 它会一直滑动——用户看得到推理在长，而一行就够了。没有文本时给空串。
+function reasoningPreview(value, max = REASONING_PREVIEW_CHARS) {
+  const text = typeof value === 'string' ? value : '';
+  const flat = text.replace(/\s+/g, ' ').trim();
+  if (!flat) return '';
+  return flat.length <= max ? flat : `…${flat.slice(flat.length - max)}`;
 }
 
 function parseInline(text) {
@@ -873,9 +889,9 @@ if (typeof module !== 'undefined') {
     runStatusLabel, sessionRows, argumentsText, toolCallFacts, replaySession, runPayload,
     clipText, toolArgumentsText, toolResultText, formatElapsed, formatDuration, toolFailureKind,
     toolRefusalReason, toolRefusedLabel, toolStateLabel, runPhaseText, runPhaseEntryText,
-    runOutcomeLabel, runTraceMeta, replayRunState, formatTokenCount, usageText,
+    runOutcomeLabel, runTraceMeta, replayRunState, formatTokenCount, usageText, reasoningPreview,
     TOOL_TEXT_MAX_CHARS, TOOL_TEXT_MAX_LINES, TOOL_REFUSAL_PREFIX,
-    RUN_NOTE_LABEL, RUN_REASONING_LABEL, RUN_CANCELLED_COPY,
+    RUN_NOTE_LABEL, RUN_REASONING_LABEL, RUN_CANCELLED_COPY, REASONING_PREVIEW_CHARS,
     uiPluginText, uiPluginNameValid, uiPluginEntrySafe, uiPluginEntryURL, uiPluginRows, uiPluginMissingExports,
     uiPluginErrorDetail, uiPluginImportError, uiPluginMissingExportError, uiPluginMountError, uiPluginUnmountError,
     uiPluginState, uiPluginInitialState, uiPluginTransition, uiPluginEnableFailureEvent, uiPluginDisableEvent,
@@ -957,6 +973,9 @@ if (typeof document !== 'undefined') {
   let running = false;
   let reloading = false;
   let currentTurn = null;
+  // 推理条目的展开状态只在会话内记住（进程内变量）：用户展开过一次，后面的推理
+  // 条目沿用同一个选择；刷新后回到默认折叠，不新增浏览器存储键。
+  let reasoningExpanded = false;
   let lastFocused = null;
   let activePanel = null;
   // switching guards a session replay in flight; sessionsPayload is the last
@@ -1135,7 +1154,8 @@ if (typeof document !== 'undefined') {
       // provider 自愿暴露的推理内容只累积在这里，绝不写进 answer，也不参与对齐。
       reasoning: '',
       reasoningEntry: null,
-      usage: null
+      // 用量是这一轮元信息行上的一段文字，服务端给了才有；它不是时间线里的条目。
+      usage: ''
     };
   }
 
@@ -1319,14 +1339,18 @@ if (typeof document !== 'undefined') {
     return turnState.timeline.children.length > 1;
   }
 
-  // 标题那一行上的概况：工具调用数、总耗时（结束时才有）、最终状态。只写真实
-  // 拿到的东西；没有过程要看时它不出现，一次直接回答不顶着这一行。
+  // 标题那一行上的概况：工具调用数、总耗时（结束时才有）、最终状态，加上这一轮
+  // 真的收到的用量。用量属于整轮，不属于某一段模型输出，所以它留在这条元信息行
+  // 上，不再夹在推理与工具卡片之间。只写真实拿到的东西。
   function updateRunMeta(turnState) {
     const state = turnState.outcome || 'running';
     const durationMs = state === 'running' || !turnState.startedAt ? null : turnState.finishedAt - turnState.startedAt;
-    turnState.meta.textContent = runTraceMeta(turnState.toolCount, durationMs, state);
+    const parts = [runTraceMeta(turnState.toolCount, durationMs, state)];
+    if (turnState.usage) parts.push(turnState.usage);
+    turnState.meta.textContent = parts.join(' · ');
     turnState.meta.dataset.state = state;
-    turnState.meta.hidden = !hasRunSteps(turnState);
+    // 一次直接回答、又没有用量时，这一行不出现。
+    turnState.meta.hidden = !hasRunSteps(turnState) && !turnState.usage;
   }
 
   // 模型在调工具前说的话不是回答，而是"运行说明"：从消息主体移到时间线里保留，
@@ -1342,27 +1366,31 @@ if (typeof document !== 'undefined') {
     turnState.body.classList.add('placeholder');
   }
 
-  // 用量是可选的：只在服务端给出来时作为时间线里的一行次级信息显示，
-  // 拿不到就不显示，不写 0，也不为它单开一块面板。
+  // 用量是可选的：只在服务端给出来时显示，拿不到就不显示，不写 0，也不为它单开
+  // 一块面板。它属于整轮运行，落在标题那一行的元信息里，所以它不再夹在推理与
+  // 工具卡片之间，也不再是一条会随事件插进时间线中间的行。
   function applyUsage(turnState, data) {
     const text = usageText(data);
     if (!text) return;
-    if (!turnState.usage) turnState.usage = appendStep(turnState, make('p', 'run-usage'), false);
-    turnState.usage.textContent = text;
+    turnState.usage = text;
     updateRunMeta(turnState);
   }
 
-  // 推理条目：一行标号 + 正文。provider 给了推理才有这一条，正文随事件逐步增长。
-  // 默认展开，因为用户要能看到它长到了哪里；整条可以折起来，正文高度也有界、
-  // 自己滚动，一次很长的推理不会把回答顶出视野。
+  // 推理条目：一行标号 + 折叠时的实时预览 + 展开后的全文。默认折叠，因为回答才是
+  // 这个回合的视觉主体；折叠时那一行里仍然跟着事件增长，用户看得到推理在长。展开
+  // 状态只在会话内记住，刷新后回到默认折叠。
   function reasoningEntryNode() {
     const entry = make('details', 'run-reasoning');
     const summary = make('summary');
     summary.append(make('span', 'run-reasoning-label', RUN_REASONING_LABEL));
+    const preview = make('span', 'run-reasoning-preview');
+    summary.append(preview);
     const text = make('pre', 'run-reasoning-body');
     entry.append(summary, text);
-    entry.open = true;
-    return { entry, text };
+    entry.open = reasoningExpanded;
+    // 用户自己折叠或展开一次，后面的推理条目沿用同一个选择。
+    entry.addEventListener('toggle', () => { reasoningExpanded = entry.open; });
+    return { entry, text, preview };
   }
 
   // assistant.reasoning 是 provider 自愿暴露的推理增量。它只在自己那一条条目里
@@ -1384,6 +1412,8 @@ if (typeof document !== 'undefined') {
     const follow = body.scrollHeight - body.scrollTop - body.clientHeight < 24;
     body.textContent = currentTurn.reasoning;
     if (follow) body.scrollTop = body.scrollHeight;
+    // 折叠时那一行的预览跟着同一份文本走：折起来也看得到它在长。
+    currentTurn.reasoningEntry.preview.textContent = reasoningPreview(currentTurn.reasoning);
     updateRunMeta(currentTurn);
     contentChanged(stick);
   }
