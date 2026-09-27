@@ -1040,6 +1040,51 @@ body {
 .settings-pane h3 { margin: 0; font-size: var(--luna-font-ui); font-weight: 600; }
 .settings-pane:focus-visible { outline: none; }
 
+/* --- 设置：能力清单 ---------------------------------------------------------
+   一行一个能力：名称、形态、是否在服务，以及它贡献的工具、上下文、路由与面板。
+   声明与权限是开发者信息，收在默认折叠的 details 里，不占主视觉。 */
+
+.settings-facts { margin: 0; }
+.settings-facts div { display: flex; justify-content: space-between; gap: var(--luna-space-4); padding: var(--luna-space-1) 0; }
+.settings-facts dt { color: var(--luna-text-muted); font-size: var(--luna-font-meta); }
+.settings-facts dd { margin: 0; color: var(--luna-text); text-align: right; overflow-wrap: anywhere; font: var(--luna-font-meta)/1.55 var(--luna-font-mono); }
+
+.capability-list { display: grid; gap: var(--luna-space-2); }
+.capability-row { display: grid; gap: var(--luna-space-2); }
+.capability-head { display: flex; align-items: center; justify-content: space-between; gap: var(--luna-space-3); }
+.capability-title { display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--luna-space-2); min-width: 0; }
+.capability-name { color: var(--luna-text); font-size: var(--luna-font-ui); font-weight: 600; }
+.capability-id { color: var(--luna-text-muted); font: var(--luna-font-label)/1.4 var(--luna-font-mono); }
+.capability-meta { display: flex; align-items: center; flex-wrap: wrap; gap: var(--luna-space-2); }
+.capability-badge {
+  padding: 0 var(--luna-space-2);
+  border: 1px solid var(--luna-border-weak);
+  border-radius: var(--luna-radius-xs);
+  color: var(--luna-text-muted);
+  font-size: var(--luna-font-label);
+  line-height: 18px;
+}
+.capability-state { color: var(--luna-text-muted); font-size: var(--luna-font-meta); }
+.capability-state.is-on { color: var(--luna-success); }
+.capability-state.is-off { color: var(--luna-warning); }
+.capability-contributions { display: grid; gap: var(--luna-space-1); margin: 0; }
+.capability-group { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: var(--luna-space-2); align-items: baseline; }
+.capability-contributions dt { color: var(--luna-text-muted); font-size: var(--luna-font-meta); }
+.capability-contributions dd { margin: 0; }
+.capability-items { display: flex; flex-wrap: wrap; gap: var(--luna-space-2); margin: 0; padding: 0; list-style: none; }
+.capability-item { color: var(--luna-text); font: var(--luna-font-meta)/1.55 var(--luna-font-mono); overflow-wrap: anywhere; }
+.capability-off { margin-left: var(--luna-space-2); color: var(--luna-warning); font-size: var(--luna-font-label); }
+.capability-none { margin: 0; }
+.capability-developer { color: var(--luna-text-muted); font-size: var(--luna-font-label); }
+.capability-developer summary { cursor: pointer; }
+.capability-developer-list { display: grid; gap: var(--luna-space-1); margin: var(--luna-space-2) 0 0; }
+.capability-developer-row { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: var(--luna-space-2); }
+.capability-developer-row dt { color: var(--luna-text-muted); }
+.capability-developer-row dd { margin: 0; overflow-wrap: anywhere; }
+.capability-error { margin: 0; color: var(--luna-danger); font-size: var(--luna-font-meta); }
+.capability-status { min-height: 18px; }
+.capability-status.failure { color: var(--luna-danger); }
+
 /* --- 界面插件 ---------------------------------------------------------------
    宿主只负责每个插件一行和挂载容器；插件自己的元素由插件决定，可以引用上面的
    公共控件类与 --luna-* 变量跟随主题。同源运行，样式作用域不等于沙箱。 */

@@ -761,6 +761,344 @@ test('a capability that stops being enabled loses its entry and its panel togeth
   assert.equal(h.$('capability-panel-memory').hidden, false);
 });
 
+// 设置里的能力清单：一份状态载荷 + 一个记录请求的假服务，就能把「看得见」与
+// 「点得动」都钉住。夹具自己翻转状态，页面必须重读状态，而不是本地改一个变量
+// 就宣称成功。
+function capabilitySettingsHarness(options = {}) {
+  const state = {
+    model: 'fixture-model', provider_host: 'example.invalid', reasoning_effort: 'high',
+    capabilities: [
+      { id: 'memory', title: 'Memory', deployment: 'builtin', state: 'enabled',
+        contributions: [
+          { kind: 'tool', id: 'luna_remember' },
+          { kind: 'context', id: 'facts' },
+          { kind: 'route', id: '/api/memory' },
+          { kind: 'panel', id: 'memory' }
+        ],
+        claims: [{ kind: 'route-prefix', id: '/api/memory' }, { kind: 'state-namespace', id: '.runtime' }],
+        permissions: [{ kind: 'state.write' }],
+        panels: [{ id: 'memory', title: '记忆', entry: '/api/memory/panel.js' }] },
+      // 只贡献一条上下文块、没有 claim 也没有 permission 的能力同样要在清单里。
+      { id: 'workspace', title: 'Workspace', deployment: 'builtin', state: 'enabled',
+        contributions: [{ kind: 'context', id: 'project' }], claims: [], permissions: [], panels: [] }
+    ]
+  };
+  const h = navigationHarness({
+    ...options,
+    respond: async (url, requestOptions) => {
+      if (url === '/api/state') return { ok: true, json: async () => state };
+      if (url.startsWith('/api/plugins/')) {
+        if (options.reject) return { ok: false, status: 409, json: async () => ({ error: '这个能力现在不能切换' }) };
+        const [, , , id, action] = url.split('/');
+        state.capabilities = state.capabilities.map((capability) => capability.id === id
+          ? { ...capability, state: action === 'disable' ? 'disabled' : 'enabled' }
+          : capability);
+        return { ok: true, json: async () => ({}) };
+      }
+      return options.respond ? options.respond(url, requestOptions) : undefined;
+    }
+  });
+  h.capabilityState = state;
+  // 页头入口与能力面板由同一份状态派生：停用后入口必须和面板一起消失，所以这一处
+  // 查询和 capabilityHarness 用的是同一个选择器。
+  h.capabilityToggle = () => h.document.querySelector('.capability-panel-toggle');
+  h.capabilityToggles = () => [...h.document.querySelectorAll('.capability-panel-toggle')];
+  h.posts = () => h.calls
+    .filter(({ url, options: call }) => url.startsWith('/api/plugins/') && call && call.method === 'POST')
+    .map(({ url }) => url);
+  h.capabilityRow = (id) => [...h.$('capability-list').children].find((row) => row.dataset.capability === id);
+  h.openCapabilities = async () => {
+    await h.click('settings-toggle');
+    await h.click('settings-tab-capabilities');
+  };
+  return h;
+}
+
+test('the settings list reads every capability into a row with its contributions', () => {
+  const { capabilityRows, capabilityStateLabel, capabilityDeploymentLabel, capabilityKindLabel } = require('./app.js');
+  const memory = {
+    id: 'memory', title: 'Memory', deployment: 'builtin', state: 'enabled',
+    contributions: [
+      { kind: 'tool', id: 'luna_remember' },
+      { kind: 'context', id: 'facts' },
+      { kind: 'route', id: '/api/memory' },
+      { kind: 'panel', id: 'memory' }
+    ],
+    claims: [{ kind: 'route-prefix', id: '/api/memory' }, { kind: 'state-namespace', id: '.runtime' }],
+    permissions: [{ kind: 'state.write' }],
+    panels: [{ id: 'memory', title: '记忆', entry: '/api/memory/panel.js' }]
+  };
+  const rows = capabilityRows([memory, {
+    id: 'workspace', title: 'Workspace', deployment: 'builtin', state: 'enabled',
+    contributions: [{ kind: 'context', id: 'project' }], claims: [], permissions: [], panels: []
+  }]);
+  assert.deepEqual(rows.map((row) => [row.id, row.title, row.deploymentLabel, row.stateLabel, row.action, row.actionLabel]), [
+    ['memory', 'Memory', '内置', '已启用', 'disable', '停用'],
+    ['workspace', 'Workspace', '内置', '已启用', 'disable', '停用']
+  ], '两个能力都在，顺序就是注册顺序');
+
+  assert.deepEqual(rows[0].groups, [
+    { kind: 'tool', label: '工具', items: ['luna_remember'], status: '' },
+    { kind: 'context', label: '上下文', items: ['facts'], status: '' },
+    { kind: 'route', label: '路由', items: ['/api/memory'], status: '' },
+    { kind: 'panel', label: '面板', items: ['记忆'], status: '' }
+  ], '贡献按种类分组、按固定顺序，面板给的是用户看得到的名字');
+  assert.deepEqual(rows[0].claims, ['route-prefix · /api/memory', 'state-namespace · .runtime']);
+  assert.deepEqual(rows[0].permissions, ['state.write']);
+  assert.deepEqual(rows[1].groups, [{ kind: 'context', label: '上下文', items: ['project'], status: '' }],
+    '只贡献一条上下文同样完整列出来');
+  assert.deepEqual(rows[1].claims, []);
+  assert.deepEqual(rows[1].permissions, []);
+
+  // 停用不删掉清单：每一组都还在，只是标成“未在服务”。
+  const off = capabilityRows([{ ...memory, state: 'disabled' }])[0];
+  assert.equal(off.enabled, false);
+  assert.equal(off.stateLabel, '已停用');
+  assert.equal(off.action, 'enable');
+  assert.equal(off.actionLabel, '启用');
+  assert.deepEqual(off.groups.map((group) => group.kind), ['tool', 'context', 'route', 'panel'], '停用不丢分组');
+  for (const group of off.groups) assert.equal(group.status, '未在服务');
+  for (const group of rows[0].groups) assert.equal(group.status, '', '在服务时不打标记');
+
+  // 标签只查闭合的表；表里没有的值原样带出来，缺字段有缺字段的说法。
+  assert.equal(capabilityStateLabel('registered'), '已注册');
+  assert.equal(capabilityStateLabel('failed'), '启动失败');
+  assert.equal(capabilityStateLabel(''), '状态未知');
+  assert.equal(capabilityDeploymentLabel('process'), '子进程');
+  assert.equal(capabilityDeploymentLabel('browser'), '浏览器模块');
+  assert.equal(capabilityDeploymentLabel(undefined), '未说明');
+  assert.equal(capabilityKindLabel('context'), '上下文');
+  assert.equal(capabilityKindLabel('wat'), 'wat（未识别）');
+});
+
+test('the settings list survives a payload the kernel did not send', () => {
+  const { capabilityRows } = require('./app.js');
+  for (const payload of [undefined, null, 'nope', 7, {}]) {
+    assert.deepEqual(capabilityRows(payload), [], `${JSON.stringify(payload)} 不是能力数组`);
+  }
+  assert.deepEqual(capabilityRows([null, 'x', 7, {}, { title: '没有 id' }]), [], '没有 id 的行无法寻址，不编出来');
+
+  // 未知种类、未知状态、未知形态、空字段：都留着，按自己的名字显示。
+  const unknown = capabilityRows([{
+    id: 'probe', title: '', deployment: 'orbital', state: 'weird',
+    contributions: [{ kind: 'wasm', id: 'module.a' }, { kind: 'tool', id: '' }, {}, 'nope'],
+    claims: [{ kind: 'route-prefix' }, null, 'x'],
+    permissions: [{ kind: '' }, 'x']
+  }])[0];
+  assert.equal(unknown.title, 'probe', '没有 title 时用 id');
+  assert.equal(unknown.deploymentLabel, 'orbital（未识别）');
+  assert.equal(unknown.stateLabel, 'weird（未识别）');
+  assert.deepEqual(unknown.groups, [
+    { kind: 'tool', label: '工具', items: ['未声明'], status: '' },
+    { kind: 'wasm', label: 'wasm（未识别）', items: ['module.a'], status: '' },
+    { kind: 'unknown', label: '未说明', items: ['未声明'], status: '' }
+  ], '未知种类排在后排，按它自己的名字');
+  assert.deepEqual(unknown.claims, ['route-prefix'], '缺 id 的 claim 仍按它的 kind 显示');
+  assert.deepEqual(unknown.permissions, []);
+
+  // 没有 contributions 数组的能力就是“没有声明任何贡献”，不是一个空行都没有。
+  const bare = capabilityRows([{ id: 'bare', title: 'Bare', state: 'enabled' }])[0];
+  assert.deepEqual(bare.groups, []);
+  assert.deepEqual(bare.claims, []);
+  assert.deepEqual(bare.permissions, []);
+});
+
+test('the capability state path refuses anything the kernel could not have registered', () => {
+  const { capabilityStatePath, capabilityRows } = require('./app.js');
+  assert.equal(capabilityStatePath('memory', 'disable'), '/api/plugins/memory/disable');
+  assert.equal(capabilityStatePath('workspace', 'enable'), '/api/plugins/workspace/enable');
+  const refused = [
+    ['', 'disable'], ['Memory', 'disable'], ['../memory', 'disable'], ['a/b', 'enable'],
+    ['memory ', 'enable'], ['memory?x=1', 'enable'], ['m'.repeat(33), 'enable'], [7, 'enable'],
+    ['memory', 'reload'], ['memory', ''], ['memory', undefined]
+  ];
+  for (const [id, action] of refused) {
+    assert.equal(capabilityStatePath(id, action), '', `${JSON.stringify(id)} / ${action} 不得变成路径`);
+  }
+  // 行上也不给控件：按一个不可能存在的路径发请求只会失败。
+  assert.equal(capabilityRows([{ id: '../memory', title: 'Memory', state: 'enabled' }])[0].action, '');
+});
+
+test('the reasoning tier is read as a startup parameter and never guessed', () => {
+  const { reasoningEffortView, REASONING_EFFORT_LEVELS } = require('./app.js');
+  assert.deepEqual(REASONING_EFFORT_LEVELS, ['minimal', 'low', 'medium', 'high', 'none']);
+  const high = reasoningEffortView('high');
+  assert.equal(high.present, true);
+  assert.equal(high.value, 'high');
+  assert.equal(high.label, '高（high）');
+  assert.match(high.note, /LUNA_REASONING_EFFORT/);
+  assert.match(high.note, /推理过程是否展示无关/, '档位与推理展示是两件事，文案分开说');
+  assert.equal(reasoningEffortView('none').label, '不思考（none）');
+  assert.equal(reasoningEffortView(' medium ').value, 'medium', '两侧空白不算另一个档位');
+
+  // 没有发送档位：说清楚是进程没发、provider 默认生效，绝不当成 medium。
+  for (const absent of ['', '   ', undefined, null, 0, [], {}]) {
+    const view = reasoningEffortView(absent);
+    assert.equal(view.present, false, `${JSON.stringify(absent)} 就是“没有发送档位”`);
+    assert.equal(view.value, '');
+    assert.equal(view.label, '进程未发送该档位');
+    assert.match(view.note, /默认档位/);
+    assert.match(view.note, /LUNA_REASONING_EFFORT/);
+    assert.doesNotMatch(view.label + view.note, /medium/, '没有发送档位不是 medium，也不是“默认 medium”');
+  }
+  // 只有 provider 认的那几个档位是已知的：大小写不同就是另一个值。
+  assert.equal(reasoningEffortView('highish').label, 'highish（未识别）');
+  assert.equal(reasoningEffortView('Medium').label, 'Medium（未识别）');
+});
+
+test('the settings modal carries a capability area and a read-only model service block', () => {
+  const html = source('index.html');
+  const js = source('app.js');
+  assert.match(html, /<button id="settings-tab-capabilities" class="settings-tab" role="tab"[^>]*data-pane="settings-pane-capabilities"/);
+  assert.match(html, /<section id="settings-pane-capabilities" class="settings-pane" role="tabpanel"[^>]*hidden>/);
+  assert.match(html, /<ul id="capability-list" class="luna-list capability-list"><\/ul>/, '清单由脚本填充，标记里不预置任何能力');
+  assert.match(html, /id="capability-empty"[^>]*hidden>暂未读到能力。</);
+  assert.match(html, /id="capability-status"[^>]*role="status"/);
+  assert.match(html, /id="capability-retry"[^>]*>重新读取能力<\/button>/);
+  // 能力名不写死在标记里：与能力面板入口同一条规则。
+  for (const text of ['Memory', 'Workspace', 'luna_remember', 'state.write']) {
+    assert.equal(html.includes(text), false, `宿主不预置 ${text}`);
+  }
+  // 模型服务：模型、提供方与档位都在同一份状态里，档位是只读项而不是控件。
+  assert.match(html, /<dd id="settings-model">/);
+  assert.match(html, /<dd id="settings-provider">/);
+  assert.match(html, /<dd id="settings-effort">/);
+  assert.match(html, /id="settings-effort-note"/);
+  assert.doesNotMatch(html, /<(?:select|input|button)[^>]*id="settings-effort/);
+
+  assert.match(js, /renderCapabilities\(state\.capabilities\)/);
+  assert.match(js, /renderModelFacts\(state\)/);
+  assert.match(js, /fetch\(path, \{ method: 'POST' \}\)/, '启停只有这一条请求路径');
+  assert.match(js, /capabilityStatePath\(row\.id, row\.action\)/);
+  assert.equal(js.includes('innerHTML'), false);
+  assert.equal(js.includes('sessionStorage'), false);
+});
+
+test('every capability style the settings script builds a class for exists in the stylesheet', () => {
+  const css = source('style.css');
+  const selectors = ['.capability-list', '.capability-row', '.capability-head', '.capability-title', '.capability-name',
+    '.capability-id', '.capability-meta', '.capability-badge', '.capability-state', '.capability-state.is-on',
+    '.capability-state.is-off', '.capability-contributions', '.capability-group', '.capability-items', '.capability-item',
+    '.capability-off', '.capability-none', '.capability-error', '.capability-developer', '.capability-developer-list',
+    '.capability-developer-row', '.capability-status', '.capability-status.failure', '.settings-facts'];
+  for (const selector of selectors) {
+    assert.ok(
+      [`${selector} {`, `${selector}:`, `${selector},`, `${selector}.`].some((form) => css.includes(form)),
+      `missing style ${selector}`
+    );
+  }
+  // 这一块沿用语义主题与尺度 token：不引入装饰色、渐变或自定的圆角。
+  const added = css.slice(css.indexOf('/* --- 设置：能力清单'), css.indexOf('/* --- 界面插件'));
+  assert.ok(added.length > 0, '能力清单的样式块必须在');
+  assert.equal(/gradient\s*\(/i.test(added), false);
+  assert.doesNotMatch(added, /border-radius:\s*(?:1[0-9]|[2-9][0-9])px/);
+  assert.doesNotMatch(added, /#[0-9a-f]{3,8}\b/i, '颜色只来自 --luna-* token');
+});
+
+test('settings lists every capability with its contributions and toggles it through the kernel', async () => {
+  const h = capabilitySettingsHarness();
+  await h.settle();
+  await h.openCapabilities();
+  assert.equal(h.$('capability-list').children.length, 2, 'Memory 与 Workspace 都要在清单里');
+  assert.equal(h.$('capability-empty').hidden, true);
+
+  const memory = h.capabilityRow('memory');
+  assert.equal(memory.querySelector('.capability-name').textContent, 'Memory');
+  assert.equal(memory.querySelector('.capability-id').textContent, 'memory');
+  assert.equal(memory.querySelector('.capability-badge').textContent, '内置');
+  assert.equal(memory.querySelector('.capability-state').textContent, '已启用');
+  const groups = [...memory.querySelectorAll('.capability-group')];
+  assert.deepEqual(groups.map((group) => group.querySelector('dt').textContent), ['工具', '上下文', '路由', '面板']);
+  assert.deepEqual(groups.map((group) => group.querySelector('.capability-item').textContent),
+    ['luna_remember', 'facts', '/api/memory', '记忆'], '贡献逐项列出来');
+  assert.equal(memory.querySelectorAll('.capability-off').length, 0, '在服务时不打标记');
+
+  // 只贡献一条上下文、没有 claim 与 permission 的能力完整出现，而不是被藏起来。
+  const workspace = h.capabilityRow('workspace');
+  assert.deepEqual([...workspace.querySelectorAll('.capability-group')].map((group) => group.querySelector('dt').textContent), ['上下文']);
+  assert.equal(workspace.querySelector('.capability-item').textContent, 'project');
+  assert.equal(workspace.querySelector('.capability-developer').hidden, true, '没有声明与权限就没有次级块');
+  assert.equal(workspace.querySelector('.capability-state').textContent, '已启用');
+
+  // 声明与权限是次级层级：默认收起。
+  const developer = memory.querySelector('.capability-developer');
+  assert.equal(developer.hidden, false);
+  assert.equal(developer.open, false, '声明与权限默认收起');
+  assert.deepEqual([...developer.querySelectorAll('dd')].map((dd) => dd.textContent),
+    ['route-prefix · /api/memory、state-namespace · .runtime', 'state.write']);
+
+  // 轮询复用同一行：焦点留在停用按钮上。
+  const toggle = memory.querySelector('.capability-toggle');
+  toggle.focus();
+  await h.poll();
+  assert.equal(h.capabilityRow('memory').querySelector('.capability-toggle'), toggle, '轮询不重建行');
+  assert.equal(h.document.activeElement, toggle);
+
+  // 停用：请求真的发出去，然后按内核答复的状态重绘。
+  toggle.click();
+  await h.settle();
+  assert.deepEqual(h.posts(), ['/api/plugins/memory/disable'], '停用请求真的发出去了');
+  const after = h.capabilityRow('memory');
+  assert.equal(after.querySelector('.capability-state').textContent, '已停用');
+  assert.equal(after.querySelector('.capability-toggle').textContent, '启用');
+  const off = [...after.querySelectorAll('.capability-group')];
+  assert.deepEqual(off.map((group) => group.querySelector('dt').textContent),
+    ['工具未在服务', '上下文未在服务', '路由未在服务', '面板未在服务']);
+  assert.deepEqual(off.map((group) => group.querySelector('.capability-item').textContent),
+    ['luna_remember', 'facts', '/api/memory', '记忆'], '停用后仍列全它贡献了什么');
+  assert.equal(h.capabilityToggle(), null, '停用后页头入口与面板一起消失');
+  assert.equal(h.capabilityRow('workspace').querySelector('.capability-state').textContent, '已启用', '别的能力不受影响');
+  assert.match(h.$('capability-status').textContent, /Memory 已停用/);
+
+  // 再启用：同一条路径回来。
+  h.capabilityRow('memory').querySelector('.capability-toggle').click();
+  await h.settle();
+  assert.deepEqual(h.posts(), ['/api/plugins/memory/disable', '/api/plugins/memory/enable']);
+  assert.equal(h.capabilityRow('memory').querySelector('.capability-state').textContent, '已启用');
+  assert.ok(h.capabilityToggle(), '重新启用后页头入口回来');
+  assert.equal(h.capabilityRow('memory').querySelectorAll('.capability-off').length, 0);
+
+  // 载荷形状不对时清单说实话：清空、给出重读入口，不编行。
+  h.capabilityState.capabilities = 'nope';
+  await h.poll();
+  assert.equal(h.$('capability-list').children.length, 0);
+  assert.equal(h.$('capability-empty').hidden, false);
+});
+
+test('a rejected state change is reported as a failure and never as the new state', async () => {
+  const h = capabilitySettingsHarness({ reject: true });
+  await h.settle();
+  await h.openCapabilities();
+  h.capabilityRow('memory').querySelector('.capability-toggle').click();
+  await h.settle();
+  assert.deepEqual(h.posts(), ['/api/plugins/memory/disable'], '请求发出去了，即便内核拒绝');
+  assert.equal(h.capabilityRow('memory').querySelector('.capability-state').textContent, '已启用',
+    '被拒绝的请求不许写成已改变');
+  assert.equal(h.capabilityRow('memory').querySelectorAll('.capability-off').length, 0, '没有“未在服务”的假标记');
+  assert.equal(h.capabilityRow('memory').querySelector('.capability-toggle').textContent, '停用', '按钮回到可再试的状态');
+  assert.equal(h.capabilityRow('memory').querySelector('.capability-toggle').disabled, false);
+  assert.match(h.$('capability-status').textContent, /停用 Memory 失败：这个能力现在不能切换/);
+  assert.equal(h.$('capability-status').className.includes('failure'), true);
+  assert.ok(h.capabilityToggle(), '页头入口保持原样');
+});
+
+test('the model service block shows the running model and the tier the process sent', async () => {
+  const h = capabilitySettingsHarness();
+  await h.settle();
+  await h.click('settings-toggle');
+  await h.click('settings-tab-model');
+  assert.equal(h.$('settings-model').textContent, 'fixture-model');
+  assert.equal(h.$('settings-provider').textContent, 'example.invalid');
+  assert.equal(h.$('settings-effort').textContent, '高（high）');
+  assert.match(h.$('settings-effort-note').textContent, /LUNA_REASONING_EFFORT/);
+
+  // 同一个进程没有发送档位：界面上说清是“进程没发、provider 默认”，不是 medium。
+  h.capabilityState.reasoning_effort = undefined;
+  await h.poll();
+  assert.equal(h.$('settings-effort').textContent, '进程未发送该档位');
+  assert.doesNotMatch(h.$('settings-effort').textContent + h.$('settings-effort-note').textContent, /medium/);
+});
+
 test('closing a panel before its module resolves leaves nothing mounted', async () => {
   const h = capabilityHarness({ narrow: true });
   await h.settle();
@@ -2438,10 +2776,14 @@ test('the run surface reuses the existing status element and invents no new stat
   assert.match(js, /send\.addEventListener\('click'/);
   assert.match(js, /\/api\/runs\/\$\{runID\}\/cancel/);
   assert.match(js, /runStatus\.dataset\.state = liveRun\.state/);
-  for (const text of ['思考', '分析意图', 'thinking', 'reasoning 内容']) {
+  // 运行表面不自造思考态：没有“思考中/分析意图”这类状态，也没有另一套控制栏。
+  // 档位是启动期的模型参数，只作为设置里的只读项出现，所以这里禁的是状态词汇，
+  // 不是“思考”这个词本身——全文禁止会把它挡在产品之外。
+  for (const text of ['思考中', '思考状态', '分析意图', 'thinking', 'reasoning 内容']) {
     assert.equal(html.includes(text), false, `标记里不出现 ${text}`);
     assert.equal(js.includes(text), false, `脚本里不出现 ${text}`);
   }
+  assert.equal(html.includes('思考档位'), true, '档位只在设置里作为只读参数出现');
   assert.equal(js.includes('innerHTML'), false);
   const storedKeys = new Set([...js.matchAll(/localStorage\.(?:getItem|setItem)\('([^']+)'/g)].map((match) => match[1]));
   assert.deepEqual([...storedKeys].sort(), ['luna.sidebar', 'luna.sidebarWidth', 'luna.theme'],

@@ -127,6 +127,7 @@
       <div class="settings-body">
         <nav class="settings-nav" role="tablist" aria-orientation="vertical" aria-label="设置分类">
           <button id="settings-tab-appearance" class="settings-tab" role="tab" type="button" aria-selected="true" aria-controls="settings-pane-appearance" data-pane="settings-pane-appearance" tabindex="0">外观</button>
+          <button id="settings-tab-capabilities" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-capabilities" data-pane="settings-pane-capabilities" tabindex="-1">能力</button>
           <button id="settings-tab-data" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-data" data-pane="settings-pane-data" tabindex="-1">本机数据</button>
           <button id="settings-tab-model" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-model" data-pane="settings-pane-model" tabindex="-1">模型服务</button>
         </nav>
@@ -143,6 +144,14 @@
             </div>
             <p class="luna-muted">主题只影响这一台机器的浏览器显示，与模型和会话内容无关。</p>
           </section>
+          <section id="settings-pane-capabilities" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-capabilities" tabindex="0" hidden>
+            <h3>能力</h3>
+            <p class="luna-muted">能力由内核装配。一个能力在用时，它贡献的工具、上下文、路由和面板才会出现在这一台机器上；停用它只是把这些从服务里取下，它保存的数据不会被删除。</p>
+            <p id="capability-status" class="luna-status capability-status" role="status"></p>
+            <ul id="capability-list" class="luna-list capability-list"></ul>
+            <p id="capability-empty" class="luna-muted" hidden>暂未读到能力。</p>
+            <div><button id="capability-retry" class="luna-button" type="button">重新读取能力</button></div>
+          </section>
           <section id="settings-pane-data" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-data" tabindex="0" hidden>
             <h3>本机数据</h3>
             <p class="luna-muted">会话记录与各能力保存的数据都在本机。能看什么、能改什么由对应能力的面板负责。</p>
@@ -150,6 +159,12 @@
           <section id="settings-pane-model" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-model" tabindex="0" hidden>
             <h3>模型服务</h3>
             <p class="luna-muted">发送的内容会交给这台机器上配置的模型服务处理。</p>
+            <dl class="settings-facts">
+              <div><dt>模型</dt><dd id="settings-model">—</dd></div>
+              <div><dt>提供方</dt><dd id="settings-provider">—</dd></div>
+              <div><dt>思考档位</dt><dd id="settings-effort">—</dd></div>
+            </dl>
+            <p id="settings-effort-note" class="luna-muted"></p>
             <div><button id="settings-runtime" class="luna-button" type="button">查看运行详情</button></div>
           </section>
         </div>

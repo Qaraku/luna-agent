@@ -405,6 +405,191 @@ function capabilityPanelUnmountError(title, detail) {
   return `能力面板 ${title} 关闭时清理失败，容器已移除：${detail}`;
 }
 
+// --- 设置里的能力清单：把声明翻译成人看得见的行 -----------------------------
+//
+// 内核只回答三件事：注册了哪些能力、它现在在不在服务、它声明了什么。这一层把它
+// 变成界面模型：启用状态、部署形态，以及它贡献的工具 / 上下文 / 路由 / 面板。
+// 声明与权限也在这里成型，但界面把它们放在次级层级——那是开发者信息。
+//
+// 一个能力“没有工具、没有权限”不是异常：只贡献一条上下文块的能力同样要在清单里
+// 出现。所以这里不按“贡献多少”筛行，只丢掉无法寻址的行（没有 id 就没有路径和键）。
+
+const CAPABILITY_STATE_LABELS = { enabled: '已启用', disabled: '已停用', registered: '已注册', failed: '启动失败' };
+const CAPABILITY_DEPLOYMENT_LABELS = { builtin: '内置', process: '子进程', browser: '浏览器模块' };
+const CAPABILITY_KIND_LABELS = { tool: '工具', context: '上下文', route: '路由', panel: '面板' };
+// 贡献分组的固定显示顺序；payload 里出现这里没有的种类时排在后面，按它自己的名字。
+const CAPABILITY_KIND_ORDER = ['tool', 'context', 'route', 'panel'];
+
+// capabilityLabel 只查一张封闭的标签表。表里没有的取值原样带出来，而不是就近映射
+// 成别的意思——界面看不懂的值必须留得下来，不能悄悄变成“未知”以外的某个档。
+function capabilityLabel(value, labels, fallback) {
+  const text = capabilityPanelText(value);
+  if (text === '') return fallback;
+  return labels[text] || `${text}（未识别）`;
+}
+
+function capabilityStateLabel(state) {
+  return capabilityLabel(state, CAPABILITY_STATE_LABELS, '状态未知');
+}
+
+function capabilityDeploymentLabel(deployment) {
+  return capabilityLabel(deployment, CAPABILITY_DEPLOYMENT_LABELS, '未说明');
+}
+
+function capabilityKindLabel(kind) {
+  return capabilityLabel(kind, CAPABILITY_KIND_LABELS, '未说明');
+}
+
+// capabilityStatePath is the only place the browser builds the kernel's own state
+// path. A descriptor id may only be a lowercase letter followed by lowercase
+// letters, digits or hyphens, so anything else — a slash, a percent, an upper
+// case letter — is a payload the kernel could not have registered, and it is
+// refused here rather than turned into a request. A caller that gets '' must not
+// fetch at all.
+function capabilityStatePath(id, action) {
+  // 这里刻意不做 trim 之类的“善意修正”：带尾空格或大写的 id 内核不可能注册过，
+  // 修好它等于替内核接受一个它没有承认过的标识。不是字符串就直接拒。
+  const value = typeof id === 'string' ? id : '';
+  if (!/^[a-z][a-z0-9-]{0,31}$/.test(value)) return '';
+  if (action !== 'enable' && action !== 'disable') return '';
+  return `/api/plugins/${value}/${action}`;
+}
+
+// capabilityGroups groups a capability's contributions by kind, so the row reads
+// as "what it contributes" instead of a flat dump. Empty groups are not created;
+// a kind this front end does not know is kept under its own name. Every group
+// carries whether it is actually in service: a disabled capability keeps its
+// whole list and says 未在服务, instead of looking as if those contributions had
+// never been declared.
+function capabilityGroups(capability, outOfService) {
+  const panels = new Map();
+  if (Array.isArray(capability.panels)) {
+    for (const value of capability.panels) {
+      const panel = value && typeof value === 'object' ? value : null;
+      const id = panel ? capabilityPanelText(panel.id) : '';
+      if (id) panels.set(id, capabilityPanelText(panel.title) || id);
+    }
+  }
+  const groups = new Map();
+  const order = [];
+  const list = Array.isArray(capability.contributions) ? capability.contributions : [];
+  for (const value of list) {
+    const item = value && typeof value === 'object' ? value : null;
+    if (!item) continue;
+    const kind = capabilityPanelText(item.kind);
+    const key = kind || 'unknown';
+    if (!groups.has(key)) {
+      groups.set(key, { kind: key, label: kind ? capabilityKindLabel(kind) : '未说明', items: [] });
+      order.push(key);
+    }
+    const id = capabilityPanelText(item.id);
+    // 面板贡献显示用户会看到的那块面板的名字；没有对应面板时退回 id 本身。
+    const label = kind === 'panel' && id ? panels.get(id) || id : id || '未声明';
+    groups.get(key).items.push(label);
+  }
+  const rank = (key) => {
+    const index = CAPABILITY_KIND_ORDER.indexOf(key);
+    return index < 0 ? CAPABILITY_KIND_ORDER.length : index;
+  };
+  return order
+    .map((key) => groups.get(key))
+    .sort((left, right) => rank(left.kind) - rank(right.kind))
+    .map((group) => ({ ...group, status: outOfService ? '未在服务' : '' }));
+}
+
+// claim 与 permission 保持内核自己的词汇（kind · id），不改写成普通用户的说法。
+function capabilityClaimRows(claims) {
+  const rows = [];
+  const list = Array.isArray(claims) ? claims : [];
+  for (const value of list) {
+    const claim = value && typeof value === 'object' ? value : null;
+    if (!claim) continue;
+    const label = [capabilityPanelText(claim.kind), capabilityPanelText(claim.id)].filter(Boolean).join(' · ');
+    if (label) rows.push(label);
+  }
+  return rows;
+}
+
+function capabilityPermissionRows(permissions) {
+  const rows = [];
+  const list = Array.isArray(permissions) ? permissions : [];
+  for (const value of list) {
+    const permission = value && typeof value === 'object' ? value : null;
+    if (!permission) continue;
+    const kind = capabilityPanelText(permission.kind);
+    if (kind) rows.push(kind);
+  }
+  return rows;
+}
+
+// capabilityRows is the whole settings list, in the order the kernel registered
+// the capabilities. Only a row without an id is dropped: nothing can address it.
+function capabilityRows(capabilities) {
+  if (!Array.isArray(capabilities)) return [];
+  const rows = [];
+  for (const value of capabilities) {
+    const capability = value && typeof value === 'object' ? value : null;
+    if (!capability) continue;
+    const id = capabilityPanelText(capability.id);
+    if (!id) continue;
+    const state = capabilityPanelText(capability.state);
+    const enabled = state === 'enabled';
+    // “未在服务”是对这个能力此刻是否在服务的判断，只有内核明确报过的状态才配得上
+    // 这句话。一个没见过的状态不能被写成“未在服务”——那等于替内核下一个它没下过的
+    // 结论，正好和这一层存在的理由相反。
+    const knownState = Object.prototype.hasOwnProperty.call(CAPABILITY_STATE_LABELS, state);
+    const outOfService = knownState && !enabled;
+    let action = enabled ? 'disable' : 'enable';
+    if (capabilityStatePath(id, action) === '') action = '';
+    rows.push({
+      id,
+      title: capabilityPanelText(capability.title) || id,
+      deployment: capabilityPanelText(capability.deployment),
+      deploymentLabel: capabilityDeploymentLabel(capability.deployment),
+      state,
+      stateLabel: capabilityStateLabel(state),
+      enabled,
+      groups: capabilityGroups(capability, outOfService),
+      claims: capabilityClaimRows(capability.claims),
+      permissions: capabilityPermissionRows(capability.permissions),
+      error: capabilityPanelText(capability.error),
+      action,
+      actionLabel: enabled ? '停用' : '启用'
+    });
+  }
+  return rows;
+}
+
+// --- 设置里的模型服务：启动期参数只读 ---------------------------------------
+//
+// `reasoning_effort` 是启动时决定的模型运行参数（模型怎么想），与“推理过程是否
+// 展示”是两件事。它在进程内不能热切换（模型只构建一次），所以界面只读显示。
+// 字段不出现不是 medium，而是这个进程没有发送该档位、provider 自己的默认值生效：
+// 文案必须把这两件事分开说，不能替进程猜一个档位。
+
+const REASONING_EFFORT_LABELS = { minimal: '极简', low: '低', medium: '中', high: '高', none: '不思考' };
+const REASONING_EFFORT_LEVELS = ['minimal', 'low', 'medium', 'high', 'none'];
+
+function reasoningEffortView(value) {
+  const text = capabilityPanelText(value);
+  if (text === '') {
+    return {
+      present: false,
+      value: '',
+      label: '进程未发送该档位',
+      note: '这个进程没有发送思考档位，模型服务自己的默认档位生效。要固定它，设置 LUNA_REASONING_EFFORT 后重启 Luna。'
+    };
+  }
+  return {
+    present: true,
+    value: text,
+    label: REASONING_EFFORT_LEVELS.includes(text)
+      ? `${REASONING_EFFORT_LABELS[text]}（${text}）`
+      : `${text}（未识别）`,
+    note: '思考档位在启动时决定，本进程内不能切换；要改需要设置 LUNA_REASONING_EFFORT 后重启 Luna。它决定模型怎么想，与推理过程是否展示无关。'
+  };
+}
+
 // --- Sessions -------------------------------------------------------------
 
 // The current session lives in the URL hash and never in browser storage: a
@@ -913,7 +1098,10 @@ if (typeof module !== 'undefined') {
     uiPluginHostAPI, UI_PLUGIN_API_VERSION, UI_PLUGIN_ENTRY_REASON, UI_PLUGIN_REQUIRED_EXPORTS,
     capabilityPanelText, capabilityPanelEntryURL, capabilityPanelElementID, capabilityPanels,
     capabilityPanelEntryError, capabilityPanelImportError, capabilityPanelMissingExportError,
-    capabilityPanelMountError, capabilityPanelUnmountError
+    capabilityPanelMountError, capabilityPanelUnmountError,
+    capabilityStatePath, capabilityStateLabel, capabilityDeploymentLabel, capabilityKindLabel,
+    capabilityRows, capabilityGroups, capabilityClaimRows, capabilityPermissionRows,
+    reasoningEffortView, REASONING_EFFORT_LEVELS
   };
 }
 
@@ -965,7 +1153,9 @@ if (typeof document !== 'undefined') {
     runtime: { element: runtimeDrawer, toggle: runtimeToggle, close: runtimeClose, refresh: updateState },
     extensions: { element: $('extensions-panel'), toggle: extensionsToggle, close: $('extensions-close'), refresh: updateUIPlugins },
     sessions: { element: sessionSidebar, toggle: sessionToggle, close: sessionClose, refresh: updateSessions },
-    settings: { element: $('settings-panel'), toggle: $('settings-toggle'), close: $('settings-close'), refresh: () => {} }
+    // 打开设置时重新读一次状态：能力清单与模型服务参数都是这一刻的事实，不是页
+    // 面首次加载时的旧值。
+    settings: { element: $('settings-panel'), toggle: $('settings-toggle'), close: $('settings-close'), refresh: () => { updateState(); } }
   };
   const appShell = document.querySelector('.app-shell');
   const runtimeBrief = $('runtime-brief');
@@ -2228,6 +2418,163 @@ if (typeof document !== 'undefined') {
 
   uiPluginsRetry.addEventListener('click', () => updateUIPlugins(true));
 
+  // --- 设置：能力清单与只读的模型服务参数 ---------------------------------
+
+  const capabilityList = $('capability-list');
+  const capabilityEmpty = $('capability-empty');
+  const capabilityStatus = $('capability-status');
+  const capabilityRetry = $('capability-retry');
+  // 最近一次成功读到的 payload：停用按钮触发的那次重绘、以及读不到状态时的显示都用
+  // 它。一次读不到状态不会把清单清空，也不会把能力说成“停用”。
+  let capabilityPayload = null;
+  // 正在等内核答复的能力 id：这段时间里按钮不可点，重复点击不会发出第二次请求。
+  const capabilityPending = new Set();
+
+  function setCapabilityStatus(text, className = '') {
+    capabilityStatus.textContent = text;
+    capabilityStatus.className = `luna-status capability-status${className ? ` ${className}` : ''}`;
+  }
+
+  function capabilityGroupNode(group) {
+    const entry = make('div', 'capability-group');
+    const term = make('dt');
+    term.append(document.createTextNode(group.label));
+    // 停用的能力仍然列全它声明的每一组，“未在服务”标在那一组上。
+    if (group.status) term.append(make('span', 'capability-off', group.status));
+    const items = make('ul', 'capability-items');
+    for (const label of group.items) items.append(make('li', 'capability-item', label));
+    const details = make('dd');
+    details.append(items);
+    entry.append(term, details);
+    return entry;
+  }
+
+  function capabilityDeveloperNode() {
+    const developer = make('details', 'capability-developer');
+    // 声明与权限是开发者信息：默认收起，展开才看。
+    developer.open = false;
+    developer.append(make('summary', '', '声明与权限'), make('dl', 'capability-developer-list'));
+    return developer;
+  }
+
+  // capabilityRowNode 建一次节点，updateCapabilityRow 之后只改内容：轮询不会重建
+  // 行，所以键盘焦点和已经展开的细节都留在原处。
+  function capabilityRowNode() {
+    const item = make('li', 'capability-row luna-list-item');
+    const head = make('div', 'capability-head');
+    const title = make('div', 'capability-title');
+    title.append(make('span', 'capability-name'), make('span', 'capability-id'));
+    const toggle = make('button', 'luna-button capability-toggle');
+    toggle.type = 'button';
+    toggle.addEventListener('click', () => setCapabilityState(item.capabilityRow));
+    head.append(title, toggle);
+
+    const meta = make('div', 'capability-meta');
+    meta.append(make('span', 'capability-badge'), make('span', 'capability-state'));
+
+    const error = make('p', 'capability-error');
+    error.hidden = true;
+
+    item.append(head, meta, error, make('dl', 'capability-contributions'), capabilityDeveloperNode());
+    return item;
+  }
+
+  function updateCapabilityRow(item, row) {
+    item.capabilityRow = row;
+    item.dataset.capability = row.id;
+    item.querySelector('.capability-name').textContent = row.title;
+    item.querySelector('.capability-id').textContent = row.id;
+
+    const toggle = item.querySelector('.capability-toggle');
+    const pending = capabilityPending.has(row.id);
+    // 内核没有把这个 id 报成可寻址的能力时不给出控件：按不对的路径发请求只会失败。
+    toggle.hidden = row.action === '';
+    toggle.disabled = pending;
+    toggle.textContent = pending ? `${row.actionLabel}中…` : row.actionLabel;
+    toggle.setAttribute('aria-label', `${row.actionLabel}${row.title}`);
+
+    item.querySelector('.capability-badge').textContent = row.deploymentLabel;
+    const state = item.querySelector('.capability-state');
+    state.textContent = row.stateLabel;
+    state.classList.toggle('is-on', row.enabled);
+    state.classList.toggle('is-off', !row.enabled);
+
+    const error = item.querySelector('.capability-error');
+    error.hidden = row.error === '';
+    error.textContent = row.error;
+
+    const contributions = item.querySelector('.capability-contributions');
+    contributions.replaceChildren();
+    if (row.groups.length === 0) contributions.append(make('p', 'capability-none luna-muted', '没有声明任何贡献。'));
+    for (const group of row.groups) contributions.append(capabilityGroupNode(group));
+
+    const developer = item.querySelector('.capability-developer');
+    const lines = [];
+    if (row.claims.length) lines.push(['声明', row.claims.join('、')]);
+    if (row.permissions.length) lines.push(['权限', row.permissions.join('、')]);
+    const list = developer.querySelector('.capability-developer-list');
+    list.replaceChildren();
+    for (const [label, text] of lines) {
+      const entry = make('div', 'capability-developer-row');
+      entry.append(make('dt', '', label), make('dd', '', text));
+      list.append(entry);
+    }
+    // 没有声明也没有权限的能力（例如只贡献一条上下文）不显示这个折叠块。
+    developer.hidden = lines.length === 0;
+  }
+
+  function renderCapabilities(payload) {
+    if (payload !== undefined) capabilityPayload = payload;
+    const rows = capabilityRows(capabilityPayload);
+    reconcileList(capabilityList, rows, (row) => row.id, capabilityRowNode, updateCapabilityRow, capabilityRetry);
+    capabilityEmpty.hidden = rows.length > 0;
+  }
+
+  // setCapabilityState is the only place the browser asks the kernel to change a
+  // capability's state. Nothing is marked as changed here: the request either
+  // fails — and says so, keeping the last reported state — or it succeeds, and
+  // then the list is rebuilt from a fresh /api/state read. The interface never
+  // shows a state the kernel did not report.
+  async function setCapabilityState(row) {
+    if (!row || !row.id || !row.action || capabilityPending.has(row.id)) return;
+    const path = capabilityStatePath(row.id, row.action);
+    if (!path) return;
+    const { action, actionLabel: label, title } = row;
+    capabilityPending.add(row.id);
+    setCapabilityStatus(`正在${label} ${title}…`);
+    renderCapabilities();
+    let failure = '';
+    try {
+      const response = await fetch(path, { method: 'POST' });
+      if (!response.ok) failure = await errorMessage(response);
+    } catch (error) {
+      failure = error.message;
+    }
+    capabilityPending.delete(row.id);
+    renderCapabilities();
+    setCapabilityStatus(
+      failure
+        ? `${label} ${title} 失败：${failure}（它仍按上一次读到的状态显示）`
+        : `${title} 已${action === 'disable' ? '停用' : '启用'}。`,
+      failure ? 'failure' : ''
+    );
+    // 以内核的实际状态重绘：工具、上下文、路由与面板都跟着这一份状态走。
+    await updateState();
+  }
+
+  // 模型服务参数是这个进程启动时定下的，界面只读显示：模型、提供方与思考档位来自
+  // 同一份状态；档位的说明与“推理过程是否展示”分开写。
+  function renderModelFacts(state) {
+    const payload = state && typeof state === 'object' ? state : {};
+    $('settings-model').textContent = valueOrDash(payload.model);
+    $('settings-provider').textContent = valueOrDash(payload.provider_host);
+    const effort = reasoningEffortView(payload.reasoning_effort);
+    $('settings-effort').textContent = effort.label;
+    $('settings-effort-note').textContent = effort.note;
+  }
+
+  capabilityRetry.addEventListener('click', () => updateState());
+
   function renderState(state) {
     $('model').textContent = valueOrDash(state.model);
     $('provider').textContent = valueOrDash(state.provider_host);
@@ -2263,6 +2610,10 @@ if (typeof document !== 'undefined') {
     // 页头入口与面板容器只随这一份状态变化。一次读不到状态时这里不会被调用，
     // 所以"读不到"不会被当成"停用"，页头保持原样。
     syncCapabilityPanels(capabilityPanels(state.capabilities));
+    // 设置里的能力清单与模型服务参数读的是同一份状态：停用后入口、面板与这里的
+    // "未在服务"一起变，不会各说一套。
+    renderCapabilities(state.capabilities);
+    renderModelFacts(state);
   }
 
   async function updateState() {
