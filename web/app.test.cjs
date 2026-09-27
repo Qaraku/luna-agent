@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const { pathToFileURL } = require('node:url');
 
 const root = __dirname;
 const source = (name) => fs.readFileSync(path.join(root, name), 'utf8');
@@ -3369,4 +3370,34 @@ test('运行详情只说这一次运行用什么，开发诊断在设置里', as
   await h.click('settings-toggle');
   await h.click('settings-tab-capabilities');
   assert.equal(h.$('settings-pane-model').contains(h.$('settings-budgets')), true, '模型服务一页也报同一份预算');
+});
+
+test('every shipped UI plugin module is a valid manifest and exports the host contract', async () => {
+  // 门禁里没有别的命令解析 plugins/ui 下的真实文件：`node --check` 只查 web/app.js（而且它按
+  // CommonJS 解析，撞到 ESM 的 export 会静默 exit 0），这个套件的其余部分只演基座，Go 侧的
+  // internal/uiplugin 用例在临时目录里搭"形状像 plugins/ui"的根。所以这一条把真实模块 import 一遍，
+  // 顺带按宿主自己的规则校验清单：目录名、清单里的 name、title 与 entry。
+  const { uiPluginEntrySafe, uiPluginNameValid, UI_PLUGIN_REQUIRED_EXPORTS } = require('./app.js');
+  const dir = path.join(__dirname, '..', 'plugins', 'ui');
+  const names = fs.readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+  assert.ok(names.length > 0, 'plugins/ui 下至少要有一个界面插件，否则这条检查会空过');
+
+  for (const name of names) {
+    const manifest = JSON.parse(fs.readFileSync(path.join(dir, name, 'plugin.json'), 'utf8'));
+    assert.equal(uiPluginNameValid(name), true, `${name} 的目录名必须是合法的插件名`);
+    assert.equal(manifest.name, name, `${name} 的清单 name 必须与目录名一致`);
+    assert.notEqual(String(manifest.title ?? '').trim(), '', `${name} 的清单必须有 title`);
+    // 先确认 entry 是插件目录内的相对路径，再拿它拼文件路径（顺序不能反）。
+    assert.equal(uiPluginEntrySafe(manifest.entry), true, `${name} 的 entry 必须是插件目录内的相对路径`);
+
+    // 动态 import 覆盖两件事：语法能被宿主真正解析，以及导出契约。空文件在这里自然失败
+    // （没有导出），所以不必单独量文件大小。
+    const module = await import(pathToFileURL(path.join(dir, name, manifest.entry)).href);
+    for (const exportName of UI_PLUGIN_REQUIRED_EXPORTS) {
+      assert.equal(typeof module[exportName], 'function', `${name} 必须导出 ${exportName} 函数`);
+    }
+  }
 });
