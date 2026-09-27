@@ -414,8 +414,8 @@ func (h *Host) State() State {
 
 // Invoke calls the text-transform tool.
 func (h *Host) Invoke(ctx context.Context, in Input) (Output, error) {
-	if len(in.Text) > 16384 || in.DelayMS < 0 || in.DelayMS > 3000 {
-		return Output{}, fmt.Errorf("text max 16384 bytes; delay_ms must be 0..3000")
+	if len(in.Text) > 16384 || in.DelayMS < 0 || in.DelayMS > pluginprotocol.MaxDelayMS {
+		return Output{}, fmt.Errorf("text max 16384 bytes; delay_ms must be 0..%d", pluginprotocol.MaxDelayMS)
 	}
 	return h.invoke(ctx, ToolTextTransform, in)
 }
@@ -427,8 +427,8 @@ func (h *Host) ReadFile(ctx context.Context, req ReadRequest) (Output, error) {
 	if len(req.Path) > 4096 {
 		return Output{}, fmt.Errorf("path must not exceed 4096 bytes")
 	}
-	if req.DelayMS < 0 || req.DelayMS > 3000 {
-		return Output{}, fmt.Errorf("delay_ms must be 0..3000")
+	if req.DelayMS < 0 || req.DelayMS > pluginprotocol.MaxDelayMS {
+		return Output{}, fmt.Errorf("delay_ms must be 0..%d", pluginprotocol.MaxDelayMS)
 	}
 	absolute, err := fileread.Resolve(h.opts.ReadRoot, req.Path, h.opts.ReadLimit)
 	if err != nil {
@@ -448,8 +448,8 @@ func (h *Host) ListDir(ctx context.Context, req ListRequest) (Output, error) {
 	if len(req.Path) > 4096 {
 		return Output{}, fmt.Errorf("path must not exceed 4096 bytes")
 	}
-	if req.DelayMS < 0 || req.DelayMS > 3000 {
-		return Output{}, fmt.Errorf("delay_ms must be 0..3000")
+	if req.DelayMS < 0 || req.DelayMS > pluginprotocol.MaxDelayMS {
+		return Output{}, fmt.Errorf("delay_ms must be 0..%d", pluginprotocol.MaxDelayMS)
 	}
 	absolute, err := fileread.ResolveDir(h.opts.ReadRoot, req.Path)
 	if err != nil {
@@ -476,8 +476,8 @@ func (h *Host) SearchFiles(ctx context.Context, req SearchRequest) (Output, erro
 	if len(req.Path) > 4096 {
 		return Output{}, fmt.Errorf("path must not exceed 4096 bytes")
 	}
-	if req.DelayMS < 0 || req.DelayMS > 3000 {
-		return Output{}, fmt.Errorf("delay_ms must be 0..3000")
+	if req.DelayMS < 0 || req.DelayMS > pluginprotocol.MaxDelayMS {
+		return Output{}, fmt.Errorf("delay_ms must be 0..%d", pluginprotocol.MaxDelayMS)
 	}
 	if err := fileread.ValidateQuery(req.Query); err != nil {
 		return Output{}, err

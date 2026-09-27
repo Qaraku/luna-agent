@@ -32,6 +32,23 @@ func testHost(t *testing.T, opts Options) *Host {
 	return h
 }
 
+// slowCallOptions is for the two tests that keep a tool call in flight while a
+// reload publishes the next generation. Both have to observe a call that is
+// still running when the replacement lands, and a reload builds and starts a
+// candidate for every tool on the allowlist: measured under the gate's own
+// parallel run with the race detector, that takes about three seconds even with
+// the builds warmed. The defaults are sized for a tool call rather than for a
+// test racing one against a reload — a five second RPC timeout leaves no room to
+// observe anything at all — so these tests state the timeouts they need instead
+// of inheriting them. Nothing here changes the defaults other tests rely on.
+func slowCallOptions() Options {
+	return Options{
+		BuildTimeout: 120 * time.Second,
+		StartTimeout: 60 * time.Second,
+		RPCTimeout:   60 * time.Second,
+	}
+}
+
 func waitFor(t *testing.T, fn func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -101,14 +118,14 @@ func TestEveryAllowlistedToolStartsInItsOwnProcess(t *testing.T) {
 }
 
 func TestRealSubprocessReplacementPinsInflightAndRollsBack(t *testing.T) {
-	h := testHost(t, Options{})
+	h := testHost(t, slowCallOptions())
 	// Warm every tool family's candidate builds before the timed section below. A
-	// reload builds a candidate for each tool on the allowlist, and under the gate's
-	// parallel run a cold build can outlast the in-flight window (delay_ms is capped
-	// at 3000), so the call finishes first and the assertion that follows fails for a
-	// reason that has nothing to do with pinning. This test is about pinning a call
-	// to the generation that started it, not about how long a build takes; reloading
-	// to v2 and back leaves the host in the state the rest of the test expects.
+	// reload builds a candidate for each tool on the allowlist, and a cold build
+	// can outlast the in-flight window, so the call finishes first and the
+	// assertion that follows fails for a reason that has nothing to do with
+	// pinning. This test is about pinning a call to the generation that started
+	// it, not about how long a build takes; reloading to v2 and back leaves the
+	// host in the state the rest of the test expects.
 	if err := h.Reload(context.Background(), "v2"); err != nil {
 		t.Fatal(err)
 	}
@@ -123,11 +140,12 @@ func TestRealSubprocessReplacementPinsInflightAndRollsBack(t *testing.T) {
 		t.Fatalf("bad reader state: %+v", reader)
 	}
 
-	// Keep the old RPC in flight longer than a reload takes. The reload's builds were
-	// warmed at the top of this test, so this window only has to cover starting a
-	// candidate and shaking hands with it, which is why 3000 (the cap delay_ms
-	// carries) is enough even under the gate's parallel run.
-	const inFlightMS = 3000
+	// Keep the old RPC in flight longer than a reload takes. Ten seconds is about
+	// three times the slowest reload measured under the gate's parallel run, and
+	// it is the reason this test asks for its own RPC timeout: the five second
+	// default is shorter than the window, so a call that outlives a reload would
+	// be killed by the timeout instead of pinned.
+	const inFlightMS = 10000
 	done := make(chan Output, 1)
 	errs := make(chan error, 1)
 	go func() {
@@ -136,9 +154,11 @@ func TestRealSubprocessReplacementPinsInflightAndRollsBack(t *testing.T) {
 		errs <- err
 	}()
 	waitFor(t, func() bool { a := h.State().Active(ToolTextTransform); return a != nil && a.Inflight == 1 })
+	reloadStarted := time.Now()
 	if err := h.Reload(context.Background(), "v2"); err != nil {
 		t.Fatal(err)
 	}
+	t.Logf("timed reload took %v (in-flight window is %dms)", time.Since(reloadStarted), inFlightMS)
 	second := *active(t, h, ToolTextTransform)
 	if second.Version != "v2" || second.Generation == first.Generation || second.PluginPID == first.PluginPID {
 		t.Fatalf("bad replacement: %+v", second)
@@ -412,7 +432,9 @@ func TestReadFilePinsInflightCallAndDrainsOnReload(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(readRoot, "notes.txt"), []byte("content\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	h := testHost(t, Options{ReadRoot: readRoot})
+	opts := slowCallOptions()
+	opts.ReadRoot = readRoot
+	h := testHost(t, opts)
 	before := *active(t, h, ToolReadFile)
 
 	type reply struct {
@@ -421,7 +443,9 @@ func TestReadFilePinsInflightCallAndDrainsOnReload(t *testing.T) {
 	}
 	done := make(chan reply, 1)
 	go func() {
-		out, err := h.ReadFile(context.Background(), ReadRequest{Path: "notes.txt", DelayMS: 3000})
+		// The same window as the replacement test: the call has to still be
+		// running when the reload publishes the next generation.
+		out, err := h.ReadFile(context.Background(), ReadRequest{Path: "notes.txt", DelayMS: 10000})
 		done <- reply{out, err}
 	}()
 	waitFor(t, func() bool { a := h.State().Active(ToolReadFile); return a != nil && a.Inflight == 1 })

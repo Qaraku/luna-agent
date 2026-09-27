@@ -42,8 +42,24 @@ type Input struct {
 	MaxMatches   int `json:"max_matches"`
 	MaxFiles     int `json:"max_files"`
 	MaxFileBytes int `json:"max_file_bytes"`
-	DelayMS      int `json:"delay_ms"`
+	// DelayMS makes a candidate take a known amount of time before it answers.
+	// It exists for the replacement tests, which have to keep one call in flight
+	// while a reload publishes the next generation: without a delay the call is
+	// over before there is anything to pin. MaxDelayMS is the largest value a
+	// candidate accepts, and it is deliberately generous — the window has to
+	// survive a machine running the whole test suite in parallel under the race
+	// detector, where starting and hand-shaking a candidate has been measured at
+	// over three seconds. A window sized for an idle machine is a test that fails
+	// on a busy one, for a reason that has nothing to do with what it tests.
+	DelayMS int `json:"delay_ms"`
 }
+
+// MaxDelayMS bounds Input.DelayMS. It is stated once, here, because both the
+// host and every candidate enforce it: two copies of a bound are two bounds that
+// can drift apart, and the plugin that enforced the smaller one would refuse a
+// call the host thought was fine.
+const MaxDelayMS = 30000
+
 type Metadata struct {
 	Version  string
 	PID      int

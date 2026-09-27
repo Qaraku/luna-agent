@@ -24,8 +24,8 @@ func (tool) Metadata() (pluginprotocol.Metadata, error) {
 	return pluginprotocol.Metadata{Version: "v1", PID: os.Getpid(), Protocol: 1}, nil
 }
 func (tool) Invoke(in pluginprotocol.Input) (string, error) {
-	if in.DelayMS < 0 || in.DelayMS > 3000 {
-		return "", fmt.Errorf("delay_ms must be 0..3000")
+	if in.DelayMS < 0 || in.DelayMS > pluginprotocol.MaxDelayMS {
+		return "", fmt.Errorf("delay_ms must be 0..%d", pluginprotocol.MaxDelayMS)
 	}
 	time.Sleep(time.Duration(in.DelayMS) * time.Millisecond)
 	return fileread.Read(in.Path, in.MaxBytes)
