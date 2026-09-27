@@ -5,17 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
   <title>Luna</title>
-  <script id="theme-bootstrap">
-    (() => {
-      let preference = 'system';
-      try {
-        const saved = window.localStorage.getItem('luna.theme');
-        if (saved === 'light' || saved === 'dark') preference = saved;
-      } catch (_) {}
-      document.documentElement.dataset.theme = preference === 'system'
-        ? (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light') : preference;
-    })();
-  </script>
+  <script src="/theme.js"></script>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
