@@ -166,6 +166,7 @@ Startup errors name the missing variable but never print its value.
 | `GET` | `/api/ui-plugins/<name>/<file>` | One file from inside that plugin's own directory, contained after normalization and after symlink resolution; an unknown extension is refused rather than guessed into a `Content-Type` |
 | `GET` | `/api/memory` | Contributed by the Memory capability. The facts in effect and the retracted ones, without the storage record type. The model has no equivalent endpoint, because memory reaches it only through the injection |
 | `POST` | `/api/memory/retract` | Contributed by the Memory capability. `{"at":"...","text":"..."}` — takes exactly the fact those two identify out of the effective set: `200` when it was in effect, `404` when it was not, `400` on a malformed request |
+| `GET` | `/api/memory/panel.js`, `/api/memory/panel.css` | The panel's own assets, contributed by the Memory capability and served from its own routes. The stylesheet is served as a file rather than injected as a `<style>` element, which the server's Content-Security-Policy refuses |
 
 Mutation requests must come from the exact bound browser origin. There is no CORS support and no public-network mode.
 

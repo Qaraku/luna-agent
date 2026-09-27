@@ -63,7 +63,7 @@ Eino 拥有内部的模型/工具循环。它是实现依赖，不是 Luna 的�
 
 ### 能力：Memory
 
-Memory 是官方内置能力（`internal/plugins/memory`），不再属于内核业务：`fact`、`remember`、`retract`、注入块的渲染、存储上限、接口形状与面板文案都由它自己决定与测试。它贡献四样东西——写工具 `luna_remember`、一个上下文块、两条数据路由（`GET /api/memory`、`POST /api/memory/retract`）与一个浏览器面板——外加一个状态命名空间 `.runtime`。
+Memory 是官方内置能力（`internal/plugins/memory`），不再属于内核业务：`fact`、`remember`、`retract`、注入块的渲染、存储上限、接口形状与面板文案都由它自己决定与测试。它贡献四样东西——写工具 `luna_remember`、一个上下文块、三条路由（`GET /api/memory`、`POST /api/memory/retract`，以及面板自己的两个资产：`GET /api/memory/panel.js` 与 `GET /api/memory/panel.css`）与一个浏览器面板——外加一个状态命名空间 `.runtime`。面板的样式表走它自己的路由而不是注入 `<style>`：服务的 CSP 是 `default-src 'self'` 且没有 `style-src 'unsafe-inline'`，注入的样式表会被浏览器拒绝。模块用自己 URL 推导样式表地址，卸载时把 `<link>` 一并摘掉。
 
 内核看到的只有这些贡献：包装工具、按预算注入块、挂上路由、把面板入口交给宿主，并对 `POST /api/memory/retract` 施加与其它变更相同的 Origin 要求。停用这个能力会同时拿掉这四样；数据留在原处。
 
