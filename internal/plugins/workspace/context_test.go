@@ -101,3 +101,101 @@ func TestTwoReadsOfTheSameRunRenderTheSameBlock(t *testing.T) {
 		t.Fatalf("first=%+v second=%+v, want the same single block", first, second)
 	}
 }
+
+// When the project states rules, the capability contributes a second block of
+// the instruction kind, carrying the rule text the composition root read. The
+// project identity stays the reference block it always was.
+func TestContextsAddsAnInstructionBlockWhenTheProjectStatesRules(t *testing.T) {
+	const rule = "Commit messages are written in English."
+	blocks, err := newPluginWithRules(t, projectRoot(t), rule).Contexts(context.Background())
+	if err != nil {
+		t.Fatalf("Contexts: %v", err)
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("blocks=%+v, want the identity and the rules blocks", blocks)
+	}
+	if blocks[0].ID != ProjectContextID || blocks[0].Kind != plugin.ContextReference {
+		t.Fatalf("blocks[0]=%+v, want the reference identity block", blocks[0])
+	}
+	rules := blocks[1]
+	if rules.ID != RulesContextID || rules.Kind != plugin.ContextInstruction {
+		t.Fatalf("blocks[1]=%+v, want an instruction contribution with id %q", rules, RulesContextID)
+	}
+	for _, want := range []string{rulesBlockHeader, rule} {
+		if !strings.Contains(rules.Text, want) {
+			t.Fatalf("the rules block does not contain %q:\n%s", want, rules.Text)
+		}
+	}
+}
+
+// A project that states no rules contributes no instruction block: an empty rule
+// block would tell the model "follow this" and then say nothing. Whitespace is
+// the same statement, so it is treated the same way.
+func TestContextsContributesNoRulesBlockWithoutRuleText(t *testing.T) {
+	for _, rules := range []string{"", "   ", "\n	\n"} {
+		blocks, err := newPluginWithRules(t, projectRoot(t), rules).Contexts(context.Background())
+		if err != nil {
+			t.Fatalf("Contexts(%q): %v", rules, err)
+		}
+		if len(blocks) != 1 {
+			t.Fatalf("rules=%q produced %+v, want the identity block alone", rules, blocks)
+		}
+		for _, block := range blocks {
+			if block.Kind == plugin.ContextInstruction {
+				t.Fatalf("rules=%q produced an instruction block: %+v", rules, block)
+			}
+		}
+	}
+}
+
+// The capability never cuts a rule set to fit: a set that does not fit the
+// budget it declared for it is dropped, because a rule that stops mid-sentence
+// is a rule the project never wrote. The boundary is exact, so the case that
+// fits is not refused as well.
+func TestAnOverLongRuleSetIsRefusedRatherThanCut(t *testing.T) {
+	fits := strings.Repeat("a", MaxRulesTextBytes)
+	blocks, err := newPluginWithRules(t, projectRoot(t), fits).Contexts(context.Background())
+	if err != nil {
+		t.Fatalf("Contexts: %v", err)
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("a rule set at the text ceiling produced %d blocks, want 2", len(blocks))
+	}
+
+	tooLong := strings.Repeat("a", MaxRulesTextBytes+1)
+	blocks, err = newPluginWithRules(t, projectRoot(t), tooLong).Contexts(context.Background())
+	if err != nil {
+		t.Fatalf("Contexts: %v", err)
+	}
+	if len(blocks) != 1 {
+		t.Fatalf("an over-long rule set produced %d blocks, want the identity block alone", len(blocks))
+	}
+	if strings.Contains(blocks[0].Text, tooLong) {
+		t.Fatalf("the refused rule set leaked into the identity block")
+	}
+}
+
+// Every rules block stays inside the budget the descriptor asks the Kernel for:
+// a block larger than its declared budget would be cut by the Kernel, and the
+// capability never relies on that.
+func TestTheRulesBlockFitsTheBudgetDeclaredForIt(t *testing.T) {
+	declared := 0
+	for _, c := range Descriptor().Contributions {
+		if c.Kind == plugin.ContributionContext && c.ID == RulesContextID {
+			declared = c.BudgetBytes
+		}
+	}
+	if declared != RulesBudgetBytes {
+		t.Fatalf("declared budget=%d, want %d", declared, RulesBudgetBytes)
+	}
+	blocks, err := newPluginWithRules(t, projectRoot(t), strings.Repeat("a", MaxRulesTextBytes)).Contexts(context.Background())
+	if err != nil {
+		t.Fatalf("Contexts: %v", err)
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("blocks=%+v, want the identity and the rules blocks", blocks)
+	}
+	if size := len(blocks[1].Text); size == 0 || size > declared {
+		t.Fatalf("rules block size=%d, want 1..%d bytes", size, declared)
+	}
+}

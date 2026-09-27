@@ -252,6 +252,22 @@ func TestRegisterAccepts(t *testing.T) {
 
 // ---- Register：拒绝 ----
 
+// Valid is the one place the set of ContextKind values is defined, so it must
+// accept every declared kind and reject everything else — including the empty
+// string, which is not a kind.
+func TestContextKindValidCoversEveryDeclaredKind(t *testing.T) {
+	for _, k := range []ContextKind{ContextReference, ContextInstruction, ContextSkill} {
+		if !k.Valid() {
+			t.Fatalf("%q is declared but Valid rejects it", k)
+		}
+	}
+	for _, k := range []ContextKind{"", "Reference", "instruction ", "widget"} {
+		if k.Valid() {
+			t.Fatalf("%q is not a declared kind but Valid accepts it", k)
+		}
+	}
+}
+
 func TestRegisterRejects(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -348,6 +364,27 @@ func TestRegisterRejects(t *testing.T) {
 				list: []ContextBlock{{ID: "docs", Kind: ContextReference}},
 			},
 			wantErr: `exposes context "docs" without a matching context contribution`,
+		},
+		{
+			// 装配方只会标注它认识的 Kind。放一个未知 Kind 过去，模型收到的
+			// 就是一段没有语义的文本，所以这里必须在注册期就拒绝，并指名是
+			// 哪个能力的哪条贡献。
+			name: "context with an unknown kind",
+			target: contextPlugin{
+				d:    withContrib(desc("luna", DeploymentBuiltin), Contribution{Kind: ContributionContext, ID: "notes"}),
+				list: []ContextBlock{{ID: "notes", Kind: ContextKind("widget"), Text: "x"}},
+			},
+			wantErr: `plugin "luna" contributes context "notes" with unknown kind "widget"`,
+		},
+		{
+			// 空 Kind 不是一种 Kind：没有这条检查，一块无法说明自己是规则的
+			// 文本同样会到达模型。
+			name: "context with an empty kind",
+			target: contextPlugin{
+				d:    withContrib(desc("luna", DeploymentBuiltin), Contribution{Kind: ContributionContext, ID: "notes"}),
+				list: []ContextBlock{{ID: "notes", Text: "x"}},
+			},
+			wantErr: `contributes context "notes" with unknown kind ""`,
 		},
 		{
 			name:    "context contribution without a ContextProvider implementation",

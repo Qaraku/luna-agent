@@ -398,6 +398,11 @@ func checkConsistency(p Plugin, d Descriptor) error {
 			if !ids[b.ID] {
 				return fmt.Errorf("plugin %q exposes context %q without a matching context contribution", d.ID, b.ID)
 			}
+			// 未知 Kind 必须在注册期被拒：装配方只会标注它认识的类型，放它过去
+			// 就等于给模型一段没有语义的文本。错误指名能力与那条贡献。
+			if !b.Kind.Valid() {
+				return fmt.Errorf("plugin %q contributes context %q with unknown kind %q", d.ID, b.ID, b.Kind)
+			}
 		}
 	} else if len(declared(ContributionContext)) > 0 {
 		return fmt.Errorf("plugin %q declares context contributions but does not implement ContextProvider", d.ID)

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -113,6 +115,58 @@ func sessionsDir(root, explicit string) string {
 	return filepath.Join(root, ".runtime", "sessions")
 }
 
+// loadRules reads the project-rule file the Workspace capability will
+// contribute.
+//
+// Reading belongs to this layer, not to the capability: the capability never
+// opens a path, so it needs no filesystem permission — and the Kernel only
+// enforces permissions it can, so a permission declared but not enforced would
+// be a claim that means nothing. Here there is a path, and the file is read
+// with the capability's own text ceiling.
+//
+// The second return value is a problem statement for the operator when no rules
+// can be contributed: a file that cannot be opened, that is empty, or that is
+// larger than the ceiling yields no text rather than a truncated rule set. The
+// statement names the file, never the absolute path it sits in, and it is for
+// the operator only — it is never handed to the capability, so it cannot reach
+// the model.
+func loadRules(path string, maxText int) (text, problem string) {
+	if path == "" {
+		return "", ""
+	}
+	name := filepath.Base(path)
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Sprintf("project rules file %q cannot be opened: %s", name, fileReason(err))
+	}
+	defer file.Close()
+	// One byte past the ceiling, so a file that is too large is recognised as
+	// too large instead of being silently cut to fit.
+	data, err := io.ReadAll(io.LimitReader(file, int64(maxText)+1))
+	if err != nil {
+		return "", fmt.Sprintf("project rules file %q cannot be read: %s", name, fileReason(err))
+	}
+	text = strings.TrimSpace(string(data))
+	if text == "" {
+		return "", fmt.Sprintf("project rules file %q is empty", name)
+	}
+	if len(text) > maxText {
+		return "", fmt.Sprintf("project rules file %q is larger than %d bytes", name, maxText)
+	}
+	return text, ""
+}
+
+// fileReason reduces an *fs.PathError to its underlying reason. os errors echo
+// the path they were given, and a message about a rules file must not carry the
+// host's absolute layout.
+func fileReason(err error) string {
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) {
+		return pathErr.Err.Error()
+	}
+	return err.Error()
+}
+
 // stateRoot resolves where capabilities keep their state: an explicit directory
 // wins, otherwise state lives under the resolved root next to the sessions. A
 // capability then claims a namespace inside it, and the kernel resolves that
@@ -139,6 +193,7 @@ func run() error {
 	readLimit := flag.Int("read-limit", 0, "single-read cap in bytes for luna_read_file (default: 262144)")
 	sessionsFlag := flag.String("sessions-dir", "", "directory holding the append-only session files (default: <root>/.runtime/sessions/)")
 	stateFlag := flag.String("state-dir", "", "root directory holding capability state (default: <root>)")
+	rulesFlag := flag.String("rules-file", "", "file holding the project rules the workspace capability contributes (default: none)")
 	flag.Parse()
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
@@ -174,11 +229,17 @@ func run() error {
 	if err := registry.Enable(memory.PluginID); err != nil {
 		return fmt.Errorf("enable memory capability: %w", err)
 	}
-	// The Workspace capability names the project this session is working in. It
-	// is built from the same directory the file tool is bounded to and keeps no
-	// state of its own: identity comes from the root, so it claims no namespace
-	// and asks for no permission.
-	project, err := workspace.New(projectRoot(root, *readRoot))
+	// The Workspace capability names the project this session is working in and
+	// states that project's rules. It is built from the same directory the file
+	// tool is bounded to and keeps no state of its own: identity comes from the
+	// root, so it claims no namespace and asks for no permission. The rules are
+	// read here and handed in as text — the capability opens no file, so it
+	// needs no permission the Kernel cannot yet enforce.
+	rules, rulesProblem := loadRules(*rulesFlag, workspace.MaxRulesTextBytes)
+	if rulesProblem != "" {
+		log.Printf("luna: %s; no project rules will be contributed", rulesProblem)
+	}
+	project, err := workspace.New(projectRoot(root, *readRoot), rules)
 	if err != nil {
 		return fmt.Errorf("open workspace capability: %w", err)
 	}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
+	"github.com/Qaraku/luna-agent/internal/plugins/workspace"
 )
 
 func TestRootFromExecutableRuntimeBinary(t *testing.T) {
@@ -251,6 +252,81 @@ func TestUIPluginsDirIsUnderTheResolvedRoot(t *testing.T) {
 	got := uiPluginsDir("/repo")
 	if want := filepath.Join("/repo", "plugins", "ui"); got != want {
 		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// The rules file is read by the composition root, not by the capability. A file
+// it cannot use yields no rules rather than a cut-down set, and the statement
+// about it names the file, never the directory it sits in.
+func TestLoadRulesReadsTheFileAndReportsProblemsWithoutAHostPath(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return path
+	}
+	limit := workspace.MaxRulesTextBytes
+
+	// A readable file is read and trimmed, with no problem to report.
+	good := write("rules.md", "\n  Commit messages are written in English.  \n")
+	text, problem := loadRules(good, limit)
+	if problem != "" {
+		t.Fatalf("a readable file reported %q", problem)
+	}
+	if text != "Commit messages are written in English." {
+		t.Fatalf("rules text=%q, want the trimmed body", text)
+	}
+
+	// No file configured is not a problem: the project simply states no rules.
+	if text, problem := loadRules("", limit); text != "" || problem != "" {
+		t.Fatalf("unconfigured rules: text=%q problem=%q, want both empty", text, problem)
+	}
+
+	// A missing file is reported by name, and the report must not carry the
+	// absolute host path os.Open echoes back.
+	missing := filepath.Join(dir, "missing.md")
+	text, problem = loadRules(missing, limit)
+	if text != "" || !strings.Contains(problem, "missing.md") || !strings.Contains(problem, "cannot be opened") {
+		t.Fatalf("missing file: text=%q problem=%q", text, problem)
+	}
+	if strings.Contains(problem, dir) {
+		t.Fatalf("the report carries the host path %q: %q", dir, problem)
+	}
+
+	// An empty file states no rules, and says so.
+	empty := write("empty.md", "  \n\t\n")
+	text, problem = loadRules(empty, limit)
+	if text != "" || !strings.Contains(problem, "empty.md") || !strings.Contains(problem, "is empty") {
+		t.Fatalf("empty file: text=%q problem=%q", text, problem)
+	}
+
+	// The boundary is exact: exactly the ceiling is read whole, one byte more is
+	// refused whole rather than cut to fit.
+	atLimit := write("at-limit.md", strings.Repeat("a", limit))
+	text, problem = loadRules(atLimit, limit)
+	if problem != "" || len(text) != limit {
+		t.Fatalf("at the ceiling: len(text)=%d problem=%q, want %d and no problem", len(text), problem, limit)
+	}
+	over := write("over.md", strings.Repeat("a", limit+1))
+	text, problem = loadRules(over, limit)
+	if text != "" || !strings.Contains(problem, "over.md") || !strings.Contains(problem, "larger than") {
+		t.Fatalf("over the ceiling: len(text)=%d problem=%q", len(text), problem)
+	}
+	if strings.Contains(problem, dir) {
+		t.Fatalf("the report carries the host path %q: %q", dir, problem)
+	}
+}
+
+// The ceiling the composition root reads a rules file with is the capability's
+// own: a file the capability would refuse to state is never loaded whole. It is
+// derived from the block budget, so it stays below it.
+func TestTheRulesReadCeilingIsTheCapabilitysOwn(t *testing.T) {
+	if workspace.MaxRulesTextBytes <= 0 || workspace.MaxRulesTextBytes >= workspace.RulesBudgetBytes {
+		t.Fatalf("rules text ceiling=%d, want a positive value below the block budget %d",
+			workspace.MaxRulesTextBytes, workspace.RulesBudgetBytes)
 	}
 }
 

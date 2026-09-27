@@ -41,20 +41,56 @@ func (p *Plugin) Render() string {
 	return b.String()
 }
 
-// Contexts renders the one reference block this capability contributes.
+// rulesBlock renders the project-rule contribution, or reports that there is
+// none to make. It contributes nothing in three honest cases and never a
+// shortened rule set:
+//
+//   - the project states no rules (the composition root handed over no text);
+//   - the rules are blank, which is the same statement made with whitespace;
+//   - the rules do not fit the budget this capability declared for them. Cutting
+//     them at the budget would put a rule the project never wrote in front of
+//     the model, so an over-long set is dropped while the project's own file
+//     stays the record of it.
+//
+// It reads nothing and writes nothing: the text was fixed when the composition
+// root built the capability, so a context read cannot fail between two reads of
+// the same run.
+func (p *Plugin) rulesBlock() (plugin.ContextBlock, bool) {
+	text := strings.TrimSpace(p.rules)
+	if text == "" {
+		return plugin.ContextBlock{}, false
+	}
+	full := rulesBlockHeader + "\n" + text
+	if len(full) > RulesBudgetBytes {
+		return plugin.ContextBlock{}, false
+	}
+	return plugin.ContextBlock{
+		ID:   RulesContextID,
+		Kind: plugin.ContextInstruction,
+		Text: full,
+	}, true
+}
+
+// Contexts renders the blocks this capability contributes: the project identity,
+// always, and the project rules when the project states any.
 //
 // It reads nothing and writes nothing: identity is fixed when the plugin is
-// constructed from the root the Kernel resolved, so a context read cannot fail
-// and cannot change between two reads of the same run. The block is always
+// constructed from the root the Kernel resolved, and the rules were read by the
+// composition root before construction, so a context read cannot fail and cannot
+// change between two reads of the same run. The reference block is always
 // contributed — a session that cannot say which project it is in would be
 // indistinguishable from one whose block silently failed.
 //
 // The text carries no leading blank line: the Kernel is what decides where a
-// reference contribution lands.
+// contribution lands and what kind of block it is.
 func (p *Plugin) Contexts(context.Context) ([]plugin.ContextBlock, error) {
-	return []plugin.ContextBlock{{
+	blocks := []plugin.ContextBlock{{
 		ID:   ProjectContextID,
 		Kind: plugin.ContextReference,
 		Text: p.Render(),
-	}}, nil
+	}}
+	if rules, ok := p.rulesBlock(); ok {
+		blocks = append(blocks, rules)
+	}
+	return blocks, nil
 }

@@ -11,13 +11,21 @@ import (
 )
 
 // newPlugin is the capability bound to a project directory named like the
-// repository it usually runs in. The directory is never created: identity comes
-// from the name the Kernel hands over, and this capability never touches disk.
+// repository it usually runs in, with no project rules. The directory is never
+// created: identity comes from the name the Kernel hands over, the rules come
+// from the composition root, and this capability never touches disk.
 func newPlugin(t *testing.T, root string) *Plugin {
 	t.Helper()
-	p, err := New(root)
+	return newPluginWithRules(t, root, "")
+}
+
+// newPluginWithRules is the capability bound to a root and handed rule text, the
+// way the composition root builds it after reading the rules file.
+func newPluginWithRules(t *testing.T, root, rules string) *Plugin {
+	t.Helper()
+	p, err := New(root, rules)
 	if err != nil {
-		t.Fatalf("New(%q): %v", root, err)
+		t.Fatalf("New(%q, %q): %v", root, rules, err)
 	}
 	return p
 }
@@ -48,13 +56,21 @@ func TestTheDescriptorRegistersWithoutAnyGrantedPermission(t *testing.T) {
 	if d.ID != PluginID || d.Title != PluginTitle || d.Deployment != plugin.DeploymentBuiltin {
 		t.Fatalf("descriptor=%+v", d)
 	}
-	want := []plugin.Contribution{{Kind: plugin.ContributionContext, ID: ProjectContextID, BudgetBytes: ProjectBudgetBytes}}
-	if len(d.Contributions) != 1 || d.Contributions[0] != want[0] {
+	want := []plugin.Contribution{
+		{Kind: plugin.ContributionContext, ID: ProjectContextID, BudgetBytes: ProjectBudgetBytes},
+		{Kind: plugin.ContributionContext, ID: RulesContextID, BudgetBytes: RulesBudgetBytes},
+	}
+	if len(d.Contributions) != len(want) {
 		t.Fatalf("contributions=%+v, want %+v", d.Contributions, want)
 	}
-	// Identity is all this slice contributes: no tool, no route, no panel — and
-	// therefore nothing that could carry a serving generation or a plugin
-	// process id to the model.
+	for i := range want {
+		if d.Contributions[i] != want[i] {
+			t.Fatalf("contributions=%+v, want %+v", d.Contributions, want)
+		}
+	}
+	// Identity and rules are all this slice contributes: no tool, no route, no
+	// panel — and therefore nothing that could carry a serving generation or a
+	// plugin process id to the model.
 	for _, c := range d.Contributions {
 		if c.Kind != plugin.ContributionContext {
 			t.Fatalf("capability contributes %s %q, want a context block only", c.Kind, c.ID)
@@ -80,8 +96,8 @@ func TestTheCapabilityClaimsNoNamespaceAndAsksForNoPermission(t *testing.T) {
 // to render, so construction fails instead of contributing a blank block.
 func TestARootThatNamesNoProjectIsRefused(t *testing.T) {
 	for _, root := range []string{"", "/"} {
-		if p, err := New(root); err == nil {
-			t.Fatalf("New(%q) accepted a root with no project name: %+v", root, p)
+		if p, err := New(root, ""); err == nil {
+			t.Fatalf("New(%q, \"\") accepted a root with no project name: %+v", root, p)
 		}
 	}
 }
