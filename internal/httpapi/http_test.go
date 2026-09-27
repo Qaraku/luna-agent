@@ -746,3 +746,39 @@ func TestListenRejectsNonLiteralLoopback(t *testing.T) {
 	}
 	l.Close()
 }
+
+// The candidate names once lived in two places: a literal inside the reload guard and
+// the allowlist table. This pins the accepted and refused sets, so collapsing them into
+// one source cannot quietly change which names a request may name.
+func TestReloadAcceptsExactlyTheAllowlistedCandidates(t *testing.T) {
+	h := testHandler(t, fakeRunner{})
+	// Near misses of the allowlisted names as well as names that are not candidates at all.
+	probes := []string{"v1", "v2", "broken", "", "V1", "v1 ", " v1", "v1\n", "vn", "v3",
+		"broken2", "v1,v2", "v1/v2", "../v1", "other", "v2.0"}
+	allowed := map[string]bool{}
+	for _, name := range pluginhost.CandidateNames() {
+		allowed[name] = true
+	}
+	if !allowed["v1"] || !allowed["v2"] || !allowed["broken"] {
+		t.Fatalf("allowlist candidates = %v", pluginhost.CandidateNames())
+	}
+	for _, candidate := range probes {
+		body, err := json.Marshal(map[string]string{"candidate": candidate})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := request(t, h, http.MethodPost, "/api/reload", string(body), true)
+		want := http.StatusBadRequest
+		if allowed[candidate] {
+			want = http.StatusOK
+		}
+		if w.Code != want {
+			t.Fatalf("candidate %q got %d, want %d（接受的候选只能来自 Allowlist）", candidate, w.Code, want)
+		}
+	}
+	// 拒绝的理由也要跟着表走：未知候选是 400（名字不对），不是 Reload 之后的 409。
+	w := request(t, h, http.MethodPost, "/api/reload", `{"candidate":"other"}`, true)
+	if !strings.Contains(w.Body.String(), "candidate must be v1, v2 or broken") {
+		t.Fatalf("refusal should name the allowlist's candidates: %s", w.Body.String())
+	}
+}

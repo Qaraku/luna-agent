@@ -60,6 +60,31 @@ var Allowlist = []ToolSpec{
 	{Tool: ToolFindFiles, Dir: "find_files", Candidates: []string{"v1", "v2", "broken"}},
 }
 
+// CandidateNames returns the candidate versions the allowlist accepts, in the order
+// the table declares them. Every allowlisted tool declares the same set, so naming one
+// candidate names them all: callers that have to say what is allowed read it from here
+// instead of keeping a second copy of the names.
+func CandidateNames() []string {
+	if len(Allowlist) == 0 {
+		return nil
+	}
+	names := make([]string, len(Allowlist[0].Candidates))
+	copy(names, Allowlist[0].Candidates)
+	return names
+}
+
+// CandidateAllowed reports whether candidate is one every allowlisted tool accepts, so
+// a caller can only ever name a candidate the table itself contains. The HTTP guard and
+// Reload both decide with this function.
+func CandidateAllowed(candidate string) bool {
+	for _, spec := range Allowlist {
+		if !spec.allows(candidate) {
+			return false
+		}
+	}
+	return true
+}
+
 // Infrastructure failures mean the tool never ran because its owned plugin
 // could not serve the call. They end the run, unlike a refusal the tool makes
 // about the call itself: internal/agent turns those into a result the model can
@@ -690,14 +715,10 @@ func pluginGone(g *generation, err error) bool {
 }
 
 // allowedCandidate reports whether every allowlisted tool has this candidate,
-// so one reload can publish a consistent set.
+// so one reload can publish a consistent set. It is the table's decision, not this
+// host's: the runtimes here were built from that same table.
 func (h *Host) allowedCandidate(candidate string) bool {
-	for _, rt := range h.tools {
-		if !rt.spec.allows(candidate) {
-			return false
-		}
-	}
-	return true
+	return CandidateAllowed(candidate)
 }
 
 // Reload builds and validates candidate for every allowlisted tool and then

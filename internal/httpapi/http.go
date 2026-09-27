@@ -606,6 +606,21 @@ func method(w http.ResponseWriter, allow string) {
 	w.Header().Set("Allow", allow)
 	fail(w, 405, fmt.Errorf("method must be %s", allow))
 }
+
+// candidateSentence renders the allowlist's candidates the way the refusal has always
+// read ("v1, v2 or broken"), so the message follows the table instead of keeping a
+// second copy of the names.
+func candidateSentence(names []string) string {
+	switch len(names) {
+	case 0:
+		return "one of the allowlisted candidates"
+	case 1:
+		return names[0]
+	default:
+		return strings.Join(names[:len(names)-1], ", ") + " or " + names[len(names)-1]
+	}
+}
+
 func (s *Server) reload(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Candidate string `json:"candidate"`
@@ -613,8 +628,8 @@ func (s *Server) reload(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	if in.Candidate != "v1" && in.Candidate != "v2" && in.Candidate != "broken" {
-		fail(w, 400, fmt.Errorf("candidate must be v1, v2 or broken"))
+	if !pluginhost.CandidateAllowed(in.Candidate) {
+		fail(w, 400, fmt.Errorf("candidate must be %s", candidateSentence(pluginhost.CandidateNames())))
 		return
 	}
 	if err := s.plugins.Reload(r.Context(), in.Candidate); err != nil {
