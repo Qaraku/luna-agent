@@ -170,6 +170,10 @@ type Server struct {
 	runner       Runner
 	sessions     Sessions
 	capabilities *plugin.Registry
+	// skills is the Skills capability as the interface uses it: which skills
+	// are installed and which of them the user turned off. It is supplied by
+	// the composition root, which also owns where that preference is stored.
+	skills SkillCatalog
 	// commands is the table the composer's slash commands come from. It is
 	// served to the browser rather than duplicated there.
 	commands  *command.Table
@@ -317,6 +321,12 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.listUIPlugins(w)
+	case "/api/skills":
+		if r.Method != http.MethodGet {
+			method(w, http.MethodGet)
+			return
+		}
+		s.sendSkills(w)
 	case "/api/runs":
 		if r.Method != http.MethodPost {
 			method(w, http.MethodPost)
@@ -344,6 +354,14 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.setPluginState(w, id, action)
+			return
+		}
+		if name, action, ok := skillStatePath(r.URL.Path); ok {
+			if r.Method != http.MethodPost {
+				method(w, http.MethodPost)
+				return
+			}
+			s.setSkillState(w, name, action)
 			return
 		}
 		if id, ok := sessionModelPath(r.URL.Path); ok {

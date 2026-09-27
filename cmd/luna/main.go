@@ -27,6 +27,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	skillsplugin "github.com/Qaraku/luna-agent/internal/plugins/skills"
 	"github.com/Qaraku/luna-agent/internal/plugins/workspace"
+	"github.com/Qaraku/luna-agent/internal/settings"
 	"github.com/Qaraku/luna-agent/internal/skills"
 	"github.com/Qaraku/luna-agent/internal/store"
 	"github.com/Qaraku/luna-agent/internal/uiplugin"
@@ -228,6 +229,38 @@ func userConfig(path string) (*config.File, error) {
 	return &file, nil
 }
 
+// settingsFileFor is where Luna's own preference file lives: beside the user's
+// configuration file, because that is the directory a user can find without
+// knowing anything about where Luna is installed. It is not a flag: the user
+// edits config.yaml, and Luna writes this one, so which file it is is not a
+// choice either side needs to make.
+func settingsFileFor(configDir string) string {
+	return filepath.Join(configDir, settings.FileName)
+}
+
+// loadUserSettings reads the preference file Luna owns. A missing file is not an
+// error: a user who has never turned a skill off has no settings at all, and
+// that is the same state as an empty one.
+//
+// A file that is there but unreadable or unrecognised fails the start, carrying
+// the reason. Starting with every skill on would leave the user with a setting
+// that does not apply and no one to tell them why.
+//
+// Which file was read is reported for the same reason the configuration file's
+// path is: someone who edited it and sees no effect needs to know whether it was
+// read at all.
+func loadUserSettings(path string) (settings.Settings, error) {
+	file, found, err := settings.Load(path)
+	if err != nil {
+		return settings.Settings{}, err
+	}
+	if !found {
+		return settings.Settings{}, nil
+	}
+	log.Printf("luna: reading user settings from %s", path)
+	return file, nil
+}
+
 // stateRoot resolves where capabilities keep their state: an explicit directory
 // wins, otherwise state lives under the resolved root next to the sessions. A
 // capability then claims a namespace inside it, and the kernel resolves that
@@ -305,6 +338,15 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Settings are the other half of the user's configuration, and a different
+	// file for a different reason: config.yaml is theirs to edit, settings.yaml
+	// is Luna's to write. Turning a skill off is a choice, not a state change of
+	// the capability, so it is stored where the user's other choices are.
+	settingsPath := settingsFileFor(paths.Config)
+	userSettings, err := loadUserSettings(settingsPath)
+	if err != nil {
+		return err
+	}
 	cfg, err := config.Load(os.Getenv, configFile)
 	if err != nil {
 		return err
@@ -368,7 +410,7 @@ func run() error {
 	for _, problem := range skillProblems {
 		log.Printf("luna: skill %s", problem)
 	}
-	skillSet := skillsplugin.New(discovered)
+	skillSet := skillsplugin.New(discovered, userSettings.DisabledSkills()...)
 	if err := registry.Register(skillSet); err != nil {
 		return fmt.Errorf("register skills capability: %w", err)
 	}
@@ -412,7 +454,7 @@ func run() error {
 	for _, model := range cfg.Models {
 		models = append(models, httpapi.ModelRef{Name: model.Name, Provider: model.Provider})
 	}
-	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Models: models, ReasoningEffort: cfg.ReasoningEffort, WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands))
+	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Models: models, ReasoningEffort: cfg.ReasoningEffort, WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(newSkillCatalog(skillSet, settingsPath, userSettings)))
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: 70 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() {

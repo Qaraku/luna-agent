@@ -35,7 +35,7 @@ func invoke(t *testing.T, tool *SkillViewTool, arguments string) (string, error)
 
 func TestReadsTheSkillWithoutItsFrontmatter(t *testing.T) {
 	skill, _ := newSkillDir(t, "alpha", sampleSkill)
-	tool := NewSkillViewTool([]lunas.Skill{skill})
+	tool := NewSkillViewTool([]lunas.Skill{skill}, nil)
 
 	body, err := invoke(t, tool, `{"name":"alpha"}`)
 	if err != nil {
@@ -54,7 +54,7 @@ func TestReadsAFileInsideTheSkillDirectory(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "notes.md"), []byte("Details.\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	tool := NewSkillViewTool([]lunas.Skill{skill})
+	tool := NewSkillViewTool([]lunas.Skill{skill}, nil)
 
 	body, err := invoke(t, tool, `{"name":"alpha","path":"notes.md"}`)
 	if err != nil {
@@ -80,7 +80,7 @@ func TestRefusesAPathOutsideTheSkillDirectory(t *testing.T) {
 	if err := os.WriteFile(outside, []byte("secret\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	tool := NewSkillViewTool([]lunas.Skill{skill})
+	tool := NewSkillViewTool([]lunas.Skill{skill}, nil)
 
 	for _, path := range []string{"../beta/" + lunas.FileName, "../secret.txt", "/etc/passwd", "../../etc/passwd"} {
 		arguments, err := json.Marshal(map[string]string{"name": "alpha", "path": path})
@@ -102,7 +102,7 @@ func TestRefusesAPathOutsideTheSkillDirectory(t *testing.T) {
 
 func TestRefusesAnUnknownSkill(t *testing.T) {
 	skill, _ := newSkillDir(t, "alpha", sampleSkill)
-	tool := NewSkillViewTool([]lunas.Skill{skill})
+	tool := NewSkillViewTool([]lunas.Skill{skill}, nil)
 
 	_, err := invoke(t, tool, `{"name":"beta"}`)
 	if err == nil || !strings.Contains(err.Error(), `no skill named "beta"`) {
@@ -113,7 +113,7 @@ func TestRefusesAnUnknownSkill(t *testing.T) {
 	}
 	// The list is empty, so every name is unknown — and the refusal says so
 	// rather than reading something.
-	if _, err := invoke(t, NewSkillViewTool(nil), `{"name":"alpha"}`); err == nil {
+	if _, err := invoke(t, NewSkillViewTool(nil, nil), `{"name":"alpha"}`); err == nil {
 		t.Fatal("a name was accepted with no skills discovered")
 	}
 }
@@ -124,7 +124,7 @@ func TestRefusesAFileOverTheLimit(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "long.txt"), []byte(long), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	tool := NewSkillViewTool([]lunas.Skill{skill}, 1024)
+	tool := NewSkillViewTool([]lunas.Skill{skill}, nil, 1024)
 
 	// The skill file itself is inside the limit: only the over-limit file is
 	// refused, so a limiter that refused everything would not pass below.
@@ -151,7 +151,7 @@ func TestRefusesAFileThatIsNotText(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "blob.bin"), []byte("head\x00tail"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	tool := NewSkillViewTool([]lunas.Skill{skill})
+	tool := NewSkillViewTool([]lunas.Skill{skill}, nil)
 
 	body, err := invoke(t, tool, `{"name":"alpha","path":"blob.bin"}`)
 	if err == nil || !strings.Contains(err.Error(), "NUL") {
@@ -161,7 +161,7 @@ func TestRefusesAFileThatIsNotText(t *testing.T) {
 
 func TestRefusesAMissingFile(t *testing.T) {
 	skill, _ := newSkillDir(t, "alpha", sampleSkill)
-	tool := NewSkillViewTool([]lunas.Skill{skill})
+	tool := NewSkillViewTool([]lunas.Skill{skill}, nil)
 
 	_, err := invoke(t, tool, `{"name":"alpha","path":"absent.md"}`)
 	if err == nil || !strings.Contains(err.Error(), "not found") {
@@ -171,7 +171,7 @@ func TestRefusesAMissingFile(t *testing.T) {
 
 func TestRefusesMalformedArguments(t *testing.T) {
 	skill, _ := newSkillDir(t, "alpha", sampleSkill)
-	tool := NewSkillViewTool([]lunas.Skill{skill})
+	tool := NewSkillViewTool([]lunas.Skill{skill}, nil)
 
 	cases := map[string]string{
 		"no name":     `{"path":"notes.md"}`,
@@ -189,7 +189,7 @@ func TestRefusesMalformedArguments(t *testing.T) {
 }
 
 func TestTheToolStatesWhenToUseItAndRequiresAName(t *testing.T) {
-	tool := NewSkillViewTool(nil)
+	tool := NewSkillViewTool(nil, nil)
 	if tool.Name() != SkillToolName {
 		t.Fatalf("name=%q", tool.Name())
 	}

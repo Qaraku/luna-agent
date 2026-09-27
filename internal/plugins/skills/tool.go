@@ -24,16 +24,23 @@ const skillViewDescription = "Read one installed skill: its own " + skills.FileN
 // one is opened. Its boundary is the skill's own directory and it reuses
 // internal/fileread rather than checking paths itself, so a skill read cannot
 // reach anywhere the file tools could not.
+//
+// It holds the whole discovery, not just the skills in service, because the two
+// refusals it can give are different answers: a name that was never discovered,
+// and a name the user turned off. A nil state is the empty selection — nothing
+// turned off.
 type SkillViewTool struct {
 	found []skills.Skill
+	state *selection
 	limit int
 }
 
-// NewSkillViewTool wires the tool to the skills discovery produced. limit is the
-// single-read cap; 0 means fileread.DefaultLimit, the same 256 KiB the file
-// tools use.
-func NewSkillViewTool(found []skills.Skill, limit ...int) *SkillViewTool {
-	tool := &SkillViewTool{found: found, limit: fileread.DefaultLimit}
+// NewSkillViewTool wires the tool to the skills discovery produced and to the
+// selection the manifest also reads, so a skill that is not in the manifest is
+// also not readable through the tool. limit is the single-read cap; 0 means
+// fileread.DefaultLimit, the same 256 KiB the file tools use.
+func NewSkillViewTool(found []skills.Skill, state *selection, limit ...int) *SkillViewTool {
+	tool := &SkillViewTool{found: found, state: state, limit: fileread.DefaultLimit}
 	if len(limit) > 0 && limit[0] > 0 {
 		tool.limit = limit[0]
 	}
@@ -94,6 +101,13 @@ func (t *SkillViewTool) Invoke(_ context.Context, arguments string) (string, err
 	name := strings.TrimSpace(in.Name)
 	if name == "" {
 		return "", errors.New("name is required")
+	}
+	// A skill the user turned off is refused by name, not reported as never
+	// discovered: "there is no such skill" would be a false statement about
+	// this installation, and the model would have no way to tell that the
+	// procedure it wants is on disk but out of service.
+	if t.state.off(name) {
+		return "", fmt.Errorf("the skill %q is turned off in the user's settings; it is not read while it is off", name)
 	}
 	dir, ok := t.dirOf(name)
 	if !ok {

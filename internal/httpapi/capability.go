@@ -51,6 +51,12 @@ func (s *Server) requiresOrigin(method, path string) bool {
 		// path is a wrong-method request and is answered 405.
 		return !isReadMethod(method)
 	}
+	if strings.HasPrefix(path, skillsStatePrefix) {
+		// Turning a skill off writes to the user's own settings file, so it is
+		// a mutation in the same way starting a run is. A read method to this
+		// path is a wrong-method request and is answered 405.
+		return !isReadMethod(method)
+	}
 	if _, ok := sessionModelPath(path); ok {
 		// Choosing a session's model changes what its next runs do, so it is a
 		// mutation in the same way starting a run is and carries the same Origin

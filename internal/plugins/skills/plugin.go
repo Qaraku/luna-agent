@@ -13,6 +13,7 @@ package skills
 
 import (
 	"context"
+	"strings"
 
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/skills"
@@ -51,22 +52,91 @@ const listBlockHeader = "The skills installed here, one line each. A skill is a 
 
 // Plugin contributes the manifest and the tool that reads one skill.
 //
-// It holds the skills discovered at start-up and nothing else: no state
-// directory, no route, no panel, and no permission. Being built in is a
-// deployment choice, not a privilege: it declares the same contributions and
-// asks for the same permissions any other built-in capability would, which here
-// means no claims and no permissions at all.
+// It holds the skills discovered at start-up and which of them the user has
+// turned off, and nothing else: no state directory, no route, no panel, and no
+// permission. Being built in is a deployment choice, not a privilege: it
+// declares the same contributions and asks for the same permissions any other
+// built-in capability would, which here means no claims and no permissions at
+// all.
+//
+// Turning a skill off is not a lifecycle state change of this capability: the
+// capability stays in service, its manifest and its tool stay declared, and one
+// name leaves the set of skills they read. That is why it is a setting the user
+// owns rather than a state the registry keeps.
 type Plugin struct {
 	found []skills.Skill
+	state *selection
 	tool  *SkillViewTool
 }
 
-// New binds the capability to the skills the composition root discovered. A
-// discovery with no skills is a normal state, not an error: the capability then
-// contributes no context block, and its tool reports that no skill by that name
-// is installed.
-func New(found []skills.Skill) *Plugin {
-	return &Plugin{found: found, tool: NewSkillViewTool(found)}
+// SkillStatus is one discovered skill and whether it is in service, as anything
+// outside the capability sees it. It carries no directory: where a skill lives
+// on this machine is not something an interface needs to show.
+type SkillStatus struct {
+	Name        string
+	Description string
+	Scope       skills.Scope
+	Enabled     bool
+	// DisabledReason says why the skill is not in service, written for the
+	// person who turned it off. It is empty for a skill that is on.
+	DisabledReason string
+}
+
+// DisabledReasonSetting is what a disabled skill's status says: the user turned
+// it off in their own settings file. A skill can be out of service for exactly
+// one reason today, so the reason is a constant rather than a computed
+// sentence.
+const DisabledReasonSetting = "已在设置里停用"
+
+// New binds the capability to the skills the composition root discovered and to
+// the names the user has turned off in settings. A discovery with no skills is a
+// normal state, not an error: the capability then contributes no context block,
+// and its tool reports that no skill by that name is installed. A disabled name
+// that was never discovered is ignored — the settings file may hold names whose
+// directory was removed.
+func New(found []skills.Skill, disabled ...string) *Plugin {
+	state := newSelection(disabled...)
+	return &Plugin{found: found, state: state, tool: NewSkillViewTool(found, state)}
+}
+
+// Skills returns every discovered skill and whether it is in service, in
+// discovery order. It reads the current selection and changes nothing: the
+// interface uses it to show the list and to answer whether a name exists.
+func (p *Plugin) Skills() []SkillStatus {
+	statuses := make([]SkillStatus, 0, len(p.found))
+	for _, skill := range p.found {
+		status := SkillStatus{Name: skill.Name, Description: skill.Description, Scope: skill.Scope, Enabled: !p.state.off(skill.Name)}
+		if !status.Enabled {
+			status.DisabledReason = DisabledReasonSetting
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses
+}
+
+// SetDisabled turns one discovered skill off or on and reports whether a skill
+// by that name exists here. A name that was never discovered is not stored: the
+// interface cannot turn off something the capability cannot see, so the answer
+// is the same one the tool would give the model.
+//
+// This is the only way the set changes, and both the manifest and the tool read
+// it when they are next asked — the manifest once per run, the tool once per
+// call. A toggle is therefore in effect for the next run without rebuilding the
+// agent or restarting anything.
+func (p *Plugin) SetDisabled(name string, disabled bool) bool {
+	target := strings.TrimSpace(name)
+	found := false
+	for _, skill := range p.found {
+		if skill.Name == target {
+			found = true
+			break
+		}
+	}
+	if target == "" || !found {
+		return false
+	}
+	p.state.set(target, disabled)
+	return true
 }
 
 // Descriptor declares exactly what this capability exposes. The registry checks
@@ -100,14 +170,18 @@ func (p *Plugin) Descriptor() plugin.Descriptor { return Descriptor() }
 func (p *Plugin) Tools() []plugin.Tool { return []plugin.Tool{p.tool} }
 
 // Contexts renders the manifest of discovered skills, or contributes nothing
-// when there are none. It reads nothing at run time: the skills were discovered
-// once at start-up, so two reads of the same run cannot disagree.
+// when there are none in service. It reads nothing at run time: the skills were
+// discovered once at start-up, so two reads of the same run cannot disagree.
+//
+// It does read the current selection, which is what makes turning a skill off
+// take effect on the next run: a skill the user turned off is not in the
+// manifest, so the model is not told about it at all.
 //
 // An empty manifest is no block at all rather than a header with nothing under
 // it: telling the model there are skills, and then naming none, would be a
 // statement about this installation that is not true.
 func (p *Plugin) Contexts(context.Context) ([]plugin.ContextBlock, error) {
-	text, _ := skills.List(p.found, ListBudgetBytes)
+	text, _ := skills.List(p.state.on(p.found), ListBudgetBytes)
 	if text == "" {
 		return nil, nil
 	}
