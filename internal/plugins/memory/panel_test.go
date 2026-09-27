@@ -50,9 +50,19 @@ func TestThePanelStylesheetIsServedByTheCapability(t *testing.T) {
 	if strings.TrimSpace(body) == "" {
 		t.Fatal("the served stylesheet is empty")
 	}
-	for _, want := range []string{".memory-panel-list", ".memory-panel-item", ".memory-panel-retract"} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("the served stylesheet has no rule for %q", want)
+	// 模块写的每个 memory-panel-* 类都要有规则。名单从模块本身解析出来而不是手抄：
+	// 手抄的清单会在下次加类时漏掉，而样式表没覆盖的类不会报错，只会静默退回浏览器
+	// 默认样式。
+	classes := map[string]bool{}
+	for _, class := range regexp.MustCompile(`memory-panel-[a-z-]+`).FindAllString(string(panelModule), -1) {
+		classes[class] = true
+	}
+	if len(classes) == 0 {
+		t.Fatal("the panel module builds no panel classes at all")
+	}
+	for class := range classes {
+		if !strings.Contains(body, "."+class) {
+			t.Fatalf("the served stylesheet has no rule for %q, which the module builds", class)
 		}
 	}
 	// The CSP allows this asset, not a second fetch of something else: a rule
@@ -88,6 +98,18 @@ func TestThePanelModuleLinksItsStylesheetAndNeverInjectsAStyleElement(t *testing
 	}
 	if !strings.Contains(after, "state.link.remove()") {
 		t.Fatalf("unmount does not remove the stylesheet link")
+	}
+}
+
+// 面板是产品界面，不是生命周期日志。模块往宿主日志里写"已挂载"一类事件时，每次
+// 打开面板都会在下面多出一行，用户看到的就是一串重复日志；那件事发生在模块自己
+// 身上，所以这条断言盯的是模块的源码。
+func TestThePanelModuleWritesNoLifecycleLog(t *testing.T) {
+	module := string(panelModule)
+	for _, forbidden := range []string{"已挂载", "未挂载", "api.log", "console."} {
+		if strings.Contains(module, forbidden) {
+			t.Fatalf("the panel module still writes %q: that is a lifecycle log, not panel content", forbidden)
+		}
 	}
 }
 

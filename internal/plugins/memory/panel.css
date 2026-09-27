@@ -11,10 +11,19 @@
  * references are checked against web/style.css by a test.
  */
 
-.memory-panel-hint { margin: 0 0 var(--luna-space-3); }
-.memory-panel-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--luna-space-2); }
+.memory-panel-hint { margin: 0 0 var(--luna-space-4); color: var(--luna-text-muted); }
+/* 生效中与已撤回是同一套卡片的两组：分组标题是二级信息，条目才是内容。 */
+.memory-panel-group { display: grid; gap: var(--luna-space-2); margin: 0 0 var(--luna-space-4); }
+.memory-panel-group-retracted { margin-bottom: 0; }
+.memory-panel-heading { margin: 0; font-size: var(--luna-font-label); font-weight: 600; color: var(--luna-text-subtle); }
+.memory-panel-list, .memory-panel-retracted { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--luna-space-2); }
 .memory-panel-item { display: grid; gap: var(--luna-space-1); padding: var(--luna-space-2) var(--luna-space-3); border: 1px solid var(--luna-border-weak); border-radius: var(--luna-radius-sm); background: var(--luna-surface); }
 .memory-panel-text { margin: 0; overflow-wrap: anywhere; }
+/* 已撤回的条目不再生效：整块降到次要色，且没有可点的动作，与生效中的卡片一眼可分。 */
+.memory-panel-item-retracted { background: transparent; border-style: dashed; }
+.memory-panel-item-retracted .memory-panel-text { color: var(--luna-text-muted); }
 .memory-panel-meta { margin: 0; font-size: var(--luna-font-meta); color: var(--luna-text-muted); }
 .memory-panel-retract { justify-self: start; }
 .memory-panel-empty, .memory-panel-status { margin: var(--luna-space-2) 0 0; font-size: var(--luna-font-meta); color: var(--luna-text-muted); }
+.memory-panel-group > .memory-panel-empty { margin: 0; }
+.memory-panel-status.failure { color: var(--luna-danger); }

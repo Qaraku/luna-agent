@@ -205,10 +205,17 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
   const context = vm.createContext({
     document, window, location, URLSearchParams, TextDecoder, console,
     history: { replaceState(_state, _title, url) { location._hash = url.includes('#') ? `#${url.split('#')[1]}` : ''; } },
-    requestAnimationFrame: (fn) => frames.push(fn),
+    requestAnimationFrame: (fn) => { const frame = { run: fn }; frames.push(frame); return frame; },
     // 间隔定时器一并登记回调本身，所以 clearInterval 能把它从 poll() 的名单里摘掉；
     // 应用只在一次运行期间开一个秒表，结束时必须能停掉它。
-    setTimeout: (fn) => frames.push(fn), clearTimeout() {},
+    // setTimeout 与 rAF 共用一个待执行队列，settle() 按登记顺序把它们跑完。定时器
+    // 必须有身份：clearTimeout 要真的把回调从队列里摘掉，否则一个已经被取消的瞬时
+    // 提示仍然会照常触发，测试看到的状态变化顺序就和浏览器不一致。
+    setTimeout: (fn) => { const timer = { run: fn }; frames.push(timer); return timer; },
+    clearTimeout: (timer) => {
+      const index = frames.indexOf(timer);
+      if (index >= 0) frames.splice(index, 1);
+    },
     setInterval: (fn) => { intervals.push(fn); return fn; },
     clearInterval: (fn) => {
       const index = intervals.indexOf(fn);
@@ -236,7 +243,7 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
   vm.runInContext(source('app.js'), context, { filename: 'app.js' });
   const settle = async () => {
     await new Promise((resolve) => setImmediate(resolve));
-    while (frames.length) frames.shift()();
+    while (frames.length) frames.shift().run();
     await new Promise((resolve) => setImmediate(resolve));
   };
   return {
@@ -686,6 +693,43 @@ test('navigation preserves running and switching guards without discarding draft
   assert.ok(h.document.activeElement === h.$('capability-panel-memory').querySelector('button'), '运行结束不夺走面板焦点');
   assert.equal(h.$('session-new').disabled, false);
   assert.equal(h.$('message').value, '发送内容', '准入失败保留原有草稿恢复行为');
+});
+
+test('the session status line is an operation channel, not a log of what already happened', async () => {
+  const h = capabilityHarness();
+  await h.settle();
+  const status = () => h.$('session-status');
+
+  // 新建会话是"现在能做什么"的提示，短暂停留后自己消失，不留常驻文案。
+  h.$('session-new').click();
+  assert.equal(status().textContent, '新会话：发送第一条消息后开始记录。');
+  await h.settle();
+  assert.equal(status().textContent, '', '瞬时提示自行消失');
+  assert.equal(status().className, 'session-status');
+
+  // 恢复成功不写确认：会话已经显示出来了，列表、标题和消息就是证据。
+  h.location.hash = '#session=aaaaaaaa';
+  await h.settle();
+  assert.equal(status().textContent, '', '恢复成功不写“已恢复会话”这类确认');
+  assert.equal(h.$('conversation').textContent.includes('已保存的消息'), true, '会话真的被恢复了');
+});
+
+test('a failed session read keeps its message in the status line', async () => {
+  const h = capabilityHarness({ respond: async (url) => {
+    if (url === '/api/sessions/aaaaaaaa') {
+      return { ok: false, status: 500, json: async () => ({ error: '会话文件读不出来' }) };
+    }
+  } });
+  await h.settle();
+  h.location.hash = '#session=aaaaaaaa';
+  await h.settle();
+  assert.equal(h.$('session-status').textContent, '无法读取这个会话：会话文件读不出来');
+  assert.equal(h.$('session-status').className, 'session-status failure');
+  // 一个更早的瞬时提示（"正在恢复会话…"）已经排在待执行队列里；它被取消，不能把
+  // 后来写入的错误抹掉。
+  await h.settle();
+  assert.equal(h.$('session-status').textContent, '无法读取这个会话：会话文件读不出来');
+  assert.equal(h.$('session-status').className, 'session-status failure');
 });
 
 test('an enabled capability contributes a header entry and a panel container', async () => {
@@ -1703,6 +1747,10 @@ test('the front end keeps the session in the hash and reaches the DOM only throu
   assert.match(js, /sessionRowNode/);
   assert.match(js, /assistantReplayNode/);
   assert.match(js, /valueOrDash\(state\.current_session_id\)/);
+  // 状态行不是内部日志：确认类文案（列表与消息已经说清的事实）不再写进去。
+  for (const text of ['已恢复会话。', '会话已开始记录。']) {
+    assert.equal(js.includes(text), false, `状态行不写确认类文案：${text}`);
+  }
   assert.equal(js.includes('innerHTML'), false);
   assert.equal(/\beval\s*\(/.test(js), false);
   assert.equal(js.includes('new Function'), false);

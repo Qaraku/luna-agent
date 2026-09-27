@@ -2633,9 +2633,27 @@ if (typeof document !== 'undefined') {
 
   // --- 会话侧栏与地址栏 ---------------------------------------------------
 
+  // 状态行只承载两件事：一次操作的短暂反馈，和需要用户处理的错误。
+  // 确认类的事实（"已恢复会话""会话已开始记录"）不写进来——会话列表、标题和
+  // 消息已经说明了它们，再挂一行文字只是内部日志。操作反馈短暂停留后自己
+  // 消失；错误保留到下一次操作。每次写入都先撤掉上一个定时器，所以一个旧的
+  // 反馈不会顺手把后来写入的错误抹掉。
+  const SESSION_STATUS_LINGER = 4000;
+  let sessionStatusTimer = null;
+
   function setSessionStatus(text, className = '') {
+    if (sessionStatusTimer !== null) {
+      clearTimeout(sessionStatusTimer);
+      sessionStatusTimer = null;
+    }
     sessionStatus.textContent = text;
     sessionStatus.className = `session-status${className ? ` ${className}` : ''}`;
+    if (!text || className === 'failure') return;
+    sessionStatusTimer = setTimeout(() => {
+      sessionStatusTimer = null;
+      sessionStatus.textContent = '';
+      sessionStatus.className = 'session-status';
+    }, SESSION_STATUS_LINGER);
   }
 
   // 用稳定标识复用列表控件，避免轮询在按下与点击之间替换节点或丢失键盘焦点。
@@ -2803,7 +2821,8 @@ if (typeof document !== 'undefined') {
       const response = await fetch(`/api/sessions/${id}`, { cache: 'no-store' });
       if (!response.ok) throw new Error(await errorMessage(response));
       renderReplayedSession(await response.json());
-      setSessionStatus('已恢复会话。');
+      // 成功不再写一条确认：会话已经显示出来了，状态行回到空。
+      setSessionStatus('');
     } catch (error) {
       dropSession();
       setSessionStatus(`无法读取这个会话：${error.message}`, 'failure');
@@ -2845,7 +2864,7 @@ if (typeof document !== 'undefined') {
     currentSessionID = id;
     location.hash = sessionHash(id);
     rerenderSessions();
-    setSessionStatus('会话已开始记录。');
+    // 会话 id 与标题已经出现在列表里，状态行不再重复一句"已开始记录"。
   }
 
   async function applySessionHash() {

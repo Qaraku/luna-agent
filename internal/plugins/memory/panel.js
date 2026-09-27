@@ -7,6 +7,12 @@
 // panel's content away with the route it talks to, instead of leaving a host
 // panel that renders nothing.
 //
+// The panel is a product surface, not a lifecycle log: mounting, unmounting and
+// how many requests went out are things the module knows and the user does not
+// need. What it shows is the two halves of the store that actually differ for a
+// reader — the facts in effect and the facts that were retracted — with where
+// each one came from and when, plus the one thing the reader can do about it.
+//
 // It uses the same mount(target, api) / unmount(target) contract as every other
 // browser module, and the host's own classes for the shared look; its layout
 // rules come from the capability's own stylesheet route, so the host
@@ -23,12 +29,20 @@ const RETRACT_URL = '/api/memory/retract';
 // element is refused, and a refused one leaves the panel unstyled.
 const STYLE_URL = new URL('panel.css', import.meta.url).href;
 
+// How long an operation's own feedback stays before it takes itself away. The
+// status line carries "what is happening right now" and "what went wrong" —
+// never a running commentary. A settled state (a fact that moved to the
+// retracted list) is already visible in the lists, so it is not repeated here.
+const STATUS_LINGER = 6000;
+
 // One mount's state. A module instance lives in the container the host created,
 // so the state is keyed by that container and released on unmount.
 const states = new WeakMap();
 
 export function mount(target, api) {
-  const log = api && typeof api.log === 'function' ? api.log : () => {};
+  // api 留在签名里（宿主按契约传入），但这个面板不写生命周期日志：挂载、
+  // 卸载和请求次数是模块自己的事，不是用户要看的内容。
+  void api;
   const link = document.createElement('link');
   link.rel = 'stylesheet';
   link.href = STYLE_URL;
@@ -36,37 +50,54 @@ export function mount(target, api) {
 
   const hint = document.createElement('p');
   hint.className = 'memory-panel-hint';
-  hint.textContent = '这里只能撤回，不能编辑或新增；撤回只把事实移出生效集合，记录仍在本地文件里。';
+  hint.textContent = '这些是 Luna 正在使用的记忆。撤回会把一条事实移出生效集合，记录仍留在本地文件里；要让它重新生效，只能由模型再记录一次。';
 
-  const list = document.createElement('ul');
-  list.className = 'memory-panel-list';
+  // 生效中：当前真的会进入对话的那些事实，每条都能就地撤回。
+  const activeHeading = document.createElement('h3');
+  activeHeading.className = 'memory-panel-heading';
+  const activeList = document.createElement('ul');
+  activeList.className = 'memory-panel-list';
+  const activeEmpty = document.createElement('p');
+  activeEmpty.className = 'memory-panel-empty';
+  const activeGroup = document.createElement('section');
+  activeGroup.className = 'memory-panel-group';
+  activeGroup.append(activeHeading, activeList, activeEmpty);
 
-  const empty = document.createElement('p');
-  empty.className = 'memory-panel-empty';
-  empty.textContent = '还没有记录任何事实。';
-  empty.hidden = true;
+  // 已撤回：还在文件里、但不再生效的那些。整组在没有撤回记录时不出现，
+  // 所以第一次使用的面板就是一个安静的初始态。
+  const goneHeading = document.createElement('h3');
+  goneHeading.className = 'memory-panel-heading';
+  const goneList = document.createElement('ul');
+  goneList.className = 'memory-panel-retracted';
+  const goneGroup = document.createElement('section');
+  goneGroup.className = 'memory-panel-group memory-panel-group-retracted';
+  goneGroup.append(goneHeading, goneList);
 
   const status = document.createElement('p');
   status.className = 'memory-panel-status';
   status.setAttribute('role', 'status');
 
-  target.append(hint, list, empty, status);
+  target.append(hint, activeGroup, goneGroup, status);
 
   const state = {
     link,
-    list,
-    empty,
+    activeHeading,
+    activeList,
+    activeEmpty,
+    goneHeading,
+    goneList,
+    goneGroup,
     status,
     facts: [],
+    retracted: [],
     busy: false,
     pending: null,
     controller: null,
   };
   states.set(target, state);
-  render(status, 0, []);
+  draw(state);
 
   load(state);
-  log('记忆面板已挂载');
 }
 
 export function unmount(target) {
@@ -90,43 +121,77 @@ function load(state) {
     .then(({ response, payload }) => {
       if (!response.ok) throw new Error(errorText(payload) || `读取失败（${response.status}）`);
       state.facts = Array.isArray(payload.facts) ? payload.facts : [];
-      const retracted = Array.isArray(payload.retracted) ? payload.retracted : [];
+      state.retracted = Array.isArray(payload.retracted) ? payload.retracted : [];
       draw(state);
-      render(state.status, state.facts.length, retracted);
     })
     .catch((error) => {
       if (error && error.name === 'AbortError') return;
-      state.status.textContent = errorMessage(error);
+      setStatus(state, errorMessage(error), 'failure');
     });
 }
 
 function draw(state) {
-  state.list.replaceChildren();
-  state.empty.hidden = state.facts.length > 0;
-  state.facts.forEach((fact, index) => {
-    const item = document.createElement('li');
-    item.className = 'memory-panel-item';
+  // 生效中
+  state.activeList.replaceChildren();
+  state.facts.forEach((fact, index) => state.activeList.append(factNode(state, fact, index)));
+  state.activeHeading.textContent = `生效中 · ${state.facts.length} 条`;
+  state.activeEmpty.hidden = state.facts.length > 0;
+  state.activeEmpty.textContent = state.retracted.length > 0 ? '没有生效中的记忆。' : '还没有记录任何事实。';
 
-    const text = document.createElement('p');
-    text.className = 'memory-panel-text';
-    text.textContent = textOf(fact.text);
-    item.append(text);
+  // 已撤回
+  state.goneList.replaceChildren();
+  state.retracted.forEach((entry) => state.goneList.append(retractedNode(entry)));
+  state.goneHeading.textContent = `已撤回 · ${state.retracted.length} 条`;
+  state.goneGroup.hidden = state.retracted.length === 0;
+}
 
-    const meta = document.createElement('p');
-    meta.className = 'memory-panel-meta';
-    meta.textContent = `${whenOf(fact.at)}${fact.source_session ? ` · 来自 ${textOf(fact.source_session)}` : ''}`;
-    item.append(meta);
+function factNode(state, fact, index) {
+  const item = document.createElement('li');
+  item.className = 'memory-panel-item';
 
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'memory-panel-retract luna-button';
-    button.textContent = '撤回';
-    button.disabled = state.busy;
-    button.addEventListener('click', () => retract(state, index));
-    item.append(button);
+  const text = document.createElement('p');
+  text.className = 'memory-panel-text';
+  text.textContent = textOf(fact.text);
+  item.append(text);
 
-    state.list.append(item);
-  });
+  const meta = document.createElement('p');
+  meta.className = 'memory-panel-meta';
+  meta.textContent = joinMeta([
+    textOf(fact.source_session) ? `来自会话 ${textOf(fact.source_session)}` : '',
+    `记录于 ${whenOf(fact.at)}`,
+  ]);
+  item.append(meta);
+
+  // 这一条能做什么：只有生效中的记忆有可点的动作；已撤回的没有。
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'memory-panel-retract luna-button';
+  button.textContent = '撤回';
+  button.disabled = state.busy;
+  button.addEventListener('click', () => retract(state, index));
+  item.append(button);
+
+  return item;
+}
+
+// A retracted entry carries the fact and when it was retracted, and nothing
+// else: /api/memory does not name a source session for one. What is not on the
+// wire is not shown, so the line says what actually happened to it.
+function retractedNode(entry) {
+  const item = document.createElement('li');
+  item.className = 'memory-panel-item memory-panel-item-retracted';
+
+  const text = document.createElement('p');
+  text.className = 'memory-panel-text';
+  text.textContent = textOf(entry.text);
+  item.append(text);
+
+  const meta = document.createElement('p');
+  meta.className = 'memory-panel-meta';
+  meta.textContent = joinMeta([`记录于 ${whenOf(entry.at)}`, `撤回于 ${whenOf(entry.retracted_at)}`]);
+  item.append(meta);
+
+  return item;
 }
 
 function retract(state, index) {
@@ -134,7 +199,7 @@ function retract(state, index) {
   if (!fact || state.busy) return;
   state.busy = true;
   draw(state);
-  state.status.textContent = '正在撤回…';
+  setStatus(state, '正在撤回…', '');
   fetch(RETRACT_URL, {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json' },
@@ -144,25 +209,42 @@ function retract(state, index) {
     .then(({ response, payload }) => {
       state.busy = false;
       if (!response.ok) {
-        state.status.textContent = errorText(payload) || `撤回失败（${response.status}）`;
+        setStatus(state, errorText(payload) || `撤回失败（${response.status}）`, 'failure');
         draw(state);
         return;
       }
-      state.status.textContent = '已撤回一条；若还要恢复，只能由模型再次记录。';
+      // 成功的证据是这条事实真的移到了「已撤回」，不再另写一条状态文案。
+      setStatus(state, '', '');
       load(state);
     })
     .catch((error) => {
       state.busy = false;
-      state.status.textContent = errorMessage(error);
+      setStatus(state, errorMessage(error), 'failure');
       draw(state);
     });
 }
 
-function render(status, count, retracted) {
-  const parts = [];
-  if (count > 0) parts.push(`生效中 ${count} 条`);
-  if (retracted.length > 0) parts.push(`已撤回 ${retracted.length} 条`);
-  status.textContent = parts.join(' · ');
+// setStatus carries exactly one thing at a time. A failure stays until the next
+// operation or an explicit empty status; feedback for an operation in flight
+// takes itself away, and cannot push a failure out, because the timer that
+// would clear the line is dropped when someone else writes to it.
+function setStatus(state, text, className) {
+  if (state.pending !== null) {
+    clearTimeout(state.pending);
+    state.pending = null;
+  }
+  state.status.textContent = text;
+  state.status.className = `memory-panel-status${className ? ` ${className}` : ''}`;
+  if (!text || className) return;
+  state.pending = setTimeout(() => {
+    state.pending = null;
+    state.status.textContent = '';
+    state.status.className = 'memory-panel-status';
+  }, STATUS_LINGER);
+}
+
+function joinMeta(parts) {
+  return parts.filter(Boolean).join(' · ');
 }
 
 function textOf(value) {
