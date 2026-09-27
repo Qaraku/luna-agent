@@ -40,6 +40,15 @@ type File struct {
 	APIKeyEnv string `yaml:"api_key_env"`
 	// ReasoningEffort overrides LUNA_REASONING_EFFORT.
 	ReasoningEffort string `yaml:"reasoning_effort"`
+	// MaxIterations is how many model turns one run may take before the agent
+	// stops it as a runaway loop, overriding LUNA_MAX_ITERATIONS. Zero means
+	// not stated, and the layer that owns the budget applies its own default:
+	// the number is stated once, not twice.
+	MaxIterations int `yaml:"max_iterations"`
+	// RunTimeout is how long one run may take before it is stopped and
+	// reported as cancelled, overriding LUNA_RUN_TIMEOUT. It is a Go duration
+	// such as "20m" or "90s"; empty means not stated.
+	RunTimeout string `yaml:"run_timeout"`
 	// Models are the other models this user may switch to. The default one is
 	// not repeated here: it is whatever the settings above resolve to, and it is
 	// always available.
@@ -128,6 +137,8 @@ func (f File) trimmed() File {
 		BaseURL:         strings.TrimSpace(f.BaseURL),
 		APIKeyEnv:       strings.TrimSpace(f.APIKeyEnv),
 		ReasoningEffort: strings.TrimSpace(f.ReasoningEffort),
+		MaxIterations:   f.MaxIterations,
+		RunTimeout:      strings.TrimSpace(f.RunTimeout),
 		Models:          models,
 	}
 }

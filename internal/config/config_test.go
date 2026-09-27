@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // isEmptyFile reports whether a file carries nothing, which is what a missing or
@@ -352,6 +353,90 @@ func TestModelEntriesThatCannotBeUsedAreRefused(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := Load(fileEnv(), &File{Models: []Model{tc.entry}}); err == nil {
 				t.Fatalf("%+v was accepted", tc.entry)
+			}
+		})
+	}
+}
+
+// budgetEnv is a complete configuration whose two run budgets are the arguments.
+func budgetEnv(maxIterations, runTimeout string) func(string) string {
+	values := map[string]string{
+		"OPENAI_BASE_URL":   "https://example.test/v1",
+		"OPENAI_API_KEY":    "test-key",
+		"OPENAI_MODEL_NAME": "test-model",
+	}
+	if maxIterations != "" {
+		values[MaxIterationsEnv] = maxIterations
+	}
+	if runTimeout != "" {
+		values[RunTimeoutEnv] = runTimeout
+	}
+	return env(values)
+}
+
+// A run budget that is not stated is zero, which the layer that enforces it
+// reads as "use your own default": the number is declared once, where it is
+// enforced, rather than repeated in the configuration.
+func TestUnstatedRunBudgetsResolveToZero(t *testing.T) {
+	cfg, err := Load(budgetEnv("", ""), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxIterations != 0 || cfg.RunTimeout != 0 {
+		t.Fatalf("unstated budgets became %d, %v", cfg.MaxIterations, cfg.RunTimeout)
+	}
+}
+
+func TestTheEnvironmentCarriesBothRunBudgets(t *testing.T) {
+	cfg, err := Load(budgetEnv("120", "25m"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxIterations != 120 {
+		t.Fatalf("max iterations = %d", cfg.MaxIterations)
+	}
+	if cfg.RunTimeout != 25*time.Minute {
+		t.Fatalf("run timeout = %v", cfg.RunTimeout)
+	}
+}
+
+func TestTheFileOverridesBothRunBudgets(t *testing.T) {
+	cfg, err := Load(budgetEnv("120", "25m"), &File{MaxIterations: 8, RunTimeout: " 90s "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxIterations != 8 || cfg.RunTimeout != 90*time.Second {
+		t.Fatalf("file budgets not applied: %d, %v", cfg.MaxIterations, cfg.RunTimeout)
+	}
+}
+
+// A budget that cannot be used is refused rather than read as zero: a run that
+// silently ignores the number its user set is a run whose bound nobody knows.
+func TestRunBudgetsThatCannotBeUsedAreRefused(t *testing.T) {
+	cases := []struct {
+		name          string
+		maxIterations string
+		runTimeout    string
+		file          *File
+		mentions      string
+	}{
+		{"zero iterations", "0", "", nil, MaxIterationsEnv},
+		{"negative iterations", "-3", "", nil, MaxIterationsEnv},
+		{"not a number", "many", "", nil, MaxIterationsEnv},
+		{"zero timeout", "", "0s", nil, RunTimeoutEnv},
+		{"negative timeout", "", "-5m", nil, RunTimeoutEnv},
+		{"not a duration", "", "soon", nil, RunTimeoutEnv},
+		{"file iterations", "", "", &File{MaxIterations: -1}, "max_iterations"},
+		{"file timeout", "", "", &File{RunTimeout: "later"}, "run_timeout"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(budgetEnv(tc.maxIterations, tc.runTimeout), tc.file)
+			if err == nil {
+				t.Fatal("a budget that cannot be used was accepted")
+			}
+			if !strings.Contains(err.Error(), tc.mentions) {
+				t.Fatalf("error %q does not name %q", err, tc.mentions)
 			}
 		})
 	}

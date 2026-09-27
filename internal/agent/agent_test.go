@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Qaraku/luna-agent/internal/config"
 	"github.com/Qaraku/luna-agent/internal/fileread"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/cloudwego/eino/adk"
@@ -1469,5 +1470,75 @@ func TestReasoningIsStreamedAndKeptOutOfTheAnswer(t *testing.T) {
 	}
 	if answer := events[len(events)-1].Data.(RunFinished).Answer; answer != "答案是 42。" {
 		t.Fatalf("answer=%q", answer)
+	}
+}
+
+// countingToolModel answers every turn with a tool call, so the run only ends
+// when the turn ceiling ends it. It counts the turns it was asked for.
+type countingToolModel struct{ calls int }
+
+func (m *countingToolModel) Generate(context.Context, []*schema.Message, ...model.Option) (*schema.Message, error) {
+	m.calls++
+	return schema.AssistantMessage("", []schema.ToolCall{{ID: "call-1", Type: "function", Function: schema.FunctionCall{Name: ToolName, Arguments: `{"text":"x"}`}}}), nil
+}
+func (m *countingToolModel) Stream(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	msg, err := m.Generate(ctx, in, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return schema.StreamReaderFromArray([]*schema.Message{msg}), nil
+}
+func (m *countingToolModel) WithTools([]*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+	return m, nil
+}
+
+// The turn ceiling is a backstop that stops a model which would keep calling
+// tools forever, and it is configurable: a task that legitimately needs tens of
+// turns is not cut off by a number nobody can see or change.
+func TestTheRunCeilingIsConfigurableAndSaysSo(t *testing.T) {
+	m := &countingToolModel{}
+	r, err := NewRunner(context.Background(), m, fakeInvoker{out: pluginhost.Output{Result: "ok"}}, &recordingReader{out: pluginhost.Output{Result: "ok"}}, WithMaxIterations(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.Run(context.Background(), RunRequest{Message: "go", RunID: "run-1", SessionID: "s-1", Sink: &collectingSink{}})
+	if err == nil {
+		t.Fatal("a model that never stops calling tools did not end the run")
+	}
+	if m.calls != 2 {
+		t.Fatalf("the run made %d turns, want the 2 it was given", m.calls)
+	}
+	// The sentinel survives the explanation, so a caller classifies the ceiling
+	// by marker rather than by reading the message.
+	if !errors.Is(err, adk.ErrExceedMaxIterations) {
+		t.Fatalf("the ceiling error lost its marker: %v", err)
+	}
+	for _, want := range []string{"2-turn budget", "max_iterations", config.MaxIterationsEnv} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the ceiling error does not say %q: %v", want, err)
+		}
+	}
+}
+
+// A ceiling the user did not state is the declared default, and the default is
+// far above what real work costs — the point of the change is that the number
+// that ends a run is not a small fixed constant.
+func TestTheDefaultCeilingIsUsedWhenNoneIsConfigured(t *testing.T) {
+	m := &countingToolModel{}
+	r, err := NewRunner(context.Background(), m, fakeInvoker{}, &recordingReader{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.maxIterations != DefaultMaxIterations {
+		t.Fatalf("ceiling = %d, want the default %d", r.maxIterations, DefaultMaxIterations)
+	}
+	if DefaultMaxIterations < 32 {
+		t.Fatalf("the default ceiling %d would cut off normal multi-step work", DefaultMaxIterations)
+	}
+	if got := MaxIterationsFor(config.Config{}); got != DefaultMaxIterations {
+		t.Fatalf("MaxIterationsFor(unset) = %d", got)
+	}
+	if got := MaxIterationsFor(config.Config{MaxIterations: 7}); got != 7 {
+		t.Fatalf("MaxIterationsFor(7) = %d", got)
 	}
 }

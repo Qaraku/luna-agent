@@ -770,12 +770,55 @@ type Runner struct {
 	// builtRevision is the capability list's revision at build time, or zero
 	// when the runner was built without a list.
 	builtRevision uint64
+	// maxIterations is how many model turns one run may take before the agent
+	// stops it as a runaway loop. It is resolved once, at construction, so a run
+	// and the error that explains it agree on the number.
+	maxIterations int
 }
 
 // clientFactory builds the model client for one entry of the configured model
 // list. Building one resolves an endpoint and a key; it is not a request, and
 // the provider is first spoken to by the run.
 type clientFactory func(ctx context.Context, cfg config.Config, entry config.Model) (model.ToolCallingChatModel, error)
+
+// DefaultMaxIterations is how many model turns one run may take before the agent
+// stops it as a runaway loop.
+//
+// It is a backstop, not a work budget. A task that reads and searches a
+// repository, or that works through a list of sources, legitimately takes tens
+// of turns — and one turn may carry several tool calls — so this ceiling sits
+// far above what real work costs. What ends a run for a real reason is the run
+// deadline and Stop; this is only what stops a model that would otherwise keep
+// calling tools forever, and a user who wants a tighter or looser guard sets
+// max_iterations.
+const DefaultMaxIterations = 64
+
+// MaxIterationsFor resolves the turn ceiling a runner built from cfg enforces:
+// what the user configured, or this package's default. It exists so a caller
+// that has to report the budget does not restate the default.
+func MaxIterationsFor(cfg config.Config) int {
+	if cfg.MaxIterations > 0 {
+		return cfg.MaxIterations
+	}
+	return DefaultMaxIterations
+}
+
+// explainRunBudget names the budget that ended a run.
+//
+// Eino reports the turn ceiling as its own sentinel with nothing about where
+// the number came from, and a run that ends for a reason the user can change
+// has to say which number to change. The classification is by marker rather
+// than by message text, so a reworded upstream error still classifies.
+func explainRunBudget(err error, maxIterations int) error {
+	if err == nil || !errors.Is(err, adk.ErrExceedMaxIterations) {
+		return err
+	}
+	return fmt.Errorf("%w: this run reached its %d-turn budget (max_iterations). A task that needs more turns can be given more: raise max_iterations in the user configuration file or set %s", err, maxIterations, config.MaxIterationsEnv)
+}
+
+// WithMaxIterations sets how many model turns one run may take before the agent
+// stops it as a runaway loop. A non-positive value keeps the default.
+func WithMaxIterations(n int) Option { return func(r *Runner) { r.maxIterations = n } }
 
 // WithConfig supplies the model list a run may be sent to. The first entry is
 // the default: a run that names no model, and one that names the first entry,
@@ -792,6 +835,9 @@ func NewRunner(ctx context.Context, m model.ToolCallingChatModel, invoker Invoke
 	r := &Runner{buildCtx: ctx, model: m, invoker: invoker, files: files, clients: map[string]model.ToolCallingChatModel{}, clientFor: openAICompatibleClient}
 	for _, opt := range opts {
 		opt(r)
+	}
+	if r.maxIterations <= 0 {
+		r.maxIterations = DefaultMaxIterations
 	}
 	if err := r.build(m, r.defaultModelName()); err != nil {
 		return nil, err
@@ -819,7 +865,7 @@ func (r *Runner) build(m model.ToolCallingChatModel, modelName string) error {
 	for _, contributed := range r.capabilityTools() {
 		tools = append(tools, contributed)
 	}
-	a, err := adk.NewChatModelAgent(r.buildCtx, &adk.ChatModelAgentConfig{Name: "luna", Description: "Local Luna core preview", Instruction: instruction, GenModelInput: r.modelInputWithCapabilities(), Model: m, ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: tools, ExecuteSequentially: true}}, MaxIterations: 6})
+	a, err := adk.NewChatModelAgent(r.buildCtx, &adk.ChatModelAgentConfig{Name: "luna", Description: "Local Luna core preview", Instruction: instruction, GenModelInput: r.modelInputWithCapabilities(), Model: m, ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: tools, ExecuteSequentially: true}}, MaxIterations: r.maxIterations})
 	if err != nil {
 		return err
 	}
@@ -969,13 +1015,17 @@ func keyForEntry(cfg config.Config, entry config.Model) (key, env string) {
 	return strings.TrimSpace(os.Getenv(env)), env
 }
 
+// NewOpenAIRunner builds the agent every run is sent to, from the configuration
+// the process was started with. The run budgets come from the same place: the
+// turn ceiling is the configured one, and zero there means the default this
+// package declares.
 func NewOpenAIRunner(ctx context.Context, cfg config.Config, invoker Invoker, files FileTools, opts ...Option) (*Runner, error) {
 	entry := config.Model{Name: cfg.Model, Provider: cfg.ProviderHost, BaseURL: cfg.BaseURL}
 	m, err := openai.NewChatModel(ctx, openAIChatConfig(entry, cfg.APIKey, cfg.ReasoningEffort))
 	if err != nil {
 		return nil, err
 	}
-	return NewRunner(ctx, m, invoker, files, append([]Option{WithConfig(cfg)}, opts...)...)
+	return NewRunner(ctx, m, invoker, files, append([]Option{WithConfig(cfg), WithMaxIterations(MaxIterationsFor(cfg))}, opts...)...)
 }
 
 // The history cap is stated here, in the S2a spec's terms: a run's model input
@@ -1142,7 +1192,9 @@ func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err
 			continue
 		}
 		if ev.Err != nil {
-			return "", ev.Err
+			// The turn ceiling is the one iterator error the user can do
+			// something about, so it is reported with the number to change.
+			return "", explainRunBudget(ev.Err, r.maxIterations)
 		}
 		if ev.Output == nil || ev.Output.MessageOutput == nil {
 			continue

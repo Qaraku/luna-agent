@@ -61,7 +61,11 @@ type Info struct {
 	// in the environment the server was started from. It is never a secret and it
 	// is not changeable while the process runs: the model is built once.
 	ReasoningEffort string
-	WebDir          string
+	// MaxIterations is how many model turns one run may take. It is reported so
+	// the interface can show the budget the run is actually working under
+	// instead of leaving a number that ends a run invisible.
+	MaxIterations int
+	WebDir        string
 	// UIPluginsDir is the plugins/ui directory holding runtime UI plugins. It
 	// is added by S4a and changes no existing field's meaning. An unset value
 	// lists no plugins and serves no file rather than failing a request.
@@ -79,7 +83,13 @@ type State struct {
 	ProviderHost string    `json:"provider_host"`
 	// ReasoningEffort is empty when no level was chosen, which is not the same as
 	// "medium": nothing was sent, so the provider's own default is what applied.
-	ReasoningEffort string              `json:"reasoning_effort,omitempty"`
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// MaxIterations and RunTimeoutMS are the two run budgets this server
+	// enforces: how many model turns a run may take, and how long it may take
+	// before it is stopped and reported as cancelled. They are reported because
+	// a bound that ends a run has to be visible in the product.
+	MaxIterations   int                 `json:"max_iterations,omitempty"`
+	RunTimeoutMS    int64               `json:"run_timeout_ms,omitempty"`
 	ModelConfigured bool                `json:"model_configured"`
 	ModelConnected  bool                `json:"model_connected"`
 	Plugins         []pluginhost.Record `json:"plugins"`
@@ -142,7 +152,16 @@ func pluginsReady(records []pluginhost.Record) bool {
 	return true
 }
 
-var runTimeout = 60 * time.Second
+// DefaultRunTimeout is how long one run may take before it is stopped and
+// reported as run.cancelled{reason:"timeout"}.
+//
+// It bounds a run that is going nowhere — a provider that accepted the request
+// and then stopped answering, or a model that keeps calling tools — and it is
+// not a work budget: a real investigation that reads and searches a repository
+// can legitimately take many minutes, so the default sits far above that and a
+// deployment that wants another value sets run_timeout. Stop is what ends a run
+// the user no longer wants; this is only the backstop behind it.
+const DefaultRunTimeout = 15 * time.Minute
 
 // errRunStopped is the cause a Stop request cancels the active run with. The
 // value never reaches a client: the wire reason is the fixed word "user".
@@ -201,10 +220,19 @@ type Server struct {
 	// would name a run nobody can stop, and a handle without a run would name
 	// nothing at all.
 	cancelRun context.CancelCauseFunc
-	eventMu   sync.Mutex
-	events    []LifecycleEvent
-	connected atomic.Bool
+	// runTimeout is how long one run may take. It is resolved once, when the
+	// server is built, so every run this server admits is bounded the same way
+	// and the state it reports is the bound it enforces.
+	runTimeout time.Duration
+	eventMu    sync.Mutex
+	events     []LifecycleEvent
+	connected  atomic.Bool
 }
+
+// WithRunTimeout sets how long one run may take before it is stopped and
+// reported as cancelled with the timeout reason. A non-positive value keeps the
+// default.
+func WithRunTimeout(d time.Duration) Option { return func(s *Server) { s.runTimeout = d } }
 
 func Listen(addr string) (net.Listener, error) {
 	host, _, err := net.SplitHostPort(addr)
@@ -218,9 +246,12 @@ func Listen(addr string) (net.Listener, error) {
 	return net.Listen("tcp", addr)
 }
 func New(p PluginManager, r Runner, sessions Sessions, info Info, opts ...Option) http.Handler {
-	s := &Server{plugins: p, runner: r, sessions: sessions, info: info, started: time.Now()}
+	s := &Server{plugins: p, runner: r, sessions: sessions, info: info, started: time.Now(), runTimeout: DefaultRunTimeout}
 	for _, opt := range opts {
 		opt(s)
+	}
+	if s.runTimeout <= 0 {
+		s.runTimeout = DefaultRunTimeout
 	}
 	return http.HandlerFunc(s.serveHTTP)
 }
@@ -267,7 +298,7 @@ func (s *Server) state() State {
 	s.eventMu.Lock()
 	events := append([]LifecycleEvent{}, s.events...)
 	s.eventMu.Unlock()
-	return State{HostPID: os.Getpid(), StartedAt: s.started, Model: s.info.Model, ProviderHost: s.info.ProviderHost, ReasoningEffort: s.info.ReasoningEffort, ModelConfigured: s.info.Model != "" && s.info.ProviderHost != "", ModelConnected: s.connected.Load(), Plugins: ps.Plugins, Busy: busy, CurrentRunID: id, CurrentSessionID: sessionID, Events: events, Capabilities: capabilityViews(s.capabilities), Demo: true}
+	return State{HostPID: os.Getpid(), StartedAt: s.started, Model: s.info.Model, ProviderHost: s.info.ProviderHost, ReasoningEffort: s.info.ReasoningEffort, MaxIterations: s.info.MaxIterations, RunTimeoutMS: s.runTimeout.Milliseconds(), ModelConfigured: s.info.Model != "" && s.info.ProviderHost != "", ModelConnected: s.connected.Load(), Plugins: ps.Plugins, Busy: busy, CurrentRunID: id, CurrentSessionID: sessionID, Events: events, Capabilities: capabilityViews(s.capabilities), Demo: true}
 }
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -691,7 +722,7 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	// different things — an expired deadline and a caller who changed their mind
 	// — and the first cancellation is the one that decides the cause the runner
 	// reports.
-	runCtx, cancelTimeout := context.WithTimeout(r.Context(), runTimeout)
+	runCtx, cancelTimeout := context.WithTimeout(r.Context(), s.runTimeout)
 	defer cancelTimeout()
 	runCtx, cancelRun := context.WithCancelCause(runCtx)
 	// Releasing the run context is this handler's job on every path, including

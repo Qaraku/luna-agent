@@ -78,10 +78,10 @@ func testHandler(t *testing.T, r Runner) http.Handler {
 	return handlerWithStore(t, r, newTestStore(t))
 }
 
-func handlerWithStore(t *testing.T, r Runner, sessions Sessions) http.Handler {
+func handlerWithStore(t *testing.T, r Runner, sessions Sessions, opts ...Option) http.Handler {
 	t.Helper()
 	p := &fakePlugins{state: everyAllowlistedTool()}
-	return New(p, r, sessions, Info{BoundHost: "127.0.0.1:43210", Model: "fake-model", ProviderHost: "provider.test", WebDir: "../../web"})
+	return New(p, r, sessions, Info{BoundHost: "127.0.0.1:43210", Model: "fake-model", ProviderHost: "provider.test", WebDir: "../../web"}, opts...)
 }
 
 func request(t *testing.T, h http.Handler, method, path, body string, origin bool) *httptest.ResponseRecorder {
@@ -112,13 +112,12 @@ func (r timeoutRunner) Run(ctx context.Context, _ agent.RunRequest) (string, err
 }
 
 func TestRunTimeoutCoversRunnerInvocation(t *testing.T) {
-	oldTimeout := runTimeout
-	runTimeout = 20 * time.Millisecond
-	defer func() { runTimeout = oldTimeout }()
-
 	runner := timeoutRunner{deadline: make(chan time.Time, 1)}
 	started := time.Now()
-	w := request(t, testHandler(t, runner), http.MethodPost, "/api/runs", `{"message":"do it"}`, true)
+	// The deadline is an option rather than a package variable, so the value a
+	// server enforces is the value it was given and the value it reports.
+	handler := handlerWithStore(t, runner, newTestStore(t), WithRunTimeout(20*time.Millisecond))
+	w := request(t, handler, http.MethodPost, "/api/runs", `{"message":"do it"}`, true)
 	elapsed := time.Since(started)
 	deadline := <-runner.deadline
 	if deadline.IsZero() {
@@ -668,6 +667,20 @@ func TestStateCarriesTheChosenReasoningEffortAndNothingWhenUnchosen(t *testing.T
 		}
 		if !strings.Contains(body, test.expected) {
 			t.Fatalf("state did not report the chosen level: %s", body)
+		}
+	}
+}
+
+// The two run budgets are visible in the state the browser reads: a bound that
+// can end a run has to be something the user can see, and the deadline reported
+// is the one this server enforces.
+func TestStateCarriesTheRunBudgetsItEnforces(t *testing.T) {
+	p := &fakePlugins{state: pluginState(pluginhost.ToolReadFile)}
+	h := New(p, fakeRunner{}, newTestStore(t), Info{BoundHost: "127.0.0.1:43210", Model: "fake-model", ProviderHost: "provider.test", MaxIterations: 64, WebDir: "../../web"}, WithRunTimeout(90*time.Second))
+	body := request(t, h, http.MethodGet, "/api/state", "", false).Body.String()
+	for _, want := range []string{`"max_iterations":64`, `"run_timeout_ms":90000`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("state does not report %s: %s", want, body)
 		}
 	}
 }

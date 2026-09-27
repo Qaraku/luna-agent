@@ -501,7 +501,7 @@ func run() error {
 	for _, model := range cfg.Models {
 		models = append(models, httpapi.ModelRef{Name: model.Name, Provider: model.Provider})
 	}
-	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Models: models, ReasoningEffort: cfg.ReasoningEffort, WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(newSkillCatalog(skillSet, settingsPath, userSettings)), httpapi.WithWorkspaces(workspaceStore))
+	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(newSkillCatalog(skillSet, settingsPath, userSettings)), httpapi.WithWorkspaces(workspaceStore), httpapi.WithRunTimeout(cfg.RunTimeout))
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: 70 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() {
