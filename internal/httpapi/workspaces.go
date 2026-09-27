@@ -63,6 +63,10 @@ type workspaceView struct {
 	ID   string   `json:"id"`
 	Name string   `json:"name"`
 	Dirs []string `json:"dirs"`
+	// Missing marks a binding whose workspace is gone. Without it the client
+	// could only see that a session looks unbound while a run of that session
+	// refuses to start, which is the one combination nobody can act on.
+	Missing bool `json:"missing,omitempty"`
 }
 
 type workspacesResponse struct {
@@ -209,16 +213,21 @@ func (s *Server) setSessionWorkspace(w http.ResponseWriter, r *http.Request, id 
 // The association is stored as an id in the session's config record, and the
 // playback object reports the whole workspace, so a client does not have to read
 // a config record and join it against the workspace list to know where a session
-// works. It is null when the session is bound to nothing, and also when the id
-// no longer names a workspace — a deleted workspace is not a binding.
+// works. It is null when the session is bound to nothing — and only then. A
+// binding whose workspace is gone is reported as missing instead of dropped:
+// dropping it would say the session works nowhere, while a run of that session
+// refuses to start for exactly that reason, and a client showing "no workspace"
+// next to a run that fails over the workspace is a state nobody can act on.
 func (s *Server) sessionWorkspace(session store.Session) *workspaceView {
-	if s.workspaces == nil || session.Config == nil || session.Config.Workspace == "" {
+	if session.Config == nil || session.Config.Workspace == "" {
 		return nil
 	}
-	found, ok := s.workspaces.Get(session.Config.Workspace)
-	if !ok {
-		return nil
+	id := session.Config.Workspace
+	if s.workspaces != nil {
+		if found, ok := s.workspaces.Get(id); ok {
+			view := workspaceViewOf(found)
+			return &view
+		}
 	}
-	view := workspaceViewOf(found)
-	return &view
+	return &workspaceView{ID: id, Dirs: []string{}, Missing: true}
 }

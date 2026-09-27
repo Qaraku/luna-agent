@@ -203,3 +203,37 @@ func TestSessionWorkspaceRefusesUnknownTargets(t *testing.T) {
 		t.Fatalf("no Origin: status = %d, want 403", w.Code)
 	}
 }
+
+// A binding whose workspace is gone is reported as missing rather than dropped:
+// the session's record still names it, and a run of that session refuses to start
+// over exactly that, so a client has to be able to see why instead of being shown
+// a session that looks unbound and then fails when it is used.
+func TestAReplayReportsAWorkspaceThatIsGone(t *testing.T) {
+	h, sessions, _ := handlerWithWorkspaces(t)
+	id := seedSession(t, sessions, "bound to something gone")
+	const gone = "0123456789abcdef01234567"
+	if err := sessions.AppendConfig(id, store.ConfigRecord{Type: store.TypeConfig, Workspace: gone}); err != nil {
+		t.Fatalf("append config: %v", err)
+	}
+
+	w := request(t, h, http.MethodGet, "/api/sessions/"+id, "", false)
+	var detail struct {
+		Workspace *struct {
+			ID      string   `json:"id"`
+			Dirs    []string `json:"dirs"`
+			Missing bool     `json:"missing"`
+		} `json:"workspace"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("decode %s: %v", w.Body.String(), err)
+	}
+	if detail.Workspace == nil {
+		t.Fatal("a session bound to a workspace that is gone is not bound to nothing")
+	}
+	if detail.Workspace.ID != gone || !detail.Workspace.Missing {
+		t.Fatalf("workspace = %+v, want the id it names and missing=true", *detail.Workspace)
+	}
+	if detail.Workspace.Dirs == nil {
+		t.Fatal("dirs must be a list even when the workspace is gone")
+	}
+}
