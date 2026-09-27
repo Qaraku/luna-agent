@@ -47,7 +47,13 @@ type Info struct {
 	BoundHost    string
 	Model        string
 	ProviderHost string
-	WebDir       string
+	// ReasoningEffort is the level the process was started with, which is how
+	// hard the model was asked to think. It is part of the state the browser may
+	// read so that the setting is visible in the product instead of only existing
+	// in the environment the server was started from. It is never a secret and it
+	// is not changeable while the process runs: the model is built once.
+	ReasoningEffort string
+	WebDir          string
 	// UIPluginsDir is the plugins/ui directory holding runtime UI plugins. It
 	// is added by S4a and changes no existing field's meaning. An unset value
 	// lists no plugins and serves no file rather than failing a request.
@@ -59,10 +65,13 @@ type LifecycleEvent struct {
 	Message string    `json:"message"`
 }
 type State struct {
-	HostPID         int                 `json:"host_pid"`
-	StartedAt       time.Time           `json:"started_at"`
-	Model           string              `json:"model"`
-	ProviderHost    string              `json:"provider_host"`
+	HostPID      int       `json:"host_pid"`
+	StartedAt    time.Time `json:"started_at"`
+	Model        string    `json:"model"`
+	ProviderHost string    `json:"provider_host"`
+	// ReasoningEffort is empty when no level was chosen, which is not the same as
+	// "medium": nothing was sent, so the provider's own default is what applied.
+	ReasoningEffort string              `json:"reasoning_effort,omitempty"`
 	ModelConfigured bool                `json:"model_configured"`
 	ModelConnected  bool                `json:"model_connected"`
 	Plugins         []pluginhost.Record `json:"plugins"`
@@ -231,7 +240,7 @@ func (s *Server) state() State {
 	s.eventMu.Lock()
 	events := append([]LifecycleEvent{}, s.events...)
 	s.eventMu.Unlock()
-	return State{HostPID: os.Getpid(), StartedAt: s.started, Model: s.info.Model, ProviderHost: s.info.ProviderHost, ModelConfigured: s.info.Model != "" && s.info.ProviderHost != "", ModelConnected: s.connected.Load(), Plugins: ps.Plugins, Busy: busy, CurrentRunID: id, CurrentSessionID: sessionID, Events: events, Capabilities: capabilityViews(s.capabilities), Demo: true}
+	return State{HostPID: os.Getpid(), StartedAt: s.started, Model: s.info.Model, ProviderHost: s.info.ProviderHost, ReasoningEffort: s.info.ReasoningEffort, ModelConfigured: s.info.Model != "" && s.info.ProviderHost != "", ModelConnected: s.connected.Load(), Plugins: ps.Plugins, Busy: busy, CurrentRunID: id, CurrentSessionID: sessionID, Events: events, Capabilities: capabilityViews(s.capabilities), Demo: true}
 }
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")

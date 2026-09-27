@@ -633,6 +633,33 @@ func TestStateAndHealthContainNoSecretAndHonestConnectionState(t *testing.T) {
 	}
 }
 
+// How hard the model was asked to think is a setting rather than a secret, so the
+// state the browser reads carries it. An unchosen level stays absent instead of
+// being reported as a default the process never sent, because those are different
+// things: the provider's own default applied, not one we picked.
+func TestStateCarriesTheChosenReasoningEffortAndNothingWhenUnchosen(t *testing.T) {
+	p := &fakePlugins{state: pluginState(pluginhost.ToolReadFile)}
+	for _, test := range []struct {
+		effort   string
+		expected string
+	}{
+		{effort: "high", expected: `"reasoning_effort":"high"`},
+		{effort: ""},
+	} {
+		h := New(p, fakeRunner{}, newTestStore(t), Info{BoundHost: "127.0.0.1:43210", Model: "fake-model", ProviderHost: "provider.test", ReasoningEffort: test.effort, WebDir: "../../web"})
+		body := request(t, h, http.MethodGet, "/api/state", "", false).Body.String()
+		if test.expected == "" {
+			if strings.Contains(body, "reasoning_effort") {
+				t.Fatalf("an unchosen level was reported: %s", body)
+			}
+			continue
+		}
+		if !strings.Contains(body, test.expected) {
+			t.Fatalf("state did not report the chosen level: %s", body)
+		}
+	}
+}
+
 // /api/state reports every allowlisted tool, not one active entry: a single
 // active record could not name which tool had failed.
 func TestStateReportsEveryToolAndNoSingleActiveEntry(t *testing.T) {
