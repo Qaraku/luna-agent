@@ -51,6 +51,12 @@ func (s *Server) requiresOrigin(method, path string) bool {
 		// path is a wrong-method request and is answered 405.
 		return !isReadMethod(method)
 	}
+	if _, ok := sessionModelPath(path); ok {
+		// Choosing a session's model changes what its next runs do, so it is a
+		// mutation in the same way starting a run is and carries the same Origin
+		// requirement. A read method to this path is a wrong-method request.
+		return !isReadMethod(method)
+	}
 	route, _, _ := s.capabilityRoute(method, path)
 	return route != nil && !isReadMethod(route.Method())
 }

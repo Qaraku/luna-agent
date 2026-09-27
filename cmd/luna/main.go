@@ -346,15 +346,24 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("construct Eino agent: %w", err)
 	}
-	// The command table is built once, here, from the kernel's own commands. It
-	// is handed to the server instead of to the browser, so the composer's
-	// candidates and its help list come from one description of what exists.
-	commands, err := command.New(command.Builtins()...)
+	// The command table is built once, here, from the kernel's own commands plus
+	// what this configuration offers. It is handed to the server instead of to
+	// the browser, so the composer's candidates and its help list come from one
+	// description of what exists.
+	modelNames := make([]string, 0, len(cfg.Models))
+	for _, model := range cfg.Models {
+		modelNames = append(modelNames, model.Name)
+	}
+	commands, err := command.New(append(command.Builtins(), command.ModelCommand(modelNames))...)
 	if err != nil {
 		return fmt.Errorf("build the command table: %w", err)
 	}
 	bound := listener.Addr().String()
-	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, ReasoningEffort: cfg.ReasoningEffort, WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands))
+	models := make([]httpapi.ModelRef, 0, len(cfg.Models))
+	for _, model := range cfg.Models {
+		models = append(models, httpapi.ModelRef{Name: model.Name, Provider: model.Provider})
+	}
+	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Models: models, ReasoningEffort: cfg.ReasoningEffort, WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands))
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: 70 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() {

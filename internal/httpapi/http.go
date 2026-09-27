@@ -42,12 +42,19 @@ type Sessions interface {
 	Exists(id string) (bool, error)
 	List() ([]store.Summary, error)
 	Read(id string) (store.Session, error)
+	// AppendConfig records a choice a session made about its own runs, such as
+	// which model to use. It appends: a session's file is a record of what was
+	// asked for, in order, and the newest statement is the one in effect.
+	AppendConfig(id string, record store.ConfigRecord) error
 }
 
 type Info struct {
 	BoundHost    string
 	Model        string
 	ProviderHost string
+	// Models are the models a run may be sent to, the default first. A runtime
+	// configured by environment variables alone has exactly one entry.
+	Models []ModelRef
 	// ReasoningEffort is the level the process was started with, which is how
 	// hard the model was asked to think. It is part of the state the browser may
 	// read so that the setting is visible in the product instead of only existing
@@ -286,6 +293,12 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.sendCommands(w)
+	case "/api/models":
+		if r.Method != http.MethodGet {
+			method(w, http.MethodGet)
+			return
+		}
+		s.sendModels(w, r)
 	case "/api/reload":
 		if r.Method != http.MethodPost {
 			method(w, http.MethodPost)
@@ -331,6 +344,14 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.setPluginState(w, id, action)
+			return
+		}
+		if id, ok := sessionModelPath(r.URL.Path); ok {
+			if r.Method != http.MethodPost {
+				method(w, http.MethodPost)
+				return
+			}
+			s.setSessionModel(w, r, id)
 			return
 		}
 		if id, ok := sessionPathID(r.URL.Path); ok {
@@ -586,17 +607,20 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, fmt.Errorf("message is required and must not exceed 16384 bytes"))
 		return
 	}
-	// A supplied session must exist. This is checked before admission, so an
-	// unknown id costs the caller a 4xx and not the single-run slot.
+	// A supplied session must exist, and a session's own choice of model travels
+	// with it. Both are read before admission, so an unknown id costs the caller
+	// a 4xx and not the single-run slot.
+	runModel := ""
 	if in.SessionID != "" {
-		exists, err := s.sessions.Exists(in.SessionID)
+		session, err := s.sessions.Read(in.SessionID)
 		if err != nil {
 			fail(w, sessionStatus(err), err)
 			return
 		}
-		if !exists {
-			fail(w, 404, fmt.Errorf("unknown session %q", in.SessionID))
-			return
+		// A session that chose a model keeps that choice. An empty one means the
+		// configuration's default, which the runner resolves.
+		if session.Config != nil {
+			runModel = session.Config.Model
 		}
 	}
 	// The run context carries both ends of the run: a deadline, and a cancel
@@ -658,7 +682,7 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	sink := &streamSink{ctx: runCtx, events: make(chan agent.Event, streamSinkCapacity)}
 	result := make(chan runResult, 1)
 	go func() {
-		answer, err := s.runner.Run(runCtx, agent.RunRequest{RunID: id, SessionID: sessionID, Message: in.Message, Sink: sink})
+		answer, err := s.runner.Run(runCtx, agent.RunRequest{RunID: id, SessionID: sessionID, Message: in.Message, Model: runModel, Sink: sink})
 		close(sink.events)
 		result <- runResult{answer, err}
 	}()
