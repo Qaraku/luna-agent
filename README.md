@@ -28,6 +28,7 @@ flowchart LR
     subgraph Plugins["Tool plugin subprocesses"]
         T1["luna_text_transform · v1"]
         R1["luna_read_file · v1"]
+        D1["luna_list_dir · v1"]
         C["candidate build · v2 for every tool"]
     end
 
@@ -42,8 +43,10 @@ flowchart LR
     Agent -->|"luna_remember (capability-contributed, no process)"| Mem
     Agent -->|"luna_text_transform"| PH
     Agent -->|"luna_read_file"| PH
+    Agent -->|"luna_list_dir"| PH
     PH -->|"net/rpc"| T1
     PH -->|"net/rpc"| R1
+    PH -->|"net/rpc"| D1
     PH -.->|"build + handshake, then publish"| C
     UIP -->|"mount / unmount in the page"| UIPlug
 ```
@@ -75,21 +78,22 @@ See [docs/architecture.md](docs/architecture.md) for ownership and reload semant
 
 - An Eino `ChatModelAgent` named `luna` with automatic tool choice, a six-iteration ceiling, and sequential execution when one model turn contains multiple tool calls.
 - OpenAI-compatible configuration read only from the process environment.
-- Three model-visible tools, in two kinds. The two **plugin-backed** tools are replaceable at runtime and are each backed by an allowlisted subprocess candidate, so both use the same `v1` / `v2` / `broken` vocabulary and a replacement has one shape whatever the tool does. The third, `luna_remember`, is contributed by a **built-in capability**: it is not a subprocess, so it has no candidate, no generation and no process to replace, its call events carry no process identity, and a `broken` reload cannot take memory away from the agent.
+- Four model-visible tools, in two kinds. The three **plugin-backed** tools are replaceable at runtime and are each backed by an allowlisted subprocess candidate, so all three use the same `v1` / `v2` / `broken` vocabulary and a replacement has one shape whatever the tool does. The fourth, `luna_remember`, is contributed by a **built-in capability**: it is not a subprocess, so it has no candidate, no generation and no process to replace, its call events carry no process identity, and a `broken` reload cannot take memory away from the agent.
 
   | Tool | Kind | `v1` returns | `v2` returns |
   |---|---|---|---|
   | `luna_text_transform` | plugin-backed | the input with surrounding whitespace trimmed | trimmed, uppercased, prefixed with `Luna · ` |
   | `luna_read_file` | plugin-backed | the text of a host-validated file inside the read root | the same text with `CRLF` and lone `CR` normalized to `LF` |
+  | `luna_list_dir` | plugin-backed | one level of a host-validated directory inside the read root: each entry with its kind, and a size for regular files | the same listing with every size as an exact byte count |
   | `luna_remember` | capability-contributed | appends one fact | — (no candidates) |
 
-  `broken` refuses the plugin handshake for both plugin-backed tools, so a failed replacement stays observable on both.
+  `broken` refuses the plugin handshake for every plugin-backed tool, so a failed replacement stays observable on all three.
 
 - The agent remembers durable facts, and that is a capability's business rather than the kernel's. `luna_remember` is contributed by the built-in Memory capability, which owns its own store and its own rules; the file is still an append-only JSONL `.runtime/memory.jsonl` by default — one line is one fact, carrying its type (`fact`), text, timestamp and the session that wrote it — and the file name inside its state directory is the capability's own choice, not a kernel setting. `-state-dir` moves the state root the capability keeps that directory under (default: the resolved root, the same place as before, so existing data needs no migration); there is no `-memory-file` flag any more. Writes are bounded to 200 facts and 32 KiB of encoded lines overall, with 500 characters on a single fact, dropping the oldest first — every complete line counts, retractions included, so retracting in a loop cannot grow the file. The stored facts are re-read on every run and injected as one context block the capability contributes: the kernel labels it as reference data rather than instructions and truncates on line boundaries inside the block's budget, and the capability keeps the most recent facts, capped at 50 facts and 8 KiB of rendered lines; newlines inside a fact are collapsed, so stored text cannot open a prompt line of its own. Memory is write-only from the model's side: it can add a fact and can never read, list, edit or delete one, and a memory file that cannot be read fails the run instead of running as if nothing were remembered.
 
 - 用户通过 Memory 能力贡献的面板查看和撤回事实；`GET /api/memory` 与 `POST /api/memory/retract` 也是这个能力贡献的接口，内核只负责挂载与守卫。`GET /api/memory` 列出生效与已撤回的事实；`POST /api/memory/retract` 按文本和时间戳共同匹配目标。撤回只追加记录，不就地修改事实；读取和上下文注入时排除被撤回的事实。字节上限计算所有记录，压缩重写时一起移除事实及对应撤回记录，避免反复撤回导致文件无限增长。模型权限不变，仍没有读取、列出、编辑或撤回工具。
 
-- `luna_read_file` is the only filesystem capability, and it is bounded: the host normalizes the requested path, rejects absolute paths and `..` escapes, resolves symbolic links, and refuses anything that is not still inside the read root; a single read above the 256 KiB cap is refused with an explicit error instead of being truncated, and content with a NUL byte is refused as binary. The plugin receives an already-validated absolute path plus the cap and never interprets a path itself. The read root defaults to the resolved repository root and can be pointed elsewhere with `-read-root`. Memory is not a filesystem capability the model holds either: it writes through the tool its capability contributes, never through a path.
+- The model's filesystem capability is read-only and bounded, and both file tools share one boundary. `luna_read_file` reads one file and `luna_list_dir` lists one directory, and each takes a path relative to the same read root. The host is the only place that path is interpreted: it normalizes it, rejects absolute paths and `..` escapes, resolves symbolic links, and refuses anything that is not still inside the read root, so a listing can never reach somewhere a read cannot, and an out-of-bounds path is refused before any plugin runs. A single read above the 256 KiB cap is refused with an explicit error instead of being truncated, and content with a NUL byte is refused as binary. A listing is deliberately one level deep and never recursive: a subdirectory appears as an entry and is not entered, each entry carries its kind (`dir`, `file`, `link`, `other`) and a size for regular files, directories come first and then files and links, each sorted by name, and one listing renders at most 200 entries in lines of at most 160 bytes — saying how many entries it left out instead of quietly returning a prefix. The plugin receives an already-validated absolute path plus the caps and never interprets a path itself. The read root defaults to the resolved repository root and can be pointed elsewhere with `-read-root`. Memory is not a filesystem capability the model holds either: it writes through the tool its capability contributes, never through a path.
 
 - Validated hot reload: build, start, handshake, and metadata checks all complete for every allowlisted plugin tool before the new generations are published together. In-flight calls stay pinned to their original generation until it drains.
 - A loopback-only HTTP service with guarded mutation origins, bounded request bodies, and a default 60-second whole-run context deadline.
@@ -173,9 +177,9 @@ Mutation requests must come from the exact bound browser origin. There is no COR
 
 ## Observing a hot reload
 
-1. Ask Luna to transform text and confirm the tool result comes back as `moon light`; ask it to read a file inside the read root and confirm the file text comes back. The runtime drawer lists one row per plugin record, each with its own version, generation and plugin PID; the tool a built-in capability contributes has no row, because there is no process identity to report.
-2. `POST /api/reload` with `{"candidate":"v2"}`. Both plugin-backed tools move to a new generation with new plugin PIDs: the next transform returns `Luna · MOON LIGHT`, and a file whose lines end in `CRLF` comes back with `LF`.
-3. `POST /api/reload` with `{"candidate":"broken"}`. The reload fails and both plugin-backed tools keep serving `v2`, because a candidate is published for every plugin-backed tool or for none. Memory is unaffected by a reload either way: it is a built-in capability, so it has no candidate generation to replace and a reload never touches a capability's contributions or state.
+1. Ask Luna to transform text and confirm the tool result comes back as `moon light`; ask it to read a file inside the read root and confirm the file text comes back; ask it what a directory inside the read root holds and confirm the entries come back with their kind and size. The runtime drawer lists one row per plugin record, each with its own version, generation and plugin PID; the tool a built-in capability contributes has no row, because there is no process identity to report.
+2. `POST /api/reload` with `{"candidate":"v2"}`. All three plugin-backed tools move to a new generation with new plugin PIDs: the next transform returns `Luna · MOON LIGHT`, a file whose lines end in `CRLF` comes back with `LF`, and a file size in a listing comes back as an exact byte count.
+3. `POST /api/reload` with `{"candidate":"broken"}`. The reload fails and all three plugin-backed tools keep serving `v2`, because a candidate is published for every plugin-backed tool or for none. Memory is unaffected by a reload either way: it is a built-in capability, so it has no candidate generation to replace and a reload never touches a capability's contributions or state.
 
 Assert on the tool result rather than on model prose: the tool result identifies the serving generation deterministically.
 
@@ -195,7 +199,7 @@ node --test web/app.test.cjs
 
 以下为既有测试覆盖与历史验证记录：
 
-Go unit and integration coverage includes configuration alias handling, one process per allowlisted tool, real subprocess replacement and draining, broken-candidate rollback with the active generation kept serving, RPC timeout termination, a plugin process killed mid-call classified as infrastructure, host-side file-read path validation (absolute paths, `..` escapes, symlink escape, non-regular files, the size cap and binary content), a refusal reaching the model as the call's result while an infrastructure failure still ends the run, strict tool schemas and trailing-JSON rejection, sequential tool execution, streaming of assistant text as it arrives, with a tool-call turn's own text demoted to a run note rather than becoming the answer, deterministic fake-model Eino event mapping, whole-run timeout and cancellation cleanup, exactly-one SSE terminal semantics, UI plugin listing and containment, and HTTP guards. A focused post-disconnect race regression also passed 50 repeated race-detector runs.
+Go unit and integration coverage includes configuration alias handling, one process per allowlisted tool, real subprocess replacement and draining, broken-candidate rollback with the active generation kept serving, RPC timeout termination, a plugin process killed mid-call classified as infrastructure, host-side file-read path validation (absolute paths, `..` escapes, symlink escape, non-regular files, the size cap and binary content), the same host-side validation for a directory listing (a path that is not a directory or does not exist is refused, one listing is never recursive, and both of its caps are stated in the result instead of truncating it silently), a refusal reaching the model as the call's result while an infrastructure failure still ends the run, strict tool schemas and trailing-JSON rejection, sequential tool execution, streaming of assistant text as it arrives, with a tool-call turn's own text demoted to a run note rather than becoming the answer, deterministic fake-model Eino event mapping, whole-run timeout and cancellation cleanup, exactly-one SSE terminal semantics, UI plugin listing and containment, and HTTP guards. A focused post-disconnect race regression also passed 50 repeated race-detector runs.
 
 Separate end-to-end validation completed the checks that deterministic tests cannot provide:
 
@@ -227,7 +231,7 @@ The spike is a separate Go module and historical evidence. The root application 
 
 ## Boundaries
 
-The slice deliberately excludes multi-agent orchestration, arbitrary shell or network tools, filesystem access beyond the bounded read-only `luna_read_file`, browser-supplied plugin code or paths, a plugin marketplace, an installation path that adds a UI plugin from the browser, persisted UI plugin enablement, production authentication, tenant isolation, public deployment, cross-origin API access, and retries that could duplicate model or tool effects. Reasoning the provider itself exposes is streamed to the browser as run content (it never becomes the answer); nothing infers reasoning a provider does not report.
+The slice deliberately excludes multi-agent orchestration, arbitrary shell or network tools, filesystem access beyond the bounded read-only file tools (`luna_read_file` and `luna_list_dir`), browser-supplied plugin code or paths, a plugin marketplace, an installation path that adds a UI plugin from the browser, persisted UI plugin enablement, production authentication, tenant isolation, public deployment, cross-origin API access, and retries that could duplicate model or tool effects. Reasoning the provider itself exposes is streamed to the browser as run content (it never becomes the answer); nothing infers reasoning a provider does not report.
 
 记忆采用有上限的事实存储，不包含检索、向量嵌入或相关性排序；每轮注入的是上限内最近的事实，而非最相关的事实。系统不会自动从对话抽取事实，只有模型调用 `luna_remember` 时才写入。模型只能追加，不能读取、列出、编辑或撤回；用户可从页头“记忆”入口查看和撤回，无需手工编辑文件。撤回仍为追加记录，事实继续保存在本地文件中。记忆不区分用户身份，也不提供跨用户隔离，仅适合本地单用户场景。
 

@@ -78,7 +78,7 @@ Memory 是官方内置能力（`internal/plugins/memory`），不再属于内核
 
 ### 插件进程
 
-模型可见的工具来自两处：两个由插件支撑的包装器，由核心按插件宿主的白名单注册、各自作为独立进程运行、各有自己的输入 schema；以及启用中能力贡献的工具。Memory 贡献的 `luna_remember` 属于后者，紧跟其后描述。
+模型可见的工具来自两处：三个由插件支撑的包装器，由核心按插件宿主的白名单注册、各自作为独立进程运行、各有自己的输入 schema；以及启用中能力贡献的工具。Memory 贡献的 `luna_remember` 属于后者，紧跟其后描述。
 
 `luna_text_transform`:
 
@@ -112,15 +112,35 @@ Memory 是官方内置能力（`internal/plugins/memory`），不再属于内核
 }
 ```
 
+`luna_list_dir`:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "Directory path, relative to the configured read root; use \".\" for the read root itself"
+    }
+  },
+  "required": ["path"],
+  "additionalProperties": false
+}
+```
+
+列表 schema 刻意只有一个参数：递归深度、通配或过滤器都会把一次列举变成对整个读取根的无界遍历，所以这里没有可以要求它们的入口。
+
 每个实现都是一个真实的 HashiCorp `go-plugin` net/rpc 子进程。它的 RPC 协议是核心/插件边界的私有协议。子进程只接收最小环境（`PATH`、`HOME`、`TMPDIR`，以及存在时的 `GOCACHE`），不接收 provider 的 OpenAI 环境变量。
 
 `luna_read_file` 把它的边界分成两半。`internal/fileread.Resolve` 在宿主上运行，是唯一解释模型提供的路径的地方：它规范化路径、拒绝绝对路径和 `..` 越界、解析符号链接，并拒绝任何不是仍位于读取根目录内的普通文件。随后插件拿到的是已解析的绝对路径加上大小上限，它自己从不解释路径。超过上限（默认 256 KiB，`-read-limit`）的读取和包含 NUL 字节的内容都会被明确报错拒绝，而不是被截断或猜测，错误字符串绝不携带宿主绝对路径。文件不存在时报告为 `file not found: "<the path the model asked for>"`；宿主说明发生了什么，而不说明路径越过了哪个内部边界。读取根目录默认为解析出的仓库根目录，由 `-read-root` 设置。上述每一种拒绝都以调用结果的形式到达模型，而不是让运行失败——见 SSE 契约中的 `tool.failed` 条目。
 
+`luna_list_dir` 复用同一套边界，而不是另写一套。`internal/fileread.ResolveDir` 与 `Resolve` 走同一次规范化、同一次越界拒绝和同一次符号链接解析（两者共用的 `resolveWithinRoot`），差别只在解析结果要满足什么：读要求普通文件，列举要求目录。读根也只有一个——宿主级 `Options.ReadRoot`（`-read-root`），所以列举永远到不了读取到不了的地方；绝对路径、`..` 越界、不存在的路径和不是目录的路径都在任何 RPC 之前被拒绝。插件拿到的是已校验的绝对目录路径与两个上限（条目数默认 200、单行默认 160 字节，两者目前没有对应的命令行开关），自己从不解释路径。列举刻意只有一层：子目录作为条目出现而不进入，一次列举也不会跟随符号链接，因此它不可能长成对整个读取根的无界遍历。每行给出类型（`dir` / `file` / `link` / `other`）、普通文件的大小和名字；目录排在文件与链接之前，各组内按名字保持稳定顺序；命中条目数上限或单行上限时，结果会说明被留下的条目、或被截断的名字及其真实长度，而不是静默返回一个前缀。这些拒绝与读取的一样，以调用结果的形式到达模型，而不是让运行失败。
+
 允许的候选从 `plugins/<tool>/<candidate>/` 编译，全部来自根应用源码：
 
-- `v1`：`luna_text_transform` 去除首尾空白；`luna_read_file` 返回宿主已校验路径的文本；
-- `v2`：`luna_text_transform` 去除首尾空白、用 Go 字符串处理转大写，并在前面加上 `Luna · `；`luna_read_file` 把 `CRLF` 和单独的 `CR` 规范化为 `LF`；
-- `broken`：对两个工具都启动一个无法完成预期握手的程序。
+- `v1`：`luna_text_transform` 去除首尾空白；`luna_read_file` 返回宿主已校验路径的文本；`luna_list_dir` 渲染宿主已校验目录的一层内容，每个条目带类型，普通文件带大小（人类可读单位）；
+- `v2`：`luna_text_transform` 去除首尾空白、用 Go 字符串处理转大写，并在前面加上 `Luna · `；`luna_read_file` 把 `CRLF` 和单独的 `CR` 规范化为 `LF`；`luna_list_dir` 的边界与 `v1` 相同，只把大小换成精确字节数；
+- `broken`：对三个工具都启动一个无法完成预期握手的程序。
 
 ### 能力贡献的工具
 
@@ -212,6 +232,7 @@ Eino 的 `ToolsNode` 配置为 `ExecuteSequentially: true`。如果一个模型�
   │                                  ├─ OpenAI 兼容 ChatModel
   │                                  ├─ luna_text_transform 包装器 ──> 固定的插件 generation，走 net/rpc
   │                                  ├─ luna_read_file 包装器 ──> 固定的插件 generation，走 net/rpc
+  │                                  ├─ luna_list_dir 包装器 ──> 固定的插件 generation，走 net/rpc
   │                                  └─ luna_remember（Memory 能力贡献）──> internal/plugins/memory（仅追加 JSONL）
   └─ SSE 事件 <──────── Luna 自有的运行局部事件出口
 
@@ -222,7 +243,7 @@ Eino 的 `ToolsNode` 配置为 `ExecuteSequentially: true`。如果一个模型�
                                      └─ 为全部工具发布一个新 generation，否则一个也不发布
 ```
 
-模型工具选择是自动的。当用户明确要求文本转换或明确要求调用它时，系统指令要求使用 `luna_text_transform`；当用户要求读取文件时，要求使用 `luna_read_file`；当用户要求记住一条持久事实时，说明来自 `luna_remember` 自己的工具描述——系统指令不再点名任何能力；没有任何请求会强制 provider 级的 `tool_choice: required`。含工具调用的回合中模型输出的助手内容会**边产生边作为 `assistant.delta` 发出**，但它绝不进入最终答案：只有无工具调用的回答回合中的助手文本才构成 `run.finished` 里的答案。这一区分由浏览器负责呈现——一段文本之后如果跟着 `tool.started`，它就作为「运行说明」留在运行轨迹里；如果跟着终止事件，它就是答案。之所以不能在运行期判定，是因为一个回合是否是回答只有该回合结束时（`finish_reason`）才知道。
+模型工具选择是自动的。当用户明确要求文本转换或明确要求调用它时，系统指令要求使用 `luna_text_transform`；当用户要求读取文件时，要求使用 `luna_read_file`；当用户想知道某个目录或这个项目里有什么、或在读取前需要先发现路径时，要求使用 `luna_list_dir`，并说明一次调用只列一层、仓库要一层目录一次地走；当用户要求记住一条持久事实时，说明来自 `luna_remember` 自己的工具描述——系统指令不再点名任何能力；没有任何请求会强制 provider 级的 `tool_choice: required`。含工具调用的回合中模型输出的助手内容会**边产生边作为 `assistant.delta` 发出**，但它绝不进入最终答案：只有无工具调用的回答回合中的助手文本才构成 `run.finished` 里的答案。这一区分由浏览器负责呈现——一段文本之后如果跟着 `tool.started`，它就作为「运行说明」留在运行轨迹里；如果跟着终止事件，它就是答案。之所以不能在运行期判定，是因为一个回合是否是回答只有该回合结束时（`finish_reason`）才知道。
 
 每个回合的模型输入都从磁盘组装，而不是来自进程状态：先是系统指令，然后是按文件顺序排列的会话早前消息，最后是本回合的用户消息。启用中能力贡献的上下文块追加在这条系统消息内部，而不是在消息之后：system 角色保持它的位置，被贡献的文本也无法作为后续消息到达。早前消息由 `internal/agent` 中的两个常量限定——`MaxHistoryMessages = 40` 条消息和 `MaxHistoryBytes = 64 KiB` 的消息文本——策略是确定性的：保留最近的消息，先丢弃最旧的。保留集合是持久化历史的连续后缀，从最新消息向前累积，直到任一上限将被超过，因此消息从不被重排、抽样或跳过，扫描停止点之前的所有内容也一并丢弃。因此对字节上限来说过大的消息会结束历史，而不是被截断。字节上限高于 16,384 字节的 HTTP 消息上限，因此本回合自己的消息总是能放下。一次运行自己的记录被排除在它自己的输入之外，且只有消息文本进入输入：没有任何工具结果或插件身份能通过持久化历史到达模型。本切片没有摘要和检索：历史被回放，记忆被注入，两者都不被搜索、过滤或摘要。
 
@@ -262,9 +283,9 @@ data: <JSON payload>
 - `run.started` —— `{"run_id":"...","session_id":"..."}`；运行被准入到的会话，当本次请求没有提供会话时由本请求创建。下面的终止事件规则不变。
 - `assistant.delta` —— `{"text":"..."}`；文本边产生边发出，包含含工具调用的回合里的文本。哪些文本是答案由终止事件划界，不由这个事件本身声明。
 - `assistant.reasoning` —— `{"text":"..."}`；provider 自愿暴露的推理内容的**流式增量**。它是运行内容而不是回答：**不进入最终答案**，不写入 transcript，也不参与答案对齐。provider 不报告推理时（取决于 provider 与是否 thinking 模式）这个事件根本不出现——运行期不会推断、不会伪造、也不为它留占位。响应只展示这一路真实到达的内容。
-- `tool.started` —— `{"run_id":"...","name":"...","arguments":...}`，其中 `name` 是当前可用的模型可见工具名之一：由子进程支撑的 `luna_text_transform` 与 `luna_read_file`，以及启用中能力贡献的工具（Memory 的 `luna_remember`）
+- `tool.started` —— `{"run_id":"...","name":"...","arguments":...}`，其中 `name` 是当前可用的模型可见工具名之一：由子进程支撑的 `luna_text_transform`、`luna_read_file` 与 `luna_list_dir`，以及启用中能力贡献的工具（Memory 的 `luna_remember`）
 - `tool.finished` —— `{"run_id":"...","name":"...","result":"...","duration_ms":N,"generation":N,"version":"...","plugin_pid":N}`，用于服务了该调用的子进程工具；对于内置能力贡献的调用（例如 `luna_remember`），这三个身份字段在 JSON 中缺席，而不是被发成 0，因为没有进程服务它
-- `tool.failed` —— 运行/工具身份、一个错误和 `duration_ms`；当有子进程服务了这次尝试时带有 generation/版本/PID，没有时省略。工具就调用本身作出的**拒绝**——被拒绝的路径、单次读取大小上限、二进制内容、格式错误的参数——同样作为调用结果交给模型，因此运行继续，模型可以向用户解释原因。只有**基础设施**故障才结束整轮：没有活跃插件、终止了插件的 RPC 超时或取消、插件进程已经消失，或内置能力用 `plugin.ErrUnavailable` 标记了“这次调用我服务不了”。插件宿主用哨兵错误标记前者（`pluginhost.ErrUnknownTool`、`ErrNoActivePlugin`、`ErrRPCTimeout`、`ErrRPCCanceled`、`ErrPluginGone`），因此包装器按标记分类，而不是匹配报错文字；插件内部抛出的拒绝以纯文本穿越 `net/rpc`，因此永远不属于其中之一。被拒绝的调用仍然带着错误写入它的 `tool_call` 记录，因此失败的调用在重启后依然存在。运行被停止而中断的调用不是拒绝：它以同样的身份关闭，错误就是停止原因，并且**结束整轮**——模型不会被告知工具拒绝了一个它从未拒绝的调用。
+- `tool.failed` —— 运行/工具身份、一个错误和 `duration_ms`；当有子进程服务了这次尝试时带有 generation/版本/PID，没有时省略。工具就调用本身作出的**拒绝**——被拒绝的路径（读取与列举共用同一套边界检查）、单次读取大小上限、二进制内容、格式错误的参数——同样作为调用结果交给模型，因此运行继续，模型可以向用户解释原因。只有**基础设施**故障才结束整轮：没有活跃插件、终止了插件的 RPC 超时或取消、插件进程已经消失，或内置能力用 `plugin.ErrUnavailable` 标记了“这次调用我服务不了”。插件宿主用哨兵错误标记前者（`pluginhost.ErrUnknownTool`、`ErrNoActivePlugin`、`ErrRPCTimeout`、`ErrRPCCanceled`、`ErrPluginGone`），因此包装器按标记分类，而不是匹配报错文字；插件内部抛出的拒绝以纯文本穿越 `net/rpc`，因此永远不属于其中之一。被拒绝的调用仍然带着错误写入它的 `tool_call` 记录，因此失败的调用在重启后依然存在。运行被停止而中断的调用不是拒绝：它以同样的身份关闭，错误就是停止原因，并且**结束整轮**——模型不会被告知工具拒绝了一个它从未拒绝的调用。
 - `usage.updated` —— `{"run_id":"...","input_tokens":N,"output_tokens":N,"total_tokens":N,"cached_tokens":N?,"reasoning_tokens":N?}`；只在 provider 报告用量时出现。运行期不依赖它，也不会估算它没被告知的 token 数。
 - `run.finished` —— `{"run_id":"...","answer":"..."}`
 - `run.failed` —— `{"run_id":"...","error":"..."}`；真正的失败，例如 provider 或存储故障。
