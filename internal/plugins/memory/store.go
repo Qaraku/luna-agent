@@ -6,11 +6,13 @@
 // plugin identity (generation, version, process id) and no field for a
 // credential, so neither can travel through memory into a model context.
 //
-// Memory is core state, not a replaceable extension: the model can add a fact
-// through the host-native `luna_remember` tool, and it still has no read, list
-// or retract path. Reading happens only by system injection, and the user can
-// retract a stored fact from the browser — both go through this store, so the
-// model-visible surface never widens.
+// Memory belongs to the Memory capability, not to the kernel: the store, the
+// caps, the rendering and the routes are this package's business, and the
+// kernel sees only the contributions it declares. The model can add a fact
+// through `luna_remember`, and it still has no read, list or retract path.
+// Reading happens only when the capability contributes its context block, and
+// the user can retract a stored fact from the panel — both go through this
+// store, so the model-visible surface never widens.
 //
 // Three properties carry the design:
 //

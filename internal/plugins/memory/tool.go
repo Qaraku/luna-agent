@@ -79,7 +79,7 @@ func validateFactText(text string) error {
 }
 
 // decodeOne accepts exactly one JSON object and rejects unknown fields and
-// trailing JSON values. It is the tool's own copy of the rule the host-native
+// trailing JSON values. It is the tool's own copy of the rule the kernel's
 // wrappers share: a malformed call must be refused before it reaches the store.
 func decodeOne(arguments string, into any) error {
 	d := json.NewDecoder(strings.NewReader(arguments))

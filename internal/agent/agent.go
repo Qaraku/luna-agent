@@ -107,9 +107,9 @@ type ToolStarted struct {
 }
 
 // ToolFinished is the event a served tool call produces. The identity fields are
-// absent for a host-native tool: no plugin served the call, so generation,
-// version and process id are omitted rather than reported as zero. Every
-// plugin-backed call still carries all three.
+// absent for a tool a capability contributes: no process served the call, so
+// generation, version and process id are omitted rather than reported as zero.
+// Every plugin-backed call still carries all three.
 type ToolFinished struct {
 	RunID      string `json:"run_id"`
 	Name       string `json:"name"`
