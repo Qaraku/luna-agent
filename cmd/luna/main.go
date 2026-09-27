@@ -21,6 +21,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
+	"github.com/Qaraku/luna-agent/internal/plugins/workspace"
 	"github.com/Qaraku/luna-agent/internal/store"
 	"github.com/Qaraku/luna-agent/internal/uiplugin"
 )
@@ -88,6 +89,18 @@ func resolveRoot(explicit, executable, workingDir string) (string, error) {
 		return "", errors.New("cannot locate web/ and plugins/; pass -root")
 	}
 	return "", fmt.Errorf("cannot locate web/ and plugins/; tried %s; pass -root", strings.Join(tried, ", "))
+}
+
+// projectRoot resolves the directory a capability may treat as the project the
+// agent is working in: the read root the file tool is bounded to. An unset read
+// root means the repository root, which is the same default the plugin host
+// applies; resolving it here, once, keeps the identity the model is given and
+// the boundary the host enforces from drifting apart.
+func projectRoot(root, explicitReadRoot string) string {
+	if explicitReadRoot != "" {
+		return explicitReadRoot
+	}
+	return root
 }
 
 // sessionsDir resolves the session directory. An explicit value wins; otherwise
@@ -161,6 +174,20 @@ func run() error {
 	if err := registry.Enable(memory.PluginID); err != nil {
 		return fmt.Errorf("enable memory capability: %w", err)
 	}
+	// The Workspace capability names the project this session is working in. It
+	// is built from the same directory the file tool is bounded to and keeps no
+	// state of its own: identity comes from the root, so it claims no namespace
+	// and asks for no permission.
+	project, err := workspace.New(projectRoot(root, *readRoot))
+	if err != nil {
+		return fmt.Errorf("open workspace capability: %w", err)
+	}
+	if err := registry.Register(project); err != nil {
+		return fmt.Errorf("register workspace capability: %w", err)
+	}
+	if err := registry.Enable(workspace.PluginID); err != nil {
+		return fmt.Errorf("enable workspace capability: %w", err)
+	}
 	listener, err := httpapi.Listen(*addr)
 	if err != nil {
 		return err
@@ -169,7 +196,7 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	plugins, err := pluginhost.New(ctx, root, pluginhost.Options{ReadRoot: *readRoot, ReadLimit: *readLimit})
+	plugins, err := pluginhost.New(ctx, root, pluginhost.Options{ReadRoot: projectRoot(root, *readRoot), ReadLimit: *readLimit})
 	if err != nil {
 		return fmt.Errorf("start plugin host: %w", err)
 	}
