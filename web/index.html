@@ -142,6 +142,7 @@
         <nav class="settings-nav" role="tablist" aria-orientation="vertical" aria-label="设置分类">
           <button id="settings-tab-appearance" class="settings-tab" role="tab" type="button" aria-selected="true" aria-controls="settings-pane-appearance" data-pane="settings-pane-appearance" tabindex="0">外观</button>
           <button id="settings-tab-capabilities" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-capabilities" data-pane="settings-pane-capabilities" tabindex="-1">能力</button>
+          <button id="settings-tab-skills" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-skills" data-pane="settings-pane-skills" tabindex="-1">技能</button>
           <button id="settings-tab-data" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-data" data-pane="settings-pane-data" tabindex="-1">本机数据</button>
           <button id="settings-tab-model" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-model" data-pane="settings-pane-model" tabindex="-1">模型服务</button>
         </nav>
@@ -165,6 +166,14 @@
             <ul id="capability-list" class="luna-list capability-list"></ul>
             <p id="capability-empty" class="luna-muted" hidden>暂未读到能力。</p>
             <div><button id="capability-retry" class="luna-button" type="button">重新读取能力</button></div>
+          </section>
+          <section id="settings-pane-skills" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-skills" tabindex="0" hidden>
+            <h3>技能</h3>
+            <p class="luna-muted">技能是本机目录里的一份说明书。Luna 按每个技能的名字与描述决定什么时候读它；停用一个技能只是这一次不把它交给模型，文件不会被删除。</p>
+            <p id="skill-status" class="luna-status skill-status" role="status"></p>
+            <ul id="skill-list" class="luna-list skill-list"></ul>
+            <p id="skill-empty" class="luna-muted" hidden>没有发现任何技能。用户级技能放在 $XDG_DATA_HOME/luna/skills（默认 ~/.local/share/luna/skills），每个技能是一个目录、目录里有 SKILL.md；用 -skills-dir 可以再指定一个目录。</p>
+            <div><button id="skill-refresh" class="luna-button" type="button">重新读取技能</button></div>
           </section>
           <section id="settings-pane-data" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-data" tabindex="0" hidden>
             <h3>本机数据</h3>

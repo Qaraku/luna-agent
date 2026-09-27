@@ -1231,6 +1231,226 @@ test('a rejected state change is reported as a failure and never as the new stat
   assert.ok(h.capabilityToggle(), '页头入口保持原样');
 });
 
+test('the skills list reads the discovery payload into one row per skill', () => {
+  const { skillRows, skillActionPath, skillDescriptionText, skillScopeLabel, SKILLS_PATH,
+    SKILL_DESCRIPTION_MAX_CHARS } = require('./app.js');
+  assert.equal(SKILLS_PATH, '/api/skills', '只有一条读取路径');
+
+  const rows = skillRows({ skills: [
+    { name: 'demo', description: '一段演示用的说明。', scope: 'user', enabled: true, disabled_reason: '' },
+    { name: 'notes_writer', description: '把会话整理成笔记。', scope: 'project', enabled: false,
+      disabled_reason: '这一台机器没有配置入口。' },
+    { name: 'mystery' }
+  ] });
+  assert.deepEqual(rows.map((row) => [row.name, row.scopeLabel, row.stateLabel, row.action, row.actionLabel]), [
+    ['demo', '用户级', '已启用', 'disable', '停用'],
+    ['notes_writer', '项目级', '已停用', 'enable', '启用'],
+    ['mystery', '来源未知', '状态未报', '', '']
+  ], '顺序就是服务端给的顺序；没有报启用状态的技能不写状态、也没有可点的控件');
+  assert.equal(rows[0].disabledReason, '');
+  assert.equal(rows[1].disabledReason, '这一台机器没有配置入口。', '停用原因照原样带出来');
+
+  // 来源表里没有的取值原样带出来，不就近映射成 user。
+  assert.equal(skillScopeLabel('bundle'), 'bundle（未识别）');
+  assert.equal(skillScopeLabel(undefined), '来源未知');
+
+  // 描述可能很长（上限 1024 字符）：行里截断，末尾必须是明确的省略号。
+  const long = '很长的描述。'.repeat(80);
+  const clipped = skillDescriptionText(long);
+  assert.equal(clipped.length, SKILL_DESCRIPTION_MAX_CHARS);
+  assert.equal(clipped.endsWith('…'), true, '截断要看得见');
+  assert.equal(long.startsWith(clipped.slice(0, -1)), true, '截断的是原文的开头');
+  assert.equal(skillDescriptionText('  一\n\n  段  '), '一 段', '空白折叠成单空格');
+  assert.equal(skillDescriptionText(undefined), '');
+  const bare = skillRows({ skills: [{ name: 'demo' }] })[0];
+  assert.equal(bare.descriptionText, '没有写描述。');
+  assert.equal(bare.descriptionMissing, true);
+
+  // 载荷形状不对时没有行：没有名字的技能无法寻址，也不会被编一个名字。
+  for (const payload of [undefined, {}, { skills: 'nope' }, { skills: [null, 'x', { description: '无名字' }] }]) {
+    assert.deepEqual(skillRows(payload), []);
+  }
+
+  // 路径只在一个地方拼：名字是一个目录名，带分隔符或过长的名字直接拒。
+  assert.equal(skillActionPath('demo', 'disable'), '/api/skills/demo/disable');
+  assert.equal(skillActionPath('notes_writer', 'enable'), '/api/skills/notes_writer/enable');
+  for (const name of ['', '../etc', 'a/b', '.hidden', 'x'.repeat(65), 'demo ', 42, null]) {
+    assert.equal(skillActionPath(name, 'disable'), '', `${JSON.stringify(name)} 不得变成路径`);
+  }
+  assert.equal(skillActionPath('demo', 'toggle'), '', '只有启停两个动作');
+});
+
+test('the settings modal carries a skills area fed only by the server', () => {
+  const html = source('index.html');
+  const js = source('app.js');
+  const css = source('style.css');
+  assert.match(html, /<button id="settings-tab-skills" class="settings-tab" role="tab"[^>]*data-pane="settings-pane-skills"/);
+  assert.match(html, /<section id="settings-pane-skills" class="settings-pane" role="tabpanel"[^>]*hidden>/);
+  assert.match(html, /<ul id="skill-list" class="luna-list skill-list"><\/ul>/, '清单由脚本填充，标记里不预置任何技能');
+  assert.match(html, /id="skill-status"[^>]*role="status"/);
+  assert.match(html, /id="skill-refresh"[^>]*>重新读取技能<\/button>/);
+  // 空态必须说清技能放在哪里才会被发现，而不是一句“没有数据”。
+  assert.match(html, /id="skill-empty"[^>]*hidden>[^<]*XDG_DATA_HOME\/luna\/skills/);
+  assert.match(html, /id="skill-empty"[^>]*hidden>[^<]*-skills-dir/);
+  for (const text of ['demo', 'notes_writer', 'SKILL.md 正文']) {
+    assert.equal(html.includes(text), false, `宿主不预置 ${text}`);
+  }
+  assert.match(js, /fetch\(SKILLS_PATH, \{ cache: 'no-store' \}\)/, '技能清单只有这一条读取路径');
+  assert.match(js, /skillActionPath\(row\.name, row\.action\)/);
+  assert.match(js, /renderSkills\(await response\.json\(\)\)/);
+
+  const selectors = ['.skill-list', '.skill-row', '.skill-head', '.skill-title', '.skill-name', '.skill-scope',
+    '.skill-description', '.skill-description.is-missing', '.skill-meta', '.skill-state', '.skill-state.is-on',
+    '.skill-state.is-off', '.skill-reason', '.skill-error', '.skill-status', '.skill-status.failure'];
+  for (const selector of selectors) {
+    assert.ok(
+      [`${selector} {`, `${selector}:`, `${selector},`, `${selector}.`].some((form) => css.includes(form)),
+      `missing style ${selector}`
+    );
+  }
+});
+
+// 技能页：一份发现结果 + 一个记录请求的假服务。POST 只翻服务端自己那份状态，
+// 页面必须重读 /api/skills 才可能看到变化——本地改一个变量是过不了这些断言的。
+function skillSettingsHarness(options = {}) {
+  const state = { skills: [
+    { name: 'demo', description: '一段演示用的说明。', scope: 'user', enabled: true, disabled_reason: '' },
+    { name: 'notes_writer', description: '把会话整理成笔记。', scope: 'project', enabled: false,
+      disabled_reason: '这一台机器没有配置入口。' }
+  ] };
+  const h = navigationHarness({
+    ...options,
+    respond: async (url, requestOptions) => {
+      // 夹具可以直接接管某一次读取（例如让它失败），否则走下面这份技能目录。
+      const custom = options.respond ? await options.respond(url, requestOptions) : undefined;
+      if (custom) return custom;
+      // 服务端每次回答都是一份新的 JSON：读到的清单是那一刻的快照，之后目录变了
+      // 也不会回头改写页面已经读到的那一份。
+      if (url === '/api/skills') return { ok: true, json: async () => JSON.parse(JSON.stringify(state)) };
+      if (url.startsWith('/api/skills/')) {
+        if (options.status) {
+          return { ok: false, status: options.status, json: async () => ({ error: options.message || '服务端拒绝' }) };
+        }
+        const [, , , name, action] = url.split('/');
+        // 服务端只认它自己发现过的名字：读清单之后消失的技能在这里就是未知名字。
+        if (!state.skills.some((skill) => skill.name === name)) {
+          return { ok: false, status: 404, json: async () => ({ error: 'unknown skill' }) };
+        }
+        state.skills = state.skills.map((skill) => skill.name === name
+          ? { ...skill, enabled: action === 'enable' } : skill);
+        return { ok: true, json: async () => ({ name, enabled: action === 'enable' }) };
+      }
+      return options.respond ? options.respond(url, requestOptions) : undefined;
+    }
+  });
+  h.skillState = state;
+  h.skillRow = (name) => [...h.$('skill-list').children].find((row) => row.dataset.skill === name);
+  h.skillPosts = () => h.calls
+    .filter(({ url, options: call }) => url.startsWith('/api/skills/') && call && call.method === 'POST')
+    .map(({ url }) => url);
+  h.skillReads = () => h.calls.filter(({ url }) => url === '/api/skills').length;
+  h.openSkills = async () => {
+    await h.click('settings-toggle');
+    await h.click('settings-tab-skills');
+  };
+  return h;
+}
+
+test('settings lists every discovered skill and switches it through the server', async () => {
+  const h = skillSettingsHarness();
+  await h.settle();
+  assert.equal(h.skillReads(), 0, '没打开技能页就不读技能清单');
+
+  await h.openSkills();
+  assert.equal(h.skillReads(), 1, '切到技能页读一次');
+  assert.equal(h.$('skill-list').children.length, 2, '发现几个就列几行');
+  assert.equal(h.$('skill-empty').hidden, true);
+  assert.match(h.$('skill-status').textContent, /已发现 2 个技能/);
+
+  const demo = h.skillRow('demo');
+  assert.equal(demo.querySelector('.skill-name').textContent, 'demo');
+  assert.equal(demo.querySelector('.skill-scope').textContent, '用户级');
+  assert.equal(demo.querySelector('.skill-state').textContent, '已启用');
+  assert.equal(demo.querySelector('.skill-description').textContent, '一段演示用的说明。');
+  assert.equal(demo.querySelector('.skill-toggle').textContent, '停用');
+  assert.equal(demo.querySelector('.skill-reason').hidden, true, '启用中的技能不显示停用原因');
+
+  const off = h.skillRow('notes_writer');
+  assert.equal(off.querySelector('.skill-state').textContent, '已停用');
+  assert.equal(off.querySelector('.skill-reason').hidden, false);
+  assert.equal(off.querySelector('.skill-reason').textContent, '这一台机器没有配置入口。');
+  assert.equal(off.querySelector('.skill-toggle').textContent, '启用');
+
+  // 停用：真的发 POST，然后按服务端的答复重绘。
+  demo.querySelector('.skill-toggle').click();
+  await h.settle();
+  assert.deepEqual(h.skillPosts(), ['/api/skills/demo/disable'], '停用请求真的发出去了');
+  assert.equal(h.skillReads(), 2, '改完必须重读服务端的清单');
+  assert.equal(h.skillRow('demo').querySelector('.skill-state').textContent, '已停用');
+  assert.equal(h.skillRow('demo').querySelector('.skill-toggle').textContent, '启用');
+  assert.match(h.$('skill-status').textContent, /demo 已停用/);
+  assert.equal(h.skillRow('notes_writer').querySelector('.skill-state').textContent, '已停用', '别的技能不受影响');
+
+  // 反向启用：同一条路径回来。
+  h.skillRow('demo').querySelector('.skill-toggle').click();
+  await h.settle();
+  assert.deepEqual(h.skillPosts(), ['/api/skills/demo/disable', '/api/skills/demo/enable']);
+  assert.equal(h.skillRow('demo').querySelector('.skill-state').textContent, '已启用');
+  assert.equal(h.skillRow('demo').querySelector('.skill-toggle').textContent, '停用');
+
+  // 一个都没发现：说清把技能放在哪里才会被发现，而不是留一片空白。
+  h.skillState.skills = [];
+  await h.click('skill-refresh');
+  assert.equal(h.$('skill-list').children.length, 0);
+  assert.equal(h.$('skill-empty').hidden, false);
+  assert.match(h.$('skill-empty').textContent, /-skills-dir/);
+});
+
+test('a skill the server refuses or does not know keeps its reported state', async () => {
+  const refused = skillSettingsHarness({ status: 409, message: '这个技能现在不能切换' });
+  await refused.settle();
+  await refused.openSkills();
+  refused.skillRow('demo').querySelector('.skill-toggle').click();
+  await refused.settle();
+  assert.deepEqual(refused.skillPosts(), ['/api/skills/demo/disable'], '被拒绝的请求也是真发出去的');
+  assert.equal(refused.skillRow('demo').querySelector('.skill-state').textContent, '已启用',
+    '被拒绝的请求不许写成已改变');
+  assert.equal(refused.skillRow('demo').querySelector('.skill-toggle').textContent, '停用');
+  assert.match(refused.$('skill-status').textContent, /停用 demo 失败：这个技能现在不能切换/);
+  assert.equal(refused.$('skill-status').className.includes('failure'), true);
+
+  // 读清单之后从服务端消失的技能：请求打到的是一个未知名字，界面如实报 404，
+  // 不把它说成停用。
+  const gone = skillSettingsHarness();
+  await gone.settle();
+  await gone.openSkills();
+  gone.skillState.skills = gone.skillState.skills.filter((skill) => skill.name !== 'demo');
+  gone.skillRow('demo').querySelector('.skill-toggle').click();
+  await gone.settle();
+  assert.deepEqual(gone.skillPosts(), ['/api/skills/demo/disable']);
+  assert.match(gone.$('skill-status').textContent, /停用 demo 失败：unknown skill/);
+  assert.equal(gone.skillRow('demo').querySelector('.skill-state').textContent, '已启用');
+  assert.equal(gone.skillRow('demo').querySelectorAll('.skill-state.is-off').length, 0, '没有假的停用标记');
+});
+
+test('a skill list that cannot be read keeps the last rows and says so', async () => {
+  let failing = false;
+  const h = skillSettingsHarness({
+    respond: async (url) => (url === '/api/skills' && failing
+      ? { ok: false, status: 503, json: async () => ({ error: '技能目录暂时读不到' }) }
+      : undefined)
+  });
+  await h.settle();
+  await h.openSkills();
+  assert.equal(h.$('skill-list').children.length, 2);
+  failing = true;
+  await h.click('skill-refresh');
+  assert.equal(h.$('skill-list').children.length, 2, '读失败不清空上一次读到的行');
+  assert.equal(h.$('skill-empty').hidden, true, '读失败不是“一个技能都没有”');
+  assert.match(h.$('skill-status').textContent, /读取技能清单失败：技能目录暂时读不到/);
+  assert.equal(h.$('skill-status').className.includes('failure'), true);
+});
+
 test('the model service block shows the running model and the tier the process sent', async () => {
   const h = capabilitySettingsHarness();
   await h.settle();

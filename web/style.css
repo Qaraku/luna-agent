@@ -1165,6 +1165,34 @@ body {
 .capability-status { min-height: 18px; }
 .capability-status.failure { color: var(--luna-danger); }
 
+/* --- 设置：技能清单 ---------------------------------------------------------
+   一行一个技能：名字、来源、是否启用，以及它自己那一份描述。描述可能很长，
+   行里只显示截断后的文字，完整内容留在 title 里，不把模态撑开。 */
+
+.skill-list { display: grid; gap: var(--luna-space-2); }
+.skill-row { display: grid; gap: var(--luna-space-2); }
+.skill-head { display: flex; align-items: center; justify-content: space-between; gap: var(--luna-space-3); }
+.skill-title { display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--luna-space-2); min-width: 0; }
+.skill-name { color: var(--luna-text); font-size: var(--luna-font-ui); font-weight: 600; }
+.skill-scope {
+  padding: 0 var(--luna-space-2);
+  border: 1px solid var(--luna-border-weak);
+  border-radius: var(--luna-radius-xs);
+  color: var(--luna-text-muted);
+  font-size: var(--luna-font-label);
+  line-height: 18px;
+}
+.skill-description { margin: 0; color: var(--luna-text-muted); font-size: var(--luna-font-meta); line-height: 1.7; overflow-wrap: anywhere; }
+.skill-description.is-missing { font-style: italic; }
+.skill-meta { display: flex; align-items: center; flex-wrap: wrap; gap: var(--luna-space-2); }
+.skill-state { color: var(--luna-text-muted); font-size: var(--luna-font-meta); }
+.skill-state.is-on { color: var(--luna-success); }
+.skill-state.is-off { color: var(--luna-warning); }
+.skill-reason { color: var(--luna-warning); font-size: var(--luna-font-label); }
+.skill-error { margin: 0; color: var(--luna-danger); font-size: var(--luna-font-meta); }
+.skill-status { min-height: 18px; }
+.skill-status.failure { color: var(--luna-danger); }
+
 /* --- 界面插件 ---------------------------------------------------------------
    宿主只负责每个插件一行和挂载容器；插件自己的元素由插件决定，可以引用上面的
    公共控件类与 --luna-* 变量跟随主题。同源运行，样式作用域不等于沙箱。 */

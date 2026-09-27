@@ -560,6 +560,81 @@ function capabilityRows(capabilities) {
   return rows;
 }
 
+// --- 设置里的技能清单：把发现结果翻译成人看得见的行 -------------------------
+//
+// 服务端回答两件事：本机发现了哪些技能、每一个现在是否启用。来源（scope）与
+// 停用原因是技能自己的属性，有就照原样显示。和技能目录里没有的东西一律不补：
+// 一个连启用状态都没报的条目没有可点的控件，也不会被写成“已停用”。
+
+const SKILLS_PATH = '/api/skills';
+const SKILL_SCOPE_LABELS = { user: '用户级', project: '项目级', builtin: '内置' };
+// 描述最长 1024 字符（README 里写明的上限），整段塞进一行会把模态撑开。行里只
+// 显示截断后的文字，完整描述留在 title 上。
+const SKILL_DESCRIPTION_MAX_CHARS = 120;
+
+// skillDescriptionText collapses whitespace and clips a description for the row.
+// The clip is written as an ellipsis, never as a silent cut.
+function skillDescriptionText(value) {
+  const text = capabilityPanelText(value).replace(/\s+/g, ' ');
+  if (text.length <= SKILL_DESCRIPTION_MAX_CHARS) return text;
+  return `${text.slice(0, SKILL_DESCRIPTION_MAX_CHARS - 1)}…`;
+}
+
+function skillScopeLabel(scope) {
+  return capabilityLabel(scope, SKILL_SCOPE_LABELS, '来源未知');
+}
+
+// skillActionPath is the only place the browser builds a skill's state path. A
+// skill name is a directory name: letters, digits, dots, underscores and
+// hyphens, with no path separator. Anything else could not have been
+// discovered, so it is refused here instead of being turned into a request; a
+// caller that gets '' must not fetch at all.
+function skillActionPath(name, action) {
+  const value = typeof name === 'string' ? name : '';
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value)) return '';
+  if (action !== 'enable' && action !== 'disable') return '';
+  return `${SKILLS_PATH}/${encodeURIComponent(value)}/${action}`;
+}
+
+// skillRows reads the payload of GET /api/skills into one row per skill, in the
+// order the server listed them. Only a row without a name is dropped: nothing
+// can address it, and a nameless row would need an invented name to be shown.
+function skillRows(payload) {
+  const list = payload && typeof payload === 'object' ? payload.skills : null;
+  if (!Array.isArray(list)) return [];
+  const rows = [];
+  for (const value of list) {
+    const skill = value && typeof value === 'object' ? value : null;
+    if (!skill) continue;
+    const name = capabilityPanelText(skill.name);
+    if (!name) continue;
+    // `enabled` is a boolean the server either sent or did not. A missing or
+    // non-boolean value is an unknown state, which is not the same as disabled:
+    // it gets no state word of its own and no control.
+    const reported = typeof skill.enabled === 'boolean';
+    const enabled = skill.enabled === true;
+    let action = reported ? (enabled ? 'disable' : 'enable') : '';
+    if (skillActionPath(name, action) === '') action = '';
+    const description = capabilityPanelText(skill.description);
+    rows.push({
+      name,
+      description,
+      descriptionText: skillDescriptionText(description) || '没有写描述。',
+      descriptionMissing: description === '',
+      scope: capabilityPanelText(skill.scope),
+      scopeLabel: skillScopeLabel(skill.scope),
+      reported,
+      enabled,
+      stateLabel: reported ? (enabled ? '已启用' : '已停用') : '状态未报',
+      disabledReason: capabilityPanelText(skill.disabled_reason),
+      error: capabilityPanelText(skill.error),
+      action,
+      actionLabel: reported ? (enabled ? '停用' : '启用') : ''
+    });
+  }
+  return rows;
+}
+
 // --- 设置里的模型服务：启动期参数只读 ---------------------------------------
 //
 // `reasoning_effort` 是启动时决定的模型运行参数（模型怎么想），与“推理过程是否
@@ -1186,6 +1261,8 @@ if (typeof module !== 'undefined') {
     capabilityPanelMountError, capabilityPanelUnmountError,
     capabilityStatePath, capabilityStateLabel, capabilityDeploymentLabel, capabilityKindLabel,
     capabilityRows, capabilityGroups, capabilityClaimRows, capabilityPermissionRows,
+    SKILLS_PATH, SKILL_SCOPE_LABELS, SKILL_DESCRIPTION_MAX_CHARS,
+    skillDescriptionText, skillScopeLabel, skillActionPath, skillRows,
     reasoningEffortView, REASONING_EFFORT_LEVELS,
     commandNames, findCommand, commandMenuItem, commandList, commandCandidates
   };
@@ -1242,7 +1319,7 @@ if (typeof document !== 'undefined') {
     sessions: { element: sessionSidebar, toggle: sessionToggle, close: sessionClose, refresh: updateSessions },
     // 打开设置时重新读一次状态：能力清单与模型服务参数都是这一刻的事实，不是页
     // 面首次加载时的旧值。
-    settings: { element: $('settings-panel'), toggle: $('settings-toggle'), close: $('settings-close'), refresh: () => { updateState(); } }
+    settings: { element: $('settings-panel'), toggle: $('settings-toggle'), close: $('settings-close'), refresh: () => { updateState(); if (!$('settings-pane-skills').hidden) updateSkills(); } }
   };
   const appShell = document.querySelector('.app-shell');
   const runtimeBrief = $('runtime-brief');
@@ -2461,6 +2538,8 @@ if (typeof document !== 'undefined') {
       item.setAttribute('tabindex', active ? '0' : '-1');
       const pane = $(item.dataset.pane);
       if (pane) pane.hidden = !active;
+      // 技能清单只在打开这一页时读：切到“技能”就是一次读取。
+      if (active) maybeUpdateSkills(item.dataset.pane);
     }
   }
   for (const tab of settingsTabs) tab.addEventListener('click', () => selectSettingsTab(tab));
@@ -2861,6 +2940,153 @@ if (typeof document !== 'undefined') {
   }
 
   capabilityRetry.addEventListener('click', () => updateState());
+
+  // --- 设置：技能清单 ---------------------------------------------------------
+  // 技能清单不来自 /api/state：它只在用户打开这一页（或点重读）时读一次
+  // GET /api/skills。启停是一次真的 POST，然后重读服务端的答复再重绘——界面
+  // 显示的状态始终是服务端报过的那个。
+
+  const skillList = $('skill-list');
+  const skillEmpty = $('skill-empty');
+  const skillStatus = $('skill-status');
+  const skillRefresh = $('skill-refresh');
+  // 最近一次成功读到的载荷：重绘与按钮文案都来自它。
+  let skillPayload = null;
+  // 成功读到过清单才谈得上“一个技能都没有”。读失败不算空态。
+  let skillListed = false;
+  // 正在等服务端答复的技能名：这段时间里按钮不可点，重复点击不会发第二次请求。
+  const skillPending = new Set();
+
+  function setSkillStatus(text, className = '') {
+    skillStatus.textContent = text;
+    skillStatus.className = `luna-status skill-status${className ? ` ${className}` : ''}`;
+  }
+
+  // skillRowNode 建一次节点，updateSkillRow 之后只改内容：重读不会把行重建，
+  // 键盘焦点与按钮状态留在原处。
+  function skillRowNode() {
+    const item = make('li', 'skill-row luna-list-item');
+    const head = make('div', 'skill-head');
+    const title = make('div', 'skill-title');
+    title.append(make('span', 'skill-name'), make('span', 'skill-scope'));
+    const toggle = make('button', 'luna-button skill-toggle');
+    toggle.type = 'button';
+    toggle.addEventListener('click', () => setSkillState(item.skillRow));
+    head.append(title, toggle);
+
+    const description = make('p', 'skill-description');
+    const meta = make('div', 'skill-meta');
+    const state = make('span', 'skill-state');
+    const reason = make('span', 'skill-reason');
+    reason.hidden = true;
+    meta.append(state, reason);
+
+    const error = make('p', 'skill-error');
+    error.hidden = true;
+
+    item.append(head, meta, description, error);
+    return item;
+  }
+
+  function updateSkillRow(item, row) {
+    item.skillRow = row;
+    item.dataset.skill = row.name;
+    const name = item.querySelector('.skill-name');
+    name.textContent = row.name;
+    name.setAttribute('title', row.name);
+    item.querySelector('.skill-scope').textContent = row.scopeLabel;
+
+    const state = item.querySelector('.skill-state');
+    state.textContent = row.stateLabel;
+    state.classList.toggle('is-on', row.reported && row.enabled);
+    state.classList.toggle('is-off', row.reported && !row.enabled);
+
+    const reason = item.querySelector('.skill-reason');
+    reason.hidden = row.disabledReason === '';
+    reason.textContent = row.disabledReason;
+
+    const description = item.querySelector('.skill-description');
+    description.textContent = row.descriptionText;
+    // 行里显示的是截断后的文字：完整描述挂在 title 上，没有被丢掉。
+    description.setAttribute('title', row.description);
+    description.classList.toggle('is-missing', row.descriptionMissing);
+
+    const toggle = item.querySelector('.skill-toggle');
+    const pending = skillPending.has(row.name);
+    toggle.hidden = row.action === '';
+    toggle.disabled = pending;
+    toggle.textContent = pending ? `${row.actionLabel}中…` : row.actionLabel;
+    toggle.setAttribute('aria-label', `${row.actionLabel}技能 ${row.name}`);
+
+    const error = item.querySelector('.skill-error');
+    error.hidden = row.error === '';
+    error.textContent = row.error;
+  }
+
+  function renderSkills(payload) {
+    if (payload !== undefined) skillPayload = payload;
+    const rows = skillRows(skillPayload);
+    reconcileList(skillList, rows, (row) => row.name, skillRowNode, updateSkillRow, skillRefresh);
+    skillEmpty.hidden = !(skillListed && rows.length === 0);
+  }
+
+  // updateSkills is the only place the browser asks for the skill list. A read
+  // that fails keeps the last known rows: an unreachable server is not the same
+  // as a machine with no skills. Returns whether a payload was read.
+  async function updateSkills() {
+    try {
+      const response = await fetch(SKILLS_PATH, { cache: 'no-store' });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      skillListed = true;
+      renderSkills(await response.json());
+      setSkillStatus(`已发现 ${skillRows(skillPayload).length} 个技能。`);
+      return true;
+    } catch (error) {
+      renderSkills();
+      setSkillStatus(`读取技能清单失败：${error.message}`, 'failure');
+      return false;
+    }
+  }
+
+  // setSkillState is the only place the browser asks the server to change a
+  // skill's state. Nothing is marked as changed here: a rejected request says so
+  // and keeps the last reported state, and a successful one is followed by a
+  // fresh read, so the row never shows a state the server did not report.
+  async function setSkillState(row) {
+    if (!row || !row.name || !row.action || skillPending.has(row.name)) return;
+    const path = skillActionPath(row.name, row.action);
+    if (!path) return;
+    const { action, actionLabel: label, name } = row;
+    skillPending.add(name);
+    setSkillStatus(`正在${label} ${name}…`);
+    renderSkills();
+    let failure = '';
+    try {
+      const response = await fetch(path, { method: 'POST' });
+      if (!response.ok) failure = await errorMessage(response);
+    } catch (error) {
+      failure = error.message;
+    }
+    skillPending.delete(name);
+    if (failure) {
+      renderSkills();
+      setSkillStatus(`${label} ${name} 失败：${failure}（它仍按上一次读到的状态显示）`, 'failure');
+      return;
+    }
+    // 重读服务端的清单：这一行只有在服务端确实改了状态时才会变。
+    if (!(await updateSkills())) {
+      setSkillStatus(`${label} ${name} 的请求已经发出，但重新读取技能清单失败：界面仍按上一次读到的状态显示。`, 'failure');
+      return;
+    }
+    setSkillStatus(`${name} 已${action === 'disable' ? '停用' : '启用'}。`);
+  }
+
+  skillRefresh.addEventListener('click', () => updateSkills());
+
+  // 打开这一页时才读技能清单：设置里其它分类的读取与本页无关。
+  function maybeUpdateSkills(pane) {
+    if (pane === 'settings-pane-skills') updateSkills();
+  }
 
   function renderState(state) {
     $('model').textContent = valueOrDash(state.model);
