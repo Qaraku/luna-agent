@@ -63,6 +63,18 @@ func (s *Server) requiresOrigin(method, path string) bool {
 		// requirement. A read method to this path is a wrong-method request.
 		return !isReadMethod(method)
 	}
+	if _, ok := sessionWorkspacePath(path); ok {
+		// Binding a session to a workspace writes a config record, which is a
+		// mutation for the same reason choosing its model is: it changes what
+		// the session's next runs are set up with.
+		return !isReadMethod(method)
+	}
+	if path == workspacesPath {
+		// GET reads the list; POST defines a workspace and rewrites the file
+		// the user owns. Only the write carries the Origin requirement, the
+		// same split /api/plugins/{id} uses between reading and changing.
+		return !isReadMethod(method)
+	}
 	route, _, _ := s.capabilityRoute(method, path)
 	return route != nil && !isReadMethod(route.Method())
 }

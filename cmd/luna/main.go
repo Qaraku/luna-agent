@@ -31,6 +31,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/skills"
 	"github.com/Qaraku/luna-agent/internal/store"
 	"github.com/Qaraku/luna-agent/internal/uiplugin"
+	workspacedata "github.com/Qaraku/luna-agent/internal/workspace"
 )
 
 // rootFromExecutable assumes the conventional layout where the built binary
@@ -118,6 +119,36 @@ func sessionsDir(root, explicit string) string {
 		return explicit
 	}
 	return filepath.Join(root, ".runtime", "sessions")
+}
+
+// workspaceFile resolves where the user's workspaces are stored. They are data
+// rather than configuration: a workspace names directories the user works in,
+// and losing it would mean defining it again.
+func workspaceFile(dataDir string) string { return filepath.Join(dataDir, workspacedata.FileName) }
+
+// workspaceLookup answers which workspace a session works in, by reading the
+// session's own newest config record and then the workspace store. The
+// association lives in the session file (that is what makes it a property of the
+// session) and the workspace itself lives in the workspace file, so this is the
+// one place the two are joined.
+//
+// Every way of not having a workspace answers the same thing — no workspace —
+// because the capability's alternative is the fallback identity it has always
+// rendered: a session with no config record, a record naming no workspace, and a
+// record naming one that no longer exists are all sessions that work in no
+// particular workspace.
+func workspaceLookup(sessions *store.Store, items *workspacedata.Store) workspace.Lookup {
+	return func(sessionID string) (workspace.Target, bool) {
+		session, err := sessions.Read(sessionID)
+		if err != nil || session.Config == nil || session.Config.Workspace == "" {
+			return workspace.Target{}, false
+		}
+		found, ok := items.Get(session.Config.Workspace)
+		if !ok {
+			return workspace.Target{}, false
+		}
+		return workspace.Target{Name: found.Name, Dirs: found.Dirs}, true
+	}
 }
 
 // defaultRulesName is the file a project keeps its own rules in, and therefore the
@@ -392,7 +423,23 @@ func run() error {
 	if rulesProblem != "" {
 		log.Printf("luna: %s; no project rules will be contributed", rulesProblem)
 	}
-	project, err := workspace.New(projectRoot(root, *readRoot), rules)
+	// Workspaces are the sets of directories a session can work in. They are
+	// read from the data directory, which is where a user's own content lives:
+	// losing this file would mean defining the workspaces again. A machine where
+	// nobody has defined one yet has no file, and that is not an error.
+	workspaceStore, err := workspacedata.Open(workspaceFile(paths.Data))
+	if err != nil {
+		return fmt.Errorf("open workspace store: %w", err)
+	}
+	project, err := workspace.New(workspace.Options{
+		Root:   projectRoot(root, *readRoot),
+		Rules:  rules,
+		Lookup: workspaceLookup(sessions, workspaceStore),
+		// A rule set that could not be contributed is the operator's business,
+		// the same way a fallback rules file that could not be read is: the
+		// model sees the rules or nothing, never half an explanation.
+		Report: func(problem string) { log.Printf("luna: %s", problem) },
+	})
 	if err != nil {
 		return fmt.Errorf("open workspace capability: %w", err)
 	}
@@ -454,7 +501,7 @@ func run() error {
 	for _, model := range cfg.Models {
 		models = append(models, httpapi.ModelRef{Name: model.Name, Provider: model.Provider})
 	}
-	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Models: models, ReasoningEffort: cfg.ReasoningEffort, WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(newSkillCatalog(skillSet, settingsPath, userSettings)))
+	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Models: models, ReasoningEffort: cfg.ReasoningEffort, WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(newSkillCatalog(skillSet, settingsPath, userSettings)), httpapi.WithWorkspaces(workspaceStore))
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: 70 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() {

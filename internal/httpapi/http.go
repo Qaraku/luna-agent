@@ -106,6 +106,12 @@ type sessionSummary struct {
 
 // sessionDetail is the replay shape of GET /api/sessions/{id}. Each record is
 // the JSONL line itself, so a client replays exactly what is on disk.
+//
+// Workspace is the workspace the session works in, resolved from the id its
+// newest config record names, or null when it works in none. It is reported
+// here so a client does not have to read a config record and join it against the
+// workspace list to find out where a session works; the records stay on the wire
+// unchanged, so this field adds a reading and changes none.
 type sessionDetail struct {
 	ID        string         `json:"id"`
 	Title     string         `json:"title"`
@@ -113,6 +119,7 @@ type sessionDetail struct {
 	UpdatedAt time.Time      `json:"updated_at"`
 	RunCount  int            `json:"run_count"`
 	Truncated bool           `json:"truncated"`
+	Workspace *workspaceView `json:"workspace"`
 	Records   []store.Record `json:"records"`
 }
 
@@ -174,6 +181,11 @@ type Server struct {
 	// are installed and which of them the user turned off. It is supplied by
 	// the composition root, which also owns where that preference is stored.
 	skills SkillCatalog
+	// workspaces are the sets of directories work can happen in, as the
+	// composition root stores them. They are the same store the Workspace
+	// capability reads, so what this interface defines is what the next run
+	// works in.
+	workspaces WorkspaceStore
 	// commands is the table the composer's slash commands come from. It is
 	// served to the browser rather than duplicated there.
 	commands  *command.Table
@@ -327,6 +339,15 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.sendSkills(w)
+	case workspacesPath:
+		switch r.Method {
+		case http.MethodGet:
+			s.sendWorkspaces(w)
+		case http.MethodPost:
+			s.createWorkspace(w, r)
+		default:
+			method(w, "GET, POST")
+		}
 	case "/api/runs":
 		if r.Method != http.MethodPost {
 			method(w, http.MethodPost)
@@ -370,6 +391,14 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.setSessionModel(w, r, id)
+			return
+		}
+		if id, ok := sessionWorkspacePath(r.URL.Path); ok {
+			if r.Method != http.MethodPost {
+				method(w, http.MethodPost)
+				return
+			}
+			s.setSessionWorkspace(w, r, id)
 			return
 		}
 		if id, ok := sessionPathID(r.URL.Path); ok {
@@ -452,7 +481,7 @@ func (s *Server) readSession(w http.ResponseWriter, id string) {
 	if records == nil {
 		records = []store.Record{}
 	}
-	send(w, 200, sessionDetail{ID: session.ID, Title: session.Title, CreatedAt: session.CreatedAt, UpdatedAt: session.UpdatedAt, RunCount: session.RunCount, Truncated: session.Truncated, Records: records})
+	send(w, 200, sessionDetail{ID: session.ID, Title: session.Title, CreatedAt: session.CreatedAt, UpdatedAt: session.UpdatedAt, RunCount: session.RunCount, Truncated: session.Truncated, Workspace: s.sessionWorkspace(session), Records: records})
 }
 
 // uiPluginRef is the frozen list shape of GET /api/ui-plugins.

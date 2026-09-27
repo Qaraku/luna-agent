@@ -23,7 +23,7 @@ func newPlugin(t *testing.T, root string) *Plugin {
 // way the composition root builds it after reading the rules file.
 func newPluginWithRules(t *testing.T, root, rules string) *Plugin {
 	t.Helper()
-	p, err := New(root, rules)
+	p, err := New(Options{Root: root, Rules: rules})
 	if err != nil {
 		t.Fatalf("New(%q, %q): %v", root, rules, err)
 	}
@@ -96,7 +96,7 @@ func TestTheCapabilityClaimsNoNamespaceAndAsksForNoPermission(t *testing.T) {
 // to render, so construction fails instead of contributing a blank block.
 func TestARootThatNamesNoProjectIsRefused(t *testing.T) {
 	for _, root := range []string{"", "/"} {
-		if p, err := New(root, ""); err == nil {
+		if p, err := New(Options{Root: root}); err == nil {
 			t.Fatalf("New(%q, \"\") accepted a root with no project name: %+v", root, p)
 		}
 	}

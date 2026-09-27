@@ -114,6 +114,15 @@ func (s *Server) setSessionModel(w http.ResponseWriter, r *http.Request, id stri
 		return
 	}
 	record := store.ConfigRecord{Type: store.TypeConfig, Model: name, At: time.Now()}
+	// The workspace binding is carried over rather than dropped: both fields
+	// live in one record and the newest record is the one in force, so a record
+	// that named only a model would detach the session from its workspace and
+	// its next run would fall back to the default project. Choosing a model and
+	// choosing a workspace are independent decisions about the same run; each
+	// writer changes its own field and carries the other one over.
+	if session, err := s.sessions.Read(id); err == nil && session.Config != nil {
+		record.Workspace = session.Config.Workspace
+	}
 	if err := s.sessions.AppendConfig(id, record); err != nil {
 		fail(w, sessionStatus(err), err)
 		return

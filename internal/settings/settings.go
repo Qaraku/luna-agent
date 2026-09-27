@@ -25,6 +25,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Qaraku/luna-agent/internal/atomicfile"
+
 	yaml "gopkg.in/yaml.v3"
 )
 
@@ -33,15 +35,10 @@ import (
 // internal/layout.
 const FileName = "settings.yaml"
 
-// The permissions Luna gives the file it creates and the directory it may have
-// to create. The directory is the same place config.yaml lives, so it is
-// already 0700 on most machines; when Luna does create it, it creates it
-// private rather than world-readable, because a preference file is nobody
-// else's business.
-const (
-	fileMode fs.FileMode = 0o600
-	dirMode  fs.FileMode = 0o700
-)
+// The permissions Luna gives the file it creates. The directory it may have to
+// create is internal/atomicfile's business, along with the temporary file and
+// the rename: a preference file is nobody else's business, so it is private.
+const fileMode fs.FileMode = 0o600
 
 // Settings is everything Luna keeps about the choices a user made in the
 // product, as opposed to the configuration they wrote by hand.
@@ -94,49 +91,17 @@ func Load(path string) (Settings, bool, error) {
 
 // Save writes the settings, replacing whatever was there.
 //
-// The rewrite goes through a temporary file in the same directory and a rename:
-// a preference file is small, so a whole rewrite costs nothing, and it cannot
-// leave the half-written state an in-place edit could. The rename is what makes
-// that true — until it happens the old contents are what any reader sees.
-//
-// A failure removes the temporary file, so a save that did not happen leaves
-// the directory exactly as it was. The settings are normalized on the way out:
-// see Settings.normalized.
+// The rewrite goes through internal/atomicfile: a temporary file in the same
+// directory, an explicit mode, then a rename. A preference file is small, so a
+// whole rewrite costs nothing, and it cannot leave the half-written state an
+// in-place edit could — until the rename the old contents are what any reader
+// sees. The settings are normalized on the way out: see Settings.normalized.
 func Save(path string, file Settings) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, dirMode); err != nil {
-		return fmt.Errorf("create %s: %w", filepath.Base(dir), reason(err))
-	}
 	data, err := marshal(file)
 	if err != nil {
 		return err
 	}
-	temp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-")
-	if err != nil {
-		return fmt.Errorf("write %s: %w", filepath.Base(path), reason(err))
-	}
-	tempName := temp.Name()
-	// CreateTemp already opens 0600; setting it explicitly keeps the intent
-	// here instead of in the standard library's documentation.
-	if err := temp.Chmod(fileMode); err != nil {
-		temp.Close()
-		os.Remove(tempName)
-		return fmt.Errorf("write %s: %w", filepath.Base(path), reason(err))
-	}
-	_, writeErr := temp.Write(data)
-	closeErr := temp.Close()
-	if writeErr == nil {
-		writeErr = closeErr
-	}
-	if writeErr != nil {
-		os.Remove(tempName)
-		return fmt.Errorf("write %s: %w", filepath.Base(path), reason(writeErr))
-	}
-	if err := os.Rename(tempName, path); err != nil {
-		os.Remove(tempName)
-		return fmt.Errorf("write %s: %w", filepath.Base(path), reason(err))
-	}
-	return nil
+	return atomicfile.WriteFile(path, data, fileMode)
 }
 
 // DisabledSkills returns the names of the skills the user turned off, without

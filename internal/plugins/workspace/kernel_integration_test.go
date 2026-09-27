@@ -125,7 +125,7 @@ func registerWorkspace(t *testing.T, reg *plugin.Registry, root string) {
 // would have read from the rules file.
 func registerWorkspaceWithRules(t *testing.T, reg *plugin.Registry, root, rules string) {
 	t.Helper()
-	p, err := New(root, rules)
+	p, err := New(Options{Root: root, Rules: rules})
 	if err != nil {
 		t.Fatalf("New(%q, %q): %v", root, rules, err)
 	}

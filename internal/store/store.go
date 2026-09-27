@@ -138,12 +138,24 @@ type RunRecord struct {
 // use. Model names an entry of the configured model list; it is a name, not an
 // endpoint, so the record cannot carry a credential or a target of its own.
 //
+// Workspace optionally names the workspace the session works in, by id. It is a
+// second field of the same record rather than a second kind of record, because
+// it answers the same question the model does — how this session's next run
+// should be set up — and the file already has a place for "the newest statement
+// wins". A writer that changes one field carries the other one over: a record
+// that named only a workspace would otherwise read as "and no model", which is
+// how a model choice gets silently erased.
+//
 // The record is appended, never edited: the newest statement is the one in
 // force, and what was chosen before stays in the file as history.
 type ConfigRecord struct {
-	Type  string    `json:"type"`
-	Model string    `json:"model"`
-	At    time.Time `json:"at"`
+	Type  string `json:"type"`
+	Model string `json:"model"`
+	// Workspace is the id of the workspace the session works in, or empty when
+	// the session is not bound to one. It is an id and not a name, so renaming
+	// a workspace does not detach every session that points at it.
+	Workspace string    `json:"workspace,omitempty"`
+	At        time.Time `json:"at"`
 }
 
 // Record is one decoded line. Exactly one of the five pointers is set, matching
@@ -540,6 +552,7 @@ type line struct {
 	EndedAt   time.Time `json:"ended_at"`
 	Status    string    `json:"status"`
 	Model     string    `json:"model"`
+	Workspace string    `json:"workspace"`
 }
 
 // decodeLine decodes one record. Unknown fields are ignored rather than
@@ -560,7 +573,7 @@ func decodeLine(text string) (Record, error) {
 	case TypeRun:
 		return Record{Type: TypeRun, Run: &RunRecord{Type: raw.Type, RunID: raw.RunID, StartedAt: raw.StartedAt, EndedAt: raw.EndedAt, Status: raw.Status}}, nil
 	case TypeConfig:
-		return Record{Type: TypeConfig, Config: &ConfigRecord{Type: raw.Type, Model: raw.Model, At: raw.At}}, nil
+		return Record{Type: TypeConfig, Config: &ConfigRecord{Type: raw.Type, Model: raw.Model, Workspace: raw.Workspace, At: raw.At}}, nil
 	}
 	return Record{}, fmt.Errorf("unknown record type %q", raw.Type)
 }
