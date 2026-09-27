@@ -70,12 +70,12 @@ See [docs/architecture.md](docs/architecture.md) for ownership and reload semant
 ## 日常界面
 
 - **会话**：桌面左侧会话列表和“新建会话”，可以一键折叠、也可以拖动右边缘调整宽度；折叠后页头左边出现展开入口。折叠状态和宽度只存在浏览器本地。窄屏仍然按抽屉处理，通过页头“会话”按钮打开列表，选中后回到对话。
-- **设置**：侧栏底部的“设置”打开一个独立模态，左侧是分类导航（外观 / 能力 / 本机数据 / 模型服务），右侧是内容面，内部自己滚动；关闭后回到原来的会话上下文。“能力”列出内核当前注册的能力——各自的部署形态、是否在服务、贡献了哪些工具与上下文块、哪些路由与面板，并可在这里启用或停用；声明与权限属于开发者信息，收在每行下面默认折叠的次级块里。停用只是把这些从服务里取下并如实重绘，能力自己的数据不动。模型名、provider 与思考强度在“模型服务”里只读显示，档位未设置时如实写作“未发送”，而不是补一个默认值。
+- **设置**：侧栏底部的“设置”打开一个独立模态，左侧是分类导航（外观 / 模型服务 / 能力 / 技能 / 工作区 / 界面扩展 / 诊断），右侧是内容面，内部自己滚动；关闭后回到原来的会话上下文。凡是“Luna 有什么、在用什么”的入口都在这里。“能力”列出内核当前注册的能力——各自的部署形态、是否在服务、贡献了哪些工具与上下文块、哪些路由与面板，并可在这里启用或停用，以及直接打开某个能力贡献的面板；声明与权限属于开发者信息，收在每行下面默认折叠的次级块里。停用只是把这些从服务里取下并如实重绘，能力自己的数据不动。“模型服务”显示模型、provider、思考档位与两个运行预算，并列出可用的模型、把当前会话切到其中一个；档位未设置时如实写作“未发送”，而不是补一个默认值。“工作区”列出本机定义过的工作区（一组目录），标出当前会话在用的那个并可以换；没有绑定时说清楚文件工具回到启动时的读取根。
 - **工作目录与项目规则**：内置的 Workspace 能力向模型贡献两条上下文——这个会话在哪些目录里工作（只用目录名，不写宿主绝对路径），以及这些目录自己的规则。**一个 Workspace 是一个或多个目录的集合**（例如同时包含 `luna-agent` 和 `luna-agent-dev`），会话与它关联；每个目录的 `AGENTS.md` 作为“规则”进入上下文（默认文件名，`-rules-file` 仍可覆盖单根回退时的取值）。文件不存在只意味着那个目录没有规则；超限或不可读会被报告而不是截断。**没有关联 Workspace 的会话走回退**，与旧行为一致（安装根/`-read-root` 的单根身份与规则），所以已有会话不会因为这次改动而变。`AGENTS.md` 的读取复用文件工具那套边界（`internal/fileread`，根就是那个目录），能力不新增权限声明。**Workspace 不是权限范围**：它是“在哪些目录里工作”，不是“允许读写什么”——权限是以后独立设计的另一件事。
-- **记忆**：页头的“记忆”入口来自 Memory 能力贡献的面板——宿主按 `/api/state` 的 `capabilities[]` 渲染入口与容器，打开时加载能力自己的模块，列出事实并可撤回，不提供新增或编辑。
-- **扩展**：页头独立入口管理本地界面插件，并展示插件内容；启用状态仍在刷新后重置。
+- **记忆**：页头的“记忆”入口来自 Memory 能力贡献的面板——宿主按 `/api/state` 的 `capabilities[]` 渲染入口与容器，打开时加载能力自己的模块。面板的主体是生效中的事实（每条带来源与时间，可以就地撤回），已撤回的那些只占一行摘要，点开才列出：撤回记录是存储的事实，不是用户在主要界面上要看的一屏内容。不提供新增或编辑。
+- **界面扩展**：本地界面插件的管理与内容展示在设置的“界面扩展”分类里，不再占用页头入口；启用状态仍然在刷新后重置。
 - **外观**：在设置的“外观”分类里选择“跟随系统”“浅色”“深色”。切换只改根 token，不重建会话或插件；插件可复用宿主的语义颜色、字体和基础控件样式。
-- **运行详情**：保留模型与进程状态、工具插件、重载和生命周期记录，不再承载会话、记忆或界面插件入口。
+- **运行详情**：页头的这个抽屉只说这一次运行用什么、还有多少余地——模型、提供方、思考档位、两个运行预算、会话状态与运行中的会话。**开发与排查用的东西不在它里面**：工具插件的代次与进程、候选版本的验证与替换、生命周期事件都在设置的“诊断”分类里，页头不再有第二个开关。
 
 会话列表的标题单行省略，右侧的相对时间固定不收缩，因此侧栏只纵向滚动；折叠状态、宽度和主题是浏览器本地保存的三项界面偏好。
 
@@ -173,6 +173,8 @@ model: your-model
 base_url: https://your-provider.example/v1
 api_key_env: OPENAI_API_KEY   # names the variable holding the key, never the key
 reasoning_effort: high
+max_iterations: 64            # how many model turns one run may take
+run_timeout: 20m              # how long one run may take
 ```
 
 A missing file is not an error, an empty file is an empty configuration, and an
@@ -186,6 +188,8 @@ nothing is worse than one that fails to load. Startup says which file it read.
 | `OPENAI_MODEL_NAME` | yes | Canonical name. `model` in the file overrides it |
 | `OPENAI_MODEL` / `OPENAI_MODEL_ID` | no | Accepted aliases; if several are set their non-empty values must agree, otherwise startup fails with a clear error |
 | `LUNA_REASONING_EFFORT` | no | How hard the model should think before it answers, sent as the API's own `reasoning_effort`. One of `minimal`, `low`, `medium`, `high`, `none`. Unset means the field is not sent at all, so a provider that does not define it is unaffected. Whether a level changes anything is the provider's business: against `api.deepseek.com` it is accepted and makes no measurable difference |
+| `LUNA_MAX_ITERATIONS` | no | How many model turns one run may take before it is stopped as a runaway loop (`max_iterations` in the file overrides it). A backstop, not a work budget: the default is 64 turns, which one turn may spend on several tool calls, and a task that needs more can be given more. Reaching it fails the run with a message naming the number and this variable |
+| `LUNA_RUN_TIMEOUT` | no | How long one run may take, as a Go duration such as `20m` or `90s` (`run_timeout` in the file overrides it). Default `15m`. Reaching it ends the run as `run.cancelled` with the reason `timeout`, which is not a failure |
 
 Startup errors name the missing variable but never print its value.
 
