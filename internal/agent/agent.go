@@ -627,7 +627,7 @@ type Runner struct {
 	// built from is no longer current.
 	//
 	// The build recipe also carries the model a run is sent to, for the same
-	// reason: which model a session asked for is a session-level fact, while the
+	// reason: which model a session asked for is stated per session, while the
 	// agent is built with one model fixed inside it.
 	mu       sync.Mutex
 	buildCtx context.Context
