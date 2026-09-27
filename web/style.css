@@ -1208,6 +1208,13 @@ body {
 .skill-state { color: var(--luna-text-muted); font-size: var(--luna-font-meta); }
 .skill-state.is-on { color: var(--luna-success); }
 .skill-state.is-off { color: var(--luna-warning); }
+/* 停用的那一行要有非文字线索：只说“已停用”靠的是读，扫一眼分不出哪几条没在用。
+   左侧一条琥珀色边是最容易看到的形状差异，淡化作为辅助；按钮不淡化，否则
+   “重新启用”这个动作也跟着显得不可点。 */
+.skill-row.is-off { border-left: 2px solid var(--luna-warning); padding-left: var(--luna-space-2); }
+.skill-row.is-off .skill-title,
+.skill-row.is-off .skill-meta,
+.skill-row.is-off .skill-description { opacity: .62; }
 .skill-reason { color: var(--luna-warning); font-size: var(--luna-font-label); }
 .skill-error { margin: 0; color: var(--luna-danger); font-size: var(--luna-font-meta); }
 .skill-status { min-height: 18px; }

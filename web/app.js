@@ -3031,6 +3031,9 @@ if (typeof document !== 'undefined') {
     state.textContent = row.stateLabel;
     state.classList.toggle('is-on', row.reported && row.enabled);
     state.classList.toggle('is-off', row.reported && !row.enabled);
+    // 整行也要有这个状态：只说“已停用”而整行看起来照常，用户扫一眼分不出哪几条
+    // 没在用。行淡化、按钮保持清晰，改的还是这一个状态。
+    item.classList.toggle('is-off', row.reported && !row.enabled);
 
     const reason = item.querySelector('.skill-reason');
     reason.hidden = row.disabledReason === '';
