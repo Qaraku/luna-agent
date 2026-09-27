@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Qaraku/luna-agent/internal/agent"
+	"github.com/Qaraku/luna-agent/internal/command"
 	"github.com/Qaraku/luna-agent/internal/fileread"
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
@@ -162,12 +163,15 @@ type Server struct {
 	runner       Runner
 	sessions     Sessions
 	capabilities *plugin.Registry
-	info         Info
-	started      time.Time
-	runMu        sync.Mutex
-	busy         bool
-	runID        string
-	sessionID    string
+	// commands is the table the composer's slash commands come from. It is
+	// served to the browser rather than duplicated there.
+	commands  *command.Table
+	info      Info
+	started   time.Time
+	runMu     sync.Mutex
+	busy      bool
+	runID     string
+	sessionID string
 	// cancelRun ends the active run's context with a cause, which is what makes
 	// a run stoppable from outside. It is set and cleared inside the same
 	// critical section as the run slot itself: a busy flag without a handle
@@ -276,6 +280,12 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		send(w, 200, s.state())
+	case "/api/commands":
+		if r.Method != http.MethodGet {
+			method(w, http.MethodGet)
+			return
+		}
+		s.sendCommands(w)
 	case "/api/reload":
 		if r.Method != http.MethodPost {
 			method(w, http.MethodPost)
