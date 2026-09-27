@@ -5,6 +5,10 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
   <title>Luna</title>
+  <!-- 声明一个空图标：否则浏览器会自己去要 /favicon.ico，服务没有这个路由，
+       于是每次加载都有一条控制台 404。一条无害的噪声会训练人和测试忽略控制台
+       错误，真出问题时反而看不见。data: 图片在 CSP 的 img-src 里是允许的。 -->
+  <link rel="icon" href="data:,">
   <script src="/theme.js"></script>
   <link rel="stylesheet" href="/style.css">
 </head>

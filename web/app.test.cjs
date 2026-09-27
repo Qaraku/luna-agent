@@ -227,6 +227,9 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
   // 而 index.html 只负责在样式表之前引用它——这条断言同时守住"必须是同步引用"。
   const linked = source('index.html').match(/<script src="\/theme\.js"><\/script>/);
   assert.ok(linked, 'index.html 必须在样式表之前同步引用 /theme.js');
+  // 没有声明图标时浏览器会自己去要 /favicon.ico，服务没有这个路由，于是每次加载都
+  // 留下一条控制台 404；一条无害的噪声会训练人和测试忽略控制台错误。
+  assert.match(source('index.html'), /<link rel="icon" href="data:,">/, 'index.html 必须声明一个图标');
   const bootstrap = linked ? source('theme.js') : undefined;
   if (bootstrap) vm.runInContext(bootstrap, context, { filename: 'theme.js' });
   const bootstrapTheme = document.documentElement.dataset.theme;
