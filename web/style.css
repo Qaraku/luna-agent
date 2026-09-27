@@ -759,6 +759,54 @@ body {
   text-align: right;
 }
 
+/* 命令候选：在输入框上方展开，是输入区的一部分，不是浮层——它和输入框共用
+   同一条内容边线，出现与消失只改变主区高度。行内三段是命令名、用法与说明，
+   全部来自服务端的命令表（见 app.js 的 renderCommandList）。 */
+.command-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  max-height: 232px;
+  margin: 0;
+  padding: var(--luna-space-1);
+  overflow-y: auto;
+  list-style: none;
+  border: 1px solid var(--luna-border);
+  border-radius: var(--luna-radius-lg);
+  background: var(--luna-raised);
+}
+.command-menu-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--luna-space-2);
+  min-height: var(--luna-control-sm);
+  padding: var(--luna-space-1) var(--luna-space-2);
+  border-radius: var(--luna-radius-md);
+  cursor: pointer;
+}
+.command-menu-row.is-selected { background: var(--luna-active); }
+.command-menu-name {
+  flex: none;
+  color: var(--luna-text);
+  font-family: var(--luna-font-mono);
+  font-size: var(--luna-font-body);
+}
+.command-menu-usage {
+  flex: none;
+  color: var(--luna-accent);
+  font-family: var(--luna-font-mono);
+  font-size: var(--luna-font-meta);
+}
+.command-menu-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--luna-text-muted);
+  font-size: var(--luna-font-meta);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* --- Sidebar ----------------------------------------------------------------
    会话是紧凑导航；主题、运行状态与存储说明都不在这里常驻。 */
 

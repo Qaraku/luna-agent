@@ -1079,6 +1079,92 @@ function parseMarkdownBlocks(markdown) {
   return blocks;
 }
 
+// --- The command table -------------------------------------------------------
+// The server owns the table, so nothing here invents a command name or a meaning
+// for one. These helpers only answer what a draft means against the table; the
+// composer renders what they return and never calls the model for a command.
+
+// Every name a command answers to: `name` plus its aliases. A draft reaches a
+// command through any of them.
+function commandNames(command) {
+  if (!command || typeof command !== 'object') return [];
+  const names = [command.name, ...(Array.isArray(command.aliases) ? command.aliases : [])];
+  return names.filter((name) => typeof name === 'string' && name !== '');
+}
+
+// Look a word up by name or alias, ignoring case: `/HELP` and `/help` are the
+// same entry, and a word the table does not carry is simply not a command.
+function findCommand(commands, word) {
+  const wanted = typeof word === 'string' ? word.toLowerCase() : '';
+  if (!wanted) return null;
+  for (const command of Array.isArray(commands) ? commands : []) {
+    if (commandNames(command).some((name) => name.toLowerCase() === wanted)) return command;
+  }
+  return null;
+}
+
+// One candidate row. `insert` is the whole draft the composer should hold after
+// completing it, which is what keeps completion a plain text replacement.
+function commandMenuItem(command) {
+  const names = commandNames(command);
+  if (!names.length) return null;
+  const name = names[0];
+  return {
+    name,
+    label: `/${name}`,
+    usage: typeof command.usage === 'string' ? command.usage : '',
+    summary: typeof command.summary === 'string' ? command.summary : '',
+    insert: `/${name} `
+  };
+}
+
+// The whole table, in the order the server reported it.
+function commandList(commands) {
+  return (Array.isArray(commands) ? commands : []).map(commandMenuItem).filter(Boolean);
+}
+
+// What a draft means right now:
+//   mode 'command' — `/nam` is still one word, so the names are the candidates;
+//   mode 'options' — `/name ` where that command declares args=options;
+//   mode 'none'    — anything else, including prose. A plain sentence never
+//                    grows a menu.
+function commandCandidates(commands, draft) {
+  const text = typeof draft === 'string' ? draft : '';
+  if (!text.startsWith('/')) return { mode: 'none', items: [] };
+  const body = text.slice(1);
+  const gap = body.search(/\s/);
+  if (gap < 0) {
+    const prefix = body.toLowerCase();
+    const items = [];
+    for (const command of Array.isArray(commands) ? commands : []) {
+      if (!commandNames(command).some((name) => name.toLowerCase().startsWith(prefix))) continue;
+      const item = commandMenuItem(command);
+      if (item) items.push(item);
+    }
+    return { mode: 'command', items };
+  }
+  const word = body.slice(0, gap);
+  // A further space means the argument is written: a second value is another
+  // argument, not a candidate for this one.
+  const rest = body.slice(gap + 1);
+  const command = findCommand(commands, word);
+  if (!command || command.args !== 'options' || /\s/.test(rest)) return { mode: 'none', items: [] };
+  const prefix = rest.toLowerCase();
+  const items = [];
+  for (const option of Array.isArray(command.options) ? command.options : []) {
+    if (!option || typeof option.value !== 'string' || !option.value) continue;
+    if (!option.value.toLowerCase().startsWith(prefix)) continue;
+    items.push({
+      value: option.value,
+      label: option.value,
+      usage: `/${command.name} ${option.value}`,
+      summary: typeof option.summary === 'string' ? option.summary : '',
+      insert: `/${command.name} ${option.value} `
+    });
+  }
+  return { mode: 'options', items };
+}
+
 if (typeof module !== 'undefined') {
   module.exports = {
     parseEventBlock, toolSummary, toolLabel, toolActivityLabel, candidateLabel, reloadCopy, valueOrDash,
@@ -1100,7 +1186,8 @@ if (typeof module !== 'undefined') {
     capabilityPanelMountError, capabilityPanelUnmountError,
     capabilityStatePath, capabilityStateLabel, capabilityDeploymentLabel, capabilityKindLabel,
     capabilityRows, capabilityGroups, capabilityClaimRows, capabilityPermissionRows,
-    reasoningEffortView, REASONING_EFFORT_LEVELS
+    reasoningEffortView, REASONING_EFFORT_LEVELS,
+    commandNames, findCommand, commandMenuItem, commandList, commandCandidates
   };
 }
 
@@ -2012,6 +2099,14 @@ if (typeof document !== 'undefined') {
 
   form.addEventListener('submit', (event) => {
     event.preventDefault();
+    // A draft that opens with `/` is the composer's business, not the model's:
+    // either it is a command this front end answers itself, or it is refused
+    // here. Neither path reaches /api/runs.
+    const draft = input.value.trim();
+    if (draft.startsWith('/')) {
+      submitCommand(draft);
+      return;
+    }
     submitMessage(input.value);
   });
 
@@ -2023,6 +2118,28 @@ if (typeof document !== 'undefined') {
   });
 
   input.addEventListener('keydown', (event) => {
+    // While the candidate list is open the keyboard serves it first: move,
+    // complete, dismiss. The list does not decide whether a message is sent;
+    // with it closed this whole layer is absent and Enter sends as before.
+    if (commandItems.length) {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        moveCommandSelection(event.key === 'ArrowDown' ? 1 : -1);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeCommandMenu();
+        return;
+      }
+      if (event.key === 'Tab' || (event.key === 'Enter' && !event.shiftKey && !event.isComposing)) {
+        // Completion writes the name and a space into the draft and stops
+        // there: a command is submitted by whoever decided to send it.
+        event.preventDefault();
+        completeCommandSelection();
+        return;
+      }
+    }
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       form.requestSubmit();
@@ -2034,6 +2151,135 @@ if (typeof document !== 'undefined') {
     input.style.height = `${Math.min(input.scrollHeight, 144)}px`;
   }
   input.addEventListener('input', resizeInput);
+
+  // --- The composer's command list ---------------------------------------------
+  // The table is read once at startup. A failure is not an error state: the
+  // composer still sends messages, it just has no candidates to offer, and no
+  // error copy is written for a table the user never asked about.
+  const commandMenuNode = $('command-menu');
+  let commandTable = [];
+  // The rows the open list is showing, in order. Empty means the list is closed:
+  // that single fact drives both the keyboard layer and the rendering.
+  let commandItems = [];
+  let commandSelection = -1;
+
+  async function loadCommands() {
+    try {
+      const response = await fetch('/api/commands', { cache: 'no-store' });
+      if (!response.ok) return;
+      const payload = await response.json();
+      commandTable = Array.isArray(payload?.commands) ? payload.commands : [];
+    } catch (_) {
+      commandTable = [];
+    }
+  }
+
+  function closeCommandMenu() {
+    commandItems = [];
+    commandSelection = -1;
+    commandMenuNode.replaceChildren();
+    commandMenuNode.hidden = true;
+  }
+
+  function markCommandSelection() {
+    [...commandMenuNode.children].forEach((row, index) => {
+      const selected = index === commandSelection;
+      row.className = selected ? 'command-menu-row is-selected' : 'command-menu-row';
+      row.setAttribute('aria-selected', selected ? 'true' : 'false');
+    });
+  }
+
+  function renderCommandList(items) {
+    commandItems = items;
+    commandSelection = items.length ? 0 : -1;
+    commandMenuNode.replaceChildren();
+    items.forEach((item, index) => {
+      const row = make('li', 'command-menu-row');
+      // 候选是可点的，但补全本身不发送：点一行与键盘选中是同一件事。
+      row.setAttribute('role', 'option');
+      row.setAttribute('aria-selected', index === commandSelection ? 'true' : 'false');
+      row.append(make('span', 'command-menu-name', item.label));
+      if (item.usage) row.append(make('span', 'command-menu-usage', item.usage));
+      if (item.summary) row.append(make('span', 'command-menu-summary', item.summary));
+      row.addEventListener('mousedown', (event) => {
+        event.preventDefault();
+        commandSelection = index;
+        completeCommandSelection();
+      });
+      commandMenuNode.append(row);
+    });
+    commandMenuNode.hidden = items.length === 0;
+  }
+
+  // Every keystroke re-reads the draft: the draft is the only source of truth,
+  // so completion, deletion and paste all leave the list showing what the line
+  // means now instead of what it meant before.
+  function refreshCommandMenu() {
+    const view = commandCandidates(commandTable, input.value.trim());
+    if (view.mode === 'none') {
+      closeCommandMenu();
+      return;
+    }
+    renderCommandList(view.items);
+  }
+
+  function moveCommandSelection(step) {
+    const count = commandItems.length;
+    if (!count) return;
+    commandSelection = (commandSelection + step + count) % count;
+    markCommandSelection();
+    // The selected row has to be visible: with more candidates than the list
+    // can show, this is the only feedback that the arrow key did anything.
+    const row = [...commandMenuNode.children][commandSelection];
+    if (row && typeof row.scrollIntoView === 'function') row.scrollIntoView({ block: 'nearest' });
+  }
+
+  function completeCommandSelection() {
+    const item = commandItems[commandSelection];
+    if (!item) {
+      closeCommandMenu();
+      return;
+    }
+    input.value = item.insert;
+    // 补全只改草稿：光标回到输入框，发送仍由用户决定。
+    closeCommandMenu();
+    resizeInput();
+    input.focus();
+  }
+
+  // The answer to `/help` is the table itself: every command, in the order the
+  // server reported it, with nothing sent anywhere.
+  function openCommandMenu() {
+    renderCommandList(commandList(commandTable));
+    if (!commandItems.length) setConversationStatus('暂时读不到命令表。', true);
+  }
+
+  // A refused command is answered where the user is looking — the conversation
+  // area's status line — and never as a turn: no message is added to the
+  // transcript and no run is started.
+  function submitCommand(draft) {
+    const word = draft.slice(1).split(/\s+/)[0];
+    const command = findCommand(commandTable, word);
+    // `/help` is the composer's own answer; it needs no round trip even when
+    // the table has not arrived yet.
+    if (command ? command.name === 'help' : word.toLowerCase() === 'help') {
+      openCommandMenu();
+      return;
+    }
+    if (!command) {
+      // A misspelled command must never become a model call.
+      setConversationStatus(`没有 /${word} 这个命令。可以输入 / 看一下列表。`, true);
+      return;
+    }
+    // 运行中的策略来自命令自己：标注 busy=reject 的命令在这时不执行。
+    if (command.busy === 'reject' && (running || switching)) {
+      setConversationStatus(`Luna 正在运行，/${command.name} 现在不能执行。等这次运行结束后再试。`, true);
+      return;
+    }
+    setConversationStatus(`/${command.name} 暂时还不能在这个界面上执行。`, true);
+  }
+
+  input.addEventListener('input', refreshCommandMenu);
 
   transcript.addEventListener('scroll', () => {
     if (nearBottom()) latest.hidden = true;
@@ -3168,6 +3414,7 @@ if (typeof document !== 'undefined') {
 
   syncSessionLayout();
   applySessionHash();
+  loadCommands();
   updateSessions();
   updateState();
   setInterval(updateState, 2000);

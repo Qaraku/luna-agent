@@ -2942,3 +2942,74 @@ test('the run surface reuses the existing status element and invents no new stat
   assert.deepEqual([...storedKeys].sort(), ['luna.sidebar', 'luna.sidebarWidth', 'luna.theme'],
     '轨迹的折叠状态留在会话里，不新增持久化键');
 });
+
+// --- The command table in the composer ---------------------------------------
+// The table comes from the server; what is decided here is only how a draft is
+// read against it. These are the rules the composer depends on, so they are
+// pinned without a browser in the loop.
+
+const COMMAND_TABLE = [
+  { name: 'help', summary: '列出 Luna 知道的命令。', usage: '/help', category: '会话', args: 'none', busy: 'allow' },
+  { name: 'model', summary: '切换这次会话使用的模型。', usage: '/model <模型>', category: '模型',
+    aliases: ['m', 'mdl'], args: 'options', busy: 'reject',
+    options: [{ value: 'flash', summary: '快速回答' }, { value: 'pro' }] }
+];
+
+test('a draft with a slash offers the table, in the order the server sent it', () => {
+  const { commandList, commandCandidates } = require('./app.js');
+  assert.deepStrictEqual(commandList(COMMAND_TABLE).map((item) => item.name), ['help', 'model']);
+  const all = commandCandidates(COMMAND_TABLE, '/');
+  assert.equal(all.mode, 'command');
+  assert.deepStrictEqual(all.items.map((item) => item.name), ['help', 'model']);
+  assert.equal(all.items[0].label, '/help');
+  assert.equal(all.items[0].usage, '/help');
+  assert.equal(all.items[0].summary, '列出 Luna 知道的命令。');
+  assert.equal(all.items[0].insert, '/help ');
+});
+
+test('a command is matched by name or alias, ignoring case', () => {
+  const { findCommand, commandCandidates } = require('./app.js');
+  assert.equal(findCommand(COMMAND_TABLE, 'model').name, 'model');
+  assert.equal(findCommand(COMMAND_TABLE, 'MDL').name, 'model');
+  assert.equal(findCommand(COMMAND_TABLE, 'nope'), null);
+  assert.deepStrictEqual(commandCandidates(COMMAND_TABLE, '/MDL').items.map((item) => item.name), ['model']);
+  assert.deepStrictEqual(commandCandidates(COMMAND_TABLE, '/m').items.map((item) => item.name), ['model']);
+  assert.deepStrictEqual(commandCandidates(COMMAND_TABLE, '/zzz').items, []);
+});
+
+test('prose never grows a menu, and a second word is not a candidate', () => {
+  const { commandCandidates } = require('./app.js');
+  assert.deepStrictEqual(commandCandidates(COMMAND_TABLE, 'hello /help'), { mode: 'none', items: [] });
+  assert.deepStrictEqual(commandCandidates(COMMAND_TABLE, ''), { mode: 'none', items: [] });
+  // The name of a command that takes no argument is settled; a space after it
+  // means the user has moved on to writing their message.
+  assert.deepStrictEqual(commandCandidates(COMMAND_TABLE, '/help ').items, []);
+  // A written option is not a candidate for another one.
+  assert.deepStrictEqual(commandCandidates(COMMAND_TABLE, '/model flash ').items, []);
+  // A value that contains a space still stops taking candidates once a value is
+  // written: a second word is a second value, not a longer first one. Without
+  // this rule the prefix filter alone would offer "gpt 4 turbo" after "gpt 4 ".
+  const spaced = [{ name: 'model', args: 'options', options: [{ value: 'gpt 4' }, { value: 'gpt 4 turbo' }] }];
+  assert.deepStrictEqual(commandCandidates(spaced, '/model gpt 4 ').items, []);
+});
+
+test('a command that takes a fixed set offers its values, and completing one is text', () => {
+  const { commandCandidates } = require('./app.js');
+  const options = commandCandidates(COMMAND_TABLE, '/model fl');
+  assert.equal(options.mode, 'options');
+  assert.deepStrictEqual(options.items.map((item) => item.value), ['flash']);
+  assert.equal(options.items[0].usage, '/model flash');
+  assert.equal(options.items[0].summary, '快速回答');
+  assert.equal(options.items[0].insert, '/model flash ');
+  // With nothing typed after the space, every value is offered.
+  assert.deepStrictEqual(commandCandidates(COMMAND_TABLE, '/model ').items.map((item) => item.value), ['flash', 'pro']);
+});
+
+test('a malformed table entry is dropped rather than rendered', () => {
+  const { commandList, commandCandidates } = require('./app.js');
+  assert.deepStrictEqual(commandList([null, {}, { name: '' }, { name: 'ok' }]).map((item) => item.name), ['ok']);
+  assert.deepStrictEqual(commandList(undefined), []);
+  assert.deepStrictEqual(commandCandidates(undefined, '/x').items, []);
+  const withJunkOptions = [{ name: 'x', args: 'options', options: [null, { value: '' }, { value: 'y' }] }];
+  assert.deepStrictEqual(commandCandidates(withJunkOptions, '/x ').items.map((item) => item.value), ['y']);
+});

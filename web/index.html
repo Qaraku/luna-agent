@@ -62,6 +62,8 @@
 
       <div class="composer-shell">
         <div class="content-container composer-inner">
+          <!-- 命令候选：内容全部来自服务端的命令表，这里只放一个空的容器。 -->
+          <ul id="command-menu" class="command-menu" role="listbox" aria-label="命令候选" hidden></ul>
           <form id="chat-form" class="composer">
             <label class="sr-only" for="message">消息</label>
             <textarea id="message" maxlength="16384" rows="1" placeholder="给 Luna 发消息…" aria-describedby="composer-hint" required></textarea>
