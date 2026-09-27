@@ -3401,3 +3401,20 @@ test('every shipped UI plugin module is a valid manifest and exports the host co
     }
   }
 });
+
+test('a capability panel that fails keeps its own message, unmount failure included', () => {
+  // 能力面板的失败文案是用户唯一能看到的原因说明。UI 插件那一套已经被逐条钉住
+  // （见 uiPluginMissingExportError / uiPluginUnmountError 的用例），能力面板这一套
+  // 以前没有：宿主换文案或漏掉「容器已移除」这句承诺，套件都不会响。
+  const {
+    capabilityPanelEntryError, capabilityPanelImportError,
+    capabilityPanelMissingExportError, capabilityPanelMountError, capabilityPanelUnmountError,
+  } = require('./app.js');
+  assert.equal(capabilityPanelEntryError('记忆'), '能力面板 记忆 的入口地址无法识别，未加载。');
+  assert.equal(capabilityPanelImportError('记忆', 'boom'), '无法加载能力面板 记忆 的模块：boom');
+  assert.equal(capabilityPanelMissingExportError('记忆', ['mount', 'unmount']), '能力面板 记忆 缺少必需的导出 mount、unmount。');
+  assert.equal(capabilityPanelMissingExportError('记忆', 'mount'), '能力面板 记忆 缺少必需的导出 mount。');
+  assert.equal(capabilityPanelMountError('记忆', 'boom'), '能力面板 记忆 挂载失败：boom');
+  // 关这一句同时是宿主的行为承诺（app.js 的 teardownCapabilityPanel 先 try/catch 再 remove）。
+  assert.equal(capabilityPanelUnmountError('记忆', 'boom'), '能力面板 记忆 关闭时清理失败，容器已移除：boom');
+});
