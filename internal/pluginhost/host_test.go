@@ -110,11 +110,19 @@ func TestRealSubprocessReplacementPinsInflightAndRollsBack(t *testing.T) {
 		t.Fatalf("bad reader state: %+v", reader)
 	}
 
-	// Keep the old RPC in flight longer than a cached candidate build.
+	// Keep the old RPC in flight longer than a reload takes. KNOWN LOAD-SENSITIVE:
+	// a reload builds a candidate for every tool on the allowlist, and the gate runs
+	// packages in parallel, so under load the replacement can still be building when
+	// this window closes - the call then finishes first, nothing is pinned, and the
+	// assertion below fails for a reason that has nothing to do with pinning. The
+	// window cannot simply be widened: delay_ms is capped at 3000 (see the host's
+	// validation), which is what a window sized for two tools was chosen against.
+	// Fixing this properly means a window that does not race a build at all.
+	const inFlightMS = 3000
 	done := make(chan Output, 1)
 	errs := make(chan error, 1)
 	go func() {
-		out, err := h.Invoke(context.Background(), Input{Text: " first ", DelayMS: 3000})
+		out, err := h.Invoke(context.Background(), Input{Text: " first ", DelayMS: inFlightMS})
 		done <- out
 		errs <- err
 	}()
@@ -150,8 +158,10 @@ func TestRealSubprocessReplacementPinsInflightAndRollsBack(t *testing.T) {
 		return len(h.State().Plugins) == len(Allowlist) && syscall.Kill(first.PluginPID, 0) == syscall.ESRCH
 	})
 	before := map[string]Record{}
-	for _, tool := range []string{ToolTextTransform, ToolReadFile} {
-		before[tool] = *active(t, h, tool)
+	// 白名单里每个工具都取一份，不写死名字：加一个工具时这条测试要问的仍然是
+	// “重载失败后每个工具的代次都没被换掉”。
+	for _, spec := range Allowlist {
+		before[spec.Tool] = *active(t, h, spec.Tool)
 	}
 	if err := h.Reload(context.Background(), "broken"); err == nil {
 		t.Fatal("broken candidate accepted")

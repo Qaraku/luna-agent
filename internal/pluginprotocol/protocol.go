@@ -12,19 +12,36 @@ var Handshake = plugin.HandshakeConfig{ProtocolVersion: 1, MagicCookieKey: "LUNA
 // path the host has already validated against the read root. Path/MaxEntries/
 // MaxLineBytes serve the directory-listing plugin, where Path is the same kind
 // of validated absolute path — a directory — and the two caps bound how much of
-// it one listing renders. A plugin never receives a model- or browser-supplied
-// path in Path.
+// it one listing renders. Path/Query/MaxMatches/MaxFiles/MaxFileBytes serve the
+// search plugin, where Path is a validated absolute file or directory, Query is
+// the literal to look for, MaxLineBytes bounds one rendered line and the other
+// three bound how many matches are rendered, how many files are read and how
+// large a file may be before it is skipped. A plugin never receives a model- or
+// browser-supplied path in Path.
 type Input struct {
 	Text     string `json:"text"`
 	Path     string `json:"path"`
 	MaxBytes int    `json:"max_bytes"`
+	// Query is the literal a search looks for. It is data, not a pattern: the
+	// plugin passes it to fileread.Search, which matches it with a substring
+	// test, so nothing in it is interpreted.
+	Query string `json:"query"`
 	// MaxEntries and MaxLineBytes carry the listing caps: at most that many
 	// entries are rendered, and one rendered line is at most that many bytes.
 	// A plugin that is sent no cap falls back to its own default rather than
 	// rendering an unbounded listing, and it states the cap it hit in the
-	// result instead of cutting the list silently.
+	// result instead of cutting the list silently. MaxLineBytes bounds one
+	// rendered line of a search as well.
 	MaxEntries   int `json:"max_entries"`
 	MaxLineBytes int `json:"max_line_bytes"`
+	// MaxMatches, MaxFiles and MaxFileBytes carry the search caps: at most that
+	// many matching lines are rendered, at most that many files are read, and no
+	// file larger than that many bytes is read at all. A plugin sent no cap
+	// falls back to its own default, and it states the cap that stopped it
+	// rather than returning a prefix of the answer silently.
+	MaxMatches   int `json:"max_matches"`
+	MaxFiles     int `json:"max_files"`
+	MaxFileBytes int `json:"max_file_bytes"`
 	DelayMS      int `json:"delay_ms"`
 }
 type Metadata struct {

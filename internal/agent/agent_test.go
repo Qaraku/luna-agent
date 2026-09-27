@@ -31,10 +31,10 @@ func (f fakeInvoker) Invoke(context.Context, pluginhost.Input) (pluginhost.Outpu
 	return f.out, f.err
 }
 
-// recordingReader captures the read and list requests the tool wrappers
+// recordingReader captures the read, list and search requests the tool wrappers
 // produced, so a test can prove a wrapper forwards the raw model-supplied path
-// instead of validating it itself. Reads and listings are recorded and can fail
-// separately: a test that makes one refuse must not accidentally make the other
+// instead of validating it itself. The three are recorded and can fail
+// separately: a test that makes one refuse must not accidentally make another
 // refuse too.
 type recordingReader struct {
 	requests     []pluginhost.ReadRequest
@@ -43,6 +43,12 @@ type recordingReader struct {
 	listRequests []pluginhost.ListRequest
 	listOut      pluginhost.Output
 	listErr      error
+	// search serves the host-side half of luna_search_files. A value without it
+	// is a file capability that serves reads and listings only, which the core
+	// offers no search tool for.
+	searchRequests []pluginhost.SearchRequest
+	searchOut      pluginhost.Output
+	searchErr      error
 }
 
 func (r *recordingReader) ReadFile(_ context.Context, req pluginhost.ReadRequest) (pluginhost.Output, error) {
@@ -53,6 +59,23 @@ func (r *recordingReader) ReadFile(_ context.Context, req pluginhost.ReadRequest
 func (r *recordingReader) ListDir(_ context.Context, req pluginhost.ListRequest) (pluginhost.Output, error) {
 	r.listRequests = append(r.listRequests, req)
 	return r.listOut, r.listErr
+}
+
+func (r *recordingReader) SearchFiles(_ context.Context, req pluginhost.SearchRequest) (pluginhost.Output, error) {
+	r.searchRequests = append(r.searchRequests, req)
+	return r.searchOut, r.searchErr
+}
+
+// readListOnly is a file capability that serves reads and listings and nothing
+// else, so a test can prove the core offers no search tool for it.
+type readListOnly struct{ recordingReader }
+
+func (readListOnly) ReadFile(context.Context, pluginhost.ReadRequest) (pluginhost.Output, error) {
+	return pluginhost.Output{}, nil
+}
+
+func (readListOnly) ListDir(context.Context, pluginhost.ListRequest) (pluginhost.Output, error) {
+	return pluginhost.Output{}, nil
 }
 
 type collectingSink struct {

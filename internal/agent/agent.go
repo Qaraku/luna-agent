@@ -24,13 +24,14 @@ import (
 )
 
 const (
-	// ToolName, ReadFileToolName and ListDirToolName are the model-visible names
-	// of the plugin-backed tools. The names come from the plugin host's
-	// allowlist, so the core cannot register a tool the host cannot route or
-	// replace.
-	ToolName         = pluginhost.ToolTextTransform
-	ReadFileToolName = pluginhost.ToolReadFile
-	ListDirToolName  = pluginhost.ToolListDir
+	// ToolName, ReadFileToolName, ListDirToolName and SearchFilesToolName are
+	// the model-visible names of the plugin-backed tools. The names come from
+	// the plugin host's allowlist, so the core cannot register a tool the host
+	// cannot route or replace.
+	ToolName            = pluginhost.ToolTextTransform
+	ReadFileToolName    = pluginhost.ToolReadFile
+	ListDirToolName     = pluginhost.ToolListDir
+	SearchFilesToolName = pluginhost.ToolSearchFiles
 )
 
 // instruction is the whole system instruction the core owns. It states how to
@@ -38,7 +39,7 @@ const (
 // because a capability describes its own tool and contributes its own reference
 // block. Text that would have to change when a capability changes does not
 // belong here.
-const instruction = "You are Luna, a truthful local demo. Use luna_text_transform whenever the user explicitly requests text transformation or explicitly asks to call it; it returns exactly what the active candidate produced, so when the result equals the input, say so plainly instead of guessing that the plugin is broken. Use luna_list_dir to see what a directory contains — when the user asks what is in a directory or in the project, or when you need to discover a path before reading it; the path must be relative to the configured read root, and one call lists one level only: subdirectories are named but not entered, and there is no option to list a whole tree in one call, so walk a repository one directory per call. Use luna_read_file when the user asks you to read a file; the path must be relative to the configured read root, which holds the local text files you may read. A tool that refuses a call returns a result that begins \"the tool refused this call:\" followed by the reason: report that reason in the user's own language, and do not retry the same call or describe the tool as unavailable. Do not claim tools or actions that were not observed."
+const instruction = "You are Luna, a truthful local demo. Use luna_text_transform whenever the user explicitly requests text transformation or explicitly asks to call it; it returns exactly what the active candidate produced, so when the result equals the input, say so plainly instead of guessing that the plugin is broken. Use luna_list_dir to see what a directory contains — when the user asks what is in a directory or in the project, or when you need to discover a path before reading it; the path must be relative to the configured read root, and one call lists one level only: subdirectories are named but not entered, and there is no option to list a whole tree in one call, so walk a repository one directory per call. Use luna_search_files to find where something is written — when you need to locate text, a name or a definition rather than read a file you already know; the query is a literal string and never a pattern, because this tool has no pattern language, so a regular expression is searched as its own characters, and the path says where the search starts, a directory or one file, relative to the configured read root, which nothing outside may be searched. A search looks below the path you give and is bounded, so it can stop at one of its caps; when it does it states the cap it reached and that the remaining paths were not searched, and you must report that limit rather than describe the whole project as covered. Use luna_read_file when the user asks you to read a file; the path must be relative to the configured read root, which holds the local text files you may read. A tool that refuses a call returns a result that begins \"the tool refused this call:\" followed by the reason: report that reason in the user's own language, and do not retry the same call or describe the tool as unavailable. Do not claim tools or actions that were not observed."
 
 type Event struct {
 	Type string `json:"type"`
@@ -311,6 +312,21 @@ type FileTools interface {
 	ListDir(context.Context, pluginhost.ListRequest) (pluginhost.Output, error)
 }
 
+// FileSearcher is the host-side half of luna_search_files: one bounded literal
+// search of a path the host has already validated, of a file or of a directory.
+// It is a separate interface rather than a third method on FileTools because the
+// two are independent halves of one host — the core registers the search wrapper
+// only for a file capability that serves a search, so it never offers the model a
+// tool whose call would fail for want of a host half.
+type FileSearcher interface {
+	SearchFiles(context.Context, pluginhost.SearchRequest) (pluginhost.Output, error)
+}
+
+// The host the core is assembled with serves every plugin-backed wrapper the
+// core owns. Pinning it here makes a host that stopped serving one a compile
+// error rather than a tool that disappears from the model's set.
+var _ FileSearcher = (*pluginhost.Host)(nil)
+
 type TextTransformTool struct{ invoker Invoker }
 
 func NewTextTransformTool(i Invoker) *TextTransformTool { return &TextTransformTool{invoker: i} }
@@ -505,10 +521,85 @@ func readFileInfo() *schema.ToolInfo {
 	return &schema.ToolInfo{Name: ReadFileToolName, Desc: "Read a text file from the configured read root using the active local Luna subprocess plugin. The path must be relative to the read root, the directory this server was started in; an absolute path or one outside the read root is refused.", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(readFileSchema())}
 }
 
+// SearchFilesTool is the model-visible literal-search tool. It is the third
+// member of the file family: the wrapper refuses a malformed call, the host
+// refuses a path the read root does not hold and a literal it cannot search, and
+// the plugin searches only what the host resolved, in lines of the text it can
+// read.
+type SearchFilesTool struct{ searcher FileSearcher }
+
+func NewSearchFilesTool(s FileSearcher) *SearchFilesTool { return &SearchFilesTool{searcher: s} }
+func (t *SearchFilesTool) Info(context.Context) (*schema.ToolInfo, error) {
+	return searchFilesInfo(), nil
+}
+
+// searchFilesSchema is deliberately two parameters: where to start, and the
+// literal to find. A depth, a glob, a filter or a pattern flag would let one call
+// widen itself past a bounded literal search, so the schema offers no way to ask
+// for one.
+func searchFilesSchema() *jsonschema.Schema {
+	type args struct {
+		Path  string `json:"path" jsonschema_description:"Directory to search below, or one file to search, relative to the configured read root; use \".\" for the read root itself"`
+		Query string `json:"query" jsonschema_description:"Literal text to find inside single lines; nothing in it is interpreted, so a regular expression is only those characters"`
+	}
+	r := jsonschema.Reflector{DoNotReference: true, AllowAdditionalProperties: false}
+	s := r.Reflect(args{})
+	s.Required = []string{"path", "query"}
+	return s
+}
+
+func (t *SearchFilesTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.Option) (string, error) {
+	var raw any
+	if err := json.Unmarshal([]byte(arguments), &raw); err != nil {
+		raw = arguments
+	}
+	startedAt := time.Now()
+	emit(ctx, Event{Type: "tool.started", Data: ToolStarted{RunID: runID(ctx), Name: SearchFilesToolName, Arguments: raw}})
+	var in struct {
+		Path  string `json:"path"`
+		Query string `json:"query"`
+	}
+	err := decodeOne(arguments, &in)
+	if err == nil && in.Path == "" {
+		err = fmt.Errorf("path is required")
+	}
+	if err == nil && in.Query == "" {
+		err = fmt.Errorf("query is required: a search needs a literal to look for")
+	}
+	if err != nil {
+		return refuse(ctx, SearchFilesToolName, pluginhost.Output{}, err, startedAt)
+	}
+	// As with a read or a listing, the requested path is passed through
+	// unchanged: the host resolves and validates it against the read root before
+	// any plugin sees it, and the literal is validated there too.
+	out, err := t.searcher.SearchFiles(ctx, pluginhost.SearchRequest{Path: in.Path, Query: in.Query})
+	if err != nil {
+		if stopped := ctx.Err(); stopped != nil {
+			return stopCall(ctx, SearchFilesToolName, stopped, out, startedAt)
+		}
+		return refuse(ctx, SearchFilesToolName, out, err, startedAt)
+	}
+	emit(ctx, Event{Type: "tool.finished", Data: ToolFinished{RunID: runID(ctx), Name: SearchFilesToolName, Result: out.Result, DurationMS: callDurationMS(startedAt), Generation: out.Generation, Version: out.Version, PluginPID: out.PluginPID}})
+	// Only the rendered matches are model-visible; the serving generation,
+	// version and process identity stay in the event stream for the UI.
+	return out.Result, nil
+}
+
+// searchFilesInfo is the exact public schema of the search tool. The description
+// states the four things a model gets wrong about a search: the query is a
+// literal and not a pattern, the path says where the search starts and is
+// relative to the read root, a search looks below that path but is bounded and
+// says so when it stops, and a hit names its file relative to the path that was
+// searched. It never carries the absolute host path.
+func searchFilesInfo() *schema.ToolInfo {
+	return &schema.ToolInfo{Name: SearchFilesToolName, Desc: "Search the configured read root for a literal string, using the active local Luna subprocess plugin. Both arguments are required. path says where the search starts — a directory to search below, or one file — and must be relative to the read root, the directory this server was started in, where \".\" means the read root itself; an absolute path, a path outside the read root, or a path that is neither a file nor a directory is refused. query is the literal text to find, matched inside single lines exactly as written: there is no pattern language here, so a regular expression is searched as its own characters and a dot is a dot. A directory is walked below itself in path order, and a symbolic link is never followed, so a search cannot leave the read root. Each result line is <path>:<line>: <line text>, with <path> relative to the path that was searched. A search is bounded — how many matches are rendered, how long one line may be, how many files are read and how large a file may be all have caps — and when it stops at one it says which cap it reached and that the remaining paths were not searched, so a result that reports a cap has not seen the whole tree; content that is not text is counted rather than searched.", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(searchFilesSchema())}
+}
+
 var (
 	_ tool.InvokableTool = (*TextTransformTool)(nil)
 	_ tool.InvokableTool = (*ReadFileTool)(nil)
 	_ tool.InvokableTool = (*ListDirTool)(nil)
+	_ tool.InvokableTool = (*SearchFilesTool)(nil)
 )
 
 type Runner struct {
@@ -522,14 +613,21 @@ type Runner struct {
 }
 
 // NewRunner builds the agent and its tool set. Every model-visible tool is
-// registered here, by the core: the three plugin-backed wrappers, and one wrapper
-// per tool contributed by an enabled capability.
+// registered here, by the core: the plugin-backed wrappers whose host-side half
+// the runner was handed, and one wrapper per tool contributed by an enabled
+// capability.
 func NewRunner(ctx context.Context, m model.ToolCallingChatModel, invoker Invoker, files FileTools, opts ...Option) (*Runner, error) {
 	r := &Runner{}
 	for _, opt := range opts {
 		opt(r)
 	}
 	tools := []tool.BaseTool{NewTextTransformTool(invoker), NewReadFileTool(files), NewListDirTool(files)}
+	// The search wrapper is registered exactly for a file capability that serves
+	// a search: the core offers the model the plugin-backed tools it can route,
+	// and never a tool whose call would fail for want of a host half.
+	if searcher, ok := files.(FileSearcher); ok {
+		tools = append(tools, NewSearchFilesTool(searcher))
+	}
 	for _, contributed := range r.capabilityTools() {
 		tools = append(tools, contributed)
 	}

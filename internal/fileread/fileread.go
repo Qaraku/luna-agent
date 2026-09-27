@@ -1,23 +1,27 @@
-// Package fileread owns what "reading a file" and "listing a directory" mean in
-// Luna.
+// Package fileread owns what "reading a file", "listing a directory" and
+// "searching for text" mean in Luna.
 //
 // The two halves are deliberately split across the host/plugin boundary:
 //
-//   - Resolve and ResolveDir run on the host side and are the only place a
-//     model-supplied path is interpreted. They normalize the path, reject
-//     absolute paths and `..` escapes, resolve symbolic links, and refuse
+//   - Resolve, ResolveDir and ResolveSearch run on the host side and are the
+//     only place a model-supplied path is interpreted. They normalize the path,
+//     reject absolute paths and `..` escapes, resolve symbolic links, and refuse
 //     anything that does not end up inside the read root — Resolve the regular
-//     file to read, ResolveDir the directory to list. Both share the same
-//     resolution and containment code, so the boundary has one implementation
-//     whatever the tool does with the path. The host then hands the plugin the
-//     already-resolved absolute path.
-//   - Read and List run on the plugin side and never interpret a path. They
-//     receive the validated path plus the caps, and both refuse to overstate
-//     what they found: Read reads at most one byte past the cap so an oversize
-//     file is refused instead of truncated and refuses binary content, and List
-//     renders exactly one level — it never enters a subdirectory and never
+//     file to read, ResolveDir the directory to list, ResolveSearch the file or
+//     directory to search. All three share the same resolution and containment
+//     code, so the boundary has one implementation whatever the tool does with
+//     the path. The host then hands the plugin the already-resolved absolute
+//     path.
+//   - Read, List and Search run on the plugin side and never interpret a path.
+//     They receive the validated path plus the caps, and all three refuse to
+//     overstate what they found: Read reads at most one byte past the cap so an
+//     oversize file is refused instead of truncated and refuses binary content,
+//     List renders exactly one level — it never enters a subdirectory and never
 //     follows a symbolic link — and states every cap it hit instead of cutting
-//     the list silently.
+//     the list silently, and Search matches one literal per line, never follows
+//     a symbolic link, and states every cap it hit — including that its walk
+//     stopped, because a search that stopped cannot say how many matches it did
+//     not find.
 //
 // Error strings never contain an absolute host path: they are model-visible
 // through tool.failed and, for a refusal, as the text of the tool result the
@@ -49,6 +53,23 @@ const (
 	DefaultListLineBytes = 160
 )
 
+// The search caps. One search renders at most DefaultSearchMatches matching
+// lines in lines of at most DefaultSearchLineBytes bytes, reads at most
+// DefaultSearchFiles files, and reads no file larger than DefaultSearchFileBytes.
+// They bound a search for the same reason DefaultLimit bounds a read: a result
+// too large to digest is not a truthful result either.
+const (
+	DefaultSearchMatches   = 100
+	DefaultSearchLineBytes = 200
+	DefaultSearchFiles     = 2000
+	DefaultSearchFileBytes = DefaultLimit
+)
+
+// MaxQueryBytes is the longest literal one search accepts. A longer literal is
+// refused rather than cut, because a cut query would match text the model never
+// asked about.
+const MaxQueryBytes = 256
+
 // Rejections are sentinel errors so callers and tests can classify a refusal
 // without matching on message text.
 var (
@@ -65,6 +86,19 @@ var (
 	ErrBinary        = errors.New("file is not text")
 	ErrNotReadable   = errors.New("file cannot be read")
 	ErrNotListable   = errors.New("directory cannot be listed")
+	// ErrNotSearchable reports a search whose starting path is neither a
+	// regular file nor a directory — or is a symbolic link, which a search
+	// never follows.
+	ErrNotSearchable = errors.New("path is neither a regular file nor a directory")
+	// ErrQueryEmpty reports an empty (or whitespace-only) literal, which would
+	// match every line.
+	ErrQueryEmpty = errors.New("a literal query is required")
+	// ErrQueryTooLarge reports a literal longer than MaxQueryBytes.
+	ErrQueryTooLarge = errors.New("the query is longer than the limit")
+	// ErrQueryInvalid reports a literal the search cannot represent: one with a
+	// NUL byte, or one with a line break, since a match is decided within one
+	// line and such a literal could never match anything.
+	ErrQueryInvalid = errors.New("the query must be one line of text without NUL bytes")
 )
 
 // Resolve validates a requested file path against the read root and returns the
@@ -108,6 +142,47 @@ func ResolveDir(root, requested string) (string, error) {
 		return "", fmt.Errorf("%w: %q", ErrNotDir, requested)
 	}
 	return resolved, nil
+}
+
+// ResolveSearch validates a requested path against the read root and returns
+// the absolute path of the existing file or directory to search. It resolves and
+// contains the path with exactly the code Resolve and ResolveDir use, so a
+// search cannot start anywhere a read or a listing could not reach; what differs
+// is only what the resolved path has to be — a search starts either at one file
+// or at one directory — and that the plugin's walk is what bounds the rest.
+func ResolveSearch(root, requested string) (string, error) {
+	resolved, err := resolveWithinRoot(root, requested)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("%w: %q", ErrNotFound, requested)
+	}
+	if !info.IsDir() && !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%w: %q", ErrNotSearchable, requested)
+	}
+	return resolved, nil
+}
+
+// ValidateQuery checks one literal query before any work is done with it. It
+// lives here, next to the search that consumes it, so the host can refuse a
+// query on the same terms the plugin would: an empty literal matches every line
+// and says nothing, and a literal the search cannot represent — with a NUL byte,
+// or with a line break, since a match is decided within one line — would come
+// back as an empty result that looked like an answer.
+func ValidateQuery(query string) error {
+	switch {
+	case strings.TrimSpace(query) == "":
+		return ErrQueryEmpty
+	case len(query) > MaxQueryBytes:
+		return fmt.Errorf("%w: %d bytes, over the %d-byte limit", ErrQueryTooLarge, len(query), MaxQueryBytes)
+	case strings.ContainsRune(query, 0):
+		return fmt.Errorf("%w: it contains a NUL byte", ErrQueryInvalid)
+	case strings.ContainsAny(query, "\n\r"):
+		return fmt.Errorf("%w: it contains a line break", ErrQueryInvalid)
+	}
+	return nil
 }
 
 // resolveWithinRoot is the single place a model-supplied path is interpreted:
@@ -267,7 +342,7 @@ func List(dir string, opts ListOptions) (string, error) {
 		}
 		shown++
 		prefix := fmt.Sprintf("%-4s %9s  ", item.kind, item.size)
-		b.WriteString(fitLine(prefix, item.name, opts.MaxLineBytes))
+		b.WriteString(fitLine(prefix, item.name, opts.MaxLineBytes, "name"))
 		b.WriteString("\n")
 	}
 	if remaining := len(ordered) - shown; remaining > 0 {
@@ -317,12 +392,13 @@ func renderSize(size int64, exact bool) string {
 
 // fitLine renders one entry line inside maxLineBytes. A name that does not fit is
 // cut and the line says that it was cut and how long the real name is: a listing
-// whose lines were cut silently would misstate the directory it describes.
-func fitLine(prefix, name string, maxLineBytes int) string {
+// whose lines were cut silently would misstate the directory it describes. noun
+// names what was cut, so a search can state the same thing about a matched line.
+func fitLine(prefix, name string, maxLineBytes int, noun string) string {
 	if len(prefix)+len(name) <= maxLineBytes {
 		return prefix + name
 	}
-	note := fmt.Sprintf("…(name truncated; it is %d bytes)", len(name))
+	note := fmt.Sprintf("…(%s truncated; it is %d bytes)", noun, len(name))
 	if budget := maxLineBytes - len(prefix) - len(note); budget >= 1 {
 		return prefix + clip(name, budget) + note
 	}
@@ -356,6 +432,304 @@ func clip(s string, budget int) string {
 	return s[:cut]
 }
 
+// SearchOptions carries the host's caps for one search. A non-positive cap falls
+// back to the package default, so a plugin can never run an unbounded search
+// just because a host sent no cap.
+type SearchOptions struct {
+	// MaxMatches is the largest number of matching lines one search renders.
+	MaxMatches int
+	// MaxLineBytes is the largest length of one rendered line, the path and
+	// line number prefix included.
+	MaxLineBytes int
+	// MaxFiles is the largest number of files one search reads.
+	MaxFiles int
+	// MaxFileBytes is the largest file one search reads at all. A larger file is
+	// skipped and counted rather than read in part: a search that read only the
+	// first bytes of a file would answer a question about the whole file with a
+	// statement about its beginning.
+	MaxFileBytes int
+	// TrimIndent renders each matching line without its leading whitespace. Both
+	// renderings state the same path, line number and line text; the choice is
+	// what makes a candidate replacement observable in the tool result.
+	TrimIndent bool
+}
+
+// Search renders a literal search for query under path. path is an absolute
+// path the host already validated against the read root: no path is interpreted
+// here, and nothing outside path is ever entered.
+//
+// The match is literal — strings.Contains against one line at a time — and that
+// is deliberate. A regular expression would decide the cost of the call from the
+// model's own query, so a question the tool cannot answer ("no such text") could
+// become a pattern that backtracks until the call times out and reports a plugin
+// failure instead of an empty result; and it would silently read a plain query as
+// a pattern, so looking for `docs/architecture.md` would also match
+// `docsXarchitecture.md`. A literal can do neither. A model that wants a pattern
+// can search for its literals one at a time.
+//
+// A directory is walked depth-first in path order, and the walk cannot leave the
+// read root: the host resolved the starting path inside the root, no symbolic
+// link is followed — a link is counted and skipped, never entered and never read,
+// so a link that points outside the root cannot pull the search out of it — and a
+// directory named `..` is never returned by a directory read. A file larger than
+// MaxFileBytes is never opened, and content with a NUL byte is skipped the way
+// Read refuses it: it has no lines to search.
+//
+// Every cap that was reached is stated in the result instead of cutting it
+// silently, and a search that stopped says so without pretending to know what it
+// missed: at MaxMatches or MaxFiles the walk ends, and the result says the
+// remaining paths were not searched, because a search that stopped cannot count
+// the matches it did not find.
+func Search(path, query string, opts SearchOptions) (string, error) {
+	if err := ValidateQuery(query); err != nil {
+		return "", err
+	}
+	if opts.MaxMatches <= 0 {
+		opts.MaxMatches = DefaultSearchMatches
+	}
+	if opts.MaxLineBytes <= 0 {
+		opts.MaxLineBytes = DefaultSearchLineBytes
+	}
+	if opts.MaxFiles <= 0 {
+		opts.MaxFiles = DefaultSearchFiles
+	}
+	if opts.MaxFileBytes <= 0 {
+		opts.MaxFileBytes = DefaultSearchFileBytes
+	}
+	start, err := os.Lstat(path)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", ErrNotSearchable, pathError(err))
+	}
+	s := &searcher{query: query, opts: opts, start: path}
+	switch {
+	case start.Mode()&fs.ModeSymlink != 0:
+		// A search never follows a symbolic link, including as its own starting
+		// point; the host resolves the path it validated, so reaching here means
+		// the caller handed over a link rather than a resolved path.
+		return "", fmt.Errorf("%w: it is a symbolic link", ErrNotSearchable)
+	case start.IsDir():
+		if err := s.walk(path); err != nil {
+			return "", fmt.Errorf("%w: %s", ErrNotSearchable, pathError(err))
+		}
+	case start.Mode().IsRegular():
+		s.consider(path, start.Size())
+	default:
+		return "", fmt.Errorf("%w: %s", ErrNotSearchable, filepath.Base(path))
+	}
+	return s.render(), nil
+}
+
+// searcher is the state of one search: the query, the caps, and everything the
+// result has to state about what was looked at and what was left out.
+type searcher struct {
+	query string
+	opts  SearchOptions
+	start string
+
+	matches []string
+
+	// The counters below are why a result can state its own scope: how many
+	// files were searched, and what was passed over and why.
+	files      int
+	binary     int
+	oversize   int
+	links      int
+	others     int
+	unreadable int
+
+	stoppedAtMatches bool
+	stoppedAtFiles   bool
+}
+
+// walk searches every file below dir, in the order the directories return their
+// entries, and stops at the first cap that ends the walk.
+func (s *searcher) walk(dir string) error {
+	return filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			s.unreadable++
+			if entry != nil && entry.IsDir() {
+				// The directory cannot be read; its entries are counted as an
+				// unread path so the result states that the walk was incomplete.
+				return fs.SkipDir
+			}
+			if path == dir {
+				return err
+			}
+			return nil
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if entry.Type()&fs.ModeSymlink != 0 {
+			s.links++
+			return nil
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			s.unreadable++
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			s.others++
+			return nil
+		}
+		if s.consider(path, info.Size()) {
+			return fs.SkipAll
+		}
+		return nil
+	})
+}
+
+// consider searches one file, or counts why it was not searched. It reports
+// whether the walk must stop: the file cap ends the walk, and so does a match
+// that reached the match cap.
+func (s *searcher) consider(path string, size int64) (stop bool) {
+	if size > int64(s.opts.MaxFileBytes) {
+		s.oversize++
+		return false
+	}
+	if s.files == s.opts.MaxFiles {
+		s.stoppedAtFiles = true
+		return true
+	}
+	// The ceiling is checked against the bytes actually read as well, so a file
+	// that grows after the check is still skipped instead of searched in part.
+	text, reason, err := searchableText(path, s.opts.MaxFileBytes)
+	if err != nil {
+		s.unreadable++
+		return false
+	}
+	switch reason {
+	case reasonBinary:
+		s.binary++
+		return false
+	case reasonOversize:
+		s.oversize++
+		return false
+	}
+	s.files++
+	return s.collect(path, text)
+}
+
+// collect renders the matching lines of one file, in line order, and reports
+// whether the match cap ended the search.
+func (s *searcher) collect(path, text string) (stop bool) {
+	name, err := filepath.Rel(s.start, path)
+	if err != nil || name == "." {
+		name = filepath.Base(path)
+	}
+	for i, line := range strings.Split(text, "\n") {
+		// A line terminator is not part of the text a match is decided on, so a
+		// CRLF file renders like an LF one.
+		line = strings.TrimSuffix(line, "\r")
+		if !strings.Contains(line, s.query) {
+			continue
+		}
+		if len(s.matches) == s.opts.MaxMatches {
+			s.stoppedAtMatches = true
+			return true
+		}
+		rendered := line
+		if s.opts.TrimIndent {
+			rendered = strings.TrimLeft(line, " \t")
+		}
+		s.matches = append(s.matches, fitLine(fmt.Sprintf("%s:%d: ", name, i+1), rendered, s.opts.MaxLineBytes, "line"))
+	}
+	return false
+}
+
+// render states what the search found and what it cost: how many matches in how
+// many files, followed by every cap it reached and everything it did not search.
+// A result that hid either half would describe a smaller question than the one
+// that was asked.
+func (s *searcher) render() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s for %q in %s", matchCount(len(s.matches)), s.query, plural(s.files, "file"))
+	if notes := s.notes(); len(notes) > 0 {
+		fmt.Fprintf(&b, " (%s)", strings.Join(notes, "; "))
+	}
+	if len(s.matches) == 0 {
+		b.WriteString(".\n")
+		return b.String()
+	}
+	b.WriteString(":\n")
+	for _, match := range s.matches {
+		b.WriteString(match)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// notes lists what the result has to say besides the matches, in a fixed order:
+// first what was passed over, which is what the file count means, and then the
+// cap that ended the walk.
+func (s *searcher) notes() []string {
+	notes := make([]string, 0, 6)
+	if s.binary > 0 {
+		notes = append(notes, fmt.Sprintf("%s skipped as binary", plural(s.binary, "file")))
+	}
+	if s.oversize > 0 {
+		notes = append(notes, fmt.Sprintf("%s larger than the %d-byte per-file limit", plural(s.oversize, "file"), s.opts.MaxFileBytes))
+	}
+	if s.links > 0 {
+		notes = append(notes, fmt.Sprintf("%s not followed", plural(s.links, "symbolic link")))
+	}
+	if s.others > 0 {
+		notes = append(notes, fmt.Sprintf("%s not a regular file", plural(s.others, "path")))
+	}
+	if s.unreadable > 0 {
+		notes = append(notes, fmt.Sprintf("%s could not be read", plural(s.unreadable, "path")))
+	}
+	if s.stoppedAtMatches {
+		notes = append(notes, fmt.Sprintf("the search stopped at %s; the remaining paths were not searched", plural(s.opts.MaxMatches, "match")))
+	}
+	if s.stoppedAtFiles {
+		notes = append(notes, fmt.Sprintf("the search stopped after %s; the remaining paths were not searched", plural(s.opts.MaxFiles, "file")))
+	}
+	return notes
+}
+
+// The reasons a file could not be searched. They are not errors: each one is
+// counted and stated, and the search goes on.
+const (
+	reasonText     = "text"
+	reasonBinary   = "binary"
+	reasonOversize = "oversize"
+)
+
+// searchableText returns the text of path if it can be searched, or the reason
+// it cannot. The criteria are the ones Read states — at most maxBytes bytes, and
+// no NUL byte anywhere in the bytes actually read — so a file the model could not
+// read is not one it can search either. One byte past the cap is read, so a file
+// that is too large is recognised as too large instead of being searched in part.
+func searchableText(path string, maxBytes int) (string, string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", "", err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, int64(maxBytes)+1))
+	if err != nil {
+		return "", "", err
+	}
+	if len(data) > maxBytes {
+		return "", reasonOversize, nil
+	}
+	if bytes.IndexByte(data, 0) >= 0 {
+		return "", reasonBinary, nil
+	}
+	return string(data), reasonText, nil
+}
+
+// matchCount renders a match count so the header never says "0 matches for"
+// where it can say that nothing was found.
+func matchCount(n int) string {
+	if n == 0 {
+		return "no matches"
+	}
+	return plural(n, "match")
+}
+
 // plural renders a count with its noun so model-visible text never says
 // "1 entries".
 func plural(n int, noun string) string {
@@ -364,6 +738,9 @@ func plural(n int, noun string) string {
 	}
 	if strings.HasSuffix(noun, "y") {
 		return fmt.Sprintf("%d %sies", n, strings.TrimSuffix(noun, "y"))
+	}
+	if strings.HasSuffix(noun, "ch") || strings.HasSuffix(noun, "sh") || strings.HasSuffix(noun, "s") || strings.HasSuffix(noun, "x") {
+		return fmt.Sprintf("%d %ses", n, noun)
 	}
 	return fmt.Sprintf("%d %ss", n, noun)
 }

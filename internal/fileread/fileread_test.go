@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"unicode/utf8"
 )
@@ -502,5 +503,461 @@ func TestListFallsBackToTheDefaultCaps(t *testing.T) {
 	}
 	if !strings.Contains(got, fmt.Sprintf("%d entries are not listed", 5)) {
 		t.Fatalf("the default entry cap was not applied:\n%.200s", got)
+	}
+}
+
+// searchRoot builds a small tree for searching, including every kind of content
+// a search has to state something about:
+//
+//	<root>/a.txt              two lines, both holding the query
+//	<root>/docs/keep.md       one line holding the query
+//	<root>/sub/deep.txt       one line holding the query
+//	<root>/quiet.txt          no query at all
+//	<root>/nul.bin            the query, plus a NUL byte
+//	<root>/link-inside        -> docs/keep.md
+//	<root>/link-outside       -> <outside>/secret.txt, which holds the query
+func searchRoot(t *testing.T) (root, outside string) {
+	t.Helper()
+	root = t.TempDir()
+	outside = t.TempDir()
+	mustWrite(t, filepath.Join(root, "a.txt"), "first line\nErrRPCTimeout here\n")
+	mustWrite(t, filepath.Join(root, "docs", "keep.md"), "the ErrRPCTimeout call\n")
+	mustWrite(t, filepath.Join(root, "sub", "deep.txt"), "deep ErrRPCTimeout\n")
+	mustWrite(t, filepath.Join(root, "quiet.txt"), "nothing to find\n")
+	mustWrite(t, filepath.Join(root, "nul.bin"), "ErrRPCTimeout\x00binary\n")
+	if err := os.Symlink(filepath.Join("docs", "keep.md"), filepath.Join(root, "link-inside")); err != nil {
+		t.Fatalf("symlink inside: %v", err)
+	}
+	mustWrite(t, filepath.Join(outside, "secret.txt"), "ErrRPCTimeout outside the root\n")
+	if err := os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(root, "link-outside")); err != nil {
+		t.Fatalf("symlink outside: %v", err)
+	}
+	return root, outside
+}
+
+// searchHits returns the "path:line:" prefix of every match line, so a test can
+// assert on what was found and in what order without depending on the text of
+// the matched lines.
+func searchHits(t *testing.T, result string) []string {
+	t.Helper()
+	lines := strings.Split(strings.TrimRight(result, "\n"), "\n")
+	hits := make([]string, 0, len(lines))
+	for _, line := range lines[1:] {
+		if index := strings.Index(line, ": "); index >= 0 {
+			hits = append(hits, line[:index])
+		}
+	}
+	return hits
+}
+
+func TestSearchFindsLiteralLinesWithPathAndLineNumber(t *testing.T) {
+	root, _ := searchRoot(t)
+	got, err := Search(root, "ErrRPCTimeout", SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The file count is what the search actually searched: the binary file and
+	// the two symbolic links are stated separately, so the header never claims a
+	// scope it did not cover.
+	wantHeader := `3 matches for "ErrRPCTimeout" in 4 files (1 file skipped as binary; 2 symbolic links not followed):`
+	if firstLine(got) != wantHeader {
+		t.Fatalf("header = %q, want %q:\n%s", firstLine(got), wantHeader, got)
+	}
+	// The walk is depth-first in path order, and each file's own lines keep
+	// their line order, so the hits are ordered by path and then by line.
+	want := []string{"a.txt:2", "docs/keep.md:1", "sub/deep.txt:1"}
+	hits := searchHits(t, got)
+	if len(hits) != len(want) {
+		t.Fatalf("hits = %v, want %v:\n%s", hits, want, got)
+	}
+	for i := range want {
+		if hits[i] != want[i] {
+			t.Fatalf("hits = %v, want %v:\n%s", hits, want, got)
+		}
+	}
+	if !strings.Contains(got, "ErrRPCTimeout here") {
+		t.Fatalf("a matched line's text is missing:\n%s", got)
+	}
+	// The result is deterministic: the same search twice is the same text.
+	again, err := Search(root, "ErrRPCTimeout", SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != got {
+		t.Fatalf("the same search produced different text:\nfirst:\n%s\nsecond:\n%s", got, again)
+	}
+}
+
+func firstLine(s string) string {
+	if index := strings.Index(s, "\n"); index >= 0 {
+		return s[:index]
+	}
+	return s
+}
+
+// A search matches the literal the model asked for, not a pattern: the query is
+// data, so a dot is a dot and a star is a star.
+func TestSearchMatchesTheLiteralNotAPattern(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "dotted.txt"), "see docs/a.md for the file\n")
+	mustWrite(t, filepath.Join(root, "other.txt"), "see docsXaYmd for the file\n")
+	got, err := Search(root, "docs/a.md", SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "dotted.txt:1") || strings.Contains(got, "other.txt") {
+		t.Fatalf("a literal with a dot must match the literal only:\n%s", got)
+	}
+	// A regex the model might reach for matches nothing, because a star is a
+	// star and there is no pattern language here.
+	pattern, err := Search(root, "docs/.*\\.md", SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(pattern, `no matches for "docs/.*\\.md" in 2 files.`) {
+		t.Fatalf("a pattern-looking query must be searched as a literal:\n%s", pattern)
+	}
+}
+
+func TestSearchSkipsBinaryContentAndCountsIt(t *testing.T) {
+	root, _ := searchRoot(t)
+	got, err := Search(root, "ErrRPCTimeout", SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, "nul.bin") {
+		t.Fatalf("a file with a NUL byte must not be searched:\n%s", got)
+	}
+	if !strings.Contains(got, "1 file skipped as binary") {
+		t.Fatalf("the skipped binary file must be stated:\n%s", got)
+	}
+}
+
+// A search that reached its match cap says so, and does not pretend to know how
+// many matches it did not find.
+func TestSearchStatesTheMatchCap(t *testing.T) {
+	root, _ := searchRoot(t)
+	got, err := Search(root, "ErrRPCTimeout", SearchOptions{MaxMatches: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(firstLine(got), `1 match for "ErrRPCTimeout" in 2 files`) {
+		t.Fatalf("header = %q:\n%s", firstLine(got), got)
+	}
+	if !strings.Contains(got, "the search stopped at 1 match; the remaining paths were not searched") {
+		t.Fatalf("the match cap must be stated as a stop:\n%s", got)
+	}
+	if hits := searchHits(t, got); len(hits) != 1 {
+		t.Fatalf("more matches were rendered than the cap allows: %v", hits)
+	}
+}
+
+func TestSearchStatesTheFileCap(t *testing.T) {
+	root, _ := searchRoot(t)
+	got, err := Search(root, "ErrRPCTimeout", SearchOptions{MaxFiles: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "in 1 file") {
+		t.Fatalf("the header must count the files actually searched:\n%s", got)
+	}
+	if !strings.Contains(got, "the search stopped after 1 file; the remaining paths were not searched") {
+		t.Fatalf("the file cap must be stated as a stop:\n%s", got)
+	}
+	if hits := searchHits(t, got); len(hits) != 1 || !strings.HasPrefix(hits[0], "a.txt:") {
+		t.Fatalf("hits = %v, want only the first file of the walk:\n%s", hits, got)
+	}
+	// A cap that covers every file says nothing about one.
+	full, err := Search(root, "ErrRPCTimeout", SearchOptions{MaxFiles: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(full, "the search stopped") {
+		t.Fatalf("a complete search must not claim it stopped:\n%s", full)
+	}
+}
+
+// A file larger than the per-file limit is never searched, and the result says
+// how many were passed over: a partial read would answer a question about the
+// whole file with a statement about its beginning.
+func TestSearchStatesThePerFileLimit(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "big.txt"), strings.Repeat("x", 100)+" ErrRPCTimeout\n")
+	got, err := Search(root, "ErrRPCTimeout", SearchOptions{MaxFileBytes: 40})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(got, `no matches for "ErrRPCTimeout" in 0 files (1 file larger than the 40-byte per-file limit).`) {
+		t.Fatalf("an oversize file must be skipped and counted:\n%s", got)
+	}
+	// The same file is searched once the limit covers it.
+	raised, err := Search(root, "ErrRPCTimeout", SearchOptions{MaxFileBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(raised, "big.txt:1") {
+		t.Fatalf("a raised limit must search the same file:\n%s", raised)
+	}
+}
+
+// A long matched line is cut to fit the line cap, and the line says it was cut
+// and how long it really is.
+func TestSearchStatesALineCapInsteadOfCuttingALineSilently(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "long.txt"), strings.Repeat("a", 400)+" ErrRPCTimeout\n")
+	got, err := Search(root, "ErrRPCTimeout", SearchOptions{MaxLineBytes: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := firstLine(strings.TrimPrefix(got, firstLine(got)+"\n"))
+	if line == "" {
+		t.Fatalf("no match line was rendered:\n%s", got)
+	}
+	if len(line) > 80 {
+		t.Fatalf("a match line exceeded the cap: %d bytes %q", len(line), line)
+	}
+	if !strings.Contains(line, "…(line truncated; it is 414 bytes)") {
+		t.Fatalf("a cut line must say it was cut and how long it is: %q", line)
+	}
+	if !strings.HasPrefix(line, "long.txt:1: ") {
+		t.Fatalf("the cut line must still name the file and line: %q", line)
+	}
+}
+
+// A symbolic link is never followed: not into the root, and above all not out of
+// it.
+func TestSearchNeverFollowsSymbolicLinks(t *testing.T) {
+	root, outside := searchRoot(t)
+	got, err := Search(root, "ErrRPCTimeout", SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, "link-inside") || strings.Contains(got, "link-outside") {
+		t.Fatalf("a symbolic link must not be searched:\n%s", got)
+	}
+	if strings.Contains(got, "outside the root") {
+		t.Fatalf("content outside the read root was searched:\n%s", got)
+	}
+	// The link target's content appears once, as the real file it is.
+	if strings.Count(got, "the ErrRPCTimeout call") != 1 {
+		t.Fatalf("a link target must be searched exactly once, as itself:\n%s", got)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("ErrRPCTimeout only outside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	again, err := Search(root, "ErrRPCTimeout", SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(again, "only outside") {
+		t.Fatalf("changing a file outside the read root changed the search:\n%s", again)
+	}
+}
+
+func TestSearchSaysWhenNothingWasFound(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "one.txt"), "nothing here\n")
+	mustWrite(t, filepath.Join(root, "two.txt"), "nor here\n")
+	got, err := Search(root, "a string that is not in the tree", SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "no matches for \"a string that is not in the tree\" in 2 files.\n" {
+		t.Fatalf("an empty result must say what was searched: %q", got)
+	}
+	// An empty directory is reported the same way, without inventing a failure.
+	empty, err := Search(t.TempDir(), "anything", SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty != "no matches for \"anything\" in 0 files.\n" {
+		t.Fatalf("an empty directory = %q", empty)
+	}
+}
+
+// A search can start at one file: that is the same walk with only that file in
+// it, and the header still says what was searched.
+func TestSearchOfAFileSearchesThatFile(t *testing.T) {
+	root, _ := searchRoot(t)
+	got, err := Search(filepath.Join(root, "a.txt"), "ErrRPCTimeout", SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(got, `1 match for "ErrRPCTimeout" in 1 file:`) {
+		t.Fatalf("header = %q:\n%s", firstLine(got), got)
+	}
+	// The starting file is named by its base name: the result never carries an
+	// absolute host path.
+	if !strings.Contains(got, "a.txt:2: ") || strings.Contains(got, root) {
+		t.Fatalf("a single-file search must name the file without the host path:\n%s", got)
+	}
+}
+
+// The plugin is the second line of defence, not the first: a cap the host never
+// sent falls back to the package default rather than searching without a bound.
+func TestSearchFallsBackToTheDefaultCaps(t *testing.T) {
+	root := t.TempDir()
+	var content strings.Builder
+	for i := 0; i < DefaultSearchMatches+3; i++ {
+		content.WriteString("ErrRPCTimeout\n")
+	}
+	mustWrite(t, filepath.Join(root, "many.txt"), content.String())
+	got, err := Search(root, "ErrRPCTimeout", SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, fmt.Sprintf("the search stopped at %d matches", DefaultSearchMatches)) {
+		t.Fatalf("the default match cap was not applied:\n%.200s", got)
+	}
+	if hits := searchHits(t, got); len(hits) != DefaultSearchMatches {
+		t.Fatalf("%d lines were rendered, want the default cap of %d", len(hits), DefaultSearchMatches)
+	}
+}
+
+func TestSearchQueryRejections(t *testing.T) {
+	root, _ := searchRoot(t)
+	cases := []struct {
+		name  string
+		query string
+		want  error
+	}{
+		{"empty", "", ErrQueryEmpty},
+		{"blank", "   ", ErrQueryEmpty},
+		{"nul byte", "a\x00b", ErrQueryInvalid},
+		{"line break", "a\nb", ErrQueryInvalid},
+		{"carriage return", "a\rb", ErrQueryInvalid},
+		{"too long", strings.Repeat("q", MaxQueryBytes+1), ErrQueryTooLarge},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Search(root, tc.query, SearchOptions{})
+			if err == nil {
+				t.Fatalf("Search(%q) = %q, want an error", tc.query, got)
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("Search(%q) error = %v, want %v", tc.query, err, tc.want)
+			}
+			if got != "" {
+				t.Fatalf("a refused search returned %q", got)
+			}
+			// A too-long query is the one rejection that has to state the size
+			// it refused, so the model can see the limit rather than guess it.
+			if errors.Is(err, ErrQueryTooLarge) && !strings.Contains(err.Error(), fmt.Sprintf("%d", MaxQueryBytes)) {
+				t.Fatalf("the size error must state the limit: %v", err)
+			}
+		})
+	}
+	// A query exactly at the limit is accepted.
+	if _, err := Search(root, strings.Repeat("q", MaxQueryBytes), SearchOptions{}); err != nil {
+		t.Fatalf("a query at the limit was refused: %v", err)
+	}
+	if err := ValidateQuery("ErrRPCTimeout"); err != nil {
+		t.Fatalf("ValidateQuery rejected a plain literal: %v", err)
+	}
+}
+
+func TestSearchRefusesAPathItCannotSearch(t *testing.T) {
+	root, _ := searchRoot(t)
+	if _, err := Search(filepath.Join(root, "absent"), "x", SearchOptions{}); !errors.Is(err, ErrNotSearchable) {
+		t.Fatalf("a missing path error = %v, want ErrNotSearchable", err)
+	} else if strings.Contains(err.Error(), root) {
+		t.Fatalf("the error leaks an absolute path: %v", err)
+	}
+	// A symbolic link is not a starting point either: the host resolves the path
+	// it validated, so a link handed straight to the plugin is refused rather
+	// than followed.
+	if _, err := Search(filepath.Join(root, "link-outside"), "x", SearchOptions{}); !errors.Is(err, ErrNotSearchable) {
+		t.Fatalf("a symbolic link error = %v, want ErrNotSearchable", err)
+	}
+}
+
+// A directory the walk cannot read is counted, so the result never claims to
+// have searched a tree it only walked part of.
+func TestSearchCountsADirectoryItCouldNotRead(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read a directory whatever its mode says")
+	}
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "closed", "hidden.txt"), "ErrRPCTimeout\n")
+	mustWrite(t, filepath.Join(root, "open.txt"), "ErrRPCTimeout\n")
+	if err := os.Chmod(filepath.Join(root, "closed"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(root, "closed"), 0o755) })
+	got, err := Search(root, "ErrRPCTimeout", SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "1 path could not be read") {
+		t.Fatalf("an unreadable directory must be stated:\n%s", got)
+	}
+	if strings.Contains(got, "hidden.txt") {
+		t.Fatalf("a file that could not be read must not be reported as searched:\n%s", got)
+	}
+}
+
+// ResolveSearch reuses Resolve's resolution and containment, so every refusal a
+// read or a listing makes for an unsafe path is made for a search too, and the
+// path it accepts is the one a read would accept.
+func TestResolveSearchSharesTheSameBoundary(t *testing.T) {
+	root, _ := searchRoot(t)
+	for _, requested := range []string{".", "docs", "docs/../docs", "a.txt", "docs/keep.md"} {
+		got, err := ResolveSearch(root, requested)
+		if err != nil {
+			t.Fatalf("ResolveSearch(%q) rejected a path inside the root: %v", requested, err)
+		}
+		if !strings.HasPrefix(got, resolvedRoot(t, root)) {
+			t.Fatalf("ResolveSearch(%q) = %q, want a path inside the read root", requested, got)
+		}
+	}
+	// A search may start at anything a listing may start at, and at anything a
+	// read may: the resolved path is the read root's real path.
+	if got, err := ResolveSearch(root, "docs"); err != nil || got != filepath.Join(resolvedRoot(t, root), "docs") {
+		t.Fatalf("ResolveSearch(docs) = %q, err = %v", got, err)
+	}
+	if got, err := ResolveSearch(root, "docs/keep.md"); err != nil || got != filepath.Join(resolvedRoot(t, root), "docs", "keep.md") {
+		t.Fatalf("ResolveSearch(docs/keep.md) = %q, err = %v", got, err)
+	}
+
+	cases := []struct {
+		name      string
+		root      string
+		requested string
+		want      error
+	}{
+		{"empty path", root, "", ErrPathEmpty},
+		{"blank path", root, "   ", ErrPathEmpty},
+		{"nul byte", root, "docs\x00", ErrPathInvalid},
+		{"absolute path", root, "/etc", ErrPathAbsolute},
+		{"parent directory", root, "..", ErrPathEscape},
+		{"deep escape", root, "docs/../../etc", ErrPathEscape},
+		{"symlink escape", root, "link-outside", ErrSymlinkEscape},
+		{"missing path", root, "docs/absent", ErrNotFound},
+		{"empty root", "", "docs", ErrPathOutside},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ResolveSearch(tc.root, tc.requested)
+			if err == nil {
+				t.Fatalf("ResolveSearch(%q, %q) = %q, want an error", tc.root, tc.requested, got)
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("ResolveSearch(%q, %q) error = %v, want %v", tc.root, tc.requested, err, tc.want)
+			}
+			if strings.Contains(err.Error(), resolvedRoot(t, root)+string(filepath.Separator)) {
+				t.Fatalf("error leaks an absolute path: %v", err)
+			}
+		})
+	}
+}
+
+// A path that is neither a regular file nor a directory has nothing to search.
+func TestResolveSearchRefusesSomethingThatIsNeitherFileNorDirectory(t *testing.T) {
+	root := t.TempDir()
+	if err := syscall.Mkfifo(filepath.Join(root, "pipe"), 0o644); err != nil {
+		t.Skipf("cannot create a fifo here: %v", err)
+	}
+	if _, err := ResolveSearch(root, "pipe"); !errors.Is(err, ErrNotSearchable) {
+		t.Fatalf("ResolveSearch(pipe) error = %v, want ErrNotSearchable", err)
 	}
 }

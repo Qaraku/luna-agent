@@ -26,6 +26,7 @@ const (
 	ToolTextTransform = "luna_text_transform"
 	ToolReadFile      = "luna_read_file"
 	ToolListDir       = "luna_list_dir"
+	ToolSearchFiles   = "luna_search_files"
 )
 
 // ToolSpec is one allowlisted tool: its model-visible name, the directory under
@@ -54,6 +55,7 @@ var Allowlist = []ToolSpec{
 	{Tool: ToolTextTransform, Dir: "text_transform", Candidates: []string{"v1", "v2", "broken"}},
 	{Tool: ToolReadFile, Dir: "read_file", Candidates: []string{"v1", "v2", "broken"}},
 	{Tool: ToolListDir, Dir: "list_dir", Candidates: []string{"v1", "v2", "broken"}},
+	{Tool: ToolSearchFiles, Dir: "search_files", Candidates: []string{"v1", "v2", "broken"}},
 }
 
 // Infrastructure failures mean the tool never ran because its owned plugin
@@ -118,9 +120,10 @@ type Options struct {
 	BuildTimeout time.Duration
 	StartTimeout time.Duration
 	RPCTimeout   time.Duration
-	// ReadRoot bounds luna_read_file and luna_list_dir. It defaults to the
-	// repository root and is resolved once, at construction, so the containment
-	// check compares real directories rather than symbolic links.
+	// ReadRoot bounds luna_read_file, luna_list_dir and luna_search_files. It
+	// defaults to the repository root and is resolved once, at construction, so
+	// the containment check compares real directories rather than symbolic
+	// links.
 	ReadRoot string
 	// ReadLimit is the single-read size cap in bytes. It defaults to
 	// fileread.DefaultLimit (256 KiB).
@@ -132,6 +135,16 @@ type Options struct {
 	// reached.
 	ListMaxEntries   int
 	ListMaxLineBytes int
+	// SearchMaxMatches, SearchMaxLineBytes, SearchMaxFiles and
+	// SearchMaxFileBytes are the four search caps: at most this many matching
+	// lines are rendered, one rendered line is at most this many bytes, at most
+	// this many files are read, and no file larger than this many bytes is read.
+	// They default to the matching fileread.DefaultSearch* values, and every cap
+	// that is reached is stated in the result.
+	SearchMaxMatches   int
+	SearchMaxLineBytes int
+	SearchMaxFiles     int
+	SearchMaxFileBytes int
 }
 
 // ReadRequest is a file-read request from the core. Path is the raw,
@@ -150,6 +163,21 @@ type ReadRequest struct {
 // no request can widen that.
 type ListRequest struct {
 	Path string
+	// DelayMS is an operations and test knob for holding an RPC in flight. It
+	// is never exposed to the model.
+	DelayMS int
+}
+
+// SearchRequest is a literal-search request from the core. Path is the raw,
+// model-supplied path, on the same terms as ReadRequest and ListRequest: the
+// host validates it against the read root and the plugin only ever sees the
+// resolved absolute path — of a file or of a directory. Query is the raw,
+// model-supplied literal, validated here as well, and there is deliberately no
+// pattern, depth or filter knob: a search walks below the path it was given and
+// stops at its caps, and no request can widen that.
+type SearchRequest struct {
+	Path  string
+	Query string
 	// DelayMS is an operations and test knob for holding an RPC in flight. It
 	// is never exposed to the model.
 	DelayMS int
@@ -202,6 +230,18 @@ func (h *Host) withDefaults() {
 	}
 	if o.ListMaxLineBytes <= 0 {
 		o.ListMaxLineBytes = fileread.DefaultListLineBytes
+	}
+	if o.SearchMaxMatches <= 0 {
+		o.SearchMaxMatches = fileread.DefaultSearchMatches
+	}
+	if o.SearchMaxLineBytes <= 0 {
+		o.SearchMaxLineBytes = fileread.DefaultSearchLineBytes
+	}
+	if o.SearchMaxFiles <= 0 {
+		o.SearchMaxFiles = fileread.DefaultSearchFiles
+	}
+	if o.SearchMaxFileBytes <= 0 {
+		o.SearchMaxFileBytes = fileread.DefaultSearchFileBytes
 	}
 	if o.ReadRoot == "" {
 		o.ReadRoot = h.root
@@ -416,6 +456,37 @@ func (h *Host) ListDir(ctx context.Context, req ListRequest) (Output, error) {
 		return Output{}, err
 	}
 	return h.invoke(ctx, ToolListDir, Input{Path: absolute, MaxEntries: h.opts.ListMaxEntries, MaxLineBytes: h.opts.ListMaxLineBytes, DelayMS: req.DelayMS})
+}
+
+// SearchFiles calls the literal-search tool. The requested path is validated
+// here, on the host side, exactly as a read or a listing path is — same
+// normalization, same containment, same symbolic-link resolution, through
+// fileread.ResolveSearch — and so is the query, which is refused here if it is
+// empty or too long rather than reaching a plugin that would have to invent an
+// answer. The plugin is handed only the resolved absolute path, the literal and
+// the four caps.
+//
+// A refusal (an absolute path, a `..` escape, a path outside the root, something
+// that exists as neither a file nor a directory, an empty query) is therefore
+// made before any RPC, so no plugin process ever sees a path the read root does
+// not hold. Where the search may look afterwards is bounded by the plugin's walk,
+// which follows no symbolic link at all, so the search cannot leave the read root
+// by another route either.
+func (h *Host) SearchFiles(ctx context.Context, req SearchRequest) (Output, error) {
+	if len(req.Path) > 4096 {
+		return Output{}, fmt.Errorf("path must not exceed 4096 bytes")
+	}
+	if req.DelayMS < 0 || req.DelayMS > 3000 {
+		return Output{}, fmt.Errorf("delay_ms must be 0..3000")
+	}
+	if err := fileread.ValidateQuery(req.Query); err != nil {
+		return Output{}, err
+	}
+	absolute, err := fileread.ResolveSearch(h.opts.ReadRoot, req.Path)
+	if err != nil {
+		return Output{}, err
+	}
+	return h.invoke(ctx, ToolSearchFiles, Input{Path: absolute, Query: req.Query, MaxMatches: h.opts.SearchMaxMatches, MaxLineBytes: h.opts.SearchMaxLineBytes, MaxFiles: h.opts.SearchMaxFiles, MaxFileBytes: h.opts.SearchMaxFileBytes, DelayMS: req.DelayMS})
 }
 func (h *Host) invoke(ctx context.Context, tool string, in Input) (Output, error) {
 	h.mu.Lock()

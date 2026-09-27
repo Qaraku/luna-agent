@@ -151,7 +151,13 @@ func TestTheModelSeesProcessToolsAndContributedTools(t *testing.T) {
 	if _, err := r.Run(context.Background(), RunRequest{Message: "hi", RunID: "run-1", Sink: &collectingSink{}}); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{ToolName, ReadFileToolName, ListDirToolName, "notes_write"}
+	// 进程工具从白名单推导，不写死：写死的名字在加一个工具时就会红，而这条测试
+	// 问的是“模型看到的工具集合对不对”，不是“现在有几个工具”。
+	want := make([]string, 0, len(pluginhost.Allowlist)+1)
+	for _, spec := range pluginhost.Allowlist {
+		want = append(want, spec.Tool)
+	}
+	want = append(want, "notes_write")
 	got := offeredNames(m)
 	if len(got) != len(want) {
 		t.Fatalf("offered tools = %v, want %v", got, want)
