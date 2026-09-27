@@ -12,6 +12,38 @@ type Config struct {
 	APIKey       string
 	Model        string
 	ProviderHost string
+	// ReasoningEffort is how hard the model should think before it answers, sent
+	// as the API's own reasoning_effort field. Empty means the field is not sent
+	// at all, which is the default: a provider that has never heard of the field
+	// must not be affected by a knob it did not ask for.
+	ReasoningEffort string
+}
+
+// ReasoningEffortEnv is where the level is read from. It is a separate variable
+// from the ones that decide which provider is called, because the level is a
+// choice about how a run is made, not about where it is sent.
+const ReasoningEffortEnv = "LUNA_REASONING_EFFORT"
+
+// ReasoningEffortLevels are the accepted levels, and they are the levels the
+// chat-completions API defines for reasoning_effort. A level that sounds stronger
+// but is not a value the API defines (max, ultra, xhigh) is not accepted: sending
+// it would come back as a rejected request, not as more thinking.
+var ReasoningEffortLevels = []string{"minimal", "low", "medium", "high", "none"}
+
+// ParseReasoningEffort accepts the declared levels and the empty value, and
+// reports anything else with the list of what would have worked.
+func ParseReasoningEffort(value string) (string, error) {
+	trimmed := strings.TrimSpace(strings.ToLower(value))
+	if trimmed == "" {
+		return "", nil
+	}
+	for _, level := range ReasoningEffortLevels {
+		if trimmed == level {
+			return trimmed, nil
+		}
+	}
+	return "", fmt.Errorf("%s must be one of %s, or empty to send no reasoning_effort at all",
+		ReasoningEffortEnv, strings.Join(ReasoningEffortLevels, ", "))
 }
 
 func Load(getenv func(string) string) (Config, error) {
@@ -56,5 +88,9 @@ func Load(getenv func(string) string) (Config, error) {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
 		return Config{}, fmt.Errorf("OPENAI_BASE_URL must be an absolute http(s) URL")
 	}
-	return Config{BaseURL: base, APIKey: key, Model: model, ProviderHost: u.Hostname()}, nil
+	effort, err := ParseReasoningEffort(getenv(ReasoningEffortEnv))
+	if err != nil {
+		return Config{}, err
+	}
+	return Config{BaseURL: base, APIKey: key, Model: model, ProviderHost: u.Hostname(), ReasoningEffort: effort}, nil
 }

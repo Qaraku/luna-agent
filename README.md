@@ -146,6 +146,7 @@ Runtime candidate builds need the Go toolchain on `PATH`, because each reload co
 | `OPENAI_API_KEY` | yes | Environment only; there is no browser or file path to it |
 | `OPENAI_MODEL_NAME` | yes | Canonical name |
 | `OPENAI_MODEL` / `OPENAI_MODEL_ID` | no | Accepted aliases; if several are set their non-empty values must agree, otherwise startup fails with a clear error |
+| `LUNA_REASONING_EFFORT` | no | How hard the model should think before it answers, sent as the API's own `reasoning_effort`. One of `minimal`, `low`, `medium`, `high`, `none`. Unset means the field is not sent at all, so a provider that does not define it is unaffected. Whether a level changes anything is the provider's business: against `api.deepseek.com` it is accepted and makes no measurable difference |
 
 Startup errors name the missing variable but never print its value.
 

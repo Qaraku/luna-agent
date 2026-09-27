@@ -471,7 +471,16 @@ func NewRunner(ctx context.Context, m model.ToolCallingChatModel, invoker Invoke
 }
 
 func NewOpenAIRunner(ctx context.Context, cfg config.Config, invoker Invoker, reader FileReader, opts ...Option) (*Runner, error) {
-	m, err := openai.NewChatModel(ctx, &openai.ChatModelConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL, Model: cfg.Model})
+	modelConfig := &openai.ChatModelConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL, Model: cfg.Model}
+	if cfg.ReasoningEffort != "" {
+		// Only set when a level was chosen: the field is then left out of the
+		// request entirely, which is what keeps this knob from reaching providers
+		// that do not define it. How hard the model thinks is a parameter of the
+		// run; showing the reasoning it produced is a separate concern and does
+		// not depend on this being set.
+		modelConfig.ReasoningEffort = openai.ReasoningEffortLevel(cfg.ReasoningEffort)
+	}
+	m, err := openai.NewChatModel(ctx, modelConfig)
 	if err != nil {
 		return nil, err
 	}

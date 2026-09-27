@@ -55,3 +55,47 @@ func TestLoadReportsMissingNamesOnly(t *testing.T) {
 		}
 	}
 }
+
+func effortEnv(level string) func(string) string {
+	return env(map[string]string{
+		"OPENAI_BASE_URL":   "https://example.test/v1",
+		"OPENAI_API_KEY":    "test-key",
+		"OPENAI_MODEL_NAME": "test-model",
+		ReasoningEffortEnv:  level,
+	})
+}
+
+func TestLoadCarriesTheChosenReasoningEffort(t *testing.T) {
+	cfg, err := Load(effortEnv("  High "))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ReasoningEffort != "high" {
+		t.Fatalf("got %q, want the declared level lowercased", cfg.ReasoningEffort)
+	}
+}
+
+func TestLoadSendsNoReasoningEffortByDefault(t *testing.T) {
+	cfg, err := Load(effortEnv(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ReasoningEffort != "" {
+		t.Fatalf("got %q, want nothing chosen", cfg.ReasoningEffort)
+	}
+}
+
+func TestLoadRejectsALevelTheAPIDoesNotDefine(t *testing.T) {
+	for _, level := range []string{"ultra", "xhigh", "max"} {
+		_, err := Load(effortEnv(level))
+		if err == nil {
+			t.Fatalf("%q was accepted", level)
+		}
+		if !strings.Contains(err.Error(), ReasoningEffortEnv) {
+			t.Fatalf("%q: the error does not name the variable: %v", level, err)
+		}
+		if strings.Contains(err.Error(), level) {
+			t.Fatalf("%q: the error quotes the rejected value: %v", level, err)
+		}
+	}
+}
