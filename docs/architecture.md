@@ -147,9 +147,9 @@ Workspace 是官方内置能力（`internal/plugins/workspace`），和 Memory �
 
 允许的候选从 `plugins/<tool>/<candidate>/` 编译，全部来自根应用源码：
 
-- `v1`：`luna_text_transform` 去除首尾空白；`luna_read_file` 返回宿主已校验路径的文本；`luna_list_dir` 渲染宿主已校验目录的一层内容，每个条目带类型，普通文件带大小（人类可读单位）；
-- `v2`：`luna_text_transform` 去除首尾空白、用 Go 字符串处理转大写，并在前面加上 `Luna · `；`luna_read_file` 把 `CRLF` 和单独的 `CR` 规范化为 `LF`；`luna_list_dir` 的边界与 `v1` 相同，只把大小换成精确字节数；
-- `broken`：对三个工具都启动一个无法完成预期握手的程序。
+- `v1`：`luna_text_transform` 去除首尾空白；`luna_read_file` 返回宿主已校验路径的文本；`luna_list_dir` 渲染宿主已校验目录的一层内容，每个条目带类型，普通文件带大小（人类可读单位）；`luna_search_files` 在宿主已校验目录内做字面量匹配，按 `path:line: text` 返回；
+- `v2`：`luna_text_transform` 去除首尾空白、用 Go 字符串处理转大写，并在前面加上 `Luna · `；`luna_read_file` 把 `CRLF` 和单独的 `CR` 规范化为 `LF`；`luna_list_dir` 的边界与 `v1` 相同，只把大小换成精确字节数；`luna_search_files` 的边界与 `v1` 相同，只把每行的前导缩进去掉；
+- `broken`：对四个工具都启动一个无法完成预期握手的程序。
 
 ### 能力贡献的工具
 
@@ -242,6 +242,7 @@ Eino 的 `ToolsNode` 配置为 `ExecuteSequentially: true`。如果一个模型�
   │                                  ├─ luna_text_transform 包装器 ──> 固定的插件 generation，走 net/rpc
   │                                  ├─ luna_read_file 包装器 ──> 固定的插件 generation，走 net/rpc
   │                                  ├─ luna_list_dir 包装器 ──> 固定的插件 generation，走 net/rpc
+  │                                  ├─ luna_search_files 包装器 ──> 固定的插件 generation，走 net/rpc
   │                                  └─ luna_remember（Memory 能力贡献）──> internal/plugins/memory（仅追加 JSONL）
   └─ SSE 事件 <──────── Luna 自有的运行局部事件出口
 
@@ -252,7 +253,7 @@ Eino 的 `ToolsNode` 配置为 `ExecuteSequentially: true`。如果一个模型�
                                      └─ 为全部工具发布一个新 generation，否则一个也不发布
 ```
 
-模型工具选择是自动的。当用户明确要求文本转换或明确要求调用它时，系统指令要求使用 `luna_text_transform`；当用户要求读取文件时，要求使用 `luna_read_file`；当用户想知道某个目录或这个项目里有什么、或在读取前需要先发现路径时，要求使用 `luna_list_dir`，并说明一次调用只列一层、仓库要一层目录一次地走；当用户要求记住一条持久事实时，说明来自 `luna_remember` 自己的工具描述——系统指令不再点名任何能力；没有任何请求会强制 provider 级的 `tool_choice: required`。含工具调用的回合中模型输出的助手内容会**边产生边作为 `assistant.delta` 发出**，但它绝不进入最终答案：只有无工具调用的回答回合中的助手文本才构成 `run.finished` 里的答案。这一区分由浏览器负责呈现——一段文本之后如果跟着 `tool.started`，它就作为「运行说明」留在运行轨迹里；如果跟着终止事件，它就是答案。之所以不能在运行期判定，是因为一个回合是否是回答只有该回合结束时（`finish_reason`）才知道。
+模型工具选择是自动的。当用户明确要求文本转换或明确要求调用它时，系统指令要求使用 `luna_text_transform`；当用户要求读取文件时，要求使用 `luna_read_file`；当用户想知道某个目录或这个项目里有什么、或在读取前需要先发现路径时，要求使用 `luna_list_dir`，并说明一次调用只列一层、仓库要一层目录一次地走；当用户要找某个名字或某段文字出现在哪里时，要求使用 `luna_search_files`，并说明查询按字面量匹配、不是正则，一次搜索有命中数与扫描范围的上限，触到上限时会被告知还剩多少没搜；当用户要求记住一条持久事实时，说明来自 `luna_remember` 自己的工具描述——系统指令不再点名任何能力；没有任何请求会强制 provider 级的 `tool_choice: required`。含工具调用的回合中模型输出的助手内容会**边产生边作为 `assistant.delta` 发出**，但它绝不进入最终答案：只有无工具调用的回答回合中的助手文本才构成 `run.finished` 里的答案。这一区分由浏览器负责呈现——一段文本之后如果跟着 `tool.started`，它就作为「运行说明」留在运行轨迹里；如果跟着终止事件，它就是答案。之所以不能在运行期判定，是因为一个回合是否是回答只有该回合结束时（`finish_reason`）才知道。
 
 每个回合的模型输入都从磁盘组装，而不是来自进程状态：先是系统指令，然后是按文件顺序排列的会话早前消息，最后是本回合的用户消息。启用中能力贡献的上下文块追加在这条系统消息内部，而不是在消息之后：system 角色保持它的位置，被贡献的文本也无法作为后续消息到达。早前消息由 `internal/agent` 中的两个常量限定——`MaxHistoryMessages = 40` 条消息和 `MaxHistoryBytes = 64 KiB` 的消息文本——策略是确定性的：保留最近的消息，先丢弃最旧的。保留集合是持久化历史的连续后缀，从最新消息向前累积，直到任一上限将被超过，因此消息从不被重排、抽样或跳过，扫描停止点之前的所有内容也一并丢弃。因此对字节上限来说过大的消息会结束历史，而不是被截断。字节上限高于 16,384 字节的 HTTP 消息上限，因此本回合自己的消息总是能放下。一次运行自己的记录被排除在它自己的输入之外，且只有消息文本进入输入：没有任何工具结果或插件身份能通过持久化历史到达模型。本切片没有摘要和检索：历史被回放，记忆被注入，两者都不被搜索、过滤或摘要。
 
