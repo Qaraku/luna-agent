@@ -37,12 +37,15 @@ import (
 	"time"
 )
 
-// Record types, frozen by the S2a spec.
+// Record types. The first four are frozen by the S2a spec; TypeConfig was added
+// later, which the frozen format allows: a reader ignores a field it does not
+// know, and a new type is a new line, not a changed one.
 const (
 	TypeSession  = "session"
 	TypeMessage  = "message"
 	TypeToolCall = "tool_call"
 	TypeRun      = "run"
+	TypeConfig   = "config"
 )
 
 // Run statuses, frozen by the S2a spec.
@@ -131,7 +134,19 @@ type RunRecord struct {
 	Status    string    `json:"status"`
 }
 
-// Record is one decoded line. Exactly one of the four pointers is set, matching
+// ConfigRecord is one statement of which model the session's next run should
+// use. Model names an entry of the configured model list; it is a name, not an
+// endpoint, so the record cannot carry a credential or a target of its own.
+//
+// The record is appended, never edited: the newest statement is the one in
+// force, and what was chosen before stays in the file as history.
+type ConfigRecord struct {
+	Type  string    `json:"type"`
+	Model string    `json:"model"`
+	At    time.Time `json:"at"`
+}
+
+// Record is one decoded line. Exactly one of the five pointers is set, matching
 // Type.
 type Record struct {
 	Type     string
@@ -139,6 +154,7 @@ type Record struct {
 	Message  *MessageRecord
 	ToolCall *ToolCallRecord
 	Run      *RunRecord
+	Config   *ConfigRecord
 }
 
 // MarshalJSON writes a record back in the frozen line shape, including its type
@@ -153,6 +169,8 @@ func (r Record) MarshalJSON() ([]byte, error) {
 		return json.Marshal(r.ToolCall)
 	case r.Run != nil:
 		return json.Marshal(r.Run)
+	case r.Config != nil:
+		return json.Marshal(r.Config)
 	}
 	return nil, fmt.Errorf("store: record of type %q carries no payload", r.Type)
 }
@@ -168,6 +186,8 @@ func (r Record) Time() time.Time {
 		return r.ToolCall.At
 	case r.Run != nil:
 		return r.Run.EndedAt
+	case r.Config != nil:
+		return r.Config.At
 	}
 	return time.Time{}
 }
@@ -180,6 +200,10 @@ type Session struct {
 	UpdatedAt time.Time
 	RunCount  int
 	Records   []Record
+	// Config is the session's last config record, or nil when the session has
+	// never stated one. The records are append-only, so the newest statement is
+	// the one in force; the earlier ones stay in Records in file order.
+	Config *ConfigRecord
 	// Truncated reports that the file's final line was unterminated, so it was
 	// dropped as a torn write and is not part of Records.
 	Truncated bool
@@ -311,6 +335,15 @@ func (s *Store) AppendToolCall(id string, record ToolCallRecord) error {
 // AppendRun appends one run line to an existing session.
 func (s *Store) AppendRun(id string, record RunRecord) error {
 	record.Type = TypeRun
+	return s.append(id, record)
+}
+
+// AppendConfig appends one config line to an existing session: which model the
+// session's next run should use. It records the statement; resolving the name
+// against the configured models, and refusing one that is not there, happens
+// where the run is started.
+func (s *Store) AppendConfig(id string, record ConfigRecord) error {
+	record.Type = TypeConfig
 	return s.append(id, record)
 }
 
@@ -454,6 +487,12 @@ func (s *Store) readFile(path, id string, keepRecords bool) (Session, error) {
 		if record.Run != nil {
 			session.RunCount++
 		}
+		if record.Config != nil {
+			// Only the last one is kept: the statements are appended in order,
+			// so the newest is what the session now asks for.
+			latest := *record.Config
+			session.Config = &latest
+		}
 	}
 	return session, nil
 }
@@ -500,6 +539,7 @@ type line struct {
 	StartedAt time.Time `json:"started_at"`
 	EndedAt   time.Time `json:"ended_at"`
 	Status    string    `json:"status"`
+	Model     string    `json:"model"`
 }
 
 // decodeLine decodes one record. Unknown fields are ignored rather than
@@ -519,6 +559,8 @@ func decodeLine(text string) (Record, error) {
 		return Record{Type: TypeToolCall, ToolCall: &ToolCallRecord{Type: raw.Type, RunID: raw.RunID, Name: raw.Name, Arguments: raw.Arguments, Result: raw.Result, Error: raw.Error, At: raw.At}}, nil
 	case TypeRun:
 		return Record{Type: TypeRun, Run: &RunRecord{Type: raw.Type, RunID: raw.RunID, StartedAt: raw.StartedAt, EndedAt: raw.EndedAt, Status: raw.Status}}, nil
+	case TypeConfig:
+		return Record{Type: TypeConfig, Config: &ConfigRecord{Type: raw.Type, Model: raw.Model, At: raw.At}}, nil
 	}
 	return Record{}, fmt.Errorf("unknown record type %q", raw.Type)
 }

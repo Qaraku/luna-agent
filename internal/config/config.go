@@ -17,6 +17,10 @@ type Config struct {
 	// at all, which is the default: a provider that has never heard of the field
 	// must not be affected by a knob it did not ask for.
 	ReasoningEffort string
+	// Models is the set a run may be sent to, the default first. A user who has
+	// configured none has exactly one entry: what the settings above resolve to.
+	// Switching a run to another entry is what /model does.
+	Models []Model
 }
 
 // ReasoningEffortEnv is where the level is read from. It is a separate variable
@@ -119,7 +123,50 @@ func Load(getenv func(string) string, file *File) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	return Config{BaseURL: base, APIKey: key, Model: model, ProviderHost: u.Hostname(), ReasoningEffort: level}, nil
+	models, err := modelList(model, base, keyEnv, u.Hostname(), file)
+	if err != nil {
+		return Config{}, err
+	}
+	return Config{BaseURL: base, APIKey: key, Model: model, ProviderHost: u.Hostname(), ReasoningEffort: level, Models: models}, nil
+}
+
+// modelList is the effective set of models a run may be sent to: the
+// configuration's own default first, then every entry the file adds, each with
+// the endpoint and key variable it inherits when it states none of its own.
+//
+// Two entries cannot share a name. A name is how a run says which model it
+// wants, so a name that matches twice is a name that cannot be chosen — and the
+// user would only find that out by picking the wrong one.
+func modelList(defaultModel, base, keyEnv, defaultHost string, file *File) ([]Model, error) {
+	models := []Model{{Name: defaultModel, Provider: defaultHost, BaseURL: base, APIKeyEnv: keyEnv}}
+	if file == nil {
+		return models, nil
+	}
+	seen := map[string]bool{defaultModel: true}
+	for _, entry := range file.trimmed().Models {
+		if entry.Name == "" {
+			return nil, fmt.Errorf("a model entry in the user configuration file has no name")
+		}
+		if seen[entry.Name] {
+			return nil, fmt.Errorf("the model %q is listed twice; /model chooses a model by name", entry.Name)
+		}
+		seen[entry.Name] = true
+		if entry.BaseURL == "" {
+			entry.BaseURL = base
+		}
+		if entry.APIKeyEnv == "" {
+			entry.APIKeyEnv = keyEnv
+		}
+		u, err := url.Parse(entry.BaseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+			return nil, fmt.Errorf("the model %q must have an absolute http(s) base URL", entry.Name)
+		}
+		if entry.Provider == "" {
+			entry.Provider = u.Hostname()
+		}
+		models = append(models, entry)
+	}
+	return models, nil
 }
 
 // modelFromEnv reads the model from whichever alias is set. The second return

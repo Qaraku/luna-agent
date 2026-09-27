@@ -636,3 +636,138 @@ func TestListIgnoresForeignFiles(t *testing.T) {
 		t.Fatalf("list=%+v, want only %s", list, id)
 	}
 }
+
+// A session can state which model its next run should use. The statement is a
+// record like the others, and it round-trips through the frozen line shape.
+func TestConfigRecordRoundTrip(t *testing.T) {
+	s := open(t)
+	id, err := s.Create("pick a model")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	at := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+	if err := s.AppendConfig(id, ConfigRecord{Model: "beta", At: at}); err != nil {
+		t.Fatalf("append config: %v", err)
+	}
+
+	session, err := s.Read(id)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if session.Config == nil || session.Config.Model != "beta" || session.Config.Type != TypeConfig || !session.Config.At.Equal(at) {
+		t.Fatalf("session config: %+v", session.Config)
+	}
+	last := session.Records[len(session.Records)-1]
+	if last.Type != TypeConfig || last.Config == nil {
+		t.Fatalf("last record: %+v", last)
+	}
+	encoded, err := json.Marshal(last)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	want := `{"type":"config","model":"beta","at":"` + at.Format(time.RFC3339Nano) + `"}`
+	if string(encoded) != want {
+		t.Fatalf("record=%s, want %s", encoded, want)
+	}
+	// A statement about a model is not a conversation message.
+	messages, err := s.Messages(id)
+	if err != nil {
+		t.Fatalf("messages: %v", err)
+	}
+	if len(messages) != 0 {
+		t.Fatalf("messages=%+v, want none", messages)
+	}
+}
+
+// Only the newest statement is in force, and the ones before it stay in the
+// file: the record is appended, never edited.
+func TestLastConfigStatementIsTheSessionChoice(t *testing.T) {
+	s := open(t)
+	id, err := s.Create("pick a model")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	first := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+	second := first.Add(time.Minute)
+	if err := s.AppendConfig(id, ConfigRecord{Model: "beta", At: first}); err != nil {
+		t.Fatalf("append first config: %v", err)
+	}
+	if err := s.AppendConfig(id, ConfigRecord{Model: "gamma", At: second}); err != nil {
+		t.Fatalf("append second config: %v", err)
+	}
+
+	session, err := s.Read(id)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if session.Config == nil || session.Config.Model != "gamma" || !session.Config.At.Equal(second) {
+		t.Fatalf("session config: %+v, want the second statement", session.Config)
+	}
+	if got := len(session.Records); got != 3 {
+		t.Fatalf("records=%d, want the session line and both statements", got)
+	}
+	// File order, so the replay shows what was chosen and when it changed.
+	wantModels := []string{"beta", "gamma"}
+	for i, want := range wantModels {
+		record := session.Records[i+1]
+		if record.Type != TypeConfig || record.Config == nil || record.Config.Model != want {
+			t.Fatalf("record %d: %+v, want the statement %q", i+1, record, want)
+		}
+	}
+}
+
+// A session that never stated a model has none: nil, not an empty default that
+// would read as a choice.
+func TestSessionWithoutConfigRecordHasNone(t *testing.T) {
+	s := open(t)
+	id, err := s.Create("no choice made")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	writeRun(t, s, id, "run-1", "no choice made", "answer", time.Now())
+
+	session, err := s.Read(id)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if session.Config != nil {
+		t.Fatalf("session config: %+v, want nil", session.Config)
+	}
+}
+
+// The new record type is one more complete record: a torn tail after it loses
+// the fragment and nothing else, and the statement still reads.
+func TestConfigRecordToleratesATornTail(t *testing.T) {
+	s := open(t)
+	id, err := s.Create("pick a model")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	at := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+	if err := s.AppendConfig(id, ConfigRecord{Model: "beta", At: at}); err != nil {
+		t.Fatalf("append config: %v", err)
+	}
+	before, err := os.ReadFile(s.path(id))
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	torn := append([]byte{}, before...)
+	torn = append(torn, []byte(`{"type":"config","model":"gam`)...)
+	if err := os.WriteFile(s.path(id), torn, filePerm); err != nil {
+		t.Fatalf("write torn file: %v", err)
+	}
+
+	session, err := s.Read(id)
+	if err != nil {
+		t.Fatalf("read session with a torn tail: %v", err)
+	}
+	if !session.Truncated {
+		t.Fatal("a torn tail was not reported")
+	}
+	if len(session.Records) != 2 {
+		t.Fatalf("records=%+v, want the session line and the complete statement", session.Records)
+	}
+	if session.Config == nil || session.Config.Model != "beta" || !session.Config.At.Equal(at) {
+		t.Fatalf("session config: %+v", session.Config)
+	}
+}

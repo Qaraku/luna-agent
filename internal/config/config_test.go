@@ -7,6 +7,13 @@ import (
 	"testing"
 )
 
+// isEmptyFile reports whether a file carries nothing, which is what a missing or
+// an empty file must produce. File is not comparable itself once it holds a
+// slice, so the fields are checked rather than the struct.
+func isEmptyFile(f File) bool {
+	return f.Model == "" && f.BaseURL == "" && f.APIKeyEnv == "" && f.ReasoningEffort == "" && len(f.Models) == 0
+}
+
 func env(values map[string]string) func(string) string {
 	return func(k string) string { return values[k] }
 }
@@ -197,8 +204,8 @@ func TestAMissingFileIsNotAnError(t *testing.T) {
 	if err != nil || found {
 		t.Fatalf("found=%v err=%v; a file that is not there is not a problem", found, err)
 	}
-	if file != (File{}) {
-		t.Fatalf("file = %#v, want the zero value", file)
+	if !isEmptyFile(file) {
+		t.Fatalf("file = %#v, want nothing", file)
 	}
 }
 
@@ -208,7 +215,7 @@ func TestAnEmptyFileIsAnEmptyConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	file, found, err := LoadFile(path)
-	if err != nil || !found || file != (File{}) {
+	if err != nil || !found || !isEmptyFile(file) {
 		t.Fatalf("found=%v err=%v file=%#v", found, err, file)
 	}
 }
@@ -261,5 +268,91 @@ func TestAFileErrorNamesTheFileNameOnly(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), FileName) {
 		t.Fatalf("the error does not name the file: %v", err)
+	}
+}
+
+// A user who configured nothing has one model: the one their settings already
+// resolve to. The list is never empty, because /model has to have something to
+// switch back to.
+func TestTheDefaultModelIsTheWholeListWithoutAFile(t *testing.T) {
+	cfg, err := Load(fileEnv(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Models) != 1 {
+		t.Fatalf("models = %+v", cfg.Models)
+	}
+	only := cfg.Models[0]
+	if only.Name != "env-model" || only.BaseURL != "https://env.example.test/v1" ||
+		only.Provider != "env.example.test" || only.APIKeyEnv != "OPENAI_API_KEY" {
+		t.Fatalf("the default entry is not the effective configuration: %+v", only)
+	}
+}
+
+// Entries the file adds come after the default, and inherit what they leave out.
+// A user with one provider and several models writes only names.
+func TestFileModelsInheritTheEndpointAndKeyVariable(t *testing.T) {
+	cfg, err := Load(fileEnv(), &File{
+		Models: []Model{
+			{Name: "second"},
+			{Name: "third", BaseURL: "https://other.example.test/v1", APIKeyEnv: "OTHER_KEY", Provider: "Other"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Models) != 3 {
+		t.Fatalf("models = %+v", cfg.Models)
+	}
+	if cfg.Models[0].Name != "env-model" {
+		t.Fatalf("the default must come first: %+v", cfg.Models)
+	}
+	inherited := cfg.Models[1]
+	if inherited.Name != "second" || inherited.BaseURL != "https://env.example.test/v1" ||
+		inherited.APIKeyEnv != "OPENAI_API_KEY" || inherited.Provider != "env.example.test" {
+		t.Fatalf("the second entry did not inherit: %+v", inherited)
+	}
+	own := cfg.Models[2]
+	if own.BaseURL != "https://other.example.test/v1" || own.APIKeyEnv != "OTHER_KEY" || own.Provider != "Other" {
+		t.Fatalf("the third entry did not keep its own values: %+v", own)
+	}
+}
+
+// A name is how a run says which model it wants, so a name that matches twice
+// cannot be chosen — and the user would only discover that by picking the wrong
+// one.
+func TestADuplicateModelNameIsRefused(t *testing.T) {
+	cases := []struct {
+		name  string
+		file  *File
+		model string
+	}{
+		{"twice in the file", &File{Models: []Model{{Name: "a"}, {Name: "a"}}}, ""},
+		{"once as the default", &File{Model: "env-model", Models: []Model{{Name: "env-model"}}}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Load(fileEnv(), tc.file); err == nil {
+				t.Fatal("the duplicate name was accepted")
+			}
+		})
+	}
+}
+
+func TestModelEntriesThatCannotBeUsedAreRefused(t *testing.T) {
+	cases := []struct {
+		name  string
+		entry Model
+	}{
+		{"no name", Model{Provider: "P"}},
+		{"relative base url", Model{Name: "a", BaseURL: "not-a-url"}},
+		{"unsupported scheme", Model{Name: "a", BaseURL: "ftp://example.test/v1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Load(fileEnv(), &File{Models: []Model{tc.entry}}); err == nil {
+				t.Fatalf("%+v was accepted", tc.entry)
+			}
+		})
 	}
 }

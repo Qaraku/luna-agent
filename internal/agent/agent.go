@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -52,10 +53,16 @@ type runIDKey struct{}
 // RunRequest is one admitted run. RunID is core-owned; SessionID names the
 // durable session the run belongs to and is carried to the client on the
 // existing run.started event.
+//
+// Model names the entry of the configured model list this run is sent to. The
+// empty string means the configured default, which is the list's first entry.
+// A name that is not in the list fails the run: falling back to the default
+// would show the user a switch that never happened.
 type RunRequest struct {
 	RunID     string
 	SessionID string
 	Message   string
+	Model     string
 	Sink      Sink
 }
 
@@ -618,14 +625,44 @@ type Runner struct {
 	// and still be callable, which for a store-backed capability means writing.
 	// So the recipe stays here and the agent is rebuilt when the list it was
 	// built from is no longer current.
-	mu            sync.Mutex
-	buildCtx      context.Context
-	model         model.ToolCallingChatModel
-	invoker       Invoker
-	files         FileTools
-	runner        *adk.Runner
+	//
+	// The build recipe also carries the model a run is sent to, for the same
+	// reason: which model a session asked for is a session-level fact, while the
+	// agent is built with one model fixed inside it.
+	mu       sync.Mutex
+	buildCtx context.Context
+	invoker  Invoker
+	files    FileTools
+	// cfg is the model list a run may be sent to, its default first.
+	cfg config.Config
+	// model is the client the runner was started with: the default entry of
+	// cfg. Every run that asks for no particular model, and every run that asks
+	// for the default entry by name, is sent here.
+	model model.ToolCallingChatModel
+	// clients caches the clients built for the other entries by name, so a
+	// session that switches back and forth builds each one once. Guarded by mu.
+	clients map[string]model.ToolCallingChatModel
+	// clientFor builds the client for one entry. It is a field so the
+	// construction has one home and so a test can stand a fake in for a
+	// provider instead of calling one.
+	clientFor clientFactory
+
+	runner     *adk.Runner
+	builtModel string
+	// builtRevision is the capability list's revision at build time, or zero
+	// when the runner was built without a list.
 	builtRevision uint64
 }
+
+// clientFactory builds the model client for one entry of the configured model
+// list. Building one resolves an endpoint and a key; it is not a request, and
+// the provider is first spoken to by the run.
+type clientFactory func(ctx context.Context, cfg config.Config, entry config.Model) (model.ToolCallingChatModel, error)
+
+// WithConfig supplies the model list a run may be sent to. The first entry is
+// the default: a run that names no model, and one that names the first entry,
+// both use the client the runner was started with.
+func WithConfig(cfg config.Config) Option { return func(r *Runner) { r.cfg = cfg } }
 
 // NewRunner builds the agent and its tool set. Every model-visible tool is
 // registered here, by the core: the plugin-backed wrappers whose host-side half
@@ -634,19 +671,20 @@ type Runner struct {
 func NewRunner(ctx context.Context, m model.ToolCallingChatModel, invoker Invoker, files FileTools, opts ...Option) (*Runner, error) {
 	// buildCtx is the construction context, kept for rebuilds: a rebuild is not
 	// part of any single run, so it must not inherit that run's cancellation.
-	r := &Runner{buildCtx: ctx, model: m, invoker: invoker, files: files}
+	r := &Runner{buildCtx: ctx, model: m, invoker: invoker, files: files, clients: map[string]model.ToolCallingChatModel{}, clientFor: openAICompatibleClient}
 	for _, opt := range opts {
 		opt(r)
 	}
-	if err := r.build(); err != nil {
+	if err := r.build(m, r.defaultModelName()); err != nil {
 		return nil, err
 	}
 	return r, nil
 }
 
 // build assembles the model-visible tools and the agent that runs them, from the
-// capability list as it is now, and records which revision that was.
-func (r *Runner) build() error {
+// capability list as it is now, and records which revision and which model that
+// was.
+func (r *Runner) build(m model.ToolCallingChatModel, modelName string) error {
 	tools := []tool.BaseTool{NewTextTransformTool(r.invoker), NewReadFileTool(r.files), NewListDirTool(r.files)}
 	// The search wrapper is registered exactly for a file capability that serves
 	// a search: the core offers the model the plugin-backed tools it can route,
@@ -657,13 +695,75 @@ func (r *Runner) build() error {
 	for _, contributed := range r.capabilityTools() {
 		tools = append(tools, contributed)
 	}
-	a, err := adk.NewChatModelAgent(r.buildCtx, &adk.ChatModelAgentConfig{Name: "luna", Description: "Local Luna core preview", Instruction: instruction, GenModelInput: r.modelInputWithCapabilities(), Model: r.model, ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: tools, ExecuteSequentially: true}}, MaxIterations: 6})
+	a, err := adk.NewChatModelAgent(r.buildCtx, &adk.ChatModelAgentConfig{Name: "luna", Description: "Local Luna core preview", Instruction: instruction, GenModelInput: r.modelInputWithCapabilities(), Model: m, ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: tools, ExecuteSequentially: true}}, MaxIterations: 6})
 	if err != nil {
 		return err
 	}
 	r.runner = adk.NewRunner(r.buildCtx, adk.RunnerConfig{Agent: a, EnableStreaming: true})
 	r.builtRevision = r.currentRevision()
+	r.builtModel = modelName
 	return nil
+}
+
+// defaultModelName is the name of the entry a run that names no model is sent
+// to: the first entry of the configured list. A runner built without a list has
+// no name for it, which is what the empty string here means.
+func (r *Runner) defaultModelName() string {
+	if len(r.cfg.Models) == 0 {
+		return ""
+	}
+	return r.cfg.Models[0].Name
+}
+
+// modelForRun returns the client a run must be sent to and the name it is known
+// by. name is what the run asked for; the empty string, and the default entry's
+// own name, both select the client the runner was started with.
+//
+// A name that is not in the configured list is an error, never a fallback: the
+// user asked for a model, and a run answered by a different one would look like
+// a switch that took effect. Which model answered is not visible in the answer
+// itself, so the wrong model can go unnoticed for a long time.
+func (r *Runner) modelForRun(name string) (model.ToolCallingChatModel, string, error) {
+	requested := strings.TrimSpace(name)
+	def := r.defaultModelName()
+	if requested == "" || requested == def {
+		return r.model, def, nil
+	}
+	if client, ok := r.clients[requested]; ok {
+		return client, requested, nil
+	}
+	entry, ok := r.modelEntry(requested)
+	if !ok {
+		return nil, "", fmt.Errorf("unknown model %q: this Luna can run %s", requested, r.knownModels())
+	}
+	client, err := r.clientFor(r.buildCtx, r.cfg, entry)
+	if err != nil {
+		return nil, "", fmt.Errorf("build the client for model %q: %w", requested, err)
+	}
+	r.clients[requested] = client
+	return client, requested, nil
+}
+
+// modelEntry finds one entry of the configured model list by name.
+func (r *Runner) modelEntry(name string) (config.Model, bool) {
+	for _, entry := range r.cfg.Models {
+		if entry.Name == name {
+			return entry, true
+		}
+	}
+	return config.Model{}, false
+}
+
+// knownModels names the models a run may be sent to, for an error message.
+func (r *Runner) knownModels() string {
+	if len(r.cfg.Models) == 0 {
+		return "only the model it was started with: no model list is configured"
+	}
+	names := make([]string, 0, len(r.cfg.Models))
+	for _, entry := range r.cfg.Models {
+		names = append(names, entry.Name)
+	}
+	return strings.Join(names, ", ")
 }
 
 // currentRevision is the capability list's revision, or zero when the runner was
@@ -676,38 +776,82 @@ func (r *Runner) currentRevision() uint64 {
 }
 
 // agentForRun returns the agent a run should use, rebuilding it first when the
-// capability list changed since the agent was built.
+// capability list changed, or when the run is sent to a different model, since
+// the agent was built.
 //
 // A run takes the agent it gets here and keeps it to the end: a toggle during a
 // run rebuilds the agent for the NEXT run, so an in-flight run is never switched
-// out from under itself. Rebuilding before the run rather than on the toggle
-// keeps the toggle path free of this package's build errors.
-func (r *Runner) agentForRun() (*adk.Runner, error) {
+// out from under itself. The same holds for a model: switching the session's
+// model mid-run does not move the run that is already talking to a provider.
+// Rebuilding before the run rather than on the toggle keeps the toggle path free
+// of this package's build errors.
+//
+// An unknown model name is reported here, which fails the run. It is not
+// silently replaced by the default: the user would be answered by a model they
+// did not choose, and nothing in the answer says so.
+func (r *Runner) agentForRun(name string) (*adk.Runner, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.capabilities != nil && r.capabilities.Revision() != r.builtRevision {
-		if err := r.build(); err != nil {
-			return nil, fmt.Errorf("rebuild the agent after a capability change: %w", err)
+	m, resolved, err := r.modelForRun(name)
+	if err != nil {
+		return nil, err
+	}
+	revisionChanged := r.capabilities != nil && r.capabilities.Revision() != r.builtRevision
+	if revisionChanged || resolved != r.builtModel {
+		if err := r.build(m, resolved); err != nil {
+			return nil, fmt.Errorf("rebuild the agent after a capability or model change: %w", err)
 		}
 	}
 	return r.runner, nil
 }
 
-func NewOpenAIRunner(ctx context.Context, cfg config.Config, invoker Invoker, files FileTools, opts ...Option) (*Runner, error) {
-	modelConfig := &openai.ChatModelConfig{APIKey: cfg.APIKey, BaseURL: cfg.BaseURL, Model: cfg.Model}
-	if cfg.ReasoningEffort != "" {
-		// Only set when a level was chosen: the field is then left out of the
-		// request entirely, which is what keeps this knob from reaching providers
-		// that do not define it. How hard the model thinks is a parameter of the
-		// run; showing the reasoning it produced is a separate concern and does
-		// not depend on this being set.
-		modelConfig.ReasoningEffort = openai.ReasoningEffortLevel(cfg.ReasoningEffort)
+// openAIChatConfig is the client configuration for one entry of the model list,
+// called with key. The reasoning level is set only when one was chosen: the
+// field is then left out of the request entirely, which is what keeps this knob
+// from reaching providers that do not define it. How hard the model thinks is a
+// parameter of the run; showing the reasoning it produced is a separate concern
+// and does not depend on this being set.
+func openAIChatConfig(entry config.Model, key, effort string) *openai.ChatModelConfig {
+	modelConfig := &openai.ChatModelConfig{APIKey: key, BaseURL: entry.BaseURL, Model: entry.Name}
+	if effort != "" {
+		modelConfig.ReasoningEffort = openai.ReasoningEffortLevel(effort)
 	}
-	m, err := openai.NewChatModel(ctx, modelConfig)
+	return modelConfig
+}
+
+// openAICompatibleClient builds the client for one entry of the model list
+// whose key comes from the environment.
+func openAICompatibleClient(ctx context.Context, cfg config.Config, entry config.Model) (model.ToolCallingChatModel, error) {
+	key, env := keyForEntry(cfg, entry)
+	if key == "" {
+		return nil, fmt.Errorf("%s is not set", env)
+	}
+	return openai.NewChatModel(ctx, openAIChatConfig(entry, key, cfg.ReasoningEffort))
+}
+
+// keyForEntry returns the key one entry is called with, and the variable it came
+// from — named in errors, never valued. The default entry's variable is the one
+// the configuration already read, so its value is taken from the configuration
+// rather than read a second time; every other entry names its own variable,
+// which is read here. The key is never logged or returned for display.
+func keyForEntry(cfg config.Config, entry config.Model) (key, env string) {
+	if len(cfg.Models) > 0 && entry.APIKeyEnv == cfg.Models[0].APIKeyEnv {
+		return cfg.APIKey, entry.APIKeyEnv
+	}
+	env = entry.APIKeyEnv
+	if env == "" {
+		env = config.APIKeyEnv
+	}
+	return strings.TrimSpace(os.Getenv(env)), env
+}
+
+func NewOpenAIRunner(ctx context.Context, cfg config.Config, invoker Invoker, files FileTools, opts ...Option) (*Runner, error) {
+	entry := config.Model{Name: cfg.Model, Provider: cfg.ProviderHost, BaseURL: cfg.BaseURL}
+	m, err := openai.NewChatModel(ctx, openAIChatConfig(entry, cfg.APIKey, cfg.ReasoningEffort))
 	if err != nil {
 		return nil, err
 	}
-	return NewRunner(ctx, m, invoker, files, opts...)
+	return NewRunner(ctx, m, invoker, files, append([]Option{WithConfig(cfg)}, opts...)...)
 }
 
 // The history cap is stated here, in the S2a spec's terms: a run's model input
@@ -853,10 +997,10 @@ func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err
 	if err != nil {
 		return "", err
 	}
-	// The agent is resolved once per run: a capability toggled since the last
-	// run is rebuilt into this one, and this run keeps the agent it started
-	// with even if the list changes again while it is in flight.
-	agentRunner, err := r.agentForRun()
+	// The agent is resolved once per run: a capability toggled or a model chosen
+	// since the last run is built into this one, and this run keeps the agent it
+	// started with even if either changes again while it is in flight.
+	agentRunner, err := r.agentForRun(req.Model)
 	if err != nil {
 		return "", err
 	}

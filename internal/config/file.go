@@ -30,7 +30,8 @@ const FileName = "config.yaml"
 // secret in the user's dotfiles where backups and screenshots can reach it.
 type File struct {
 	// Model is the model to ask the provider for. It overrides the model
-	// environment variables.
+	// environment variables. Together with the rest of the effective
+	// configuration it forms the default entry of the model list.
 	Model string `yaml:"model"`
 	// BaseURL is the provider endpoint. It overrides OPENAI_BASE_URL.
 	BaseURL string `yaml:"base_url"`
@@ -39,6 +40,28 @@ type File struct {
 	APIKeyEnv string `yaml:"api_key_env"`
 	// ReasoningEffort overrides LUNA_REASONING_EFFORT.
 	ReasoningEffort string `yaml:"reasoning_effort"`
+	// Models are the other models this user may switch to. The default one is
+	// not repeated here: it is whatever the settings above resolve to, and it is
+	// always available.
+	Models []Model `yaml:"models"`
+}
+
+// Model is one provider endpoint a run may be sent to.
+//
+// It is deliberately not a set of credentials: BaseURL and APIKeyEnv may each be
+// left out, and then the entry inherits the value the effective configuration
+// already has. A user with one provider and several models writes only names.
+type Model struct {
+	// Name is what the provider is asked for, and the value /model accepts.
+	Name string `yaml:"name"`
+	// Provider is a label for the interface. Empty means the base URL's host,
+	// which is what a run is actually sent to.
+	Provider string `yaml:"provider"`
+	// BaseURL is this entry's endpoint. Empty inherits the configured one.
+	BaseURL string `yaml:"base_url"`
+	// APIKeyEnv names this entry's key variable. Empty inherits the configured
+	// one.
+	APIKeyEnv string `yaml:"api_key_env"`
 }
 
 // LoadFile reads the configuration file at path.
@@ -86,15 +109,25 @@ func reason(err error) error {
 	return err
 }
 
-// trim returns the file's values without surrounding space, treating a value
+// trimmed returns the file's values without surrounding space, treating a value
 // that is only whitespace as unset. A field the user left empty means "no
 // opinion" rather than "the empty string", which is what lets the environment
 // fill it in.
 func (f File) trimmed() File {
+	models := make([]Model, 0, len(f.Models))
+	for _, m := range f.Models {
+		models = append(models, Model{
+			Name:      strings.TrimSpace(m.Name),
+			Provider:  strings.TrimSpace(m.Provider),
+			BaseURL:   strings.TrimSpace(m.BaseURL),
+			APIKeyEnv: strings.TrimSpace(m.APIKeyEnv),
+		})
+	}
 	return File{
 		Model:           strings.TrimSpace(f.Model),
 		BaseURL:         strings.TrimSpace(f.BaseURL),
 		APIKeyEnv:       strings.TrimSpace(f.APIKeyEnv),
 		ReasoningEffort: strings.TrimSpace(f.ReasoningEffort),
+		Models:          models,
 	}
 }
