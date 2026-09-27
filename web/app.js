@@ -641,9 +641,30 @@ function skillRows(payload) {
 // 展示”是两件事。它在进程内不能热切换（模型只构建一次），所以界面只读显示。
 // 字段不出现不是 medium，而是这个进程没有发送该档位、provider 自己的默认值生效：
 // 文案必须把这两件事分开说，不能替进程猜一个档位。
+//
+// 两个运行预算（一轮最多多少轮模型回合、最多多长时间）也是进程启动时定下的，
+// 但它们会真的结束一次运行，所以必须看得见；界面只转述服务端报出的数字。
 
 const REASONING_EFFORT_LABELS = { minimal: '极简', low: '低', medium: '中', high: '高', none: '不思考' };
 const REASONING_EFFORT_LEVELS = ['minimal', 'low', 'medium', 'high', 'none'];
+
+// runBudgetView 把两个预算翻成一行字。缺任何一个都不编造：服务端没有报出的数字
+// 就是"这个进程没有报告"，而不是零。
+function runBudgetView(state) {
+  const payload = state && typeof state === 'object' ? state : {};
+  const turns = Number(payload.max_iterations);
+  const timeout = Number(payload.run_timeout_ms);
+  const parts = [];
+  if (Number.isFinite(turns) && turns > 0) parts.push(`${turns} 轮模型回合`);
+  if (Number.isFinite(timeout) && timeout > 0) parts.push(`${Math.round(timeout / 60000)} 分钟`);
+  if (!parts.length) {
+    return { label: '这个进程没有报告运行预算', note: '运行预算由服务端施加；没有报出数字时界面不猜一个。' };
+  }
+  return {
+    label: parts.join(' · '),
+    note: '一轮运行最多用掉这些轮次与时长，触到任一个都会结束这次运行并说明原因。要改：设置 LUNA_MAX_ITERATIONS / LUNA_RUN_TIMEOUT，或在 config.yaml 里写 max_iterations / run_timeout，然后重启 Luna。'
+  };
+}
 
 function reasoningEffortView(value) {
   const text = capabilityPanelText(value);
@@ -1339,18 +1360,18 @@ if (typeof document !== 'undefined') {
   const sessionSidebar = $('session-sidebar');
   const sessionToggle = $('session-toggle');
   const sessionClose = $('session-close');
-  // 贡献面板的入口插在扩展之前，所以这里要拿着这两个节点：一个是插入锚点，
-  // 一个说明页头顺序（贡献的面板都在扩展左边）。
-  const extensionsToggle = $('extensions-toggle');
+  // 贡献面板的入口插在运行详情之前，所以这里拿着那个节点作为插入锚点：页头的
+  // 顺序是"能力贡献的面板，然后运行详情"，宿主不决定有哪些能力。
   const runtimeActions = document.querySelector('.runtime-actions');
   const sessionMedia = window.matchMedia('(max-width: 800px)');
+  // 打开的面板登记在案：运行详情是内核自己的，能力贡献的面板在 syncCapabilityPanels
+  // 里按 /api/state 增减。界面插件与插件诊断不再是页头面板，它们是设置里的分类。
   const panels = {
     runtime: { element: runtimeDrawer, toggle: runtimeToggle, close: runtimeClose, refresh: updateState },
-    extensions: { element: $('extensions-panel'), toggle: extensionsToggle, close: $('extensions-close'), refresh: updateUIPlugins },
     sessions: { element: sessionSidebar, toggle: sessionToggle, close: sessionClose, refresh: updateSessions },
     // 打开设置时重新读一次状态：能力清单与模型服务参数都是这一刻的事实，不是页
     // 面首次加载时的旧值。
-    settings: { element: $('settings-panel'), toggle: $('settings-toggle'), close: $('settings-close'), refresh: () => { updateState(); if (!$('settings-pane-skills').hidden) updateSkills(); } }
+    settings: { element: $('settings-panel'), toggle: $('settings-toggle'), close: $('settings-close'), refresh: () => { updateState(); updateVisibleSettingsPane(); } }
   };
   const appShell = document.querySelector('.app-shell');
   const runtimeBrief = $('runtime-brief');
@@ -1368,6 +1389,15 @@ if (typeof document !== 'undefined') {
   const uiPluginsEmpty = $('ui-plugins-empty');
   const uiPluginStatus = $('ui-plugins-status');
   const uiPluginsRetry = $('ui-plugins-retry');
+  // 设置里的工作区与模型清单：两页都在被打开时才读一次服务端，节点在这里拿到
+  // 一次，后面只改内容。
+  const workspaceList = $('workspace-list');
+  const workspaceEmpty = $('workspace-empty');
+  const workspaceStatus = $('workspace-status');
+  const workspaceRefresh = $('workspace-refresh');
+  const modelList = $('settings-model-list');
+  const modelListEmpty = $('settings-model-empty');
+  const modelSwitchStatus = $('settings-model-status');
 
   let running = false;
   let reloading = false;
@@ -1382,6 +1412,9 @@ if (typeof document !== 'undefined') {
   let switching = false;
   let sessionsPayload = null;
   let currentSessionID = '';
+  // 当前会话绑定的工作区 id（空表示没有绑定）。它来自会话回放或绑定接口的答复，
+  // 所以设置里的工作区一页能把"正在用"标出来，而不是自己猜。
+  let currentWorkspaceID = '';
 
   // --- 侧栏折叠与宽度 ---------------------------------------------------------
   // 只存在浏览器本地；桌面端生效，窄屏始终走 drawer（见 CSS 的 min-width 查询）。
@@ -2394,6 +2427,8 @@ if (typeof document !== 'undefined') {
       if (!switchResponse.ok) throw new Error(await errorMessage(switchResponse));
       const chosen = await switchResponse.json();
       setConversationStatus(`已切换：这个会话的后续运行使用 ${chosen.model}。`);
+      // 设置里已经读过模型清单时跟着重读一次，这一页显示的就是服务端刚报的状态。
+      if (modelListed) await updateModelList();
     } catch (error) {
       // The server owns what is a valid model, so its refusal is the answer;
       // saying anything else here would be this file guessing at the rules.
@@ -2569,9 +2604,26 @@ if (typeof document !== 'undefined') {
       item.setAttribute('tabindex', active ? '0' : '-1');
       const pane = $(item.dataset.pane);
       if (pane) pane.hidden = !active;
-      // 技能清单只在打开这一页时读：切到“技能”就是一次读取。
-      if (active) maybeUpdateSkills(item.dataset.pane);
+      // 每一页的数据只在这一页被打开时读：切到"技能"就是一次技能清单的读取，
+      // 切到"工作区"或"界面扩展"同理。
+      if (active) loadSettingsPane(item.dataset.pane);
     }
+  }
+
+  // loadSettingsPane 是"打开这一页要读什么"的唯一一处：一页自己的读取逻辑写在
+  // 各自的小节里，这里只负责在它可见时触发一次。
+  function loadSettingsPane(pane) {
+    if (pane === 'settings-pane-skills') updateSkills();
+    else if (pane === 'settings-pane-workspace') updateWorkspaces();
+    else if (pane === 'settings-pane-extensions') updateUIPlugins();
+    else if (pane === 'settings-pane-model') updateModelList();
+  }
+
+  // updateVisibleSettingsPane 在设置被重新打开时只刷新当前可见的那一页，而不是
+  // 把所有页都读一遍。
+  function updateVisibleSettingsPane() {
+    const active = settingsTabs.find((tab) => tab.getAttribute('aria-selected') === 'true');
+    if (active) loadSettingsPane(active.dataset.pane);
   }
   for (const tab of settingsTabs) tab.addEventListener('click', () => selectSettingsTab(tab));
   $('settings-panel').addEventListener('keydown', (event) => {
@@ -2869,6 +2921,18 @@ if (typeof document !== 'undefined') {
     const meta = make('div', 'capability-meta');
     meta.append(make('span', 'capability-badge'), make('span', 'capability-state'));
 
+    // 有能力贡献面板时，这一行就是它的入口：能力自己的面板由宿主挂载，这里只是
+    // 一个能到达它的按钮，宿主不知道那个面板里有什么。
+    const open = make('button', 'luna-button capability-open');
+    open.type = 'button';
+    open.hidden = true;
+    open.addEventListener('click', () => {
+      const row = item.capabilityRow;
+      const record = row ? capabilityPanelNodes.get(row.id) : null;
+      if (record) openDrawer(record.panel);
+    });
+    meta.append(open);
+
     const error = make('p', 'capability-error');
     error.hidden = true;
 
@@ -2895,6 +2959,16 @@ if (typeof document !== 'undefined') {
     state.textContent = row.stateLabel;
     state.classList.toggle('is-on', row.enabled);
     state.classList.toggle('is-off', !row.enabled);
+
+    // 只有真的挂上了入口的能力才有"打开面板"：内核没报面板就不给一个点了没反应的
+    // 按钮。
+    const open = item.querySelector('.capability-open');
+    const record = capabilityPanelNodes.get(row.id);
+    open.hidden = !record;
+    if (record) {
+      open.textContent = `打开${record.panel.title}`;
+      open.setAttribute('aria-label', `打开${record.panel.title}`);
+    }
 
     const error = item.querySelector('.capability-error');
     error.hidden = row.error === '';
@@ -3117,10 +3191,260 @@ if (typeof document !== 'undefined') {
 
   skillRefresh.addEventListener('click', () => updateSkills());
 
-  // 打开这一页时才读技能清单：设置里其它分类的读取与本页无关。
-  function maybeUpdateSkills(pane) {
-    if (pane === 'settings-pane-skills') updateSkills();
+  // --- 设置：工作区 -----------------------------------------------------------
+  // 工作区是会话的属性：这一页列出本机定义过的工作区（一组目录），并把当前会话
+  // 绑到其中一个。列表与服务端的答复是唯一的事实来源：点"这个会话用它"之后重读
+  // 一次，界面不自己记下"大概改好了"。
+
+  let workspacePayload = null;
+  let workspaceListed = false;
+  let workspaceBusy = false;
+
+  function setWorkspaceStatus(text, className = '') {
+    workspaceStatus.textContent = text;
+    workspaceStatus.className = `luna-status workspace-status${className ? ` ${className}` : ''}`;
   }
+
+  function workspaceRowNode() {
+    const item = make('li', 'workspace-row luna-list-item');
+    const head = make('div', 'workspace-head');
+    const title = make('div', 'workspace-title');
+    title.append(make('span', 'workspace-name'), make('span', 'workspace-badge'));
+    const use = make('button', 'luna-button workspace-use');
+    use.type = 'button';
+    use.addEventListener('click', () => bindWorkspace(item.workspaceRow));
+    head.append(title, use);
+    item.append(head, make('ul', 'workspace-dirs'));
+    return item;
+  }
+
+  function updateWorkspaceRow(item, row) {
+    item.workspaceRow = row;
+    item.dataset.workspace = row.id;
+    item.querySelector('.workspace-name').textContent = row.name;
+    const badge = item.querySelector('.workspace-badge');
+    badge.textContent = row.current ? '这个会话正在用' : '';
+    badge.hidden = !row.current;
+
+    const dirs = item.querySelector('.workspace-dirs');
+    dirs.replaceChildren();
+    for (const dir of row.dirs) dirs.append(make('li', 'workspace-dir', dir));
+    if (row.dirs.length === 0) dirs.append(make('li', 'workspace-dir workspace-dir-missing', '这个工作区没有目录。'));
+
+    const use = item.querySelector('.workspace-use');
+    use.hidden = row.current;
+    use.disabled = workspaceBusy || !isSessionID(currentSessionID);
+    use.textContent = '这个会话用它';
+    use.setAttribute('aria-label', `让这个会话使用工作区 ${row.name}`);
+  }
+
+  function renderWorkspaces(payload) {
+    if (payload !== undefined) workspacePayload = payload;
+    const listed = workspaceListed && workspacePayload && Array.isArray(workspacePayload.workspaces) ? workspacePayload.workspaces : null;
+    const rows = listed ? listed.map((item) => ({
+      id: textOr(item.id), name: textOr(item.name), dirs: Array.isArray(item.dirs) ? item.dirs.map(textOr) : [],
+      current: textOr(item.id) === currentWorkspaceID
+    })) : [];
+    workspaceList.replaceChildren();
+    for (const row of rows) {
+      const item = workspaceRowNode();
+      updateWorkspaceRow(item, row);
+      workspaceList.append(item);
+    }
+    workspaceEmpty.hidden = !listed || rows.length > 0;
+    // 会话还没有 id 时说清为什么不能绑：绑定必须写进一次会话的记录里。
+    if (listed && rows.length && !isSessionID(currentSessionID)) {
+      setWorkspaceStatus('这个会话还没有消息，还没有可以记录绑定的地方。先发一条消息，再回到这一页。');
+      return;
+    }
+    // 有会话但没有任何绑定：这不是"列表为空"，而是这个会话现在不工作在某个工作区
+    // 里——文件工具这时回退到 Luna 启动时的读取根。说清楚，否则两行都像"可以直接
+    // 用"，看不出当前状态。
+    if (listed && rows.length && !currentWorkspaceID) {
+      setWorkspaceStatus('这个会话目前没有绑定工作区：文件工具回到 Luna 启动时的读取根。绑定之后，这个会话只在这些目录里读。');
+    }
+  }
+
+  async function updateWorkspaces() {
+    if (workspaceBusy) return false;
+    try {
+      const response = await fetch('/api/workspaces', { cache: 'no-store' });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      workspacePayload = await response.json();
+      workspaceListed = true;
+      renderWorkspaces();
+      setWorkspaceStatus('');
+      return true;
+    } catch (error) {
+      workspaceListed = false;
+      renderWorkspaces();
+      setWorkspaceStatus(`读取工作区失败：${error.message}`, 'failure');
+      return false;
+    }
+  }
+
+  // bindWorkspace 是这一页唯一的写操作。服务端的答复带着绑定之后的完整工作区，
+  // 所以页头标识与这一页的标记同时更新，两边不会各说一套。
+  async function bindWorkspace(row) {
+    if (!row || !row.id || workspaceBusy) return;
+    if (!isSessionID(currentSessionID)) {
+      setWorkspaceStatus('这个会话还没有消息，还没有可以记录绑定的地方。先发一条消息，再试试。', 'failure');
+      return;
+    }
+    workspaceBusy = true;
+    renderWorkspaces();
+    setWorkspaceStatus(`正在把这个会话绑到 ${row.name}…`);
+    let failure = '';
+    try {
+      const response = await fetch(`/api/sessions/${currentSessionID}/workspace`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspace: row.id })
+      });
+      if (!response.ok) failure = await errorMessage(response);
+      else {
+        const payload = await response.json();
+        currentWorkspaceID = payload.workspace ? textOr(payload.workspace.id) : '';
+        setConversationWorkspace(payload.workspace || null);
+      }
+    } catch (error) {
+      failure = error.message;
+    }
+    workspaceBusy = false;
+    if (failure) {
+      renderWorkspaces();
+      setWorkspaceStatus(`绑定 ${row.name} 失败：${failure}（它仍按上一次读到的状态显示）`, 'failure');
+      return;
+    }
+    if (!(await updateWorkspaces())) {
+      setWorkspaceStatus(`绑定 ${row.name} 的请求已经发出，但重新读取工作区失败：界面仍按上一次读到的状态显示。`, 'failure');
+      return;
+    }
+    setWorkspaceStatus(`这个会话现在工作在 ${row.name}。下一次运行就能读到里面的项目规则与文件。`);
+  }
+
+  workspaceRefresh.addEventListener('click', () => updateWorkspaces());
+
+  // --- 设置：本会话用哪个模型 -------------------------------------------------
+  // /model 命令与这一页做的是同一件事，走同一个接口：切换写进会话自己的记录，
+  // 只影响这个会话接下来的运行。列表与"当前用的是哪一个、这个选择来自哪里"都
+  // 来自 /api/models，界面不自己推断。
+
+  let modelPayload = null;
+  let modelListed = false;
+  let modelBusy = false;
+
+  function setModelSwitchStatus(text, className = '') {
+    modelSwitchStatus.textContent = text;
+    modelSwitchStatus.className = `luna-status model-switch-status${className ? ` ${className}` : ''}`;
+  }
+
+  function modelRowNode() {
+    const item = make('li', 'model-row luna-list-item');
+    const head = make('div', 'model-head');
+    const title = make('div', 'model-title');
+    title.append(make('span', 'model-name'), make('span', 'model-badge'));
+    const use = make('button', 'luna-button model-use');
+    use.type = 'button';
+    use.addEventListener('click', () => chooseModel(item.modelRow));
+    head.append(title, use);
+    item.append(head, make('p', 'model-provider'));
+    return item;
+  }
+
+  function updateModelRow(item, row) {
+    item.modelRow = row;
+    item.dataset.model = row.name;
+    item.querySelector('.model-name').textContent = row.name;
+    const badge = item.querySelector('.model-badge');
+    badge.textContent = row.current ? '这个会话在用' : row.isDefault ? '配置里的默认' : '';
+    badge.hidden = badge.textContent === '';
+    item.querySelector('.model-provider').textContent = row.provider ? `提供方 ${row.provider}` : '';
+    const use = item.querySelector('.model-use');
+    use.hidden = row.current;
+    use.disabled = modelBusy || !isSessionID(currentSessionID);
+    use.textContent = '这个会话用它';
+    use.setAttribute('aria-label', `让这个会话使用模型 ${row.name}`);
+  }
+
+  function renderModelList(payload) {
+    if (payload !== undefined) modelPayload = payload;
+    const listed = modelListed && modelPayload ? modelPayload : null;
+    const current = listed && listed.current ? textOr(listed.current.name) : '';
+    const rows = listed && Array.isArray(listed.models) ? listed.models.map((model) => ({
+      name: textOr(model.name), provider: textOr(model.provider), isDefault: Boolean(model.default), current: textOr(model.name) === current
+    })) : [];
+    modelList.replaceChildren();
+    for (const row of rows) {
+      const item = modelRowNode();
+      updateModelRow(item, row);
+      modelList.append(item);
+    }
+    modelListEmpty.hidden = !listed || rows.length > 1;
+    if (listed) {
+      const origin = listed.current && listed.current.origin === 'session' ? '这个会话选的' : '配置里的默认';
+      setModelSwitchStatus(`当前：${current || '未报告'}（${origin}）。`);
+    }
+    if (listed && rows.length && !isSessionID(currentSessionID)) {
+      setModelSwitchStatus('这个会话还没有消息，还没有可以记住选择的地方。先发一条消息，再回到这一页。');
+    }
+  }
+
+  async function updateModelList() {
+    if (modelBusy) return false;
+    try {
+      const response = await fetch('/api/models', { cache: 'no-store' });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      modelPayload = await response.json();
+      modelListed = true;
+      renderModelList();
+      return true;
+    } catch (error) {
+      modelListed = false;
+      renderModelList();
+      setModelSwitchStatus(`读取模型清单失败：${error.message}`, 'failure');
+      return false;
+    }
+  }
+
+  async function chooseModel(row) {
+    if (!row || !row.name || modelBusy) return;
+    if (!isSessionID(currentSessionID)) {
+      setModelSwitchStatus('这个会话还没有消息，还没有可以记住选择的地方。先发一条消息，再试试。', 'failure');
+      return;
+    }
+    modelBusy = true;
+    renderModelList();
+    setModelSwitchStatus(`正在把 ${row.name} 设为这个会话的模型…`);
+    let failure = '';
+    try {
+      const response = await fetch(`/api/sessions/${currentSessionID}/model`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: row.name })
+      });
+      if (!response.ok) failure = await errorMessage(response);
+    } catch (error) {
+      failure = error.message;
+    }
+    modelBusy = false;
+    if (failure) {
+      renderModelList();
+      setModelSwitchStatus(`切换 ${row.name} 失败：${failure}（它仍按上一次读到的状态显示）`, 'failure');
+      return;
+    }
+    if (!(await updateModelList())) {
+      setModelSwitchStatus(`切换 ${row.name} 的请求已经发出，但重新读取模型清单失败：界面仍按上一次读到的状态显示。`, 'failure');
+      return;
+    }
+    setModelSwitchStatus(`这个会话接下来的运行使用 ${row.name}。`);
+  }
+
+  // textOr 把服务端字段翻成字符串：缺字段渲染成空，而不是 "undefined"。
+  function textOr(value) {
+    return capabilityPanelText(value);
+  }
+
 
   function renderState(state) {
     $('model').textContent = valueOrDash(state.model);
@@ -3128,6 +3452,13 @@ if (typeof document !== 'undefined') {
     $('host-pid').textContent = valueOrDash(state.host_pid);
     $('busy').textContent = state.busy ? `运行中 · ${valueOrDash(state.current_run_id)}` : '可用';
     $('current-session').textContent = valueOrDash(state.current_session_id);
+    // 运行预算是这一次运行真正的余地：一轮能走多少轮、能走多久。两者都由服务端
+    // 施加并如实报告，界面只转述；运行详情与模型服务两处读的是同一份状态。
+    const budgets = runBudgetView(state);
+    $('effort').textContent = reasoningEffortView(state.reasoning_effort).label;
+    $('budgets').textContent = budgets.label;
+    $('settings-budgets').textContent = budgets.label;
+    $('settings-budgets').title = budgets.note;
 
     // Each allowlisted tool gets its own row, and a tool mid-replacement can
     // report a retiring generation next to its active one. Nothing here is
@@ -3388,6 +3719,7 @@ if (typeof document !== 'undefined') {
     const replay = replaySession(detail);
     setConversationTitle(replay.title);
     setConversationWorkspace(detail ? detail.workspace : null);
+    currentWorkspaceID = detail && detail.workspace ? textOr(detail.workspace.id) : '';
     conversation.replaceChildren();
     sessionNotices.replaceChildren();
     for (const notice of replay.notices) sessionNotices.append(make('p', 'session-notice', notice));
@@ -3681,8 +4013,8 @@ if (typeof document !== 'undefined') {
     close.addEventListener('click', () => closeDrawer());
     capabilityPanelNodes.set(panel.id, record);
     panels[record.key] = record.panel;
-    // 贡献面板固定在扩展之前：页头顺序与它们被声明的顺序一致。
-    runtimeActions.insertBefore(button, extensionsToggle);
+    // 贡献面板固定在运行详情之前：页头顺序与它们被声明的顺序一致。
+    runtimeActions.insertBefore(button, runtimeToggle);
     document.body.append(drawer);
     return record;
   }

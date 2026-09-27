@@ -1220,6 +1220,43 @@ body {
 .skill-status { min-height: 18px; }
 .skill-status.failure { color: var(--luna-danger); }
 
+/* --- 设置：工作区与模型清单 -------------------------------------------------
+   两页回答同一类问题：这台机器上有什么，以及当前会话在用其中的哪一个。一行一项，
+   当前那个带标记且不再给"用它"的按钮；动作按钮只在有别的选择时出现。 */
+
+.workspace-list,
+.model-list { display: grid; gap: var(--luna-space-2); }
+.workspace-row,
+.model-row { display: grid; gap: var(--luna-space-2); }
+.workspace-head,
+.model-head { display: flex; align-items: center; justify-content: space-between; gap: var(--luna-space-3); }
+.workspace-title,
+.model-title { display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--luna-space-2); min-width: 0; }
+.workspace-name,
+.model-name { color: var(--luna-text); font-size: var(--luna-font-ui); font-weight: 600; }
+.workspace-badge,
+.model-badge {
+  padding: 0 var(--luna-space-2);
+  border: 1px solid var(--luna-border-weak);
+  border-radius: var(--luna-radius-xs);
+  color: var(--luna-text-muted);
+  font-size: var(--luna-font-label);
+  line-height: 18px;
+}
+.workspace-dirs { display: grid; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.workspace-dir { color: var(--luna-text-muted); font: var(--luna-font-meta)/1.6 var(--luna-font-mono); overflow-wrap: anywhere; }
+.workspace-dir-missing { font-style: italic; }
+.model-provider { margin: 0; color: var(--luna-text-muted); font-size: var(--luna-font-meta); }
+.workspace-status,
+.model-switch-status { min-height: 18px; }
+.workspace-status.failure,
+.model-switch-status.failure { color: var(--luna-danger); }
+
+/* 设置里的小标题：一页之内再分一节（例如"这个会话用哪个模型"）。 */
+.settings-pane h4 { margin: var(--luna-space-4) 0 var(--luna-space-2); font-size: var(--luna-font-ui); font-weight: 600; }
+/* 能力的面板入口跟在状态之后，靠右对齐，与能力行的开关形成同一条右边线。 */
+.capability-open { margin-left: auto; }
+
 /* --- 界面插件 ---------------------------------------------------------------
    宿主只负责每个插件一行和挂载容器；插件自己的元素由插件决定，可以引用上面的
    公共控件类与 --luna-* 变量跟随主题。同源运行，样式作用域不等于沙箱。 */

@@ -340,23 +340,27 @@ test('theme rejects invalid preferences and safely follows system when storage f
   }
 });
 
-test('extensions open independently of diagnostics and preserve their subtree across theme and panel changes', async () => {
+test('界面插件 are reached through settings, load once, and keep their subtree across theme changes', async () => {
   const h = navigationHarness({ respond: async (url) => {
     if (url === '/api/ui-plugins') return { ok: true, json: async () => ({ plugins: [
       { name: 'counter', title: '计数器', description: '计数与计时', entry: 'plugin.js' }
     ] }) };
   } });
   await h.settle();
-  assert.ok(h.$('extensions-toggle'), '扩展有独立可见入口');
+  // 扩展不再是页头入口：界面插件是设置里的一个分类，页头只留运行详情。
+  assert.equal(h.$('extensions-toggle'), null, '页头没有独立的扩展入口');
   assert.equal(h.$('runtime-drawer').contains(h.$('ui-plugin-list')), false);
-  assert.equal(h.$('extensions-panel').contains(h.$('ui-plugin-list')), true);
+  assert.equal(h.$('settings-pane-extensions').contains(h.$('ui-plugin-list')), true);
   await h.click('runtime-toggle');
-  assert.equal(h.calls.some(({ url }) => url === '/api/ui-plugins'), false, '诊断不请求界面插件');
-  h.$('extensions-toggle').click();
+  assert.equal(h.calls.some(({ url }) => url === '/api/ui-plugins'), false, '运行详情不请求界面插件');
+  await h.click('runtime-toggle');
+  await h.click('settings-toggle');
+  assert.equal(h.calls.some(({ url }) => url === '/api/ui-plugins'), false, '打开设置本身不请求界面插件，打开那一页才读');
+  await h.click('settings-tab-extensions');
   await h.settle();
   assert.equal(h.$('runtime-drawer').hidden, true);
-  assert.equal(h.$('extensions-panel').hidden, false);
-  assert.equal(h.document.activeElement, h.$('extensions-close'));
+  assert.equal(h.$('settings-pane-extensions').hidden, false);
+  assert.equal(h.calls.filter(({ url }) => url === '/api/ui-plugins').length, 1, '打开这一页读一次');
   const list = h.$('ui-plugin-list');
   const row = list.firstElementChild;
   const stage = row.querySelector('.ui-plugin-stage');
@@ -365,29 +369,20 @@ test('extensions open independently of diagnostics and preserve their subtree ac
   // 挂载容器默认是隐藏的；这里按已启用插件的状态取焦点。
   stage.hidden = false;
   stage.append(content);
-  // 主题更新与面板开关不得触碰插件自行维护的 DOM，也不应重新读清单。
+  // 主题更新不得触碰插件自行维护的 DOM，也不应重新读清单。
   content.focus();
   await h.theme('dark');
   assert.equal(h.document.activeElement, content, '切主题不移动插件内的焦点');
   assert.equal(stage.firstElementChild, content);
   assert.equal(list.firstElementChild, row);
   assert.equal(h.$('theme-select').value, 'dark');
-  // 焦点陷阱覆盖插件自己的控件：从最后一个可聚焦元素回绕到关闭按钮，再回绕回来。
-  h.key('Tab');
-  assert.equal(h.document.activeElement, h.$('extensions-close'));
-  h.key('Tab', true);
-  assert.equal(h.document.activeElement, content);
-  await h.resize(true);
-  assert.equal(h.$('extensions-panel').hidden, false);
-  h.key('Escape');
-  assert.equal(h.document.activeElement, h.$('extensions-toggle'));
-  assert.equal(h.document.querySelector('.app-shell').inert, false);
-  await h.click('extensions-toggle');
-  assert.equal(stage.firstElementChild, content);
+  // 切走再回来只重画这一页自己的行，不重新请求，也不重建插件子树。
+  await h.click('settings-tab-appearance');
+  assert.equal(h.$('settings-pane-extensions').hidden, true);
+  await h.click('settings-tab-extensions');
+  await h.settle();
   assert.equal(h.calls.filter(({ url }) => url === '/api/ui-plugins').length, 1);
-  await h.click('runtime-backdrop');
-  assert.equal(h.$('extensions-panel').hidden, true);
-  assert.equal(h.document.activeElement, h.$('extensions-toggle'));
+  assert.equal(stage.firstElementChild, content);
 });
 
 test('a contributed panel routes independently of diagnostics and restores focus', async () => {
@@ -553,7 +548,8 @@ test('settings is one modal with its own category navigation and panes', async (
   assert.equal(h.$('settings-tab-appearance').tabIndex, -1, '未选中的分类不参与 Tab');
   h.$('settings-tab-model').focus();
   h.$('settings-panel').emit('keydown', { key: 'ArrowDown', preventDefault() {} });
-  assert.equal(h.document.activeElement, h.$('settings-tab-appearance'), '方向键在分类之间循环');
+  // 分类顺序就是导航里的顺序：模型服务之后是能力。
+  assert.equal(h.document.activeElement, h.$('settings-tab-capabilities'), '方向键在分类之间移动');
   // 模态自身占满视口，点对话框外的空白关闭。
   h.$('settings-panel').emit('click', { target: h.$('settings-panel') });
   assert.equal(h.$('settings-panel').hidden, true);
@@ -856,9 +852,9 @@ test('an enabled capability contributes a header entry and a panel container', a
   assert.ok(drawer.querySelector('.drawer-header'), '面板复用宿主的抽屉头部');
   assert.ok(drawer.querySelector('.drawer-body'), '面板复用宿主的抽屉主体');
 
-  // 入口插在扩展之前：页头顺序就是能力被声明的顺序。
+  // 入口插在运行详情之前：页头顺序就是能力被声明的顺序。
   const siblings = entry.parentElement.children;
-  assert.equal(siblings.indexOf(entry) + 1, siblings.indexOf(h.$('extensions-toggle')));
+  assert.equal(siblings.indexOf(entry) + 1, siblings.indexOf(h.$('runtime-toggle')));
 
   // 状态轮询是幂等的：入口与容器不重建，打开中的面板不被重置。
   await h.poll();
@@ -2335,16 +2331,20 @@ test('the host interface handed to a plugin is narrow and frozen', () => {
   assert.equal(uiPluginHostAPI(undefined).version, '');
 });
 
-test('the extensions panel carries a 界面插件 section and imports a plugin only on a click', () => {
+test('界面插件 are a settings pane that imports a plugin only on a click', () => {
   const html = source('index.html');
   const js = source('app.js');
-  assert.match(html, /<section class="drawer-section" aria-labelledby="ui-plugins-title">/);
+  assert.match(html, /<section id="settings-pane-extensions" class="settings-pane"[^>]*>/);
   assert.match(html, /<h3 id="ui-plugins-title">界面插件<\/h3>/);
   assert.match(html, /<ul id="ui-plugin-list" class="ui-plugin-list"><\/ul>/, 'the list is filled from the server, not from markup');
   assert.match(html, /id="ui-plugins-empty"[^>]*hidden[^>]*>暂未读到界面插件。/);
   assert.match(html, /id="ui-plugins-status"[^>]*role="status"/);
   assert.match(html, /刷新后回到停用/);
   assert.match(html, /id="ui-plugins-retry"[^>]*hidden[^>]*>重新读取插件列表<\/button>/);
+  // 页头不再有独立的扩展开关：界面插件与诊断都是设置里的分类。
+  assert.equal(html.includes('id="extensions-toggle"'), false, '扩展不再是页头入口');
+  assert.equal(html.includes('id="extensions-panel"'), false, '扩展面板不再是独立的页头面板');
+  assert.match(js, /loadSettingsPane\(item\.dataset\.pane\)/, '每一页在被打开时才读它自己的数据');
 
   // The dynamic import is a runtime call inside the enable path and never a
   // top-level statement: this file is loaded by Node under node --test.
@@ -3273,4 +3273,100 @@ test('a malformed table entry is dropped rather than rendered', () => {
   assert.deepStrictEqual(commandCandidates(undefined, '/x').items, []);
   const withJunkOptions = [{ name: 'x', args: 'options', options: [null, { value: '' }, { value: 'y' }] }];
   assert.deepStrictEqual(commandCandidates(withJunkOptions, '/x ').items.map((item) => item.value), ['y']);
+});
+
+test('设置里的工作区一页列出工作区、标出当前会话用的那个，并把会话绑到另一个', async () => {
+  const h = navigationHarness({ hash: '#session=aaaaaaaa', respond: async (url) => {
+    if (url === '/api/sessions/aaaaaaaa') {
+      return { ok: true, json: async () => ({ records: [{ type: 'message', role: 'user', text: '已保存的消息' }], workspace: { id: 'ws-two', name: '两个目录', dirs: ['/a', '/b'] } }) };
+    }
+    if (url === '/api/workspaces') {
+      return { ok: true, json: async () => ({ workspaces: [
+        { id: 'ws-one', name: 'luna-agent', dirs: ['/home/j/probe/luna-agent'] },
+        { id: 'ws-two', name: '两个目录', dirs: ['/a', '/b'] }
+      ] }) };
+    }
+    if (url === '/api/sessions/aaaaaaaa/workspace') {
+      return { ok: true, json: async () => ({ session_id: 'aaaaaaaa', workspace: { id: 'ws-one', name: 'luna-agent', dirs: ['/home/j/probe/luna-agent'] } }) };
+    }
+  } });
+  await h.settle();
+  await h.click('settings-toggle');
+  assert.equal(h.calls.some(({ url }) => url === '/api/workspaces'), false, '打开设置本身不读工作区');
+  await h.click('settings-tab-workspace');
+  await h.settle();
+  assert.equal(h.calls.filter(({ url }) => url === '/api/workspaces').length, 1, '打开这一页读一次');
+  const rows = h.$('workspace-list').children;
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].querySelector('.workspace-name').textContent, 'luna-agent');
+  assert.equal(rows[0].querySelector('.workspace-dirs').children.length, 1);
+  assert.equal(rows[1].querySelector('.workspace-dirs').children[1].textContent, '/b');
+  // 当前会话用的那个被标出来，而且不再给一个"用它"的按钮。
+  assert.equal(rows[1].querySelector('.workspace-badge').hidden, false);
+  assert.equal(rows[1].querySelector('.workspace-badge').textContent, '这个会话正在用');
+  assert.equal(rows[1].querySelector('.workspace-use').hidden, true);
+  assert.equal(rows[0].querySelector('.workspace-use').hidden, false);
+
+  rows[0].querySelector('.workspace-use').click();
+  await h.settle();
+  const posted = h.calls.filter(({ url }) => url === '/api/sessions/aaaaaaaa/workspace');
+  assert.equal(posted.length, 1, '绑定发一次请求');
+  assert.deepEqual(JSON.parse(posted[0].options.body), { workspace: 'ws-one' });
+  // 重读之后标记跟着服务端的答复走：现在是第一个在用。
+  assert.equal(h.$('workspace-list').children[0].querySelector('.workspace-badge').hidden, false);
+  assert.equal(h.$('workspace-list').children[1].querySelector('.workspace-badge').hidden, true);
+});
+
+test('设置里的模型服务一页列出模型、标出当前这个会话用的，并切换它', async () => {
+  const h = navigationHarness({ hash: '#session=aaaaaaaa', respond: async (url) => {
+    if (url === '/api/models') {
+      return { ok: true, json: async () => ({
+        models: [{ name: 'alpha', provider: 'api.test', default: true }, { name: 'beta', provider: 'api.test' }],
+        current: { name: 'beta', origin: 'session' }
+      }) };
+    }
+    if (url === '/api/sessions/aaaaaaaa/model') {
+      return { ok: true, json: async () => ({ model: 'alpha', origin: 'session' }) };
+    }
+  } });
+  await h.settle();
+  await h.click('settings-toggle');
+  await h.click('settings-tab-model');
+  await h.settle();
+  const rows = h.$('settings-model-list').children;
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].querySelector('.model-name').textContent, 'alpha');
+  assert.equal(rows[0].querySelector('.model-badge').textContent, '配置里的默认');
+  assert.equal(rows[1].querySelector('.model-badge').textContent, '这个会话在用');
+  assert.equal(rows[1].querySelector('.model-use').hidden, true, '当前那个不再给切换按钮');
+  assert.match(h.$('settings-model-status').textContent, /当前：beta（这个会话选的）/);
+
+  rows[0].querySelector('.model-use').click();
+  await h.settle();
+  const posted = h.calls.filter(({ url }) => url === '/api/sessions/aaaaaaaa/model');
+  assert.equal(posted.length, 1);
+  assert.deepEqual(JSON.parse(posted[0].options.body), { model: 'alpha' });
+});
+
+test('运行详情只说这一次运行用什么，开发诊断在设置里', async () => {
+  const h = navigationHarness({ respond: async (url) => {
+    if (url === '/api/state') {
+      return { ok: true, json: async () => ({
+        host_pid: 4242, model: 'fake-model', provider_host: 'provider.test',
+        max_iterations: 64, run_timeout_ms: 900000, busy: false, plugins: [], capabilities: [], events: []
+      }) };
+    }
+  } });
+  await h.settle();
+  await h.click('runtime-toggle');
+  await h.settle();
+  assert.equal(h.$('budgets').textContent, '64 轮模型回合 · 15 分钟', '预算按服务端报出的数字显示，不写死');
+  assert.equal(h.$('runtime-drawer').contains(h.$('candidate')), false, '候选版本不在运行详情里');
+  assert.equal(h.$('runtime-drawer').contains(h.$('events')), false, '生命周期不在运行详情里');
+  assert.equal(h.$('settings-pane-diagnostics').contains(h.$('candidate')), true, '候选版本在设置 → 诊断里');
+  assert.equal(h.$('settings-pane-diagnostics').contains(h.$('plugins')), true, '插件代次在设置 → 诊断里');
+  await h.click('runtime-toggle');
+  await h.click('settings-toggle');
+  await h.click('settings-tab-capabilities');
+  assert.equal(h.$('settings-pane-model').contains(h.$('settings-budgets')), true, '模型服务一页也报同一份预算');
 });

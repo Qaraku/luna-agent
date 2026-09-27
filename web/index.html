@@ -26,11 +26,9 @@
           <span id="conversation-workspace" class="conversation-workspace" hidden></span>
         </div>
         <div class="runtime-actions">
-          <!-- 能力贡献的面板入口由 /api/state 决定，脚本把它们插在扩展之前；
-               宿主在这里不写死任何具体能力。 -->
-          <button id="extensions-toggle" class="icon-button" type="button" aria-expanded="false" aria-controls="extensions-panel" aria-label="扩展" title="扩展">
-            <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="4" y="4" width="9" height="9" rx="2"></rect><rect x="11" y="11" width="9" height="9" rx="2"></rect></svg>
-          </button>
+          <!-- 能力贡献的面板入口由 /api/state 决定，脚本把它们插在运行详情之前；
+               宿主在这里不写死任何具体能力。界面插件与插件代次之类的开发入口
+               不在页头：它们在设置里。 -->
           <button id="runtime-toggle" class="icon-button diagnostic-toggle" type="button" aria-expanded="false" aria-controls="runtime-drawer" aria-label="运行详情" title="运行详情">
             <svg class="ui-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.6"></circle><circle cx="12" cy="12" r="1.6"></circle><circle cx="19" cy="12" r="1.6"></circle></svg>
           </button>
@@ -110,28 +108,9 @@
     <div id="sidebar-resizer" class="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="调整会话栏宽度" tabindex="0"></div>
   </aside>
 
-  <aside id="extensions-panel" class="runtime-drawer extensions-panel" role="dialog" aria-modal="true" aria-labelledby="extensions-title" tabindex="-1" hidden>
-    <header class="drawer-header">
-      <h2 id="extensions-title">扩展</h2>
-      <button id="extensions-close" class="icon-button" type="button" aria-label="关闭扩展">关闭</button>
-    </header>
-    <div class="drawer-body">
-      <section class="drawer-section" aria-labelledby="ui-plugins-title">
-        <div class="section-heading">
-          <h3 id="ui-plugins-title">界面插件</h3>
-          <span>刷新后回到停用</span>
-        </div>
-        <p class="ui-plugin-hint">只启用可信的本地插件。插件与页面同源运行，并非安全沙箱；宿主接口仅提供契约版本和日志，不提供会话 API。</p>
-        <ul id="ui-plugin-list" class="ui-plugin-list"></ul>
-        <p id="ui-plugins-empty" class="plugin-empty" hidden>暂未读到界面插件。</p>
-        <p id="ui-plugins-status" class="ui-plugin-status" role="status" hidden></p>
-        <button id="ui-plugins-retry" class="ui-plugin-retry" type="button" hidden>重新读取插件列表</button>
-      </section>
-    </div>
-  </aside>
-
   <!-- 设置是一个完整模态：自己的分类导航与内容面，内部自己滚动，
-       关闭后回到原来的会话上下文。外观、本机数据与模型服务都在这里。 -->
+       关闭后回到原来的会话上下文。凡是"Luna 有什么、在用什么"的入口都在这里，
+       包括从页头搬下来的界面插件与插件代次诊断。 -->
   <aside id="settings-panel" class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabindex="-1" hidden>
     <div class="settings-dialog">
       <header class="settings-header">
@@ -143,10 +122,12 @@
       <div class="settings-body">
         <nav class="settings-nav" role="tablist" aria-orientation="vertical" aria-label="设置分类">
           <button id="settings-tab-appearance" class="settings-tab" role="tab" type="button" aria-selected="true" aria-controls="settings-pane-appearance" data-pane="settings-pane-appearance" tabindex="0">外观</button>
+          <button id="settings-tab-model" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-model" data-pane="settings-pane-model" tabindex="-1">模型服务</button>
           <button id="settings-tab-capabilities" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-capabilities" data-pane="settings-pane-capabilities" tabindex="-1">能力</button>
           <button id="settings-tab-skills" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-skills" data-pane="settings-pane-skills" tabindex="-1">技能</button>
-          <button id="settings-tab-data" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-data" data-pane="settings-pane-data" tabindex="-1">本机数据</button>
-          <button id="settings-tab-model" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-model" data-pane="settings-pane-model" tabindex="-1">模型服务</button>
+          <button id="settings-tab-workspace" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-workspace" data-pane="settings-pane-workspace" tabindex="-1">工作区</button>
+          <button id="settings-tab-extensions" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-extensions" data-pane="settings-pane-extensions" tabindex="-1">界面扩展</button>
+          <button id="settings-tab-diagnostics" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-diagnostics" data-pane="settings-pane-diagnostics" tabindex="-1">诊断</button>
         </nav>
         <div class="settings-panes">
           <section id="settings-pane-appearance" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-appearance" tabindex="0">
@@ -177,9 +158,61 @@
             <p id="skill-empty" class="luna-muted" hidden>没有发现任何技能。用户级技能放在 $XDG_DATA_HOME/luna/skills（默认 ~/.local/share/luna/skills），每个技能是一个目录、目录里有 SKILL.md；用 -skills-dir 可以再指定一个目录。</p>
             <div><button id="skill-refresh" class="luna-button" type="button">重新读取技能</button></div>
           </section>
-          <section id="settings-pane-data" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-data" tabindex="0" hidden>
-            <h3>本机数据</h3>
-            <p class="luna-muted">会话记录与各能力保存的数据都在本机。能看什么、能改什么由对应能力的面板负责。</p>
+          <section id="settings-pane-workspace" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-workspace" tabindex="0" hidden>
+            <h3>工作区</h3>
+            <p class="luna-muted">工作区是一组目录，会话在其中的目录里读写文件：上下文里的项目规则、文件工具能读到哪里，都由它决定。它不是一个权限边界。</p>
+            <p id="workspace-status" class="luna-status workspace-status" role="status"></p>
+            <ul id="workspace-list" class="luna-list workspace-list"></ul>
+            <p id="workspace-empty" class="luna-muted" hidden>还没有定义任何工作区。</p>
+            <div><button id="workspace-refresh" class="luna-button" type="button">重新读取工作区</button></div>
+          </section>
+          <section id="settings-pane-extensions" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-extensions" tabindex="0" hidden>
+            <div class="section-heading">
+              <h3 id="ui-plugins-title">界面插件</h3>
+              <span>刷新后回到停用</span>
+            </div>
+            <p class="ui-plugin-hint">只启用可信的本地插件。插件与页面同源运行，并非安全沙箱；宿主接口仅提供契约版本和日志，不提供会话 API。</p>
+            <ul id="ui-plugin-list" class="ui-plugin-list"></ul>
+            <p id="ui-plugins-empty" class="plugin-empty" hidden>暂未读到界面插件。</p>
+            <p id="ui-plugins-status" class="ui-plugin-status" role="status" hidden></p>
+            <button id="ui-plugins-retry" class="ui-plugin-retry" type="button" hidden>重新读取插件列表</button>
+          </section>
+          <section id="settings-pane-diagnostics" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-diagnostics" tabindex="0" hidden>
+            <h3>诊断</h3>
+            <p class="luna-muted">这一页是给开发与排查用的：工具插件的代次与进程、候选版本的验证与替换、本进程的生命周期事件。日常使用不需要它，工具插件的替换能力由内核提供，这一页只是它的入口。</p>
+            <dl class="settings-facts">
+              <div><dt>主进程 PID</dt><dd id="host-pid">—</dd></div>
+            </dl>
+            <section class="drawer-section" aria-labelledby="plugins-title">
+              <h3 id="plugins-title">工具插件</h3>
+              <dl id="plugins" class="fact-list"></dl>
+              <p id="plugins-empty" class="plugin-empty" hidden>暂未读到工具插件。</p>
+            </section>
+            <section class="drawer-section" aria-labelledby="reload-title">
+              <h3 id="reload-title">替换候选版本</h3>
+              <form id="reload-form" class="reload-form">
+                <div class="reload-controls">
+                  <select id="candidate" class="luna-input" aria-label="候选版本">
+                    <option value="v1">稳定版本 v1</option>
+                    <option value="v2">候选版本 v2</option>
+                    <option value="broken">故障演练 broken</option>
+                  </select>
+                  <button id="reload" class="luna-button" type="submit">验证并启用</button>
+                </div>
+              </form>
+              <p id="reload-status" class="reload-status" role="status"></p>
+              <details id="reload-technical" class="technical-detail" hidden>
+                <summary>技术详情</summary>
+                <pre id="reload-error"></pre>
+              </details>
+            </section>
+            <section class="drawer-section lifecycle-section">
+              <details class="lifecycle-detail">
+                <summary>生命周期</summary>
+                <ol id="events" class="events"></ol>
+              </details>
+            </section>
+            <p class="luna-muted">会话记录与各能力保存的数据都在本机：能看什么、能改什么由对应能力的面板负责，这一页只说明进程自己发生了什么。</p>
           </section>
           <section id="settings-pane-model" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-model" tabindex="0" hidden>
             <h3>模型服务</h3>
@@ -188,8 +221,14 @@
               <div><dt>模型</dt><dd id="settings-model">—</dd></div>
               <div><dt>提供方</dt><dd id="settings-provider">—</dd></div>
               <div><dt>思考档位</dt><dd id="settings-effort">—</dd></div>
+              <div><dt>运行预算</dt><dd id="settings-budgets">—</dd></div>
             </dl>
             <p id="settings-effort-note" class="luna-muted"></p>
+            <h4>这个会话用哪个模型</h4>
+            <p class="luna-muted">切换只影响这个会话接下来的运行；也可以直接在输入框里用 <code>/model</code>。</p>
+            <p id="settings-model-status" class="luna-status model-switch-status" role="status"></p>
+            <ul id="settings-model-list" class="luna-list model-list"></ul>
+            <p id="settings-model-empty" class="luna-muted" hidden>这台机器上只配置了一个模型。</p>
             <div><button id="settings-runtime" class="luna-button" type="button">查看运行详情</button></div>
           </section>
         </div>
@@ -210,50 +249,16 @@
       <p id="runtime-availability" class="availability" role="status">正在读取本地运行状态…</p>
 
       <section class="drawer-section" aria-labelledby="runtime-section-title">
-        <h3 id="runtime-section-title">运行</h3>
+        <h3 id="runtime-section-title">这次运行</h3>
         <dl class="fact-list">
           <div><dt>模型</dt><dd id="model">—</dd></div>
           <div><dt>提供方</dt><dd id="provider">—</dd></div>
-          <div><dt>主进程 PID</dt><dd id="host-pid">—</dd></div>
+          <div><dt>思考档位</dt><dd id="effort">—</dd></div>
+          <div><dt>运行预算</dt><dd id="budgets">—</dd></div>
           <div><dt>会话状态</dt><dd id="busy">—</dd></div>
           <div><dt>运行中的会话</dt><dd id="current-session">—</dd></div>
         </dl>
-      </section>
-
-      <section class="drawer-section" aria-labelledby="plugins-title">
-        <h3 id="plugins-title">工具插件</h3>
-        <dl id="plugins" class="fact-list"></dl>
-        <p id="plugins-empty" class="plugin-empty" hidden>暂未读到工具插件。</p>
-      </section>
-
-      <section class="drawer-section" aria-labelledby="reload-title">
-        <div class="section-heading">
-          <h3 id="reload-title">高级：重新载入</h3>
-          <span>验证后切换</span>
-        </div>
-        <form id="reload-form" class="reload-form">
-          <label for="candidate">候选版本</label>
-          <div class="reload-controls">
-            <select id="candidate" class="luna-input">
-              <option value="v1">稳定版本 v1</option>
-              <option value="v2">候选版本 v2</option>
-              <option value="broken">故障演练 broken</option>
-            </select>
-            <button id="reload" class="luna-button" type="submit">验证并启用</button>
-          </div>
-        </form>
-        <p id="reload-status" class="reload-status" role="status"></p>
-        <details id="reload-technical" class="technical-detail" hidden>
-          <summary>技术详情</summary>
-          <pre id="reload-error"></pre>
-        </details>
-      </section>
-
-      <section class="drawer-section lifecycle-section">
-        <details class="lifecycle-detail">
-          <summary>生命周期</summary>
-          <ol id="events" class="events"></ol>
-        </details>
+        <p class="luna-muted">这里只说这一次运行用什么、还有多少余地。工具插件与候选版本的诊断在设置 → 诊断。</p>
       </section>
     </div>
   </aside>
