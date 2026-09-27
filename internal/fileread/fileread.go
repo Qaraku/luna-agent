@@ -1,5 +1,5 @@
-// Package fileread owns what "reading a file", "listing a directory" and
-// "searching for text" mean in Luna.
+// Package fileread owns what "reading a file", "listing a directory",
+// "searching for text" and "finding an entry by name" mean in Luna.
 //
 // The two halves are deliberately split across the host/plugin boundary:
 //
@@ -8,20 +8,22 @@
 //     reject absolute paths and `..` escapes, resolve symbolic links, and refuse
 //     anything that does not end up inside the read root — Resolve the regular
 //     file to read, ResolveDir the directory to list, ResolveSearch the file or
-//     directory to search. All three share the same resolution and containment
-//     code, so the boundary has one implementation whatever the tool does with
-//     the path. The host then hands the plugin the already-resolved absolute
-//     path.
-//   - Read, List and Search run on the plugin side and never interpret a path.
-//     They receive the validated path plus the caps, and all three refuse to
+//     directory to search or to find in. All three share the same resolution and
+//     containment code, so the boundary has one implementation whatever the tool
+//     does with the path. The host then hands the plugin the already-resolved
+//     absolute path.
+//   - Read, List, Search and Find run on the plugin side and never interpret a
+//     path. They receive the validated path plus the caps, and all four refuse to
 //     overstate what they found: Read reads at most one byte past the cap so an
 //     oversize file is refused instead of truncated and refuses binary content,
 //     List renders exactly one level — it never enters a subdirectory and never
 //     follows a symbolic link — and states every cap it hit instead of cutting
-//     the list silently, and Search matches one literal per line, never follows
+//     the list silently, Search matches one literal per line, never follows
 //     a symbolic link, and states every cap it hit — including that its walk
 //     stopped, because a search that stopped cannot say how many matches it did
-//     not find.
+//     not find — and Find matches one glob against one entry name, never enters
+//     a symbolic link, and states every cap it hit, including that its walk
+//     stopped, for the same reason.
 //
 // Error strings never contain an absolute host path: they are model-visible
 // through tool.failed and, for a refusal, as the text of the tool result the

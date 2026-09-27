@@ -25,7 +25,8 @@ import (
 )
 
 const (
-	// ToolName, ReadFileToolName, ListDirToolName and SearchFilesToolName are
+	// ToolName, ReadFileToolName, ListDirToolName, SearchFilesToolName and
+	// FindFilesToolName are
 	// the model-visible names of the plugin-backed tools. The names come from
 	// the plugin host's allowlist, so the core cannot register a tool the host
 	// cannot route or replace.
@@ -33,6 +34,7 @@ const (
 	ReadFileToolName    = pluginhost.ToolReadFile
 	ListDirToolName     = pluginhost.ToolListDir
 	SearchFilesToolName = pluginhost.ToolSearchFiles
+	FindFilesToolName   = pluginhost.ToolFindFiles
 )
 
 // instruction is the whole system instruction the core owns. It states how to
@@ -40,7 +42,7 @@ const (
 // because a capability describes its own tool and contributes its own reference
 // block. Text that would have to change when a capability changes does not
 // belong here.
-const instruction = "You are Luna, a truthful local demo. Use luna_text_transform whenever the user explicitly requests text transformation or explicitly asks to call it; it returns exactly what the active candidate produced, so when the result equals the input, say so plainly instead of guessing that the plugin is broken. Use luna_list_dir to see what a directory contains — when the user asks what is in a directory or in the project, or when you need to discover a path before reading it; the path must be relative to one of the directories this session works in (a single configured root when it works in none), and one call lists one level only: subdirectories are named but not entered, and there is no option to list a whole tree in one call, so walk a repository one directory per call. Use luna_search_files to find where something is written — when you need to locate text, a name or a definition rather than read a file you already know; the query is a literal string and never a pattern, because this tool has no pattern language, so a regular expression is searched as its own characters, and the path says where the search starts, a directory or one file, relative to one of the directories this session works in, which nothing outside may be searched. A search looks below the path you give and is bounded, so it can stop at one of its caps; when it does it states the cap it reached and that the remaining paths were not searched, and you must report that limit rather than describe the whole project as covered. Use luna_read_file when the user asks you to read a file; the path must be relative to one of the directories this session works in, which hold the local text files you may read. A file larger than the read limit cannot be read whole and is refused: read it in parts by giving start_line (counting from 1) and max_lines, and the result states which lines it returned and how many were left, so continue from there rather than claiming you read the file. A tool that refuses a call returns a result that begins \"the tool refused this call:\" followed by the reason: report that reason in the user's own language, and do not retry the same call or describe the tool as unavailable. Do not claim tools or actions that were not observed."
+const instruction = "You are Luna, a truthful local demo. Use luna_text_transform whenever the user explicitly requests text transformation or explicitly asks to call it; it returns exactly what the active candidate produced, so when the result equals the input, say so plainly instead of guessing that the plugin is broken. Use luna_list_dir to see what a directory contains — when the user asks what is in a directory or in the project, or when you need to discover a path before reading it; the path must be relative to one of the directories this session works in (a single configured root when it works in none), and one call lists one level only: subdirectories are named but not entered, and there is no option to list a whole tree in one call, so walk a repository one directory per call. Use luna_search_files to find where something is written — when you need to locate text or a definition rather than read a file you already know; the query is a literal string and never a pattern, because this tool has no pattern language, so a regular expression is searched as its own characters, and the path says where the search starts, a directory or one file, relative to one of the directories this session works in, which nothing outside may be searched. A search looks below the path you give and is bounded, so it can stop at one of its caps; when it does it states the cap it reached and that the remaining paths were not searched, and you must report that limit rather than describe the whole project as covered. Use luna_find_files to find files by name — when the user asks which files or directories are called something, or where a kind of file lives, rather than what is written inside one; the pattern is a glob matched against the whole entry name, so a pattern naming one file matches exactly that file while *_test.go matches every Go test file at any depth, and a plain name is never tested as a substring. A find looks below the path you give and is bounded the same way a search is: it renders a limited list of paths and states the cap it reached, so report that limit rather than describing the whole tree as covered. Use luna_read_file when the user asks you to read a file; the path must be relative to one of the directories this session works in, which hold the local text files you may read. A file larger than the read limit cannot be read whole and is refused: read it in parts by giving start_line (counting from 1) and max_lines, and the result states which lines it returned and how many were left, so continue from there rather than claiming you read the file. A tool that refuses a call returns a result that begins \"the tool refused this call:\" followed by the reason: report that reason in the user's own language, and do not retry the same call or describe the tool as unavailable. Do not claim tools or actions that were not observed."
 
 type Event struct {
 	Type string `json:"type"`
@@ -351,10 +353,21 @@ type FileSearcher interface {
 	SearchFiles(context.Context, pluginhost.SearchRequest) (pluginhost.Output, error)
 }
 
+// FileFinder is the host-side half of luna_find_files: one bounded walk that
+// matches a glob against the entry names below a path the host has already
+// validated, of a file or of a directory. It is a second separate interface for
+// the same reason FileSearcher is one: the core registers the find wrapper only
+// for a file capability that serves a find, so it never offers the model a tool
+// whose call would fail for want of a host half.
+type FileFinder interface {
+	FindFiles(context.Context, pluginhost.FindRequest) (pluginhost.Output, error)
+}
+
 // The host the core is assembled with serves every plugin-backed wrapper the
 // core owns. Pinning it here makes a host that stopped serving one a compile
 // error rather than a tool that disappears from the model's set.
 var _ FileSearcher = (*pluginhost.Host)(nil)
+var _ FileFinder = (*pluginhost.Host)(nil)
 
 type TextTransformTool struct{ invoker Invoker }
 
@@ -631,11 +644,87 @@ func searchFilesInfo() *schema.ToolInfo {
 	return &schema.ToolInfo{Name: SearchFilesToolName, Desc: "Search one of the directories this session works in for a literal string, using the active local Luna subprocess plugin. Both arguments are required. path says where the search starts — a directory to search below, or one file — and must be relative to one of the directories this session works in (a single configured root when it works in none), where \".\" means the first of them; an absolute path, a path outside them, or a path that is neither a file nor a directory is refused. query is the literal text to find, matched inside single lines exactly as written: there is no pattern language here, so a regular expression is searched as its own characters and a dot is a dot. A directory is walked below itself in path order, and a symbolic link is never followed, so a search cannot leave them. Each result line is <path>:<line>: <line text>, with <path> relative to the path that was searched. A search is bounded — how many matches are rendered, how long one line may be, how many files are read and how large a file may be all have caps — and when it stops at one it says which cap it reached and that the remaining paths were not searched, so a result that reports a cap has not seen the whole tree; content that is not text is counted rather than searched.", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(searchFilesSchema())}
 }
 
+// FindFilesTool is the model-visible name-search tool. It is the fourth member
+// of the file family: the wrapper refuses a malformed call, the host refuses a
+// path the roots do not hold and a pattern it cannot evaluate, and the plugin
+// walks only what the host resolved, matching a glob against entry names rather
+// than reading any content.
+type FindFilesTool struct{ finder FileFinder }
+
+func NewFindFilesTool(f FileFinder) *FindFilesTool { return &FindFilesTool{finder: f} }
+func (t *FindFilesTool) Info(context.Context) (*schema.ToolInfo, error) {
+	return findFilesInfo(), nil
+}
+
+// findFilesSchema is deliberately two parameters: where to look, and the glob
+// to match against entry names. A depth, a type filter or a content knob would
+// let one call ask a different question than the one the tool answers — which
+// entries are called this — so the schema offers no way to ask for one.
+func findFilesSchema() *jsonschema.Schema {
+	type args struct {
+		Path    string `json:"path" jsonschema_description:"Directory to look below, or one file to look at, relative to one of the directories this session works in; use \".\" for the first of them"`
+		Pattern string `json:"pattern" jsonschema_description:"Glob matched against one entry name and anchored to the whole name: * matches any run of characters, ? matches one character, [abc] matches one character from a set; a dot is a dot, and there is no other pattern syntax"`
+	}
+	r := jsonschema.Reflector{DoNotReference: true, AllowAdditionalProperties: false}
+	s := r.Reflect(args{})
+	s.Required = []string{"path", "pattern"}
+	return s
+}
+
+func (t *FindFilesTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.Option) (string, error) {
+	var raw any
+	if err := json.Unmarshal([]byte(arguments), &raw); err != nil {
+		raw = arguments
+	}
+	startedAt := time.Now()
+	emit(ctx, Event{Type: "tool.started", Data: ToolStarted{RunID: runID(ctx), Name: FindFilesToolName, Arguments: raw}})
+	var in struct {
+		Path    string `json:"path"`
+		Pattern string `json:"pattern"`
+	}
+	err := decodeOne(arguments, &in)
+	if err == nil && in.Path == "" {
+		err = fmt.Errorf("path is required")
+	}
+	if err == nil && in.Pattern == "" {
+		err = fmt.Errorf("pattern is required: a find needs a name to match")
+	}
+	if err != nil {
+		return refuse(ctx, FindFilesToolName, pluginhost.Output{}, err, startedAt)
+	}
+	// As with a read, a listing or a literal search, the requested path is
+	// passed through unchanged: the host resolves and validates it against the
+	// roots of this run before any plugin sees it, and the pattern is validated
+	// there too.
+	out, err := t.finder.FindFiles(ctx, pluginhost.FindRequest{Path: in.Path, Pattern: in.Pattern, Roots: roots(ctx)})
+	if err != nil {
+		if stopped := ctx.Err(); stopped != nil {
+			return stopCall(ctx, FindFilesToolName, stopped, out, startedAt)
+		}
+		return refuse(ctx, FindFilesToolName, out, err, startedAt)
+	}
+	emit(ctx, Event{Type: "tool.finished", Data: ToolFinished{RunID: runID(ctx), Name: FindFilesToolName, Result: out.Result, DurationMS: callDurationMS(startedAt), Generation: out.Generation, Version: out.Version, PluginPID: out.PluginPID}})
+	// Only the rendered paths are model-visible; the serving generation,
+	// version and process identity stay in the event stream for the UI.
+	return out.Result, nil
+}
+
+// findFilesInfo is the exact public schema of the name-search tool. The
+// description states the three things a model gets wrong about a name search:
+// that the pattern is a glob anchored to the whole name rather than a substring
+// or a regular expression, that the path says where to look and is relative to
+// the directories the session works in, and that the result is bounded and
+// names its own limit. It never carries the absolute host path.
+func findFilesInfo() *schema.ToolInfo {
+	return &schema.ToolInfo{Name: FindFilesToolName, Desc: "Find the entries whose name matches a pattern in one of the directories this session works in, using the active local Luna subprocess plugin. Both arguments are required, and this finds names, not text. path says where to look — a directory to look below, or one file to look at — and must be relative to one of the directories this session works in (a single configured root when it works in none), where \".\" means the first of them; an absolute path, a path outside them, or a path that is neither a file nor a directory is refused. pattern is a glob over one entry name, anchored to the whole name rather than tested as a substring, so \"main.go\" matches only main.go, \"*_test.go\" matches every Go test file at every depth and \"main?go\" matches a five-character name; * matches any run of characters, ? matches one character and [abc] matches one character from a set, and nothing else is interpreted, so a dot is a dot and a regular expression is matched as its own characters. Every entry below the path is examined, directories among them; a matched directory is rendered with a trailing slash, so it is not mistaken for a file to read. Each line is <kind> <size> <path>, with <path> relative to the path that was looked at. A symbolic link is named when its own name matches but is never entered, so a find cannot leave the directories this session works in. The find is bounded — how many paths are rendered, how long one line may be and how many entries are examined all have caps — and when it stops at one it says which cap it reached and that the remaining entries were not examined, so a result that reports a cap has not seen the whole tree.", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(findFilesSchema())}
+}
+
 var (
 	_ tool.InvokableTool = (*TextTransformTool)(nil)
 	_ tool.InvokableTool = (*ReadFileTool)(nil)
 	_ tool.InvokableTool = (*ListDirTool)(nil)
 	_ tool.InvokableTool = (*SearchFilesTool)(nil)
+	_ tool.InvokableTool = (*FindFilesTool)(nil)
 )
 
 type Runner struct {
@@ -720,6 +809,12 @@ func (r *Runner) build(m model.ToolCallingChatModel, modelName string) error {
 	// and never a tool whose call would fail for want of a host half.
 	if searcher, ok := r.files.(FileSearcher); ok {
 		tools = append(tools, NewSearchFilesTool(searcher))
+	}
+	// The find wrapper is registered on the same terms: a file capability that
+	// serves a name search gets it, and one that does not is offered no tool
+	// whose call would fail for want of a host half.
+	if finder, ok := r.files.(FileFinder); ok {
+		tools = append(tools, NewFindFilesTool(finder))
 	}
 	for _, contributed := range r.capabilityTools() {
 		tools = append(tools, contributed)

@@ -14,12 +14,16 @@ var Handshake = plugin.HandshakeConfig{ProtocolVersion: 1, MagicCookieKey: "LUNA
 // returned. Path/MaxEntries/
 // MaxLineBytes serve the directory-listing plugin, where Path is the same kind
 // of validated absolute path — a directory — and the two caps bound how much of
-// it one listing renders. Path/Query/MaxMatches/MaxFiles/MaxFileBytes serve the
-// search plugin, where Path is a validated absolute file or directory, Query is
-// the literal to look for, MaxLineBytes bounds one rendered line and the other
-// three bound how many matches are rendered, how many files are read and how
-// large a file may be before it is skipped. A plugin never receives a model- or
-// browser-supplied path in Path.
+// Path/Query/MaxMatches/MaxFiles/MaxFileBytes serve the search plugin, where
+// Path is a validated absolute file or directory, Query is the literal to look
+// for, MaxLineBytes bounds one rendered line and the other three bound how many
+// matches are rendered, how many files are read and how large a file may be
+// before it is skipped. Path/Pattern/MaxPaths/MaxScanned serve the name-search
+// plugin, where Path is a validated absolute file or directory, Pattern is the
+// glob matched against one entry name, MaxLineBytes bounds one rendered line,
+// MaxPaths bounds how many matching paths are rendered and MaxScanned how many
+// entries are examined. A plugin never receives a model- or browser-supplied
+// path in Path.
 type Input struct {
 	Text     string `json:"text"`
 	Path     string `json:"path"`
@@ -55,6 +59,18 @@ type Input struct {
 	MaxMatches   int `json:"max_matches"`
 	MaxFiles     int `json:"max_files"`
 	MaxFileBytes int `json:"max_file_bytes"`
+	// Pattern carries the name pattern of a name search. It is a glob over one
+	// entry name and nothing else — `*`, `?` and character classes are the only
+	// things interpreted — and the plugin passes it to fileread.Find, which
+	// matches it against a name rather than a path.
+	Pattern string `json:"pattern"`
+	// MaxPaths and MaxScanned carry the name-search caps: at most that many
+	// matching paths are rendered, and at most that many directory entries are
+	// examined. A plugin sent no cap falls back to its own default, and it
+	// states the cap that stopped it rather than returning a prefix of the
+	// answer silently.
+	MaxPaths   int `json:"max_paths"`
+	MaxScanned int `json:"max_scanned"`
 	// DelayMS makes a candidate take a known amount of time before it answers.
 	// It exists for the replacement tests, which have to keep one call in flight
 	// while a reload publishes the next generation: without a delay the call is

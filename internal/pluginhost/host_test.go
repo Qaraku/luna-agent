@@ -471,6 +471,11 @@ func TestFileCallsUseTheRootsTheyName(t *testing.T) {
 	if out, err := h.SearchFiles(ctx, SearchRequest{Path: ".", Query: "from a", Roots: []string{a}}); err != nil || !strings.Contains(out.Result, "a.txt") {
 		t.Fatalf("search under root a = %q, err = %v", out.Result, err)
 	}
+	if out, err := h.FindFiles(ctx, FindRequest{Path: ".", Pattern: "*.txt", Roots: []string{a}}); err != nil {
+		t.Fatalf("find under root a: %v", err)
+	} else if !strings.Contains(out.Result, "a.txt") || strings.Contains(out.Result, "b.txt") {
+		t.Fatalf("find under root a = %q, want a.txt and not b.txt", out.Result)
+	}
 
 	// A root that is not named is not reachable, even when another root is.
 	if out, err := h.ReadFile(ctx, ReadRequest{Path: "b.txt", Roots: []string{a}}); !errors.Is(err, fileread.ErrNotFound) {
@@ -490,6 +495,9 @@ func TestFileCallsUseTheRootsTheyName(t *testing.T) {
 	if _, err := h.SearchFiles(ctx, SearchRequest{Path: "../" + filepath.Base(a), Query: "x", Roots: []string{a, b}}); !errors.Is(err, fileread.ErrPathEscape) {
 		t.Fatalf("search through a sibling root err = %v, want ErrPathEscape", err)
 	}
+	if _, err := h.FindFiles(ctx, FindRequest{Path: "../" + filepath.Base(a), Pattern: "*", Roots: []string{a, b}}); !errors.Is(err, fileread.ErrPathEscape) {
+		t.Fatalf("find through a sibling root err = %v, want ErrPathEscape", err)
+	}
 	// An absolute path is refused however many roots are named, including one
 	// that names a file a root really holds.
 	if _, err := h.ReadFile(ctx, ReadRequest{Path: filepath.Join(b, "b.txt"), Roots: []string{a, b}}); !errors.Is(err, fileread.ErrPathAbsolute) {
@@ -505,6 +513,172 @@ func TestFileCallsUseTheRootsTheyName(t *testing.T) {
 	}
 	if _, err := h.ListDir(ctx, ListRequest{Path: "default.txt"}); !errors.Is(err, fileread.ErrNotDir) {
 		t.Fatalf("listing the configured root's file with no roots err = %v, want ErrNotDir", err)
+	}
+}
+
+// findTree builds the tree the name-search tests walk: two test files at
+// different depths, a name that merely starts with another name, and a symbolic
+// link whose target is outside the root.
+func findTree(t *testing.T) (root, outside string) {
+	t.Helper()
+	root = t.TempDir()
+	outside = t.TempDir()
+	for path, content := range map[string]string{
+		"main.go":                 "package main\n",
+		"main.go.bak":             "package main\n",
+		"engine/engine.go":        "package engine\n",
+		"engine/engine_test.go":   "package engine\n",
+		"docs/deep/deep_test.go":  "package deep\n",
+		"docs/deep/deep_bench.go": "package deep\n",
+	} {
+		full := filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(outside, "secret_test.go"), []byte("outside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "secret_test.go"), filepath.Join(root, "link-outside")); err != nil {
+		t.Fatal(err)
+	}
+	return root, outside
+}
+
+// The name-search tool reaches every depth under the root it is given, matches
+// the whole name rather than a substring of it, and is validated on the host
+// side before any RPC — the plugin never sees a path no root holds.
+func TestFindFilesWalksTheRootAndRefusesOnTheHostSide(t *testing.T) {
+	readRoot, outside := findTree(t)
+	h := testHost(t, Options{ReadRoot: readRoot})
+	ctx := context.Background()
+
+	out, err := h.FindFiles(ctx, FindRequest{Path: ".", Pattern: "*_test.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"docs/deep/deep_test.go", "engine/engine_test.go"} {
+		if !strings.Contains(out.Result, want) {
+			t.Fatalf("find did not reach %s:\n%s", want, out.Result)
+		}
+	}
+	if strings.Contains(out.Result, "secret_test.go") || strings.Contains(out.Result, outside) {
+		t.Fatalf("the walk followed a symbolic link out of the root:\n%s", out.Result)
+	}
+	if !strings.Contains(out.Result, "symbolic link") {
+		t.Fatalf("the result does not say a link was left alone:\n%s", out.Result)
+	}
+	if out.Version != "v1" || out.Generation == 0 || out.PluginPID <= 0 {
+		t.Fatalf("metadata lost: %+v", out)
+	}
+
+	// The pattern is anchored to the whole name: a name that merely starts with
+	// another name is not a match, and a matched directory is marked as one.
+	anchored, err := h.FindFiles(ctx, FindRequest{Path: ".", Pattern: "main.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(anchored.Result, "main.go") || strings.Contains(anchored.Result, "main.go.bak") {
+		t.Fatalf("the pattern was not anchored to the whole name:\n%s", anchored.Result)
+	}
+	directory, err := h.FindFiles(ctx, FindRequest{Path: ".", Pattern: "deep"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(directory.Result, "docs/deep/") {
+		t.Fatalf("a matched directory is not marked:\n%s", directory.Result)
+	}
+
+	// A refusal the host makes is a sentinel, and it is made before any plugin
+	// runs: an empty or malformed pattern, a pattern aimed at a path, an
+	// absolute path, an escape, a missing path and a symbolic link as the
+	// starting point.
+	cases := []struct {
+		name    string
+		request FindRequest
+		want    error
+	}{
+		{"empty pattern", FindRequest{Path: ".", Pattern: ""}, fileread.ErrPatternEmpty},
+		{"malformed pattern", FindRequest{Path: ".", Pattern: "["}, fileread.ErrPatternInvalid},
+		{"pattern with a separator", FindRequest{Path: ".", Pattern: "docs/*.go"}, fileread.ErrPatternInvalid},
+		{"absolute path", FindRequest{Path: "/etc", Pattern: "*"}, fileread.ErrPathAbsolute},
+		{"escape", FindRequest{Path: "../" + filepath.Base(outside), Pattern: "*"}, fileread.ErrPathEscape},
+		{"missing path", FindRequest{Path: "absent", Pattern: "*"}, fileread.ErrNotFound},
+		// The host resolves the path before any plugin sees it, so a link is
+		// refused by the containment check rather than by the plugin's own
+		// "a find does not start at a link" rule, which a caller that hands
+		// over an unresolved path still gets.
+		{"symlink start", FindRequest{Path: "link-outside", Pattern: "*"}, fileread.ErrSymlinkEscape},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := h.FindFiles(ctx, tc.request)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("FindFiles(%+v) error = %v, want %v", tc.request, err, tc.want)
+			}
+			if out.Result != "" {
+				t.Fatalf("a refused find returned a result: %q", out.Result)
+			}
+			if strings.Contains(err.Error(), readRoot) || strings.Contains(err.Error(), outside) {
+				t.Fatalf("error leaks an absolute host path: %v", err)
+			}
+		})
+	}
+}
+
+// A find that stopped says so: the path cap bounds how many matches are
+// rendered, and the result states that the rest of the tree was not examined
+// rather than reading as a complete answer.
+func TestFindFilesStatesThePathCapItReached(t *testing.T) {
+	readRoot, _ := findTree(t)
+	h := testHost(t, Options{ReadRoot: readRoot, FindMaxPaths: 1})
+	out, err := h.FindFiles(context.Background(), FindRequest{Path: ".", Pattern: "*_test.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Result, "1 path matches") {
+		t.Fatalf("the cap did not bound the rendered paths:\n%s", out.Result)
+	}
+	if !strings.Contains(out.Result, "stopped") || !strings.Contains(out.Result, "not examined") {
+		t.Fatalf("the result does not state the cap it reached:\n%s", out.Result)
+	}
+}
+
+// A name search survives replacing its candidate, and the replacement is
+// observable in exactly one column: the size unit.
+func TestFindFilesSurvivesReplacementAndV2ChangesOnlyTheSizes(t *testing.T) {
+	readRoot, _ := findTree(t)
+	if err := os.WriteFile(filepath.Join(readRoot, "engine", "large.go"), []byte(strings.Repeat("a", 2048)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := testHost(t, Options{ReadRoot: readRoot})
+	before, err := h.FindFiles(context.Background(), FindRequest{Path: ".", Pattern: "large.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(before.Result, "2.0 KiB") {
+		t.Fatalf("v1 must render a human-readable size:\n%s", before.Result)
+	}
+	if err := h.Reload(context.Background(), "v2"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := h.FindFiles(context.Background(), FindRequest{Path: ".", Pattern: "large.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(after.Result, "2048 B") {
+		t.Fatalf("v2 must render an exact byte count:\n%s", after.Result)
+	}
+	if after.Generation == before.Generation || after.PluginPID == before.PluginPID {
+		t.Fatalf("find replacement did not create a new generation: before=%+v after=%+v", before, after)
+	}
+	for _, result := range []string{before.Result, after.Result} {
+		if !strings.Contains(result, "engine/large.go") {
+			t.Fatalf("the matched path changed with the candidate: %q", result)
+		}
 	}
 }
 

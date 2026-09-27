@@ -43,12 +43,16 @@ type recordingReader struct {
 	listRequests []pluginhost.ListRequest
 	listOut      pluginhost.Output
 	listErr      error
-	// search serves the host-side half of luna_search_files. A value without it
-	// is a file capability that serves reads and listings only, which the core
-	// offers no search tool for.
+	// search serves the host-side half of luna_search_files and find the
+	// host-side half of luna_find_files. A value without one of them is a file
+	// capability the core offers no tool for: it never gets a wrapper whose
+	// call would fail for want of a host half.
 	searchRequests []pluginhost.SearchRequest
 	searchOut      pluginhost.Output
 	searchErr      error
+	findRequests   []pluginhost.FindRequest
+	findOut        pluginhost.Output
+	findErr        error
 }
 
 func (r *recordingReader) ReadFile(_ context.Context, req pluginhost.ReadRequest) (pluginhost.Output, error) {
@@ -66,9 +70,16 @@ func (r *recordingReader) SearchFiles(_ context.Context, req pluginhost.SearchRe
 	return r.searchOut, r.searchErr
 }
 
+func (r *recordingReader) FindFiles(_ context.Context, req pluginhost.FindRequest) (pluginhost.Output, error) {
+	r.findRequests = append(r.findRequests, req)
+	return r.findOut, r.findErr
+}
+
 // readListOnly is a file capability that serves reads and listings and nothing
-// else, so a test can prove the core offers no search tool for it.
-type readListOnly struct{ recordingReader }
+// else, so a test can prove the core offers a file tool only where its host half
+// exists. It deliberately does not embed recordingReader: the embedded methods
+// are exactly what would satisfy the search and find interfaces.
+type readListOnly struct{}
 
 func (readListOnly) ReadFile(context.Context, pluginhost.ReadRequest) (pluginhost.Output, error) {
 	return pluginhost.Output{}, nil
@@ -724,6 +735,167 @@ func TestListDirToolHandsAHostRefusalToTheModel(t *testing.T) {
 	failed := sink.events[1].Data.(ToolFailed)
 	if failed.Name != ListDirToolName || failed.Error == "" {
 		t.Fatalf("failed payload=%+v", failed)
+	}
+}
+
+// The name-search wrapper is the fourth member of the file family: the call is
+// announced, the serving generation stays in the event stream, and only the
+// rendered paths reach the model.
+func TestFindFilesToolEmitsStartedThenFinishedAndHidesIdentityFromTheModel(t *testing.T) {
+	sink := &collectingSink{}
+	ctx := WithRun(context.Background(), "run-1", sink)
+	finder := &recordingReader{findOut: pluginhost.Output{Result: "1 path matches \"*_test.go\" among 3 entries examined:\nfile      24 B  main_test.go\n", Generation: 9, Version: "v1", PluginPID: 77}}
+	got, err := NewFindFilesTool(finder).InvokableRun(ctx, `{"path":".","pattern":"*_test.go"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(got, "1 path matches") || !strings.Contains(got, "main_test.go") {
+		t.Fatalf("model-visible tool output must be the rendered paths, got %q", got)
+	}
+	// The wrapper forwards the raw requested path and pattern; resolving the
+	// one and validating the other is the host's job, never the wrapper's and
+	// never the plugin's.
+	if len(finder.findRequests) != 1 || finder.findRequests[0].Path != "." || finder.findRequests[0].Pattern != "*_test.go" {
+		t.Fatalf("wrapper requests=%+v", finder.findRequests)
+	}
+	for _, leak := range []string{"77", "v1", "Generation", "generation", "PluginPID", "plugin_pid", "PID", "9"} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("model-visible tool output leaked plugin identity %q: %q", leak, got)
+		}
+	}
+	if len(sink.events) != 2 || sink.events[0].Type != "tool.started" || sink.events[1].Type != "tool.finished" {
+		t.Fatalf("event order: %+v", sink.events)
+	}
+	started, ok := sink.events[0].Data.(ToolStarted)
+	if !ok || started.Name != FindFilesToolName {
+		t.Fatalf("started payload: %#v", sink.events[0].Data)
+	}
+	args, ok := started.Arguments.(map[string]any)
+	if !ok || args["path"] != "." || args["pattern"] != "*_test.go" {
+		t.Fatalf("started arguments must carry the requested path and pattern: %#v", started.Arguments)
+	}
+	finished, ok := sink.events[1].Data.(ToolFinished)
+	if !ok || finished.Name != FindFilesToolName {
+		t.Fatalf("finished payload: %#v", sink.events[1].Data)
+	}
+	if finished.Result != finder.findOut.Result || finished.Generation != 9 || finished.Version != "v1" || finished.PluginPID != 77 {
+		t.Fatalf("plugin identity must stay exact in the UI event: %+v", finished)
+	}
+}
+
+func TestFindFilesToolRejectsMalformedArgumentsBeforeTheHost(t *testing.T) {
+	for _, arguments := range []string{`{}`, `{"path":"."}`, `{"path":"","pattern":"*"}`, `{"path":".","pattern":""}`, `{"path":".","pattern":"*"}{"path":"."}`, `{"path":".","pattern":"*","depth":2}`, `{"path":".","pattern":"*","query":"x"}`, `not json`, ``} {
+		sink := &collectingSink{}
+		ctx := WithRun(context.Background(), "run-1", sink)
+		finder := &recordingReader{findOut: pluginhost.Output{Result: "should not be reached"}}
+		got, err := NewFindFilesTool(finder).InvokableRun(ctx, arguments)
+		if err != nil {
+			t.Fatalf("arguments %q became a run error instead of a refusal: %v", arguments, err)
+		}
+		if !strings.HasPrefix(got, refusalPrefix) {
+			t.Fatalf("arguments %q refusal = %q", arguments, got)
+		}
+		if len(finder.findRequests) != 0 {
+			t.Fatalf("arguments %q reached the host: %+v", arguments, finder.findRequests)
+		}
+		if len(sink.events) != 2 || sink.events[0].Type != "tool.started" || sink.events[1].Type != "tool.failed" {
+			t.Fatalf("arguments %q events=%+v", arguments, sink.events)
+		}
+		failed := sink.events[1].Data.(ToolFailed)
+		if failed.Name != FindFilesToolName || failed.Error == "" {
+			t.Fatalf("arguments %q failed payload=%+v", arguments, failed)
+		}
+	}
+}
+
+func TestFindFilesSchemaIsStrictAndOffersNoDepthOrTypeFilter(t *testing.T) {
+	info, err := NewFindFilesTool(&recordingReader{}).Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Name != FindFilesToolName {
+		t.Fatalf("tool name = %q", info.Name)
+	}
+	s, err := info.ParamsOneOf.ToJSONSchema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(s)
+	var raw map[string]any
+	_ = json.Unmarshal(b, &raw)
+	if raw["type"] != "object" || raw["additionalProperties"] != false {
+		t.Fatalf("schema is not strict: %s", b)
+	}
+	req := raw["required"].([]any)
+	if len(req) != 2 || req[0] != "path" || req[1] != "pattern" {
+		t.Fatalf("required mismatch: %s", b)
+	}
+	if props, ok := raw["properties"].(map[string]any); !ok || len(props) != 2 {
+		t.Fatalf("the schema offers more than a path and a pattern: %s", b)
+	}
+}
+
+// A refusal by the host — a path no root holds, or a pattern it cannot
+// evaluate — is handed to the model as the tool's result, so the run continues
+// and the user gets an explanation instead of a failed run. The UI still sees
+// tool.failed with the host's own message.
+func TestFindFilesToolHandsAHostRefusalToTheModel(t *testing.T) {
+	cases := []struct {
+		arguments string
+		err       error
+		mentions  string
+	}{
+		{`{"path":"/etc","pattern":"*"}`, fmt.Errorf("%w: %q", fileread.ErrPathAbsolute, "/etc"), "/etc"},
+		{`{"path":".","pattern":"["}`, fmt.Errorf("%w: %s", fileread.ErrPatternInvalid, "syntax error in pattern"), "not valid"},
+	}
+	for _, c := range cases {
+		sink := &collectingSink{}
+		ctx := WithRun(context.Background(), "run-1", sink)
+		finder := &recordingReader{findErr: c.err}
+		got, err := NewFindFilesTool(finder).InvokableRun(ctx, c.arguments)
+		if err != nil {
+			t.Fatalf("a refused find must not become a run error: %v", err)
+		}
+		if !strings.HasPrefix(got, refusalPrefix) || !strings.Contains(got, c.mentions) {
+			t.Fatalf("model-visible refusal = %q, want it to mention %q", got, c.mentions)
+		}
+		for _, leak := range []string{"Generation", "generation", "PluginPID", "plugin_pid", "v1", "v2"} {
+			if strings.Contains(got, leak) {
+				t.Fatalf("refusal leaked plugin identity %q: %q", leak, got)
+			}
+		}
+		if len(sink.events) != 2 || sink.events[0].Type != "tool.started" || sink.events[1].Type != "tool.failed" {
+			t.Fatalf("events=%+v", sink.events)
+		}
+		failed := sink.events[1].Data.(ToolFailed)
+		if failed.Name != FindFilesToolName || failed.Error == "" {
+			t.Fatalf("failed payload=%+v", failed)
+		}
+	}
+}
+
+// The core offers the model a plugin-backed tool only where the host half it
+// routes to exists: a file capability that serves reads and listings gets no
+// search and no name-search wrapper, because those calls would fail for want of
+// a host half.
+func TestTheCoreOffersNoToolItsHostCannotServe(t *testing.T) {
+	m := &toolListModel{captureModel: captureModel{answer: "ok"}}
+	r, err := NewRunner(context.Background(), m, fakeInvoker{}, readListOnly{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Run(context.Background(), RunRequest{Message: "hi", RunID: "run-1", Sink: &collectingSink{}}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{ToolName, ReadFileToolName, ListDirToolName}
+	got := offeredNames(m)
+	if len(got) != len(want) {
+		t.Fatalf("offered tools = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("offered tools = %v, want %v", got, want)
+		}
 	}
 }
 

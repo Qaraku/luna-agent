@@ -27,6 +27,7 @@ const (
 	ToolReadFile      = "luna_read_file"
 	ToolListDir       = "luna_list_dir"
 	ToolSearchFiles   = "luna_search_files"
+	ToolFindFiles     = "luna_find_files"
 )
 
 // ToolSpec is one allowlisted tool: its model-visible name, the directory under
@@ -56,6 +57,7 @@ var Allowlist = []ToolSpec{
 	{Tool: ToolReadFile, Dir: "read_file", Candidates: []string{"v1", "v2", "broken"}},
 	{Tool: ToolListDir, Dir: "list_dir", Candidates: []string{"v1", "v2", "broken"}},
 	{Tool: ToolSearchFiles, Dir: "search_files", Candidates: []string{"v1", "v2", "broken"}},
+	{Tool: ToolFindFiles, Dir: "find_files", Candidates: []string{"v1", "v2", "broken"}},
 }
 
 // Infrastructure failures mean the tool never ran because its owned plugin
@@ -120,7 +122,8 @@ type Options struct {
 	BuildTimeout time.Duration
 	StartTimeout time.Duration
 	RPCTimeout   time.Duration
-	// ReadRoot bounds luna_read_file, luna_list_dir and luna_search_files. It
+	// ReadRoot bounds luna_read_file, luna_list_dir, luna_search_files and
+	// luna_find_files. It
 	// is the default root: a call that names no roots of its own is checked
 	// against it, and it defaults to the repository root. It is resolved once,
 	// at construction, so the containment check compares real directories
@@ -146,6 +149,15 @@ type Options struct {
 	SearchMaxLineBytes int
 	SearchMaxFiles     int
 	SearchMaxFileBytes int
+	// FindMaxPaths, FindMaxLineBytes and FindMaxScanned are the three name-search
+	// caps: at most this many matching paths are rendered, one rendered line is
+	// at most this many bytes, and at most this many directory entries are
+	// examined. They default to the matching fileread.DefaultFind* values, and
+	// every cap that is reached is stated in the result. The scan cap is larger
+	// than the search's file cap because a name search reads no file content.
+	FindMaxPaths     int
+	FindMaxLineBytes int
+	FindMaxScanned   int
 }
 
 // ReadRequest is a file-read request from the core. Path is the raw,
@@ -202,6 +214,25 @@ type SearchRequest struct {
 	Path  string
 	Query string
 	// Roots are the directories this call may search, on the same terms as
+	// ReadRequest.Roots.
+	Roots []string
+	// DelayMS is an operations and test knob for holding an RPC in flight. It
+	// is never exposed to the model.
+	DelayMS int
+}
+
+// FindRequest is a name-search request from the core. Path is the raw,
+// model-supplied path, on the same terms as ReadRequest, ListRequest and
+// SearchRequest: the host validates it against the roots the call names and the
+// plugin only ever sees the resolved absolute path — of a file or of a
+// directory. Pattern is the raw, model-supplied name pattern, validated here as
+// well. There is deliberately no depth or type filter knob: a find walks below
+// the path it was given, matches every entry name it sees and stops at its
+// caps, and no request can widen that.
+type FindRequest struct {
+	Path    string
+	Pattern string
+	// Roots are the directories this call may find in, on the same terms as
 	// ReadRequest.Roots.
 	Roots []string
 	// DelayMS is an operations and test knob for holding an RPC in flight. It
@@ -268,6 +299,15 @@ func (h *Host) withDefaults() {
 	}
 	if o.SearchMaxFileBytes <= 0 {
 		o.SearchMaxFileBytes = fileread.DefaultSearchFileBytes
+	}
+	if o.FindMaxPaths <= 0 {
+		o.FindMaxPaths = fileread.DefaultFindPaths
+	}
+	if o.FindMaxLineBytes <= 0 {
+		o.FindMaxLineBytes = fileread.DefaultFindLineBytes
+	}
+	if o.FindMaxScanned <= 0 {
+		o.FindMaxScanned = fileread.DefaultFindEntries
 	}
 	if o.ReadRoot == "" {
 		o.ReadRoot = h.root
@@ -531,6 +571,39 @@ func (h *Host) SearchFiles(ctx context.Context, req SearchRequest) (Output, erro
 		return Output{}, err
 	}
 	return h.invoke(ctx, ToolSearchFiles, Input{Path: resolved.Path, Query: req.Query, MaxMatches: h.opts.SearchMaxMatches, MaxLineBytes: h.opts.SearchMaxLineBytes, MaxFiles: h.opts.SearchMaxFiles, MaxFileBytes: h.opts.SearchMaxFileBytes, DelayMS: req.DelayMS})
+}
+
+// FindFiles calls the name-search tool. The requested path is validated here,
+// on the host side, exactly as a read, a listing or a literal search validates
+// one — same normalization, same containment, same symbolic-link resolution,
+// through fileread.ResolveSearchInRoots, which is shared with the literal
+// search because the requirement is the same one: the starting path must be one
+// existing file or one existing directory, and never a symbolic link — and so
+// is the pattern, which is refused here if it is empty, too long, addressed at a
+// path rather than at a name, or not a glob the find can evaluate. The plugin is
+// handed only the resolved absolute path, the pattern and the three caps.
+//
+// A refusal (an absolute path, a `..` escape, a path outside every root,
+// something that exists as neither a file nor a directory, an empty pattern) is
+// therefore made before any RPC, so no plugin process ever sees a path none of
+// the roots holds. Where the find may look afterwards is bounded by the
+// plugin's walk, which follows no symbolic link at all, so it cannot leave a
+// root by another route either.
+func (h *Host) FindFiles(ctx context.Context, req FindRequest) (Output, error) {
+	if len(req.Path) > 4096 {
+		return Output{}, fmt.Errorf("path must not exceed 4096 bytes")
+	}
+	if req.DelayMS < 0 || req.DelayMS > pluginprotocol.MaxDelayMS {
+		return Output{}, fmt.Errorf("delay_ms must be 0..%d", pluginprotocol.MaxDelayMS)
+	}
+	if err := fileread.ValidatePattern(req.Pattern); err != nil {
+		return Output{}, err
+	}
+	resolved, err := fileread.ResolveSearchInRoots(h.readRoots(req.Roots), req.Path)
+	if err != nil {
+		return Output{}, err
+	}
+	return h.invoke(ctx, ToolFindFiles, Input{Path: resolved.Path, Pattern: req.Pattern, MaxPaths: h.opts.FindMaxPaths, MaxLineBytes: h.opts.FindMaxLineBytes, MaxScanned: h.opts.FindMaxScanned, DelayMS: req.DelayMS})
 }
 
 // readRoots is the set of roots one file call is checked against: the roots the

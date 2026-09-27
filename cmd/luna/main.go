@@ -344,7 +344,7 @@ func skillRoots(paths layout.Paths, extra repeatedPath) []skills.Root {
 func run() error {
 	addr := flag.String("addr", "127.0.0.1:0", "literal loopback listen address")
 	rootFlag := flag.String("root", "", "repository root holding web/ and plugins/ (default: auto-detect)")
-	readRoot := flag.String("read-root", "", "directory the file tools (luna_read_file, luna_list_dir, luna_search_files) are bounded to (default: the resolved root)")
+	readRoot := flag.String("read-root", "", "directory the file tools (luna_read_file, luna_list_dir, luna_search_files, luna_find_files) are bounded to (default: the resolved root)")
 	readLimit := flag.Int("read-limit", 0, "single-read cap in bytes for luna_read_file (default: 262144)")
 	sessionsFlag := flag.String("sessions-dir", "", "directory holding the append-only session files (default: <root>/.runtime/sessions/)")
 	stateFlag := flag.String("state-dir", "", "root directory holding capability state (default: <root>)")
