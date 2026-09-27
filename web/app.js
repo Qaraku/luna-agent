@@ -699,6 +699,36 @@ function sessionTitle(value) {
   return text || '未命名会话';
 }
 
+// A Workspace is the set of directories the current work touches: a session may
+// name one, several, or none. workspaceBadge turns a session's read-only
+// workspace field into the marker shown next to the title, or null when the
+// session is not tied to any workspace — no placeholder is drawn in that case.
+// The label stays one short line whatever the count (it carries the number of
+// directories, not their names), so a workspace with ten directories does not
+// widen the header; the paths are listed one per line in the element's title.
+const WORKSPACE_NAME_MAX_CHARS = 24;
+const WORKSPACE_DIR_MAX_LINES = 6;
+
+function workspaceBadge(workspace) {
+  if (!workspace || typeof workspace !== 'object') return null;
+  const name = typeof workspace.name === 'string' ? workspace.name.trim() : '';
+  const dirs = Array.isArray(workspace.dirs)
+    ? workspace.dirs.filter((dir) => typeof dir === 'string' && dir !== '')
+    : [];
+  if (!name && dirs.length === 0) return null;
+  const shownName = name.length > WORKSPACE_NAME_MAX_CHARS
+    ? `${name.slice(0, WORKSPACE_NAME_MAX_CHARS - 1)}…`
+    : name;
+  const label = [shownName, dirs.length ? `${dirs.length} 个目录` : ''].filter(Boolean).join(' · ');
+  // 绝对路径只在悬停时出现：同一项目的两份检出让路径比目录名更有区分度，
+  // 而这里是用户自己的机器。行数有上限，长清单不会变成一个巨大的提示框。
+  const listed = dirs.slice(0, WORKSPACE_DIR_MAX_LINES);
+  const title = dirs.length > listed.length
+    ? `${listed.join('\n')}\n…还有 ${dirs.length - listed.length} 个目录`
+    : listed.join('\n');
+  return { label, title };
+}
+
 // Timestamps are rendered exactly as the server wrote them (RFC 3339 carrying
 // its own offset) instead of through the browser's timezone, so a stored time
 // is never silently rewritten. A value that cannot be read is shown as missing.
@@ -1245,6 +1275,7 @@ if (typeof module !== 'undefined') {
     parseEventBlock, toolSummary, toolLabel, toolActivityLabel, candidateLabel, reloadCopy, valueOrDash,
     pluginStatusLabel, pluginRows, parseInline, parseMarkdownBlocks,
     isSessionID, parseSessionHash, sessionHash, sessionTitle, sessionTime, relativeTime, runCountLabel,
+    workspaceBadge, WORKSPACE_NAME_MAX_CHARS, WORKSPACE_DIR_MAX_LINES,
     runStatusLabel, sessionRows, argumentsText, toolCallFacts, replaySession, runPayload,
     clipText, toolArgumentsText, toolResultText, formatElapsed, formatDuration, toolFailureKind,
     toolRefusalReason, toolRefusedLabel, toolStateLabel, runPhaseText, runPhaseEntryText, runPhaseVisible,
@@ -3280,8 +3311,28 @@ if (typeof document !== 'undefined') {
     $('conversation-title').setAttribute('title', title);
   }
 
+  // The workspace marker is read from the same session payload that names the
+  // title, so switching sessions recomputes it instead of it being fetched once
+  // at startup. A session with no workspace clears the element: there is no
+  // "not set" placeholder, and no request is made for it.
+  function setConversationWorkspace(workspace) {
+    const badge = workspaceBadge(workspace);
+    const node = $('conversation-workspace');
+    if (!badge) {
+      node.textContent = '';
+      node.removeAttribute('title');
+      node.hidden = true;
+      return;
+    }
+    node.textContent = badge.label;
+    if (badge.title) node.setAttribute('title', badge.title);
+    else node.removeAttribute('title');
+    node.hidden = false;
+  }
+
   function resetConversation() {
     setConversationTitle();
+    setConversationWorkspace(null);
     conversation.replaceChildren();
     sessionNotices.replaceChildren();
     sessionNotices.hidden = true;
@@ -3333,6 +3384,7 @@ if (typeof document !== 'undefined') {
   function renderReplayedSession(detail) {
     const replay = replaySession(detail);
     setConversationTitle(replay.title);
+    setConversationWorkspace(detail ? detail.workspace : null);
     conversation.replaceChildren();
     sessionNotices.replaceChildren();
     for (const notice of replay.notices) sessionNotices.append(make('p', 'session-notice', notice));

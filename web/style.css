@@ -259,6 +259,26 @@ body {
 }
 .runtime-actions { display: flex; align-items: center; gap: var(--luna-space-3); flex: 0 0 auto; }
 
+/* 会话区标题旁的 Workspace 标识：很轻的一行，只说当前会话工作在哪个 Workspace、
+   它包含几个目录。窄屏时它可以被压缩并截断，所以再长的名字也不会顶破页头；
+   没有关联时元素整个不出现，也不占位。 */
+.conversation-workspace {
+  display: inline-block;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0 var(--luna-space-2);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  line-height: var(--luna-control-sm);
+  border: 1px solid var(--luna-border-weak);
+  border-radius: var(--luna-radius-sm);
+  color: var(--luna-text-subtle);
+  font-size: var(--luna-font-meta);
+}
+.conversation-workspace[hidden] { display: none; }
+
 .icon-button {
   position: relative;
   display: inline-grid;

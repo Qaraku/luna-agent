@@ -1885,6 +1885,47 @@ test('a session replays in record order and tool calls attach to their answer', 
   ], 'the session header record carries no conversation');
 });
 
+test('the workspace marker carries the name and the directory count, or nothing', () => {
+  const { workspaceBadge } = require('./app.js');
+  // 没有关联时不产生任何文案：界面因此什么都不画，也不写“未设置”之类的占位。
+  assert.equal(workspaceBadge(null), null);
+  assert.equal(workspaceBadge(undefined), null);
+  assert.equal(workspaceBadge({}), null);
+  assert.equal(workspaceBadge({ id: 'ab12', name: '   ', dirs: [] }), null);
+  assert.equal(workspaceBadge({ name: '', dirs: 'nope' }), null);
+  // 只有名字、没有目录时仍是一行标识，只是不带计数。
+  assert.deepEqual(workspaceBadge({ name: 'luna-agent', dirs: [] }), { label: 'luna-agent', title: '' });
+});
+
+test('multiple directories never widen the marker, and paths live in the title', () => {
+  const { workspaceBadge, WORKSPACE_NAME_MAX_CHARS, WORKSPACE_DIR_MAX_LINES } = require('./app.js');
+  const one = workspaceBadge({ id: 'ab12', name: 'luna-agent', dirs: ['/home/me/luna-agent'] });
+  assert.equal(one.label, 'luna-agent · 1 个目录');
+  assert.equal(one.title, '/home/me/luna-agent', '悬停给出完整路径');
+
+  const two = workspaceBadge({ id: 'ab12', name: 'luna-agent',
+    dirs: ['/home/me/luna-agent', '/home/me/luna-agent-dev'] });
+  assert.equal(two.label, 'luna-agent · 2 个目录', '两个目录和十个目录一样长的一行');
+  assert.equal(two.title, '/home/me/luna-agent\n/home/me/luna-agent-dev');
+
+  const many = workspaceBadge({ name: 'luna-agent',
+    dirs: Array.from({ length: 12 }, (_, index) => `/home/me/checkout-${index}`) });
+  assert.equal(many.label, 'luna-agent · 12 个目录');
+  const lines = many.title.split('\n');
+  assert.equal(lines.length, WORKSPACE_DIR_MAX_LINES + 1, '目录清单有行数上限');
+  assert.equal(lines.at(-1), '…还有 6 个目录');
+  assert.equal(lines.slice(0, WORKSPACE_DIR_MAX_LINES).every((line) => line.startsWith('/home/me/checkout-')), true);
+
+  // 超长名字截断，计数不受影响。
+  const long = workspaceBadge({ name: 'x'.repeat(80), dirs: ['/home/me/a'] });
+  assert.equal(long.label.length, WORKSPACE_NAME_MAX_CHARS + ' · 1 个目录'.length);
+  assert.equal(long.label.endsWith('… · 1 个目录'), true);
+
+  // 目录名缺失而名字还在时，仍是一行可读的标识。
+  assert.deepEqual(workspaceBadge({ name: 'luna-agent', dirs: [] }), { label: 'luna-agent', title: '' });
+  assert.deepEqual(workspaceBadge({ name: '', dirs: ['/home/me/a'] }), { label: '1 个目录', title: '/home/me/a' });
+});
+
 test('replay stays honest for empty, partial, unknown and truncated sessions', () => {
   const { replaySession } = require('./app.js');
   assert.deepEqual(replaySession({ records: [] }), { title: '未命名会话', truncated: false, turns: [], notices: [] });
