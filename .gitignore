@@ -5,3 +5,6 @@
 **/.evidence/
 **/local-evidence/
 **/*.log
+
+# Local-only multi-agent coordination state (handoff, backlog, heartbeat).
+/.hermes/
