@@ -124,7 +124,7 @@ Skills 是**程序性知识**：做某类事的方式。它由内置的 `skills`
 
 ### 插件进程
 
-模型可见的工具来自两处：三个由插件支撑的包装器，由核心按插件宿主的白名单注册、各自作为独立进程运行、各有自己的输入 schema；以及启用中能力贡献的工具。Memory 贡献的 `luna_remember` 属于后者，紧跟其后描述。
+模型可见的工具来自两处：五个由插件支撑的包装器，由核心按插件宿主的白名单注册、各自作为独立进程运行、各有自己的输入 schema；以及启用中能力贡献的工具。Memory 贡献的 `luna_remember` 属于后者，紧跟其后描述。
 
 `luna_text_transform`:
 
@@ -176,17 +176,43 @@ Skills 是**程序性知识**：做某类事的方式。它由内置的 `skills`
 
 列表 schema 刻意只有一个参数：递归深度、通配或过滤器都会把一次列举变成对整个读取根的无界遍历，所以这里没有可以要求它们的入口。
 
+`luna_find_files`:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string",
+      "description": "Directory to look below, or one file to look at, relative to one of the directories this session works in; use \".\" for the first of them"
+    },
+    "pattern": {
+      "type": "string",
+      "description": "Glob matched against one entry name and anchored to the whole name: * matches any run of characters, ? matches one character, [abc] matches one character from a set; a dot is a dot, and there is no other pattern syntax"
+    }
+  },
+  "required": ["path", "pattern"],
+  "additionalProperties": false
+}
+```
+
+名字查找的 schema 也只有两个参数：深度、类型过滤器或内容开关都会把「哪些条目叫这个名字」换成另一个问题，所以这里同样没有入口。
+
 每个实现都是一个真实的 HashiCorp `go-plugin` net/rpc 子进程。它的 RPC 协议是核心/插件边界的私有协议。子进程只接收最小环境（`PATH`、`HOME`、`TMPDIR`，以及存在时的 `GOCACHE`），不接收 provider 的 OpenAI 环境变量。
 
 `luna_read_file` 把它的边界分成两半。`internal/fileread.Resolve` 在宿主上运行，是唯一解释模型提供的路径的地方：它规范化路径、拒绝绝对路径和 `..` 越界、解析符号链接，并拒绝任何不是仍位于读取根目录内的普通文件。随后插件拿到的是已解析的绝对路径加上大小上限，它自己从不解释路径。超过上限（默认 256 KiB，`-read-limit`）的读取和包含 NUL 字节的内容都会被明确报错拒绝，而不是被截断或猜测；**但大文件不是死路**：`start_line`（1 基）与 `max_lines` 读其中一段，**按行扫描而不是先把整文件读进来再切**（后者会把要绕过的上限本身作废），结果明说返回了哪些行、还剩多少行没读，`start_line` 超过末行时拒绝并告知文件行数，错误字符串绝不携带宿主绝对路径。文件不存在时报告为 `file not found: "<the path the model asked for>"`；宿主说明发生了什么，而不说明路径越过了哪个内部边界。**可读范围按会话决定**：会话绑定了 Workspace 时，范围就是那个 Workspace 的目录集合，按顺序尝试、第一个包含该路径的目录胜出；**一个目录里逃出去的路径不会被旁边的兄弟目录救回来**（多根不等于放宽检查，绝对路径与 `..` 越界在任何一根下都仍然被拒）。没有绑定的会话回退到单一读根（默认为解析出的仓库根，`-read-root` 可改），这正是 Workspace 存在之前每个会话的行为。**绑定的 workspace 已经不存在时这次运行直接失败**（`409`，并说明绑的是哪个），而不是回退到配置的根：回退会是一个不同、可能更宽的地方——静默让模型读到比会话要求更多的东西，比说清绑定坏了更糟。上述每一种拒绝都以调用结果的形式到达模型，而不是让运行失败——见 SSE 契约中的 `tool.failed` 条目。
 
 `luna_list_dir` 复用同一套边界，而不是另写一套。`internal/fileread.ResolveDir` 与 `Resolve` 走同一次规范化、同一次越界拒绝和同一次符号链接解析（两者共用的 `resolveWithinRoot`），差别只在解析结果要满足什么：读要求普通文件，列举要求目录。**与读取用的是同一组根**（同一次多根解析，`ResolveDirInRoots` 与 `ResolveInRoots` 共用一套检查），所以列举永远到不了读取到不了的地方；绝对路径、`..` 越界、不存在的路径和不是目录的路径都在任何 RPC 之前被拒绝。插件拿到的是已校验的绝对目录路径与两个上限（条目数默认 200、单行默认 160 字节，两者目前没有对应的命令行开关），自己从不解释路径。列举刻意只有一层：子目录作为条目出现而不进入，一次列举也不会跟随符号链接，因此它不可能长成对整个读取根的无界遍历。每行给出类型（`dir` / `file` / `link` / `other`）、普通文件的大小和名字；目录排在文件与链接之前，各组内按名字保持稳定顺序；命中条目数上限或单行上限时，结果会说明被留下的条目、或被截断的名字及其真实长度，而不是静默返回一个前缀。这些拒绝与读取的一样，以调用结果的形式到达模型，而不是让运行失败。
 
+`luna_find_files` 复用同一套边界，而不另写一套：`internal/fileread.ResolveSearchInRoots` 与字面量搜索共用，因为两者的要求是同一个——起始路径必须是已存在的普通文件或目录，且不能是符号链接（宿主先解析路径，因此一个指向根外的链接由包含性检查拒绝，报 `ErrSymlinkEscape`）。模式在宿主侧先校验：空模式、含 NUL 或换行的模式、**含路径分隔符的模式**（模式匹配的是一个条目名，指向路径的模式永远匹配不到东西）以及任何 `path.Match` 解析不了的模式都在读任何目录之前被拒。插件拿到的是已校验的绝对路径、模式与三个上限（命中路径数默认 100、单行默认 200 字节、考察条目数默认 20000），自己从不解释路径。
+
+**这里的模式是 glob，而字面量搜索的 query 是字面量，这是有意的两套语义**：内容搜索若接受模式，就会把「没找到」变成「回溯到超时」；而名字查找的整个用途就是回答「哪些文件叫这个名字」，`*_test.go` 是这类问题的自然写法，把 `*` 当成普通字符只会让模型收到一个看起来像答案的空结果。于是名字模式用 `path.Match` 的语言（`*`、`?`、`[abc]`，反斜杠转义），**锚定整个条目名**而不是做子串匹配——`main.go` 只匹配那个文件，不会把 `main.go.bak` 一起带出来。查找不读任何文件内容，所以考察条目数的上限比搜索的文件数上限大得多，但它仍然是一个上限：走到任何一个上限时结果会说明触到的是哪一个、以及**剩余条目没有被考察**，而不是把前缀当成整棵树。目录也可被命中，会以尾斜杠渲染，因此命中目录不会被误当成可读文件；符号链接**按它自己的名字报告但绝不进入**（链接名本身是真实条目，进入它才可能离开读取根）。这些拒绝同样以调用结果的形式到达模型，而不是让运行失败。
+
 允许的候选从 `plugins/<tool>/<candidate>/` 编译，全部来自根应用源码：
 
-- `v1`：`luna_text_transform` 去除首尾空白；`luna_read_file` 返回宿主已校验路径的文本；`luna_list_dir` 渲染宿主已校验目录的一层内容，每个条目带类型，普通文件带大小（人类可读单位）；`luna_search_files` 在宿主已校验目录内做字面量匹配，按 `path:line: text` 返回；
-- `v2`：`luna_text_transform` 去除首尾空白、用 Go 字符串处理转大写，并在前面加上 `Luna · `；`luna_read_file` 把 `CRLF` 和单独的 `CR` 规范化为 `LF`；`luna_list_dir` 的边界与 `v1` 相同，只把大小换成精确字节数；`luna_search_files` 的边界与 `v1` 相同，只把每行的前导缩进去掉；
-- `broken`：对四个工具都启动一个无法完成预期握手的程序。
+- `v1`：`luna_text_transform` 去除首尾空白；`luna_read_file` 返回宿主已校验路径的文本；`luna_list_dir` 渲染宿主已校验目录的一层内容，每个条目带类型，普通文件带大小（人类可读单位）；`luna_search_files` 在宿主已校验目录内做字面量匹配，按 `path:line: text` 返回；`luna_find_files` 在宿主已校验文件或目录下按条目名做 glob 匹配（`path.Match` 语言：`*`、`?`、`[abc]`，锚定整个名字，不含路径分隔符），每条命中一行、给出类型、普通文件的大小与相对被查找路径的路径，目录以尾斜杠标记；
+- `v2`：`luna_text_transform` 去除首尾空白、用 Go 字符串处理转大写，并在前面加上 `Luna · `；`luna_read_file` 把 `CRLF` 和单独的 `CR` 规范化为 `LF`；`luna_list_dir` 的边界与 `v1` 相同，只把大小换成精确字节数；`luna_search_files` 的边界与 `v1` 相同，只把每行的前导缩进去掉；`luna_find_files` 的边界与 `v1` 相同，只把大小换成精确字节数；
+- `broken`：对五个工具都启动一个无法完成预期握手的程序。
 
 ### 能力贡献的工具
 
@@ -280,6 +306,7 @@ Eino 的 `ToolsNode` 配置为 `ExecuteSequentially: true`。如果一个模型�
   │                                  ├─ luna_read_file 包装器 ──> 固定的插件 generation，走 net/rpc
   │                                  ├─ luna_list_dir 包装器 ──> 固定的插件 generation，走 net/rpc
   │                                  ├─ luna_search_files 包装器 ──> 固定的插件 generation，走 net/rpc
+  │                                  ├─ luna_find_files 包装器 ──> 固定的插件 generation，走 net/rpc
   │                                  └─ luna_remember（Memory 能力贡献）──> internal/plugins/memory（仅追加 JSONL）
   └─ SSE 事件 <──────── Luna 自有的运行局部事件出口
 
@@ -290,7 +317,7 @@ Eino 的 `ToolsNode` 配置为 `ExecuteSequentially: true`。如果一个模型�
                                      └─ 为全部工具发布一个新 generation，否则一个也不发布
 ```
 
-模型工具选择是自动的。当用户明确要求文本转换或明确要求调用它时，系统指令要求使用 `luna_text_transform`；当用户要求读取文件时，要求使用 `luna_read_file`；当用户想知道某个目录或这个项目里有什么、或在读取前需要先发现路径时，要求使用 `luna_list_dir`，并说明一次调用只列一层、仓库要一层目录一次地走；当用户要找某个名字或某段文字出现在哪里时，要求使用 `luna_search_files`，并说明查询按字面量匹配、不是正则，一次搜索有命中数与扫描范围的上限，触到上限时会被告知还剩多少没搜；当用户要求记住一条持久事实时，说明来自 `luna_remember` 自己的工具描述——系统指令不再点名任何能力；没有任何请求会强制 provider 级的 `tool_choice: required`。含工具调用的回合中模型输出的助手内容会**边产生边作为 `assistant.delta` 发出**，但它绝不进入最终答案：只有无工具调用的回答回合中的助手文本才构成 `run.finished` 里的答案。这一区分由浏览器负责呈现——一段文本之后如果跟着 `tool.started`，它就作为「运行说明」留在运行轨迹里；如果跟着终止事件，它就是答案。之所以不能在运行期判定，是因为一个回合是否是回答只有该回合结束时（`finish_reason`）才知道。
+模型工具选择是自动的。当用户明确要求文本转换或明确要求调用它时，系统指令要求使用 `luna_text_transform`；当用户要求读取文件时，要求使用 `luna_read_file`；当用户想知道某个目录或这个项目里有什么、或在读取前需要先发现路径时，要求使用 `luna_list_dir`，并说明一次调用只列一层、仓库要一层目录一次地走；当用户要找某段文字出现在哪里时，要求使用 `luna_search_files`，并说明查询按字面量匹配、不是正则，一次搜索有命中数与扫描范围的上限，触到上限时会被告知还剩多少没搜；当用户想知道哪些文件或目录叫某个名字时，要求使用 `luna_find_files`，并说明模式是锚定整个条目名的 glob（一个文件名只匹配它自己，`*_test.go` 匹配任意深度的测试文件），结果是一份有上限的路径清单、触到上限时会说明剩余条目没有被考察；当用户要求记住一条持久事实时，说明来自 `luna_remember` 自己的工具描述——系统指令不再点名任何能力；没有任何请求会强制 provider 级的 `tool_choice: required`。含工具调用的回合中模型输出的助手内容会**边产生边作为 `assistant.delta` 发出**，但它绝不进入最终答案：只有无工具调用的回答回合中的助手文本才构成 `run.finished` 里的答案。这一区分由浏览器负责呈现——一段文本之后如果跟着 `tool.started`，它就作为「运行说明」留在运行轨迹里；如果跟着终止事件，它就是答案。之所以不能在运行期判定，是因为一个回合是否是回答只有该回合结束时（`finish_reason`）才知道。
 
 每个回合的模型输入都从磁盘组装，而不是来自进程状态：先是系统指令，然后是按文件顺序排列的会话早前消息，最后是本回合的用户消息。启用中能力贡献的上下文块追加在这条系统消息内部，而不是在消息之后：system 角色保持它的位置，被贡献的文本也无法作为后续消息到达。早前消息由 `internal/agent` 中的两个常量限定——`MaxHistoryMessages = 40` 条消息和 `MaxHistoryBytes = 64 KiB` 的消息文本——策略是确定性的：保留最近的消息，先丢弃最旧的。保留集合是持久化历史的连续后缀，从最新消息向前累积，直到任一上限将被超过，因此消息从不被重排、抽样或跳过，扫描停止点之前的所有内容也一并丢弃。因此对字节上限来说过大的消息会结束历史，而不是被截断。字节上限高于 16,384 字节的 HTTP 消息上限，因此本回合自己的消息总是能放下。一次运行自己的记录被排除在它自己的输入之外，且只有消息文本进入输入：没有任何工具结果或插件身份能通过持久化历史到达模型。本切片没有摘要和检索：历史被回放，记忆被注入，两者都不被搜索、过滤或摘要。
 
@@ -346,7 +373,7 @@ data: <JSON payload>
 - `run.started` —— `{"run_id":"...","session_id":"..."}`；运行被准入到的会话，当本次请求没有提供会话时由本请求创建。下面的终止事件规则不变。
 - `assistant.delta` —— `{"text":"..."}`；文本边产生边发出，包含含工具调用的回合里的文本。哪些文本是答案由终止事件划界，不由这个事件本身声明。
 - `assistant.reasoning` —— `{"text":"..."}`；provider 自愿暴露的推理内容的**流式增量**。它是运行内容而不是回答：**不进入最终答案**，不写入 transcript，也不参与答案对齐。provider 不报告推理时（取决于 provider 与是否 thinking 模式）这个事件根本不出现——运行期不会推断、不会伪造、也不为它留占位。响应只展示这一路真实到达的内容。
-- `tool.started` —— `{"run_id":"...","name":"...","arguments":...}`，其中 `name` 是当前可用的模型可见工具名之一：由子进程支撑的 `luna_text_transform`、`luna_read_file` 与 `luna_list_dir`，以及启用中能力贡献的工具（Memory 的 `luna_remember`）
+- `tool.started` —— `{"run_id":"...","name":"...","arguments":...}`，其中 `name` 是当前可用的模型可见工具名之一：由子进程支撑的 `luna_text_transform`、`luna_read_file`、`luna_list_dir`、`luna_search_files` 与 `luna_find_files`，以及启用中能力贡献的工具（Memory 的 `luna_remember`）
 - `tool.finished` —— `{"run_id":"...","name":"...","result":"...","duration_ms":N,"generation":N,"version":"...","plugin_pid":N}`，用于服务了该调用的子进程工具；对于内置能力贡献的调用（例如 `luna_remember`），这三个身份字段在 JSON 中缺席，而不是被发成 0，因为没有进程服务它
 - `tool.failed` —— 运行/工具身份、一个错误和 `duration_ms`；当有子进程服务了这次尝试时带有 generation/版本/PID，没有时省略。工具就调用本身作出的**拒绝**——被拒绝的路径（读取与列举共用同一套边界检查）、单次读取大小上限、二进制内容、格式错误的参数——同样作为调用结果交给模型，因此运行继续，模型可以向用户解释原因。只有**基础设施**故障才结束整轮：没有活跃插件、终止了插件的 RPC 超时或取消、插件进程已经消失，或内置能力用 `plugin.ErrUnavailable` 标记了“这次调用我服务不了”。插件宿主用哨兵错误标记前者（`pluginhost.ErrUnknownTool`、`ErrNoActivePlugin`、`ErrRPCTimeout`、`ErrRPCCanceled`、`ErrPluginGone`），因此包装器按标记分类，而不是匹配报错文字；插件内部抛出的拒绝以纯文本穿越 `net/rpc`，因此永远不属于其中之一。被拒绝的调用仍然带着错误写入它的 `tool_call` 记录，因此失败的调用在重启后依然存在。运行被停止而中断的调用不是拒绝：它以同样的身份关闭，错误就是停止原因，并且**结束整轮**——模型不会被告知工具拒绝了一个它从未拒绝的调用。
 - `usage.updated` —— `{"run_id":"...","input_tokens":N,"output_tokens":N,"total_tokens":N,"cached_tokens":N?,"reasoning_tokens":N?}`；只在 provider 报告用量时出现。运行期不依赖它，也不会估算它没被告知的 token 数。
@@ -435,6 +462,8 @@ Workspace 数据模型改动由确定性门禁覆盖，并做了一次**不需�
 文件工具范围改动由确定性门禁覆盖，并做了一次**不需要凭据的进程级验证**：建一个含两个目录的 Workspace 并绑定到一个会话，让假 provider 依次要求读 `a.txt`、`b.txt`、`../outside/o.txt`。四项判据：第一个目录里的文件读得到；**第二个目录里的文件也读得到**（多根不是只认第一个）；越界路径被拒（理由是 `path escapes the read root with a .. component`）；**未绑定 Workspace 的会话读同一个相对路径得到 `file not found`**——回退到配置的根，不是读得更多。多根那一层另有缺陷侧验证：把"只检查第一个根"或某处 `..` 检查去掉时，对应用例变红。
 
 文件按行范围读改动由确定性门禁覆盖，并做了一次**不需要凭据的进程级验证**：一个 20000 行 / 740000 字节的文件（远超 256 KiB）放在会话绑定的工作目录里，让假 provider 依次要求整读、读 100-149 行、读 100 行起 5 行、从 20005 行起读。五项判据：整读仍被上限拒（错误里给出实际字节数与上限）；范围读返回那 50 行；**结果明说 `lines 100-149 of 20000` 并说明剩余 19851 行未读**；只读 5 行时**不出现第 6 行**且说明剩余；`start_line` 超界被拒并告知文件有 20000 行。判据全部取自真进程（HTTP → Runner → 宿主 → 子进程插件）的事件流与结果正文。**未验证**：v2 候选在范围读下的 CRLF 规范化只由单测覆盖；"按行扫描"由 `TestReadRangeDoesNotHoldTheWholeFile` 在包内证明（它量的是范围读时不会把整文件读进内存这个可断言的事实），但它不是进程外的内存观测，所以不声称在真实二进制上量过峰值内存。
+
+名字查找改动由确定性门禁覆盖，并做了一次**不需要凭据的进程级验证**：假 provider 扮演"按指令找文件"的模型，在一个含嵌套目录与一条指向树外文件的符号链接的工作目录里，按脚本给定的参数发起 `luna_find_files` 调用。八项判据：**真二进制把 `luna_find_files` 交给了 provider**（请求体里的 `tools` 列表，共七个工具）；`*_test.go` 跨深度命中两个嵌套测试文件；`main.go` **不带出** `main.go.bak`（模式锚定整个名字，不是子串匹配）；树外的 `secret_test.go` 从不出现、且结果说明有一个符号链接没有被进入；链接**自己的名字**仍可按名字命中，命中的是链接本身而不是它指向的目标；坏模式 `[` 与绝对路径 `/etc` 都以 `the tool refused this call: ...` 回到模型（读的是 provider 第二次请求里那条 tool 消息），并且**整轮仍以 `run.finished` 结束**。判据全部取自真进程（HTTP → Runner → 宿主 → 子进程插件）的事件流与请求体，不是界面状态。**未验证**：真实模型自己会不会选对"按名字找"而不是用字面量搜索（系统指令与工具描述都写明了区别，但没有真实 provider 跑过）、以及 `v2` 候选在真实运行里的替换（只由宿主测试与单测覆盖）。
 
 ## 非目标
 
