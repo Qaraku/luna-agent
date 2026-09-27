@@ -102,6 +102,19 @@ func TestEveryAllowlistedToolStartsInItsOwnProcess(t *testing.T) {
 
 func TestRealSubprocessReplacementPinsInflightAndRollsBack(t *testing.T) {
 	h := testHost(t, Options{})
+	// Warm every tool family's candidate builds before the timed section below. A
+	// reload builds a candidate for each tool on the allowlist, and under the gate's
+	// parallel run a cold build can outlast the in-flight window (delay_ms is capped
+	// at 3000), so the call finishes first and the assertion that follows fails for a
+	// reason that has nothing to do with pinning. This test is about pinning a call
+	// to the generation that started it, not about how long a build takes; reloading
+	// to v2 and back leaves the host in the state the rest of the test expects.
+	if err := h.Reload(context.Background(), "v2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Reload(context.Background(), "v1"); err != nil {
+		t.Fatal(err)
+	}
 	first := *active(t, h, ToolTextTransform)
 	if first.Version != "v1" || first.PluginPID == os.Getpid() {
 		t.Fatalf("bad v1 state: %+v", first)
@@ -110,14 +123,10 @@ func TestRealSubprocessReplacementPinsInflightAndRollsBack(t *testing.T) {
 		t.Fatalf("bad reader state: %+v", reader)
 	}
 
-	// Keep the old RPC in flight longer than a reload takes. KNOWN LOAD-SENSITIVE:
-	// a reload builds a candidate for every tool on the allowlist, and the gate runs
-	// packages in parallel, so under load the replacement can still be building when
-	// this window closes - the call then finishes first, nothing is pinned, and the
-	// assertion below fails for a reason that has nothing to do with pinning. The
-	// window cannot simply be widened: delay_ms is capped at 3000 (see the host's
-	// validation), which is what a window sized for two tools was chosen against.
-	// Fixing this properly means a window that does not race a build at all.
+	// Keep the old RPC in flight longer than a reload takes. The reload's builds were
+	// warmed at the top of this test, so this window only has to cover starting a
+	// candidate and shaking hands with it, which is why 3000 (the cap delay_ms
+	// carries) is enough even under the gate's parallel run.
 	const inFlightMS = 3000
 	done := make(chan Output, 1)
 	errs := make(chan error, 1)
