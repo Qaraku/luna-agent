@@ -1008,3 +1008,48 @@ func TestRegistryIsSafeForConcurrentUse(t *testing.T) {
 	}
 	<-done
 }
+
+// Revision advances exactly when the descriptor surface changes: a successful
+// registration, a successful enable or disable. It is what lets an assembler
+// notice that the tool set it built is no longer the current one — so a
+// revision that also moved on a rejected transition, or that did not move on a
+// successful one, would rebuild at the wrong times or not at all.
+func TestRevisionAdvancesOnlyWhenTheListChanges(t *testing.T) {
+	r := NewRegistry(PermissionStateWrite)
+	start := r.Revision()
+
+	if err := r.Register(barePlugin{d: desc("luna", DeploymentBuiltin)}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	registered := r.Revision()
+	if registered == start {
+		t.Fatal("registration must advance the revision")
+	}
+
+	if err := r.Enable("luna"); err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+	enabled := r.Revision()
+	if enabled == registered {
+		t.Fatal("a successful enable must advance the revision")
+	}
+
+	// Rejected transitions change nothing, so they must not look like a change
+	// to anything that watches this number.
+	if err := r.Enable("luna"); err == nil {
+		t.Fatal("enabling an enabled plugin must be rejected")
+	}
+	if err := r.Disable("missing"); err == nil {
+		t.Fatal("disabling an unknown plugin must be rejected")
+	}
+	if got := r.Revision(); got != enabled {
+		t.Fatalf("a rejected transition advanced the revision: %d -> %d", enabled, got)
+	}
+
+	if err := r.Disable("luna"); err != nil {
+		t.Fatalf("Disable: %v", err)
+	}
+	if got := r.Revision(); got == enabled {
+		t.Fatal("a successful disable must advance the revision")
+	}
+}

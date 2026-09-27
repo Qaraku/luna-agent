@@ -315,6 +315,90 @@ func TestADisabledCapabilityContributesNothing(t *testing.T) {
 	}
 }
 
+// A capability toggled while the process runs changes what the model sees on the
+// NEXT run: the tool set is rebuilt from the registry instead of staying frozen
+// at construction. Without this, disabling a capability leaves its tool callable
+// — the capability reads as "off" in the registry, in /api/state and in the
+// browser, while the model can still call it and, for a store-backed capability,
+// still write through it.
+//
+// The three runs are the point: off→on again must come back, so this cannot pass
+// by simply dropping the tool forever.
+func TestTogglingACapabilityChangesTheNextRunsTools(t *testing.T) {
+	capability := &fakeCapability{
+		id:     "notes",
+		tool:   &fakeCapabilityTool{name: "notes_write", result: "written"},
+		blocks: []plugin.ContextBlock{{ID: "notes", Kind: plugin.ContextReference, Text: "Existing notes."}},
+	}
+	reg := plugin.NewRegistry()
+	if err := reg.Register(capability.plugin()); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.Enable("notes"); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &toolListModel{captureModel: captureModel{answer: "ok"}}
+	r, err := NewRunner(context.Background(), m, fakeInvoker{}, &recordingReader{}, WithCapabilities(reg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runOnce := func(runID string) {
+		t.Helper()
+		if _, err := r.Run(context.Background(), RunRequest{Message: "hi", RunID: runID, Sink: &collectingSink{}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	runOnce("run-1")
+	if !offersTool(m, "notes_write") {
+		t.Fatalf("an enabled capability's tool must be offered: %v", offeredNames(m))
+	}
+	if !systemHasText(m, "Existing notes.") {
+		t.Fatal("an enabled capability's context must reach the prompt")
+	}
+
+	// The same Runner instance: this is what a running server holds.
+	if err := reg.Disable("notes"); err != nil {
+		t.Fatal(err)
+	}
+	runOnce("run-2")
+	if offersTool(m, "notes_write") {
+		t.Fatalf("a disabled capability's tool must not be offered after a toggle: %v", offeredNames(m))
+	}
+	if systemHasText(m, "Existing notes.") {
+		t.Fatal("a disabled capability's context must not reach the prompt")
+	}
+
+	if err := reg.Enable("notes"); err != nil {
+		t.Fatal(err)
+	}
+	runOnce("run-3")
+	if !offersTool(m, "notes_write") {
+		t.Fatalf("re-enabling must offer the tool again: %v", offeredNames(m))
+	}
+}
+
+// offersTool reports whether the most recent run offered a tool by name.
+func offersTool(m *toolListModel, name string) bool {
+	for _, offered := range offeredNames(m) {
+		if offered == name {
+			return true
+		}
+	}
+	return false
+}
+
+// systemHasText reports whether the most recent model input's system message
+// contains text.
+func systemHasText(m *toolListModel, text string) bool {
+	inputs := m.all()
+	if len(inputs) == 0 || len(inputs[len(inputs)-1]) == 0 {
+		return false
+	}
+	return strings.Contains(inputs[len(inputs)-1][0].Content, text)
+}
+
 // A capability whose context cannot be read fails the round before the model is
 // asked anything: answering as if nothing were known would be a lie of omission.
 func TestAContextReadFailureFailsTheRunBeforeTheModel(t *testing.T) {

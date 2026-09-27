@@ -603,13 +603,28 @@ var (
 )
 
 type Runner struct {
-	runner     *adk.Runner
 	history    History
 	transcript Transcript
 	// capabilities is the registry of enabled contributions. The runner
 	// assembles their tools and context blocks; it knows nothing about what any
 	// of them means.
 	capabilities *plugin.Registry
+
+	// Everything below is the build recipe. It is kept because the model-visible
+	// tool set is fixed when the agent is constructed, while the capability list
+	// can change at any time (the browser's enable/disable buttons do exactly
+	// that). A runner holding only the built agent would keep offering a
+	// disabled capability's tool — the capability would read as off everywhere
+	// and still be callable, which for a store-backed capability means writing.
+	// So the recipe stays here and the agent is rebuilt when the list it was
+	// built from is no longer current.
+	mu            sync.Mutex
+	buildCtx      context.Context
+	model         model.ToolCallingChatModel
+	invoker       Invoker
+	files         FileTools
+	runner        *adk.Runner
+	builtRevision uint64
 }
 
 // NewRunner builds the agent and its tool set. Every model-visible tool is
@@ -617,26 +632,65 @@ type Runner struct {
 // the runner was handed, and one wrapper per tool contributed by an enabled
 // capability.
 func NewRunner(ctx context.Context, m model.ToolCallingChatModel, invoker Invoker, files FileTools, opts ...Option) (*Runner, error) {
-	r := &Runner{}
+	// buildCtx is the construction context, kept for rebuilds: a rebuild is not
+	// part of any single run, so it must not inherit that run's cancellation.
+	r := &Runner{buildCtx: ctx, model: m, invoker: invoker, files: files}
 	for _, opt := range opts {
 		opt(r)
 	}
-	tools := []tool.BaseTool{NewTextTransformTool(invoker), NewReadFileTool(files), NewListDirTool(files)}
+	if err := r.build(); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// build assembles the model-visible tools and the agent that runs them, from the
+// capability list as it is now, and records which revision that was.
+func (r *Runner) build() error {
+	tools := []tool.BaseTool{NewTextTransformTool(r.invoker), NewReadFileTool(r.files), NewListDirTool(r.files)}
 	// The search wrapper is registered exactly for a file capability that serves
 	// a search: the core offers the model the plugin-backed tools it can route,
 	// and never a tool whose call would fail for want of a host half.
-	if searcher, ok := files.(FileSearcher); ok {
+	if searcher, ok := r.files.(FileSearcher); ok {
 		tools = append(tools, NewSearchFilesTool(searcher))
 	}
 	for _, contributed := range r.capabilityTools() {
 		tools = append(tools, contributed)
 	}
-	a, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{Name: "luna", Description: "Local Luna core preview", Instruction: instruction, GenModelInput: r.modelInputWithCapabilities(), Model: m, ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: tools, ExecuteSequentially: true}}, MaxIterations: 6})
+	a, err := adk.NewChatModelAgent(r.buildCtx, &adk.ChatModelAgentConfig{Name: "luna", Description: "Local Luna core preview", Instruction: instruction, GenModelInput: r.modelInputWithCapabilities(), Model: r.model, ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: tools, ExecuteSequentially: true}}, MaxIterations: 6})
 	if err != nil {
-		return nil, err
+		return err
 	}
-	r.runner = adk.NewRunner(ctx, adk.RunnerConfig{Agent: a, EnableStreaming: true})
-	return r, nil
+	r.runner = adk.NewRunner(r.buildCtx, adk.RunnerConfig{Agent: a, EnableStreaming: true})
+	r.builtRevision = r.currentRevision()
+	return nil
+}
+
+// currentRevision is the capability list's revision, or zero when the runner was
+// built without one (a runner with no capabilities has nothing to rebuild for).
+func (r *Runner) currentRevision() uint64 {
+	if r.capabilities == nil {
+		return 0
+	}
+	return r.capabilities.Revision()
+}
+
+// agentForRun returns the agent a run should use, rebuilding it first when the
+// capability list changed since the agent was built.
+//
+// A run takes the agent it gets here and keeps it to the end: a toggle during a
+// run rebuilds the agent for the NEXT run, so an in-flight run is never switched
+// out from under itself. Rebuilding before the run rather than on the toggle
+// keeps the toggle path free of this package's build errors.
+func (r *Runner) agentForRun() (*adk.Runner, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.capabilities != nil && r.capabilities.Revision() != r.builtRevision {
+		if err := r.build(); err != nil {
+			return nil, fmt.Errorf("rebuild the agent after a capability change: %w", err)
+		}
+	}
+	return r.runner, nil
 }
 
 func NewOpenAIRunner(ctx context.Context, cfg config.Config, invoker Invoker, files FileTools, opts ...Option) (*Runner, error) {
@@ -799,7 +853,14 @@ func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err
 	if err != nil {
 		return "", err
 	}
-	iter := r.runner.Run(ctx, input)
+	// The agent is resolved once per run: a capability toggled since the last
+	// run is rebuilt into this one, and this run keeps the agent it started
+	// with even if the list changes again while it is in flight.
+	agentRunner, err := r.agentForRun()
+	if err != nil {
+		return "", err
+	}
+	iter := agentRunner.Run(ctx, input)
 	var b strings.Builder
 	for {
 		ev, ok := iter.Next()

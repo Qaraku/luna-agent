@@ -62,6 +62,12 @@ type Registry struct {
 	// 直接看到，两个插件不能各贡献一个同名项。上下文贡献的 ID 只在本插件内有意义，
 	// 因此不进这张表。
 	contributions map[contribKey]string
+
+	// revision 在每次"描述符面"变化后自增：登记成功，或启用/停用成功。它存在的理由是
+	// 装配方需要知道自己手上的东西是不是还代表当前清单——模型可见的工具集是构造时定下的，
+	// 只有它知道清单变过，才能重建而不是继续拿着一份过期的工具集。
+	// 只增不减，不因失败回退：一次被拒绝的转换没有改变任何东西，也就没有新的一版。
+	revision uint64
 }
 
 // NewRegistry 建立一个授权表为 grants 的注册表；不传参数表示默认无授权，
@@ -150,6 +156,7 @@ func (r *Registry) Register(p Plugin) error {
 	for k := range shared {
 		r.contributions[k] = d.ID
 	}
+	r.revision++
 	return nil
 }
 
@@ -200,7 +207,16 @@ func (r *Registry) apply(id string, e Event) error {
 	}
 	entry.State = next
 	entry.Err = nil
+	r.revision++
 	return nil
+}
+
+// Revision 报告这份清单被成功改动过多少次。装配方比较两次读到的值，就能判断自己持有的
+// 工具集是否还代表当前清单——启用/停用与登记都会让它前进，被拒绝的转换不会。
+func (r *Registry) Revision() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.revision
 }
 
 // Entry 按 ID 返回副本与是否存在的标记。
