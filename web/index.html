@@ -45,12 +45,20 @@
             <p>从一个问题、一段文字，或一个想法开始。</p>
           </section>
           <div id="session-notices" class="session-notices" hidden></div>
+          <!-- 会话切换时的加载占位：它出现在用户正在看的主区，不在侧栏。
+               它与真实内容在同一帧里换手，所以不会把外壳挤动。 -->
+          <div id="transcript-skeleton" class="transcript-skeleton" aria-hidden="true" hidden>
+            <span></span><span></span><span></span><span></span>
+          </div>
           <div id="conversation" class="conversation"></div>
         </div>
       </div>
 
       <button id="latest" class="latest-button" type="button" hidden>回到最新</button>
       <div id="run-status" class="run-status" role="status" hidden></div>
+      <!-- 会话区域的状态行：与用户正在看的内容同区，且在输入区上方，所以对话滚到
+           哪里都看得见。侧栏那一行只承载它自己的列表故障。 -->
+      <div id="conversation-status" class="conversation-status" role="status" hidden></div>
 
       <div class="composer-shell">
         <div class="content-container composer-inner">

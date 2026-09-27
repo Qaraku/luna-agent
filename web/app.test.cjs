@@ -695,26 +695,31 @@ test('navigation preserves running and switching guards without discarding draft
   assert.equal(h.$('message').value, '发送内容', '准入失败保留原有草稿恢复行为');
 });
 
-test('the session status line is an operation channel, not a log of what already happened', async () => {
+test('the navigation column carries no run state; a new session says so where the user reads', async () => {
   const h = capabilityHarness();
   await h.settle();
-  const status = () => h.$('session-status');
+  const sidebar = () => h.$('session-status').textContent;
+  const main = () => h.$('conversation-status');
 
-  // 新建会话是"现在能做什么"的提示，短暂停留后自己消失，不留常驻文案。
+  // 侧栏的主体是会话导航。新建会话这件事不在那里写一行状态，而是在用户正在看的
+  // 主区短暂停留后自己消失。
   h.$('session-new').click();
-  assert.equal(status().textContent, '新会话：发送第一条消息后开始记录。');
+  assert.equal(sidebar(), '', '侧栏不承载操作反馈');
+  assert.equal(main().textContent, '新会话：发送第一条消息后开始记录。', '瞬时提示出现在主区');
+  assert.equal(main().hidden, false);
   await h.settle();
-  assert.equal(status().textContent, '', '瞬时提示自行消失');
-  assert.equal(status().className, 'session-status');
+  assert.equal(main().textContent, '', '瞬时提示自行消失');
+  assert.equal(main().hidden, true, '空的时候不占位置');
 
   // 恢复成功不写确认：会话已经显示出来了，列表、标题和消息就是证据。
   h.location.hash = '#session=aaaaaaaa';
   await h.settle();
-  assert.equal(status().textContent, '', '恢复成功不写“已恢复会话”这类确认');
+  assert.equal(sidebar(), '', '切换会话不在侧栏写"正在恢复/已恢复"');
+  assert.equal(main().textContent, '', '成功也不在主区写确认');
   assert.equal(h.$('conversation').textContent.includes('已保存的消息'), true, '会话真的被恢复了');
 });
 
-test('a failed session read keeps its message in the status line', async () => {
+test('a failed session read states itself in the area the user is looking at', async () => {
   const h = capabilityHarness({ respond: async (url) => {
     if (url === '/api/sessions/aaaaaaaa') {
       return { ok: false, status: 500, json: async () => ({ error: '会话文件读不出来' }) };
@@ -723,13 +728,110 @@ test('a failed session read keeps its message in the status line', async () => {
   await h.settle();
   h.location.hash = '#session=aaaaaaaa';
   await h.settle();
-  assert.equal(h.$('session-status').textContent, '无法读取这个会话：会话文件读不出来');
-  assert.equal(h.$('session-status').className, 'session-status failure');
-  // 一个更早的瞬时提示（"正在恢复会话…"）已经排在待执行队列里；它被取消，不能把
-  // 后来写入的错误抹掉。
+  const main = () => h.$('conversation-status');
+  assert.equal(main().textContent, '无法读取这个会话：会话文件读不出来', '错误出现在主区');
+  assert.equal(main().className, 'conversation-status failure');
+  assert.equal(main().hidden, false);
+  assert.equal(h.$('session-status').textContent, '', '侧栏不承载会话内容的错误');
+  // 错误保留到下一次操作：这里不因定时器自己消失。
   await h.settle();
-  assert.equal(h.$('session-status').textContent, '无法读取这个会话：会话文件读不出来');
+  assert.equal(main().textContent, '无法读取这个会话：会话文件读不出来');
+  assert.equal(h.$('session-status').textContent, '');
+  // 下一次操作（发一条消息）让这一行回到空。
+  h.$('message').value = '换一条会话';
+  h.$('chat-form').emit('submit');
+  await h.settle();
+  assert.equal(main().textContent, '', '下一次操作清掉上一条错误');
+});
+
+test('the sidebar keeps its own read failure and nothing else', async () => {
+  const failing = [true];
+  const h = capabilityHarness({ respond: async (url) => {
+    if (url === '/api/sessions' && failing[0]) {
+      return { ok: false, status: 500, json: async () => ({ error: '列表读不出来' }) };
+    }
+  } });
+  await h.settle();
+  assert.equal(h.$('session-status').textContent, '无法读取会话列表：列表读不出来',
+    '导航列表自己读不到时，错误留在这一列（主体就是它）');
   assert.equal(h.$('session-status').className, 'session-status failure');
+  assert.equal(h.$('conversation-status').textContent, '', '主区不为侧栏的列表故障写一行');
+  failing[0] = false;
+  await h.poll();
+  assert.equal(h.$('session-status').textContent, '', '列表重新读到之后错误不再挂着');
+});
+
+test('the loading state and the session notices live in the conversation area, never in the navigation column', () => {
+  const html = source('index.html');
+  const css = source('style.css');
+  const js = source('app.js');
+  // 会话切换的占位在主区（转录区里），并且默认不占位置。
+  assert.match(html, /id="transcript-skeleton"[^>]*hidden/);
+  const sidebarMarkup = html.slice(html.indexOf('id="session-sidebar"'), html.indexOf('</aside>'));
+  assert.doesNotMatch(sidebarMarkup, /transcript-skeleton/, '加载占位不在侧栏');
+  assert.match(css, /\.transcript-skeleton\s*\{/);
+  assert.match(js, /transcript\.setAttribute\('aria-busy'/, '主区声明自己正在加载');
+
+  // 会话区域的状态行在对话区与输入区之间：和用户正在看的内容同一个区域。
+  assert.match(html, /id="conversation-status"[^>]*role="status"[^>]*hidden/);
+  assert.match(css, /\.conversation-status\s*\{[^}]*max-width:\s*var\(--luna-content-max\)/s);
+  assert.match(css, /\.conversation-status\.failure\s*\{[^}]*color:\s*var\(--luna-danger\)/s);
+
+  // 侧栏状态行只剩这一个用途：它自己的列表读不到。运行状态与确认类文案一个都不写。
+  // 这里断言的是**写入集合**（下面的 deepEqual），不是文件里出现过哪些字：注释里提到
+  // “不再写正在恢复会话”是文档，不是写给用户看的文案，不该被禁。
+  assert.doesNotMatch(js, /\bSESSION_STATUS_LINGER\b/, '侧栏状态行不再有自己消失的瞬时文案');
+  // 只看调用点：定义行 `function setSessionStatus(text, className = '')` 也会被这个正则
+  // 匹配到，但它是声明不是写入。
+  const writes = (js.match(/setSessionStatus\([^)]*\)/g) || [])
+    .filter((write) => !write.includes('className'));
+  // 断言"只允许这两种写入"，不是"恰好出现两条"：同一处清空可以在多个路径上被调用，
+  // 那不是契约的一部分。契约是侧栏永远只承载"列表读到/读不到"，其余一概不写。
+  const allowed = new Set([
+    'setSessionStatus(\'\')',
+    'setSessionStatus(`无法读取会话列表：${error.message}`, \'failure\')'
+  ]);
+  for (const write of writes) {
+    assert.ok(allowed.has(write), `侧栏只允许“列表读到/读不到”两种写入，出现了：${write}`);
+  }
+  assert.ok(writes.includes('setSessionStatus(\'\')')
+    && writes.some((write) => write.includes('无法读取会话列表')),
+    '两种写入都应当存在：读到列表时清空，读不到时报错');
+  assert.match(css, /\.session-status:empty\s*\{\s*display:\s*none/s);
+});
+
+test('switching a session shows the loading state in the conversation area, not in the sidebar', async () => {
+  let release = null;
+  const held = new Promise((resolve) => { release = resolve; });
+  const h = capabilityHarness({ respond: async (url) => {
+    if (url === '/api/sessions/aaaaaaaa') {
+      await held;
+      return { ok: true, json: async () => ({ records: [{ type: 'message', role: 'user', text: '已保存的消息' }] }) };
+    }
+  } });
+  await h.settle();
+  const skeleton = () => h.$('transcript-skeleton');
+
+  // 占位属于主区，默认不占位置。
+  assert.equal(skeleton().hidden, true);
+  assert.equal(h.$('transcript').contains(skeleton()), true, '加载占位在对话记录里');
+  assert.equal(h.$('session-sidebar').contains(skeleton()), false, '加载占位不在侧栏');
+
+  h.location.hash = '#session=aaaaaaaa';
+  await h.settle();
+  assert.equal(h.$('transcript').getAttribute('aria-busy'), 'true', '主区声明自己正在加载');
+  assert.equal(skeleton().hidden, false, '切换期间主区给出真实的加载表现');
+  assert.equal(h.$('conversation').hidden, true, '加载期间不显示上一份内容');
+  assert.equal(h.$('empty-state').hidden, true, '加载期间不显示空状态');
+  assert.equal(h.$('session-status').textContent, '', '侧栏整个切换过程都没有运行状态');
+
+  release();
+  await h.settle();
+  assert.equal(skeleton().hidden, true, '内容到达后占位让位');
+  assert.equal(h.$('transcript').getAttribute('aria-busy'), 'false');
+  assert.equal(h.$('conversation').hidden, false);
+  assert.equal(h.$('conversation').textContent.includes('已保存的消息'), true);
+  assert.equal(h.$('session-status').textContent, '', '加载结束也不在侧栏补一句"已恢复"');
 });
 
 test('an enabled capability contributes a header entry and a panel container', async () => {
@@ -1760,7 +1862,7 @@ test('every session style the script builds a class for exists in the stylesheet
   const css = source('style.css');
   // `.capability-panel-toggle` 不在这里：它是给夹具用的定位钩子，外观全部来自
   // 宿主的 `.icon-button`，不给它单写一条只为占位的规则。
-  const selectors = ['.session-new', '.session-list', '.session-row', '.session-row.is-current', '.session-title', '.session-meta', '.session-empty', '.session-status', '.session-notice', '.turn-note', '.assistant-body.failed', '.capability-panel-target', '.capability-panel-error'];
+  const selectors = ['.session-new', '.session-list', '.session-row', '.session-row.is-current', '.session-title', '.session-meta', '.session-empty', '.session-status', '.conversation-status', '.conversation-status.failure', '.transcript-skeleton', '.session-notice', '.turn-note', '.assistant-body.failed', '.capability-panel-target', '.capability-panel-error'];
   for (const selector of selectors) {
     assert.ok(
       [`${selector} {`, `${selector}:`, `${selector},`, `${selector}.`].some((form) => css.includes(form)),
@@ -2301,7 +2403,7 @@ test('each model leg gets its own reasoning entry behind its continuation phase 
 });
 
 test('a running reasoning entry previews its latest text, a finished one previews its opening', async () => {
-  const { REASONING_PREVIEW_CHARS, RUN_ANSWER_LABEL } = require('./app.js');
+  const { REASONING_PREVIEW_CHARS } = require('./app.js');
   const h = runHarness();
   await h.settle();
   await h.startRun('讲一段很长的推理');
@@ -2321,9 +2423,8 @@ test('a running reasoning entry previews its latest text, a finished one preview
   assert.equal(preview(), `${reasoning.slice(0, REASONING_PREVIEW_CHARS)}…`,
     '已经结束：预览给开头（后面省略），不再是一段看起来被切掉开头的残片');
 
-  // 回答有自己的容器标注：标注挂在容器上，答案文本里一个字都不多。
-  assert.equal(view.body.dataset.label, RUN_ANSWER_LABEL);
-  assert.equal(view.body.textContent, '好。', '标注不是答案文本的一部分');
+  // 回答不在自己的正文里带标注：答案文本就是渲染出来的那些节点。
+  assert.equal(view.body.textContent, '好。', '答案文本里一个字都不多');
   stream.end();
   await h.settle();
 });
@@ -2792,17 +2893,18 @@ test('every run observability style the script builds a class for exists in the 
   // 推理正文同样有界：一次很长的推理不能把回答主体顶出视野。
   assert.match(css, /\.run-reasoning-body\s*\{[^}]*max-height/s);
   assert.match(css, /\.run-reasoning\s*>\s*summary\s*\{[^}]*min-height:\s*var\(--luna-control-sm\)/s, '推理那一行沿用控件高度');
-  // 回答主体是视觉主体：它有自己的容器（raised 表面 + 边框 + 尺度 token 的圆角与
-  // 内边距）、顶上一行标注、比过程条目大一档的字号，并与过程条目之间留出一档更大
-  // 的空白（容器的边框已经划出边界，所以不再另加一条分隔线）。
-  assert.match(css, /\.assistant-body\s*\{[^}]*background:\s*var\(--luna-raised\)/s);
-  assert.match(css, /\.assistant-body\s*\{[^}]*border:\s*1px solid var\(--luna-border\)/s);
-  assert.match(css, /\.assistant-body\s*\{[^}]*border-radius:\s*var\(--luna-radius-lg\)/s);
-  assert.match(css, /\.assistant-body\s*\{[^}]*padding:\s*var\(--luna-space-4\)/s);
-  assert.match(css, /\.assistant-body\s*\{[^}]*font-size:\s*var\(--luna-font-display\)/s, '回答比过程条目大一档');
-  assert.match(css, /\.assistant-body::before\s*\{[^}]*content:\s*attr\(data-label\)/s, '回答的标注来自容器自己的 data-label');
-  assert.match(css, /\.assistant-body\.placeholder::before[^{]*\{[^}]*content:\s*none/s, '还没有答案时不出标注');
-  assert.match(css, /\.run-timeline\s*>\s*\*\s*\+\s*\.assistant-body\s*\{[^}]*margin-top:\s*var\(--luna-space-5\)/s);
+  // 回答不再是"文档阅读器"式的重卡片：没有抬升背景、没有整圈边框、没有卡片圆角、
+  // 没有行首标注，字号与用户消息同档（--luna-font-body）。它仍然是主体，靠的是
+  // 位置（时间线收尾）、整宽、与过程条目之间一档更大的留白，以及一条极轻的左侧线。
+  assert.doesNotMatch(css, /\.assistant-body\s*\{[^}]*background/s, '回答不再加卡片背景');
+  assert.doesNotMatch(css, /\.assistant-body\s*\{[^}]*border-radius/s, '回答不再有卡片圆角');
+  assert.doesNotMatch(css, /\.assistant-body\s*\{[^}]*border:\s*1px/s, '回答不再有整圈边框');
+  assert.match(css, /\.assistant-body\s*\{[^}]*font-size:\s*var\(--luna-font-body\)/s, '回答与用户消息同档字号');
+  assert.match(css, /\.assistant-body\s*\{[^}]*border-left:\s*1px solid var\(--luna-border-weak\)/s, '回答靠一条极轻的左侧线区分');
+  assert.match(css, /\.turn\.user\s+\.turn-content\s*\{[^}]*font-size:\s*var\(--luna-font-body\)/s, '用户消息同为正文档');
+  assert.match(css, /\.assistant-body\s*>\s*p\s*\{[^}]*margin:\s*0 0 var\(--luna-space-4\)/s, '段落间距给正文留出呼吸');
+  assert.equal(/\.assistant-body::?before/.test(css), false, '回答不再有文档式的行首标注');
+  assert.match(css, /\.run-timeline\s*>\s*\*\s*\+\s*\.assistant-body\s*\{[^}]*margin-top:\s*var\(--luna-space-5\)/s, '回答与过程条目之间用留白拉开');
   // 工具卡片有可辨的卡片感：surface 表面 + 弱边框 + 尺度 token 的圆角，和"不加容器
   // 的推理条目"一眼分得开，但文字仍是 12px muted。
   assert.match(css, /\.tool-row\s*\{[^}]*background:\s*var\(--luna-surface\)/s);

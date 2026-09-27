@@ -799,14 +799,13 @@ function runPayload(message, sessionID) {
 const TOOL_TEXT_MAX_CHARS = 1200;
 const TOOL_TEXT_MAX_LINES = 16;
 
-// 内联时间线里那几行标号：阶段行、运行说明、推理条目、回答。
-// 推理条目只在 assistant.reasoning 真的到达时才出现，没有这个事件时界面上不会
-// 出现任何相关文案，也不预留位置。回答那一行的标注挂在答案容器自己的 data-label
-// 上（见 style.css 的 .assistant-body::before），所以答案正文里仍然只有渲染出来
-// 的那些节点，标注不会混进它的文本。
+// 内联时间线里那几行标号：阶段行、运行说明、推理条目。推理条目只在
+// assistant.reasoning 真的到达时才出现，没有这个事件时界面上不会出现任何相关
+// 文案，也不预留位置。回答本身不再有一行文档式的标注：它靠整宽正文、位置（时间线
+// 收尾）和一档更大的留白成为回合的主体（见 style.css 的 .assistant-body），
+// 答案正文里只有真正渲染出来的那些节点。
 const RUN_NOTE_LABEL = '运行说明';
 const RUN_REASONING_LABEL = '推理';
-const RUN_ANSWER_LABEL = '回答';
 const RUN_CANCELLED_COPY = '这次运行被取消了，上面的内容没有写完。';
 
 // 推理默认折叠（回答才是这个回合的主体），折叠时那一行给一段有界的文字做预览。
@@ -1090,7 +1089,7 @@ if (typeof module !== 'undefined') {
     toolRefusalReason, toolRefusedLabel, toolStateLabel, runPhaseText, runPhaseEntryText, runPhaseVisible,
     runOutcomeLabel, runTraceMeta, replayRunState, formatTokenCount, usageText, reasoningPreview,
     TOOL_TEXT_MAX_CHARS, TOOL_TEXT_MAX_LINES, TOOL_REFUSAL_PREFIX,
-    RUN_NOTE_LABEL, RUN_REASONING_LABEL, RUN_ANSWER_LABEL, RUN_CANCELLED_COPY, REASONING_PREVIEW_CHARS,
+    RUN_NOTE_LABEL, RUN_REASONING_LABEL, RUN_CANCELLED_COPY, REASONING_PREVIEW_CHARS,
     uiPluginText, uiPluginNameValid, uiPluginEntrySafe, uiPluginEntryURL, uiPluginRows, uiPluginMissingExports,
     uiPluginErrorDetail, uiPluginImportError, uiPluginMissingExportError, uiPluginMountError, uiPluginUnmountError,
     uiPluginState, uiPluginInitialState, uiPluginTransition, uiPluginEnableFailureEvent, uiPluginDisableEvent,
@@ -1132,6 +1131,7 @@ if (typeof document !== 'undefined') {
   const transcript = $('transcript');
   const conversation = $('conversation');
   const emptyState = $('empty-state');
+  const conversationStatus = $('conversation-status');
   const form = $('chat-form');
   const input = $('message');
   const send = $('send');
@@ -1301,6 +1301,8 @@ if (typeof document !== 'undefined') {
   function addUserTurn(text) {
     const stick = nearBottom();
     if (!currentSessionID) setConversationTitle(text);
+    // 用户做了一次操作：上一次的错误提示不再挂着。
+    setConversationStatus('');
     hideEmptyState();
     conversation.append(userTurnNode(text));
     contentChanged(stick);
@@ -1318,9 +1320,6 @@ if (typeof document !== 'undefined') {
     head.append(make('span', 'assistant-label', 'Luna'), meta);
     const timeline = make('div', 'run-timeline');
     const body = make('div', 'assistant-body placeholder', 'Luna 正在回应…');
-    // 回答有自己的一行标注。标注是容器上的 data-label，由样式用 attr() 取出来，
-    // 所以答案正文里仍然只有渲染出来的节点，标注不会混进它的文本。
-    body.dataset.label = RUN_ANSWER_LABEL;
     timeline.append(body);
     turn.append(head, timeline);
     return { turn, timeline, meta, body };
@@ -2633,27 +2632,54 @@ if (typeof document !== 'undefined') {
 
   // --- 会话侧栏与地址栏 ---------------------------------------------------
 
-  // 状态行只承载两件事：一次操作的短暂反馈，和需要用户处理的错误。
-  // 确认类的事实（"已恢复会话""会话已开始记录"）不写进来——会话列表、标题和
-  // 消息已经说明了它们，再挂一行文字只是内部日志。操作反馈短暂停留后自己
-  // 消失；错误保留到下一次操作。每次写入都先撤掉上一个定时器，所以一个旧的
-  // 反馈不会顺手把后来写入的错误抹掉。
-  const SESSION_STATUS_LINGER = 4000;
-  let sessionStatusTimer = null;
-
+  // 侧栏的主体是会话导航，不是日志。它唯一会写状态的情况是自己的列表读不到——
+  // 那是这一列自身的故障，报在这里才对得上主体。会话切换期间的加载状态与成功后的
+  // 确认文案一律不写进这里：加载表现在主区的占位里（见 setTranscriptBusy），
+  // 而会话内容的读取错误在用户正在看的地方（见 setConversationStatus）。
+  // 错误保留到下一次操作，不会自己消失。
   function setSessionStatus(text, className = '') {
-    if (sessionStatusTimer !== null) {
-      clearTimeout(sessionStatusTimer);
-      sessionStatusTimer = null;
-    }
     sessionStatus.textContent = text;
     sessionStatus.className = `session-status${className ? ` ${className}` : ''}`;
-    if (!text || className === 'failure') return;
-    sessionStatusTimer = setTimeout(() => {
-      sessionStatusTimer = null;
-      sessionStatus.textContent = '';
-      sessionStatus.className = 'session-status';
-    }, SESSION_STATUS_LINGER);
+  }
+
+  // 主区状态行：会话区域里唯一会说话的一行，位置就在输入区上方，所以不论对话
+  // 滚到哪都看得见。它承载两类东西——一次操作后自己消失的瞬时提示，和需要用户
+  // 处理的错误（保留到下一次操作）。每次写入先撤掉上一个定时器，一个旧的瞬时
+  // 提示不会顺手把后来写入的错误抹掉。
+  const CONVERSATION_STATUS_LINGER = 4000;
+  let conversationStatusTimer = null;
+
+  function setConversationStatus(text, failure = false) {
+    if (conversationStatusTimer !== null) {
+      clearTimeout(conversationStatusTimer);
+      conversationStatusTimer = null;
+    }
+    conversationStatus.textContent = text;
+    conversationStatus.className = failure ? 'conversation-status failure' : 'conversation-status';
+    conversationStatus.hidden = !text;
+    if (!text || failure) return;
+    conversationStatusTimer = setTimeout(() => {
+      conversationStatusTimer = null;
+      conversationStatus.textContent = '';
+      conversationStatus.className = 'conversation-status';
+      conversationStatus.hidden = true;
+    }, CONVERSATION_STATUS_LINGER);
+  }
+
+  // 会话切换的加载表现在用户正在看的主区：一段占位骨架 + aria-busy，而不是在
+  // 侧栏追加一句状态文字。占位与真实内容在同一次同步写入里换手（先渲染，再收
+  // 占位），所以浏览器只画一帧，不会出现"占位高度 → 内容高度"的跳动；外壳的
+  // 高度由转录区自己撑开，页头与输入区不参与内容的高度。
+  function setTranscriptBusy(busy) {
+    $('transcript-skeleton').hidden = !busy;
+    transcript.setAttribute('aria-busy', busy ? 'true' : 'false');
+    if (busy) {
+      emptyState.hidden = true;
+      sessionNotices.hidden = true;
+      conversation.hidden = true;
+      return;
+    }
+    conversation.hidden = false;
   }
 
   // 用稳定标识复用列表控件，避免轮询在按下与点击之间替换节点或丢失键盘焦点。
@@ -2717,7 +2743,10 @@ if (typeof document !== 'undefined') {
       const response = await fetch('/api/sessions', { cache: 'no-store' });
       if (!response.ok) throw new Error(await errorMessage(response));
       renderSessions(await response.json());
+      // 读到了：上一次的列表故障不再挂着。
+      setSessionStatus('');
     } catch (error) {
+      // 只有这一列自身的故障写在这里：主体是导航，报错的对象就是它。
       setSessionStatus(`无法读取会话列表：${error.message}`, 'failure');
     }
   }
@@ -2742,6 +2771,8 @@ if (typeof document !== 'undefined') {
     conversation.replaceChildren();
     sessionNotices.replaceChildren();
     sessionNotices.hidden = true;
+    // 上一段会话的错误提示不跟着换到新会话里。
+    setConversationStatus('');
     emptyState.hidden = false;
     latest.hidden = true;
     currentTurn = null;
@@ -2811,21 +2842,27 @@ if (typeof document !== 'undefined') {
   // returns, no session is claimed: the id only becomes current when the server
   // has confirmed it, and a failure states itself instead of showing an empty
   // conversation as if the session were empty.
+  // 等待期间的表现发生在主区：一段占位骨架 + aria-busy。侧栏只做导航，这里既不
+  // 写"正在恢复会话…"，也不在成功时补一句"已恢复"。
   async function loadSession(id) {
     currentSessionID = id;
     rerenderSessions();
     switching = true;
     setSessionControls();
-    setSessionStatus('正在恢复会话…');
+    setTranscriptBusy(true);
     try {
       const response = await fetch(`/api/sessions/${id}`, { cache: 'no-store' });
       if (!response.ok) throw new Error(await errorMessage(response));
-      renderReplayedSession(await response.json());
-      // 成功不再写一条确认：会话已经显示出来了，状态行回到空。
-      setSessionStatus('');
+      const detail = await response.json();
+      // 先画出真实内容，再收走占位：两件事在同一次同步写入里完成，浏览器只画
+      // 一帧，所以没有"占位高度 → 内容高度"的中间帧。
+      renderReplayedSession(detail);
+      setTranscriptBusy(false);
     } catch (error) {
       dropSession();
-      setSessionStatus(`无法读取这个会话：${error.message}`, 'failure');
+      setTranscriptBusy(false);
+      // 错误留在用户正在看的地方：会话内容读不出来是这一片区域的事。
+      setConversationStatus(`无法读取这个会话：${error.message}`, true);
     } finally {
       switching = false;
       setSessionControls();
@@ -2845,7 +2882,7 @@ if (typeof document !== 'undefined') {
     if (running || switching) return;
     if (activePanel === panels.sessions) closeDrawer();
     dropSession();
-    setSessionStatus('新会话：发送第一条消息后开始记录。');
+    setConversationStatus('新会话：发送第一条消息后开始记录。');
   }
 
   function switchSession(id) {
@@ -2864,7 +2901,7 @@ if (typeof document !== 'undefined') {
     currentSessionID = id;
     location.hash = sessionHash(id);
     rerenderSessions();
-    // 会话 id 与标题已经出现在列表里，状态行不再重复一句"已开始记录"。
+    // 会话 id 与标题已经出现在列表里，这里不再重复一句"已开始记录"。
   }
 
   async function applySessionHash() {
@@ -2874,7 +2911,7 @@ if (typeof document !== 'undefined') {
       // to be copied or refreshed into a request that would be rejected.
       if (!id && location.hash.startsWith('#session')) {
         history.replaceState(null, '', `${location.pathname}${location.search}`);
-        setSessionStatus('链接里的会话 id 无法识别，已按新会话开始。', 'failure');
+        setConversationStatus('链接里的会话 id 无法识别，已按新会话开始。', true);
       }
       return;
     }
@@ -2883,12 +2920,12 @@ if (typeof document !== 'undefined') {
       // would draw two sessions into one area. The hash is put back instead.
       const restored = sessionHash(currentSessionID);
       history.replaceState(null, '', restored ? `${location.pathname}${location.search}${restored}` : `${location.pathname}${location.search}`);
-      setSessionStatus('运行中无法切换会话。', 'failure');
+      setConversationStatus('运行中无法切换会话。', true);
       return;
     }
     if (!id) {
       dropSession();
-      setSessionStatus('新会话：发送第一条消息后开始记录。');
+      setConversationStatus('新会话：发送第一条消息后开始记录。');
       return;
     }
     await loadSession(id);

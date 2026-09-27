@@ -304,6 +304,29 @@ body {
 }
 .conversation { display: flex; flex-direction: column; gap: var(--luna-space-5); }
 
+/* 会话切换时的加载表现：几行宽度不等的灰条，读起来是"内容正在到来"。
+   它是主区的东西——加载发生在哪里，反馈就在哪里，不在侧栏追加一行文字。
+   它与真实内容在同一帧里换手（见 app.js 的 setTranscriptBusy），外壳的高度由
+   转录区自己撑开，页头与输入区不参与，所以换内容时不会把布局挤动。 */
+.transcript-skeleton {
+  display: grid;
+  gap: var(--luna-space-3);
+  max-width: var(--luna-content-max);
+}
+.transcript-skeleton > span {
+  height: var(--luna-space-3);
+  border-radius: var(--luna-radius-sm);
+  background: var(--luna-surface);
+  animation: skeleton-pulse 1.6s ease-in-out infinite;
+}
+.transcript-skeleton > span:nth-child(2) { width: 88%; }
+.transcript-skeleton > span:nth-child(3) { width: 96%; }
+.transcript-skeleton > span:nth-child(4) { width: 62%; }
+@keyframes skeleton-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .45; }
+}
+
 .empty-state {
   flex: 1 1 auto;
   display: flex;
@@ -338,6 +361,8 @@ body {
   to { opacity: 1; transform: translateY(0); }
 }
 .turn.user { display: flex; justify-content: flex-end; }
+/* 用户消息与回答共用同一档正文字号（--luna-font-body）：两边是同一套视觉语言，
+   区别来自位置（右对齐）、底色和宽度，不是字号。 */
 .turn.user .turn-content {
   width: fit-content;
   max-width: min(78%, 560px);
@@ -346,7 +371,7 @@ body {
   background: var(--luna-surface);
   color: var(--luna-text);
   font-size: var(--luna-font-body);
-  line-height: 1.7;
+  line-height: 1.75;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -365,37 +390,27 @@ body {
   font-size: var(--luna-font-meta);
   font-weight: 600;
 }
+/* 回答：整宽正文，不是一张卡。没有抬升背景、没有整圈边框、没有大圆角，也没有
+   文档式的行首标注——那些会让一个回合看上去像"聊天组件 + 文档阅读器"两套东西。
+   它仍然是一个回合的主体，靠的是位置（时间线收尾）、整宽、留白（与过程条目之间
+   一档更大的空白）和一条极轻的左侧线；字号与用户消息同档，不靠变大变粗。 */
 .assistant-body {
   margin: 0;
-  padding: var(--luna-space-4);
-  border: 1px solid var(--luna-border);
-  border-radius: var(--luna-radius-lg);
-  background: var(--luna-raised);
+  padding: 0 0 0 var(--luna-space-3);
+  border-left: 1px solid var(--luna-border-weak);
   color: var(--luna-text);
-  font-size: var(--luna-font-display);
-  line-height: 1.7;
+  font-size: var(--luna-font-body);
+  line-height: 1.75;
   overflow-wrap: anywhere;
 }
-/* 回答的标注：文本由脚本放在容器的 data-label 上，这里只负责显示它。标注不是答案
-   正文的一部分——答案自己的文本节点不因为这一行而多出任何字。 */
-.assistant-body::before {
-  content: attr(data-label);
-  display: block;
-  margin-bottom: var(--luna-space-3);
-  color: var(--luna-accent);
-  font-size: var(--luna-font-label);
-  font-weight: 600;
-  letter-spacing: .08em;
-}
-/* 还没有答案时这一格只是"答案会落在这里"，不是一条已经给出的回答：标注不出。 */
-.assistant-body.placeholder::before, .assistant-body.failed::before { content: none; }
 .assistant-body > :first-child { margin-top: 0; }
 .assistant-body > :last-child { margin-bottom: 0; }
-.assistant-body > p { margin: 0 0 var(--luna-space-3); white-space: pre-wrap; }
-.assistant-body > ul, .assistant-body > ol { margin: 0 0 var(--luna-space-3); padding-left: 1.4em; }
+/* 段落间距是正文的呼吸：一档（12px）在 26px 行距下太紧，长回答读起来会像密排。 */
+.assistant-body > p { margin: 0 0 var(--luna-space-4); white-space: pre-wrap; }
+.assistant-body > ul, .assistant-body > ol { margin: 0 0 var(--luna-space-4); padding-left: 1.4em; }
 .assistant-body li + li { margin-top: var(--luna-space-1); }
-/* 答案里的标题只比答案自己的正文重一档（不比自己小）：尺度里的上一级就是正文用的
-   那一级，所以这里靠字重区分，不引入 token 之外的号数。 */
+/* 答案里的标题（## 及以下）比正文大一档：尺度里正文之上只有 display 这一档，
+   用它，不发明 token 之外的号数。正文本身仍是正文档。 */
 .assistant-body h3, .assistant-body h4, .assistant-body h5 {
   margin: var(--luna-space-5) 0 var(--luna-space-2);
   font-size: var(--luna-font-display);
@@ -409,7 +424,7 @@ body {
   font: 12.5px/1.6 var(--luna-font-mono);
 }
 .assistant-body > pre {
-  margin: 0 0 var(--luna-space-3);
+  margin: 0 0 var(--luna-space-4);
   padding: var(--luna-space-3) var(--luna-space-4);
   overflow-x: auto;
   border-radius: var(--luna-radius-md);
@@ -423,8 +438,8 @@ body {
   font: 12.5px/1.7 var(--luna-font-mono);
 }
 .assistant-body strong { font-weight: 700; }
-/* 还没有答案：这一格只是"答案会落在这里"的位置，字号回到正文尺度。 */
-.assistant-body.placeholder { color: var(--luna-text-muted); font-size: var(--luna-font-body); }
+/* 还没有答案：这一格只是"答案会落在这里"的位置，用弱一档的文字色，不假装是回答。 */
+.assistant-body.placeholder { color: var(--luna-text-muted); }
 
 /* 工具卡片是一张可展开的卡片：surface 表面 + 弱边框 + 尺度 token 的圆角与内边距，
    所以它和"不加容器的推理条目"一眼就分得开。摘要仍然只有一行 12px muted 的文字；
@@ -537,6 +552,20 @@ body {
 .run-error-detail summary { display: flex; align-items: center; min-height: var(--luna-control-sm); cursor: pointer; }
 .run-error-detail pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 
+/* 会话区域的状态行：它在对话区与输入区之间，和用户正在看的内容同一个区域，
+   所以会话读不出来时不必让侧栏变成日志区。瞬时提示自己消失，错误保留到下一次
+   操作（见 app.js 的 setConversationStatus）。 */
+.conversation-status {
+  width: 100%;
+  max-width: var(--luna-content-max);
+  margin-inline: auto;
+  padding: var(--luna-space-2) var(--luna-gutter) 0;
+  color: var(--luna-text-muted);
+  font-size: var(--luna-font-meta);
+  overflow-wrap: anywhere;
+}
+.conversation-status.failure { color: var(--luna-danger); }
+
 /* 运行状态条：复用标记里已有的 #run-status。只写当前状态与已运行时长；
    Stop 就在输入区那个按钮上，所以这里不再另起一套控制栏。 */
 .run-status {
@@ -569,9 +598,9 @@ body {
    运行中的每一步按它真实发生的顺序排在这条时间线里：阶段行（从第二段起才给）、
    推理（provider 给了才有）、运行说明、工具卡片，回答主体永远收尾。
    过程条目保持次级：文本一律 12px 及以下、用 muted 或 subtle，推理默认折叠成一行，
-   工具卡片是一张 surface 卡片，阶段行只有标点级的标号。回答主体有自己的容器、
-   顶上一行标注、大一档的字号，并与过程之间留出一档更大的空白，所以它是这个回合
-   一眼就能认出的视觉主体。
+   工具卡片是一张 surface 卡片，阶段行只有标点级的标号。回答主体是整宽正文，没有
+   容器、没有标注、与用户消息同档字号；它与过程之间留出一档更大的空白，并且是整条
+   时间线最宽的一块，所以仍然是这个回合一眼就能认出的视觉主体。
    用量属于整轮，落在标题那一行的元信息里，不在这条时间线中间。 */
 
 .run-meta {
@@ -586,9 +615,9 @@ body {
 .run-meta[data-state="failed"] { color: var(--luna-danger); }
 .run-timeline { display: flex; flex-direction: column; min-width: 0; }
 .run-timeline > * + * { margin-top: var(--luna-space-1); }
-/* 回答主体是时间线的最后一条，也是这个回合的视觉主体：它有自己的容器，所以这里
-   只要一档更大的留白把它和上面的过程条目分开，不再另加一条分隔线（容器的边框已经
-   划出边界）。一次直接回答没有过程条目，这里的留白不生效。 */
+/* 回答主体是时间线的最后一条，也是这个回合的视觉主体：它没有容器，所以这里的
+   一档更大的留白（加上它整宽的正文和一条极轻的左侧线）就是它与过程条目的分界。
+   一次直接回答没有过程条目，这里的留白不生效。 */
 .run-timeline > * + .assistant-body {
   margin-top: var(--luna-space-5);
 }
@@ -818,6 +847,9 @@ body {
 .session-row.is-current .session-title { font-weight: 600; }
 .session-meta { flex: 0 0 auto; color: var(--luna-text-muted); font-size: var(--luna-font-meta); }
 .session-empty { margin: var(--luna-space-2) 0 0; padding-inline: var(--luna-space-2); color: var(--luna-text-muted); font-size: var(--luna-font-meta); line-height: 1.6; }
+/* 侧栏的状态行只剩一个用途：这一列自己的列表读不到时把错误报在这里（主体就是
+   它）。会话切换的运行状态、恢复确认都不写在这一列——加载表现在主区的占位里，
+   内容错误在用户正在看的地方（.conversation-status）。 */
 .session-status {
   margin: var(--luna-space-2) 0 0;
   padding-inline: var(--luna-space-2);
