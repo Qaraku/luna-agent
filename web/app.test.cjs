@@ -138,6 +138,9 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
   document.documentElement.append(document.body);
   document.activeElement = document.body;
   document.createElement = (tag) => new Element(tag);
+  // 贡献面板的图标是真 SVG：产品代码用 createElementNS 建它，适配器同样照建，
+  // 只是不模拟命名空间（Element 本身不区分）。
+  document.createElementNS = (_namespace, tag) => new Element(tag);
   document.createTextNode = (text) => { const node = new Element('#text'); node.textContent = text; return node; };
   document.querySelector = (selector) => document.body.querySelector(selector);
   document.getElementById = (id) => document.querySelector(`#${id}`);
@@ -181,8 +184,7 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
     set(value) { this._hash = value; queueMicrotask(() => window.emit('hashchange')); }
   });
   const data = {
-    sessions: { sessions: [{ id: 'aaaaaaaa', title: '会话 A', run_count: 1 }, { id: 'bbbbbbbb', title: '会话 B', run_count: 2 }] },
-    memory: { facts: [{ text: '测试事实', at: '2026-09-25T10:00:00Z', source_session: 'aaaaaaaa' }] }
+    sessions: { sessions: [{ id: 'aaaaaaaa', title: '会话 A', run_count: 1 }, { id: 'bbbbbbbb', title: '会话 B', run_count: 2 }] }
   };
   const context = vm.createContext({
     document, window, location, URLSearchParams, TextDecoder, console,
@@ -193,7 +195,7 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
       calls.push({ url, options });
       const custom = respond && await respond(url, options, data);
       if (custom) return custom;
-      const payload = url === '/api/sessions' ? data.sessions : url === '/api/memory' ? data.memory
+      const payload = url === '/api/sessions' ? data.sessions
         : url.startsWith('/api/sessions/') ? { records: [{ type: 'message', role: 'user', text: '已保存的消息' }] } : {};
       return { ok: true, json: async () => payload };
     }
@@ -217,6 +219,27 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
     async theme(value, id = 'theme-select') { const control = document.getElementById(id); control.value = value; control.emit('change'); await settle(); },
     key(key, shiftKey = false) { return document.emit('keydown', { key, shiftKey }); }
   };
+}
+
+// 一个启用中的能力贡献了一块面板：宿主从 /api/state 只拿到"在用"和"模块入口"，
+// 面板内容由模块自己带来。这个夹具把那份状态钉住，并给出定位入口的两种方式。
+function capabilityHarness(options = {}) {
+  const state = { capabilities: [{
+    id: 'memory', title: 'Memory', deployment: 'builtin', state: 'enabled',
+    contributions: [{ kind: 'panel', id: 'memory' }],
+    panels: [{ id: 'memory', title: '记忆', entry: '/api/memory/panel.js' }]
+  }] };
+  const h = navigationHarness({
+    ...options,
+    respond: async (url, requestOptions, data) => {
+      if (url === '/api/state') return { ok: true, json: async () => state };
+      return options.respond ? options.respond(url, requestOptions, data) : undefined;
+    }
+  });
+  h.capabilityState = state;
+  h.capabilityToggle = () => h.document.querySelector('.capability-panel-toggle');
+  h.capabilityToggles = () => [...h.document.querySelectorAll('.capability-panel-toggle')];
+  return h;
 }
 
 test('theme follows the OS until explicitly selected and restores only its preference on reload', async () => {
@@ -330,38 +353,47 @@ test('extensions open independently of diagnostics and preserve their subtree ac
   assert.equal(h.document.activeElement, h.$('extensions-toggle'));
 });
 
-test('navigation lifecycle routes independent panels and restores focus', async () => {
-  const h = navigationHarness({ narrow: true });
+test('a contributed panel routes independently of diagnostics and restores focus', async () => {
+  const h = capabilityHarness({ narrow: true });
   await h.settle();
   assert.equal(h.$('session-sidebar').hidden, true, '窄屏会话侧栏初始关闭');
   h.$('message').value = '保留草稿';
-  await h.click('memory-toggle');
-  assert.equal(h.$('memory-panel').hidden, false);
+  const entry = h.capabilityToggle();
+  entry.focus();
+  entry.click();
+  await h.settle();
+  const drawer = h.$('capability-panel-memory');
+  assert.equal(drawer.hidden, false);
   assert.equal(h.$('runtime-drawer').hidden, true);
-  assert.equal(h.$('memory-toggle').getAttribute('aria-expanded'), 'true');
+  assert.equal(entry.getAttribute('aria-expanded'), 'true');
   assert.equal(h.document.querySelector('.app-shell').inert, true);
-  assert.equal(h.document.activeElement, h.$('memory-close'));
-  assert.equal(h.calls.filter(({ url }) => url === '/api/memory').length, 1);
-  const retract = h.$('memory-list').querySelector('button');
-  h.key('Tab', true);
-  assert.equal(h.document.activeElement, retract, 'Shift+Tab 留在面板内');
+  assert.equal(h.document.activeElement, drawer.querySelector('button'));
+  assert.equal(h.calls.filter(({ url }) => url.startsWith('/api/memory')).length, 0, '宿主自己从不请求能力自己的接口');
+  // 焦点约束覆盖面板里的每个可聚焦元素：从最后一个回绕到关闭按钮，再回绕回来。
+  const content = h.document.createElement('button');
+  content.textContent = '模块自己的控件';
+  drawer.querySelector('.drawer-body').append(content);
+  content.focus();
+  assert.equal(h.document.activeElement, content);
   h.key('Tab');
-  assert.equal(h.document.activeElement, h.$('memory-close'));
+  assert.equal(h.document.activeElement, drawer.querySelector('button'), 'Tab 从最后一个回绕到关闭按钮');
+  h.key('Tab', true);
+  assert.equal(h.document.activeElement, content, 'Shift+Tab 留在面板内');
   assert.equal(h.key('Escape').defaultPrevented, true);
-  assert.equal(h.$('memory-panel').hidden, true);
-  assert.equal(h.document.activeElement, h.$('memory-toggle'));
+  assert.equal(drawer.hidden, true);
+  assert.equal(h.document.activeElement, entry);
   assert.equal(h.document.querySelector('.app-shell').inert, false);
   await h.click('runtime-toggle');
   assert.equal(h.$('runtime-drawer').hidden, false);
   await h.poll();
-  assert.equal(h.calls.filter(({ url }) => url === '/api/memory').length, 1, '运行详情不读取记忆');
+  assert.equal(h.calls.filter(({ url }) => url.startsWith('/api/memory')).length, 0, '运行详情不读取能力自己的接口');
   // 即使入口被程序触发，也不能堆叠模态层。
-  h.$('memory-toggle').click();
+  entry.click();
   await h.settle();
   assert.equal(h.$('runtime-drawer').hidden, true);
-  assert.equal(h.$('memory-panel').hidden, false);
+  assert.equal(drawer.hidden, false);
   await h.click('runtime-backdrop');
-  assert.equal(h.$('memory-panel').hidden, true);
+  assert.equal(drawer.hidden, true);
   await h.click('session-toggle');
   assert.equal(h.$('session-sidebar').hidden, false);
   assert.equal(h.$('session-sidebar').getAttribute('aria-modal'), 'true');
@@ -371,7 +403,7 @@ test('navigation lifecycle routes independent panels and restores focus', async 
 });
 
 test('session navigation closes after selection and survives breakpoint changes', async () => {
-  const h = navigationHarness({ narrow: true, hash: '#session=aaaaaaaa' });
+  const h = capabilityHarness({ narrow: true, hash: '#session=aaaaaaaa' });
   await h.settle();
   assert.match(h.$('conversation').textContent, /已保存的消息/);
   h.$('message').value = '保留草稿';
@@ -388,10 +420,12 @@ test('session navigation closes after selection and survives breakpoint changes'
   assert.equal(h.$('runtime-backdrop').hidden, true);
   assert.equal(h.document.querySelector('.app-shell').inert, false);
   assert.equal(h.document.activeElement, h.$('session-new'));
-  await h.click('memory-toggle');
+  const entry = h.capabilityToggle();
+  entry.click();
+  await h.settle();
   assert.equal(h.$('session-sidebar').inert, true);
   await h.resize(true);
-  assert.equal(h.$('memory-panel').hidden, false, '切换断点不关闭另一模态面板');
+  assert.equal(h.$('capability-panel-memory').hidden, false, '切换断点不关闭另一模态面板');
   h.key('Escape');
   assert.equal(h.$('session-sidebar').hidden, true);
   await h.click('session-toggle');
@@ -514,41 +548,77 @@ test('visible sessions refresh without diagnostics or replacing the focused acti
   assert.deepEqual(h.calls.slice(hiddenCount).map(({ url }) => url), ['/api/state']);
 });
 
-test('memory polling preserves the retract action and posts its exact fact', async () => {
-  let finishRetraction;
-  let posted;
-  const h = navigationHarness({ respond: async (url, options, data) => {
-    if (url !== '/api/memory/retract') return;
-    posted = JSON.parse(options.body);
-    await new Promise((resolve) => { finishRetraction = resolve; });
-    data.memory = { facts: [], retracted: [posted] };
-    return { ok: true, json: async () => ({}) };
-  } });
-  await h.settle();
-  await h.click('memory-toggle');
-  const button = h.$('memory-list').querySelector('button');
-  button.focus();
-  await h.poll();
-  assert.ok(h.document.activeElement === button, '记忆轮询保留原撤回按钮');
-  button.click();
-  await h.settle();
-  assert.equal(button.disabled, true);
-  await h.poll();
-  assert.ok(h.$('memory-list').querySelector('button') === button, '撤回进行中不替换按钮');
-  assert.equal(button.disabled, true, '轮询不能重新启用正在撤回的按钮');
-  assert.deepEqual(posted, { text: '测试事实', at: '2026-09-25T10:00:00Z' });
-  finishRetraction();
-  await h.settle();
-  assert.equal(h.$('memory-list').childElementCount, 0);
-  assert.equal(h.$('memory-empty').hidden, false);
-  assert.match(h.$('memory-status').textContent, /这一条已撤回/);
-  assert.ok(h.document.activeElement === h.$('memory-close'), '撤回后焦点留在面板内');
+test('capability panels come only from enabled capabilities, in the kernel order', () => {
+  const { capabilityPanels } = require('./app.js');
+  assert.deepEqual(capabilityPanels([
+    { id: 'memory', title: 'Memory', state: 'enabled', panels: [{ id: 'memory', title: '记忆', entry: '/api/memory/panel.js' }] },
+    { id: 'quiet', title: 'Quiet', state: 'disabled', panels: [{ id: 'quiet', title: '安静的', entry: '/api/quiet/panel.js' }] },
+    { id: 'notes', title: 'Notes', state: 'enabled', panels: [
+      { id: 'notes', title: '笔记', entry: '/api/notes/panel.js' },
+      { id: 'notes-index', title: '', entry: '/api/notes/index.js' }
+    ] }
+  ]), [
+    { id: 'memory', title: '记忆', entry: '/api/memory/panel.js' },
+    { id: 'notes', title: '笔记', entry: '/api/notes/panel.js' },
+    { id: 'notes-index', title: 'notes-index', entry: '/api/notes/index.js' }
+  ], '只有 enabled 的能力贡献面板，顺序按内核注册顺序，缺 title 时用 id');
+
+  // 一条停用中、失败或状态未知的能力什么都不贡献。
+  for (const state of ['disabled', 'failed', 'retiring', '']) {
+    assert.deepEqual(capabilityPanels([
+      { id: 'memory', title: 'Memory', state, panels: [{ id: 'memory', title: '记忆', entry: '/api/memory/panel.js' }] }
+    ]), [], `状态 ${JSON.stringify(state)} 不贡献面板`);
+  }
+  assert.deepEqual(capabilityPanels([{ id: 'memory', title: 'Memory', panels: [{ id: 'memory', title: '记忆', entry: '/api/memory/panel.js' }] }]), [],
+    '没有状态就当作不在用');
+
+  // 载荷缺失或形状不对：一块面板都不编出来。
+  assert.deepEqual(capabilityPanels(undefined), []);
+  assert.deepEqual(capabilityPanels(null), []);
+  assert.deepEqual(capabilityPanels('nope'), []);
+  assert.deepEqual(capabilityPanels([]), []);
+  assert.deepEqual(capabilityPanels([null, 'x', {}]), []);
+  assert.deepEqual(capabilityPanels([{ id: 'memory', state: 'enabled' }]), [], '没有 panels 数组就没有面板');
+  assert.deepEqual(capabilityPanels([{ id: 'memory', state: 'enabled', panels: 'nope' }]), []);
+  assert.deepEqual(capabilityPanels([{ id: 'memory', state: 'enabled', panels: [null, 'x', {}] }]), []);
+  assert.deepEqual(capabilityPanels([{ id: 'memory', state: 'enabled', panels: [
+    { id: 'memory', title: '记忆' },
+    { id: '  ', title: '记忆', entry: '/api/memory/panel.js' },
+    { title: '记忆', entry: '/api/memory/panel.js' }
+  ] }]), [], '缺 id 或缺 entry 的面板不会变成一个按不动的入口');
+  assert.deepEqual(capabilityPanels([{ id: 'memory', state: 'enabled', panels: [
+    { id: 7, title: '记忆', entry: '/api/memory/panel.js' },
+    { id: 'memory', title: '记忆', entry: 7 }
+  ] }]), [], '字段不是字符串时不猜一个出来');
+});
+
+test('a panel entry becomes an import path only while it stays on this origin', () => {
+  const { capabilityPanelEntryURL, capabilityPanelElementID, capabilityPanelText, capabilityPanelEntryError } = require('./app.js');
+  assert.equal(capabilityPanelEntryURL('/api/memory/panel.js'), '/api/memory/panel.js');
+  assert.equal(capabilityPanelEntryURL('  /api/memory/panel.js  '), '/api/memory/panel.js');
+
+  const refused = ['', '   ', 'panel.js', './panel.js', '../panel.js', 'sub/panel.js', '//evil.test/p.js',
+    'https://evil.test/p.js', 'http://evil.test/p.js', 'data:text/javascript,0', '/api/memory/panel.js?x=1',
+    '/api/memory/panel.js#x', 'a%2fb.js', 'a\\b.js', '/api/panel\u0000.js', `/${'a'.repeat(200)}`];
+  for (const entry of refused) {
+    assert.equal(capabilityPanelEntryURL(entry), '', `entry ${JSON.stringify(entry)} must not become an import path`);
+  }
+  assert.equal(capabilityPanelEntryURL(undefined), '');
+  assert.equal(capabilityPanelEntryURL(7), '');
+
+  // 元素 id 是固定派生格式，夹具靠它定位。
+  assert.equal(capabilityPanelElementID('memory'), 'capability-panel-memory');
+  assert.equal(capabilityPanelElementID('notes-index'), 'capability-panel-notes-index');
+
+  assert.equal(capabilityPanelText('  记忆 '), '记忆');
+  assert.equal(capabilityPanelText(undefined), '');
+  assert.equal(capabilityPanelEntryError('记忆'), '能力面板 记忆 的入口地址无法识别，未加载。');
 });
 
 test('navigation preserves running and switching guards without discarding drafts', async () => {
   let finishRead;
   let finishRun;
-  const h = navigationHarness({ respond: async (url) => {
+  const h = capabilityHarness({ respond: async (url) => {
     if (url === '/api/sessions/bbbbbbbb') {
       await new Promise((resolve) => { finishRead = resolve; });
       return { ok: true, json: async () => ({ records: [] }) };
@@ -578,64 +648,110 @@ test('navigation preserves running and switching guards without discarding draft
   h.location.hash = '#session=aaaaaaaa';
   await h.settle();
   assert.equal(h.location.hash, '#session=bbbbbbbb', '运行中更改 hash 会恢复原会话');
-  await h.click('memory-toggle');
+  const entry = h.capabilityToggle();
+  entry.click();
+  await h.settle();
   finishRun();
   await h.settle();
-  assert.ok(h.document.activeElement === h.$('memory-close'), '运行结束不夺走面板焦点');
+  assert.ok(h.document.activeElement === h.$('capability-panel-memory').querySelector('button'), '运行结束不夺走面板焦点');
   assert.equal(h.$('session-new').disabled, false);
   assert.equal(h.$('message').value, '发送内容', '准入失败保留原有草稿恢复行为');
 });
 
-test('memory waits out an older read before refreshing a completed retraction', async () => {
-  let finishRead;
-  let reads = 0;
-  const h = navigationHarness({ respond: async (url, options, data) => {
-    if (url === '/api/memory' && ++reads === 2) {
-      const older = data.memory;
-      await new Promise((resolve) => { finishRead = resolve; });
-      return { ok: true, json: async () => older };
-    }
-    if (url === '/api/memory/retract') {
-      data.memory = { facts: [], retracted: [JSON.parse(options.body)] };
-      return { ok: true, json: async () => ({}) };
-    }
-  } });
+test('an enabled capability contributes a header entry and a panel container', async () => {
+  const h = capabilityHarness();
   await h.settle();
-  await h.click('memory-toggle');
+  const entry = h.capabilityToggle();
+  assert.ok(entry, '页头出现贡献面板的入口');
+  assert.ok(entry.classList.contains('icon-button'), '入口沿用宿主的图标按钮');
+  assert.equal(entry.getAttribute('aria-controls'), 'capability-panel-memory');
+  assert.equal(entry.getAttribute('aria-label'), '记忆');
+  assert.equal(entry.getAttribute('title'), '记忆');
+  assert.equal(entry.getAttribute('aria-expanded'), 'false');
+  assert.equal(entry.getAttribute('id'), null, '入口不带面板专属的固定 id');
+
+  const drawer = h.$('capability-panel-memory');
+  assert.ok(drawer, '面板容器按能力贡献创建');
+  assert.equal(drawer.getAttribute('role'), 'dialog');
+  assert.equal(drawer.getAttribute('aria-modal'), 'true');
+  assert.equal(drawer.getAttribute('aria-labelledby'), 'capability-panel-memory-title');
+  assert.equal(drawer.hidden, true);
+  assert.equal(drawer.querySelector('h2').textContent, '记忆');
+  assert.ok(drawer.querySelector('.drawer-header'), '面板复用宿主的抽屉头部');
+  assert.ok(drawer.querySelector('.drawer-body'), '面板复用宿主的抽屉主体');
+
+  // 入口插在扩展之前：页头顺序就是能力被声明的顺序。
+  const siblings = entry.parentElement.children;
+  assert.equal(siblings.indexOf(entry) + 1, siblings.indexOf(h.$('extensions-toggle')));
+
+  // 状态轮询是幂等的：入口与容器不重建，打开中的面板不被重置。
   await h.poll();
-  const button = h.$('memory-list').querySelector('button');
-  button.focus();
-  button.click();
+  assert.equal(h.capabilityToggle(), entry);
+  assert.equal(h.$('capability-panel-memory'), drawer);
+  assert.ok(h.calls.some(({ url }) => url === '/api/state'));
+  assert.equal(h.calls.filter(({ url }) => url.startsWith('/api/memory')).length, 0, '宿主从不直接请求能力自己的接口');
+
+  // 打开时才挂载：模块没加载起来时，面板里说的是这一条失败，整页不报错。
+  entry.click();
   await h.settle();
-  assert.equal(button.disabled, true);
-  finishRead();
-  await h.settle();
-  assert.equal(reads, 3, '旧读取结束后确实重新读取，而不是用旧事实宣布撤回完成');
-  assert.equal(h.$('memory-list').childElementCount, 0);
-  assert.match(h.$('memory-status').textContent, /这一条已撤回/);
+  assert.equal(drawer.hidden, false);
+  assert.equal(entry.getAttribute('aria-expanded'), 'true');
+  assert.equal(drawer.querySelector('.capability-panel-target'), null, '挂载没走通时容器由宿主移除');
+  assert.match(drawer.querySelector('.capability-panel-error').textContent, /无法加载能力面板 记忆 的模块/);
+  h.key('Escape');
+  assert.equal(drawer.hidden, true);
+  assert.equal(entry.getAttribute('aria-expanded'), 'false');
+  assert.equal(h.document.activeElement, entry);
 });
 
-test('closing a panel before its frame or request completes cannot reopen it', async () => {
-  let finishRead;
-  const h = navigationHarness({ narrow: true, respond: async (url) => {
-    if (url === '/api/memory') {
-      await new Promise((resolve) => { finishRead = resolve; });
-      return { ok: false, status: 500, json: async () => ({ error: '测试读取失败' }) };
-    }
-  } });
+test('a capability that stops being enabled loses its entry and its panel together', async () => {
+  const h = capabilityHarness();
   await h.settle();
-  h.$('memory-toggle').click();
+  const entry = h.capabilityToggle();
+  entry.click();
+  await h.settle();
+  assert.equal(h.$('capability-panel-memory').hidden, false);
+
+  // 停用：开着的面板先关掉，然后入口与容器一起消失。
+  h.capabilityState.capabilities = [{
+    id: 'memory', title: 'Memory', deployment: 'builtin', state: 'disabled', contributions: [],
+    panels: [{ id: 'memory', title: '记忆', entry: '/api/memory/panel.js' }]
+  }];
+  await h.poll();
+  assert.equal(h.capabilityToggle(), null, '停用后页头不再有这个入口');
+  assert.equal(h.$('capability-panel-memory'), null, '面板容器也一起消失');
+  assert.equal(h.$('runtime-backdrop').hidden, true, '面板先被关闭，没有留下遮罩');
+  assert.equal(h.document.activeElement, h.document.body, '入口被移除后焦点不留在已经删掉的节点上');
+
+  // 再启用：入口与面板都回来，下次打开是一次全新的挂载。
+  h.capabilityState.capabilities[0].state = 'enabled';
+  await h.poll();
+  const restored = h.capabilityToggle();
+  assert.ok(restored, '重新启用后入口回来');
+  assert.notEqual(restored, entry, '回来的入口是新建的，不是复用已经移除的节点');
+  restored.click();
+  await h.settle();
+  assert.equal(h.$('capability-panel-memory').hidden, false);
+});
+
+test('closing a panel before its module resolves leaves nothing mounted', async () => {
+  const h = capabilityHarness({ narrow: true });
+  await h.settle();
+  const entry = h.capabilityToggle();
+  const drawer = h.$('capability-panel-memory');
+  entry.click();
+  // 加载还没回来就关闭：这一次挂载作废，面板里不留容器也不留错误。
   h.key('Escape');
-  finishRead();
   await h.settle();
-  assert.equal(h.$('memory-panel').hidden, true);
-  assert.equal(h.$('memory-panel').classList.contains('is-open'), false);
+  assert.equal(drawer.hidden, true);
+  assert.equal(drawer.classList.contains('is-open'), false);
   assert.equal(h.$('runtime-backdrop').hidden, true);
-  assert.ok(h.document.activeElement === h.$('memory-toggle'));
-  assert.match(h.$('memory-status').textContent, /无法读取记忆/);
+  assert.equal(h.document.activeElement, entry);
+  assert.equal(drawer.querySelector('.capability-panel-target'), null);
+  assert.equal(drawer.querySelector('.capability-panel-error'), null);
   await h.click('session-toggle');
   await h.click('runtime-backdrop');
-  assert.ok(h.document.activeElement === h.$('session-toggle'));
+  assert.equal(h.document.activeElement, h.$('session-toggle'));
 });
 
 test('SSE parser preserves app-owned type and JSON payload', () => {
@@ -755,7 +871,7 @@ test('chat markup is conversation-first with an accessible hidden runtime drawer
   const html = source('index.html');
   assert.match(html, /<title>Luna<\/title>/);
   assert.match(html, />Luna<\/span>/);
-  assert.match(html, /会话记录和记忆事实都保存在本机/);
+  assert.match(html, /会话记录与各能力保存的数据都在本机/);
   assert.match(html, /有什么想一起看看？/);
   assert.match(html, /给 Luna 发消息…/);
   assert.match(html, /id="send"[^>]*aria-label="发送"/);
@@ -793,70 +909,38 @@ test('the plugin section is an empty list in markup and never a fixed tool', () 
   assert.match(js, /pluginRows\(state\.plugins\)/, 'the drawer renders the plugins array');
 });
 
-test('the memory section is an empty list in markup and says what it can do', () => {
+test('the host names no specific capability in its markup, script or styles', () => {
   const html = source('index.html');
-  assert.match(html, /id="memory-panel"[^>]*aria-labelledby="memory-title"/);
-  assert.match(html, /<h2 id="memory-title">记忆<\/h2>/);
-  assert.match(html, /<ul id="memory-list" class="memory-list"><\/ul>/, 'the list is filled from the API, not from markup');
-  assert.match(html, /id="memory-empty"[^>]*hidden[^>]*>还没有记录任何事实。/);
-  assert.match(html, /id="memory-status"[^>]*role="status"/);
-  assert.match(html, /只能撤回/, 'the section must say that retracting is all it can do');
-});
-
-test('memory rows show every fact newest first with where it came from', () => {
-  const { memoryRows } = require('./app.js');
-  const view = memoryRows({
-    facts: [
-      { text: 'prefers Go', at: '2026-09-25T10:00:00Z', source_session: 'aaaaaaaa11112222' },
-      { text: 'uses voice input', at: '2026-09-25T11:00:00Z', source_session: 'bbbbbbbb33334444' }
-    ],
-    retracted: [{ text: 'a stale fact', at: '2026-09-24T09:00:00Z', retracted_at: '2026-09-25T12:00:00Z' }]
-  });
-  assert.equal(view.facts.length, 2);
-  assert.equal(view.facts[0].text, 'uses voice input', 'the newest fact comes first');
-  assert.equal(view.facts[1].text, 'prefers Go');
-  assert.equal(view.facts[0].at, '2026-09-25T11:00:00Z', 'the exact timestamp is what a retraction posts back');
-  assert.equal(view.facts[0].session, '#bbbbbbbb');
-  assert.equal(view.retracted.length, 1);
-  assert.equal(view.retracted[0].text, 'a stale fact');
-});
-
-test('memory rows stay honest for an empty or malformed payload', () => {
-  const { memoryRows } = require('./app.js');
-  assert.deepEqual(memoryRows(undefined), { facts: [], retracted: [] });
-  assert.deepEqual(memoryRows({}), { facts: [], retracted: [] });
-  assert.deepEqual(
-    memoryRows({ facts: [null, {}, { text: 'no timestamp' }, { at: '2026-09-25T10:00:00Z' }] }),
-    { facts: [], retracted: [] },
-    'a fact without both a text and a timestamp is never rendered as a fact'
-  );
-});
-
-test('a retraction names its target exactly and never invents one', () => {
-  const { retractPayload } = require('./app.js');
-  assert.deepEqual(retractPayload({ at: '2026-09-25T11:00:00Z', text: 'uses voice input' }), {
-    at: '2026-09-25T11:00:00Z', text: 'uses voice input'
-  });
-  assert.equal(retractPayload({ at: '', text: 'x' }), null);
-  assert.equal(retractPayload({ at: '2026-09-25T11:00:00Z', text: '' }), null);
-  assert.equal(retractPayload({ text: 'x' }), null);
-  assert.equal(retractPayload(null), null);
-});
-
-test('the memory section reads the API and posts the retraction to it', () => {
   const js = source('app.js');
-  assert.match(js, /fetch\('\/api\/memory'/);
-  assert.match(js, /fetch\('\/api\/memory\/retract'/);
-  assert.match(js, /memoryRows\(payload\)/);
-  assert.match(js, /retractPayload\(/);
-  assert.equal(/innerHTML/.test(js), false, 'fact text reaches the DOM as text, never as markup');
+  const css = source('style.css');
+  for (const text of ['memory', 'Memory', '记忆']) {
+    assert.equal(html.includes(text), false, `标记里不再出现 ${text}`);
+    assert.equal(js.includes(text), false, `脚本里不再出现 ${text}`);
+    assert.equal(css.includes(text), false, `样式里不再出现 ${text}`);
+  }
+  for (const id of ['memory-toggle', 'memory-panel', 'memory-list', 'memory-status', 'memory-retract']) {
+    assert.equal(html.includes(id), false, `宿主不再写死 ${id}`);
+  }
+  assert.equal(js.includes('/api/memory'), false, '宿主不再直接请求某个能力自己的接口');
+});
+
+test('the host renders contributed panels only from the state payload', () => {
+  const js = source('app.js');
+  assert.match(js, /function capabilityPanels\(capabilities\)/, '页头入口来自 /api/state 的 capabilities');
+  assert.match(js, /syncCapabilityPanels\(capabilityPanels\(state\.capabilities\)\)/, '轮询里按同一份状态核对入口与面板');
+  assert.match(js, /capabilityPanelElementID/, '面板元素 id 是固定派生格式，夹具按它定位');
+  assert.match(js, /capabilityModule = await import\(url\)/, '模块在打开面板时才动态 import');
+  assert.match(js, /uiPluginHostAPI\(UI_PLUGIN_API_VERSION/, '挂载沿用同一个宿主 API 与日志路径');
+  assert.match(js, /capabilityModule\.unmount\(target\)/, '关闭时调模块自己的 unmount');
+  assert.match(js, /delete panels\[record\.key\]/, '能力消失时入口与面板一起从登记里移除');
+  assert.equal(js.includes('innerHTML'), false, '面板内容只能作为文本与节点进入 DOM');
 });
 
 test('the primary surface does not claim that nothing is stored', () => {
   const html = source('index.html');
   assert.equal(html.includes('不保存记录'), false, 'sessions are written to disk since the session slice');
   assert.equal(html.includes('刷新后不会保留'), false, 'a reload resumes the same session through the fragment');
-  assert.match(html, /会话记录和记忆事实都保存在本机/);
+  assert.match(html, /会话记录与各能力保存的数据都在本机/);
 });
 
 test('the primary surface omits console-era and fabricated content', () => {
@@ -1195,21 +1279,19 @@ test('a run carries the current session only when there is one', () => {
   assert.equal(runPayload('你好', undefined).message, '你好');
 });
 
-test('sessions and memory have independent navigation outside diagnostics', () => {
+test('sessions keep their own navigation and contributed panels are not part of diagnostics', () => {
   const html = source('index.html');
   const runtime = html.match(/<aside\b[^>]*id="runtime-drawer"[\s\S]*?<\/aside>/)?.[0];
   const sessions = html.match(/<aside\b[^>]*id="session-sidebar"[\s\S]*?<\/aside>/)?.[0];
-  const memory = html.match(/<aside\b[^>]*id="memory-panel"[\s\S]*?<\/aside>/)?.[0];
   assert.ok(sessions, '会话需要独立的侧栏，不能藏在运行详情内');
-  assert.ok(memory, '记忆需要独立面板');
   assert.match(sessions, /id="session-new"/);
   assert.match(sessions, /id="session-list"/);
-  assert.match(memory, /id="memory-list"/);
-  assert.doesNotMatch(runtime, /id="(?:session-new|session-list|memory-list)"/);
-  for (const [button, panel] of [['session-toggle', 'session-sidebar'], ['memory-toggle', 'memory-panel']]) {
-    assert.match(html, new RegExp(`id="${button}"[^>]*aria-controls="${panel}"`));
-  }
-  for (const id of ['session-new', 'session-list', 'memory-list', 'session-status', 'memory-status']) {
+  assert.doesNotMatch(runtime, /id="(?:session-new|session-list)"/);
+  assert.match(html, /id="session-toggle"[^>]*aria-controls="session-sidebar"/);
+  // 贡献面板的容器不写在标记里：它由 /api/state 决定，能力停用时一起消失。
+  assert.equal(/id="memory-panel"/.test(html), false);
+  assert.equal(/capability-panel-/.test(html), false, '宿主不预置任何贡献面板的元素 id');
+  for (const id of ['session-new', 'session-list', 'session-status']) {
     assert.equal([...html.matchAll(new RegExp(`id="${id}"`, 'g'))].length, 1, `${id} 只能有一个实例`);
   }
 });
@@ -1260,7 +1342,9 @@ test('the front end keeps the session in the hash and reaches the DOM only throu
 
 test('every session style the script builds a class for exists in the stylesheet', () => {
   const css = source('style.css');
-  const selectors = ['.session-new', '.session-list', '.session-row', '.session-row.is-current', '.session-title', '.session-meta', '.session-empty', '.session-status', '.session-notice', '.turn-note', '.assistant-body.failed', '.memory-list', '.memory-item', '.memory-text', '.memory-meta', '.memory-retract'];
+  // `.capability-panel-toggle` 不在这里：它是给夹具用的定位钩子，外观全部来自
+  // 宿主的 `.icon-button`，不给它单写一条只为占位的规则。
+  const selectors = ['.session-new', '.session-list', '.session-row', '.session-row.is-current', '.session-title', '.session-meta', '.session-empty', '.session-status', '.session-notice', '.turn-note', '.assistant-body.failed', '.capability-panel-target', '.capability-panel-error'];
   for (const selector of selectors) {
     assert.ok(
       [`${selector} {`, `${selector}:`, `${selector},`, `${selector}.`].some((form) => css.includes(form)),

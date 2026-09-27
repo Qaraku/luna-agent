@@ -30,9 +30,8 @@
           <h1 id="conversation-title" class="conversation-title">新会话</h1>
         </div>
         <div class="runtime-actions">
-          <button id="memory-toggle" class="icon-button" type="button" aria-expanded="false" aria-controls="memory-panel" aria-label="记忆" title="记忆">
-            <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M5 6h14M5 12h14M5 18h9"></path></svg>
-          </button>
+          <!-- 能力贡献的面板入口由 /api/state 决定，脚本把它们插在扩展之前；
+               宿主在这里不写死任何具体能力。 -->
           <button id="extensions-toggle" class="icon-button" type="button" aria-expanded="false" aria-controls="extensions-panel" aria-label="扩展" title="扩展">
             <svg class="ui-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="4" y="4" width="9" height="9" rx="2"></rect><rect x="11" y="11" width="9" height="9" rx="2"></rect></svg>
           </button>
@@ -105,21 +104,6 @@
     <div id="sidebar-resizer" class="sidebar-resizer" role="separator" aria-orientation="vertical" aria-label="调整会话栏宽度" tabindex="0"></div>
   </aside>
 
-  <aside id="memory-panel" class="runtime-drawer" role="dialog" aria-modal="true" aria-labelledby="memory-title" tabindex="-1" hidden>
-    <header class="drawer-header">
-      <h2 id="memory-title">记忆</h2>
-      <button id="memory-close" class="icon-button" type="button" aria-label="关闭记忆">关闭</button>
-    </header>
-    <div class="drawer-body">
-      <section class="drawer-section" aria-label="记忆事实">
-        <p class="ui-plugin-hint">Luna 在对话中记下的事实，会用于之后的回应。这里只能撤回，不能编辑或新增。</p>
-        <ul id="memory-list" class="memory-list"></ul>
-        <p id="memory-empty" class="session-empty" hidden>还没有记录任何事实。</p>
-        <p id="memory-status" class="ui-plugin-status" role="status" hidden></p>
-      </section>
-    </div>
-  </aside>
-
   <aside id="extensions-panel" class="runtime-drawer extensions-panel" role="dialog" aria-modal="true" aria-labelledby="extensions-title" tabindex="-1" hidden>
     <header class="drawer-header">
       <h2 id="extensions-title">扩展</h2>
@@ -171,7 +155,7 @@
           </section>
           <section id="settings-pane-data" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-data" tabindex="0" hidden>
             <h3>本机数据</h3>
-            <p class="luna-muted">会话记录和记忆事实都保存在本机。会话刷新后仍在；记忆可在“记忆”里查看和撤回。</p>
+            <p class="luna-muted">会话记录与各能力保存的数据都在本机。能看什么、能改什么由对应能力的面板负责。</p>
           </section>
           <section id="settings-pane-model" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-model" tabindex="0" hidden>
             <h3>模型服务</h3>

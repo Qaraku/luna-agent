@@ -322,6 +322,89 @@ function uiPluginHostAPI(version, log) {
   });
 }
 
+// --- 能力贡献的浏览器面板 -------------------------------------------------
+//
+// 宿主不认识任何一个具体能力。它只从 /api/state 读到：某个能力是否在用，以及
+// 它是否贡献了浏览器面板、面板模块在哪个入口。面板说什么、怎么布局由模块自己
+// 决定，能力停用时入口与面板一起消失，因为那时它什么都不再贡献。
+
+// capabilityPanelText is the one reading of a payload string, so a panel that
+// arrives with a number or an object where a string belongs becomes an empty
+// value instead of a control with "[object Object]" on it.
+function capabilityPanelText(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+// capabilityPanelEntryURL is the only place a panel module's import specifier
+// is built. The kernel serves the module from this origin, so only an absolute
+// same-origin path is importable here: a relative specifier would be resolved
+// against the page, and a protocol-relative one would leave the host entirely.
+// `%`, `?`, `#` and backslashes are refused so a hand-edited payload cannot
+// smuggle a different path past the check, and a caller that gets '' must not
+// import at all.
+function capabilityPanelEntryURL(entry) {
+  const value = capabilityPanelText(entry);
+  if (!value || value.length > 200) return '';
+  if (!value.startsWith('/') || value.startsWith('//')) return '';
+  if (/[\u0000-\u001f\u007f\\?#%]/.test(value)) return '';
+  return value;
+}
+
+// capabilityPanelElementID is the fixed derivation the fixtures rely on: the
+// panel a capability contributes under the id `notes` is `capability-panel-notes`.
+// The header entry points at it with aria-controls and carries no id of its own.
+function capabilityPanelElementID(id) {
+  return `capability-panel-${id}`;
+}
+
+// capabilityPanels turns the state payload's `capabilities` array into the panel
+// entries the header should offer, in the order the kernel registered them.
+// Only an enabled capability contributes anything, so a disabled one is skipped
+// whole. A capability without a panels array, a payload that is not an array,
+// and a panel missing an id or an entry are all dropped rather than rendered as
+// a control that could not work.
+function capabilityPanels(capabilities) {
+  if (!Array.isArray(capabilities)) return [];
+  const panels = [];
+  for (const entry of capabilities) {
+    const capability = entry && typeof entry === 'object' ? entry : null;
+    if (!capability || capability.state !== 'enabled') continue;
+    const list = Array.isArray(capability.panels) ? capability.panels : [];
+    for (const value of list) {
+      const panel = value && typeof value === 'object' ? value : null;
+      if (!panel) continue;
+      const id = capabilityPanelText(panel.id);
+      const panelEntry = capabilityPanelText(panel.entry);
+      if (!id || !panelEntry) continue;
+      panels.push({ id, title: capabilityPanelText(panel.title) || id, entry: panelEntry });
+    }
+  }
+  return panels;
+}
+
+// 一个贡献面板的失败文字：哪一块面板、哪一步没走通。宿主不为失败的面板编内容，
+// 也不把别的能力的名字借给它。
+function capabilityPanelEntryError(title) {
+  return `能力面板 ${title} 的入口地址无法识别，未加载。`;
+}
+
+function capabilityPanelImportError(title, detail) {
+  return `无法加载能力面板 ${title} 的模块：${detail}`;
+}
+
+function capabilityPanelMissingExportError(title, missing) {
+  const list = Array.isArray(missing) ? missing.join('、') : capabilityPanelText(missing);
+  return `能力面板 ${title} 缺少必需的导出 ${list}。`;
+}
+
+function capabilityPanelMountError(title, detail) {
+  return `能力面板 ${title} 挂载失败：${detail}`;
+}
+
+function capabilityPanelUnmountError(title, detail) {
+  return `能力面板 ${title} 关闭时清理失败，容器已移除：${detail}`;
+}
+
 // --- Sessions -------------------------------------------------------------
 
 // The current session lives in the URL hash and never in browser storage: a
@@ -417,41 +500,6 @@ function sessionRows(payload, currentID, now = Date.now()) {
     });
   }
   return rows;
-}
-
-// memoryRows turns GET /api/memory into display rows: the facts in effect,
-// newest first, each carrying the exact text and timestamp a retraction posts
-// back. A row that is not both a text and a timestamp is dropped rather than
-// rendered as a fact with an invented field.
-function memoryRows(payload) {
-  const view = { facts: [], retracted: [] };
-  if (!payload || typeof payload !== 'object') return view;
-  const facts = Array.isArray(payload.facts) ? payload.facts : [];
-  for (const entry of facts) {
-    const fact = entry && typeof entry === 'object' ? entry : {};
-    if (typeof fact.text !== 'string' || !fact.text) continue;
-    if (typeof fact.at !== 'string' || !fact.at) continue;
-    const session = typeof fact.source_session === 'string' && fact.source_session ? `#${fact.source_session.slice(0, 8)}` : '来源未知';
-    view.facts.push({ text: fact.text, at: fact.at, time: sessionTime(fact.at), session });
-  }
-  view.facts.reverse();
-  const retracted = Array.isArray(payload.retracted) ? payload.retracted : [];
-  for (const entry of retracted) {
-    const gone = entry && typeof entry === 'object' ? entry : {};
-    if (typeof gone.text !== 'string' || !gone.text) continue;
-    view.retracted.push({ text: gone.text, time: sessionTime(gone.retracted_at) });
-  }
-  return view;
-}
-
-// retractPayload is what a retraction posts: the stored text and the stored
-// timestamp, unchanged, so the store can name exactly one fact. A row that
-// cannot name its target is never sent.
-function retractPayload(row) {
-  if (!row || typeof row !== 'object') return null;
-  if (typeof row.at !== 'string' || !row.at) return null;
-  if (typeof row.text !== 'string' || !row.text) return null;
-  return { at: row.at, text: row.text };
 }
 
 // Replay shows the frozen record facts and nothing else. The store has no field
@@ -651,7 +699,20 @@ function parseMarkdownBlocks(markdown) {
 }
 
 if (typeof module !== 'undefined') {
-  module.exports = { parseEventBlock, toolSummary, toolLabel, toolActivityLabel, candidateLabel, reloadCopy, valueOrDash, pluginStatusLabel, pluginRows, parseInline, parseMarkdownBlocks, isSessionID, parseSessionHash, sessionHash, sessionTitle, sessionTime, relativeTime, runCountLabel, runStatusLabel, sessionRows, memoryRows, retractPayload, argumentsText, toolCallFacts, replaySession, runPayload, uiPluginText, uiPluginNameValid, uiPluginEntrySafe, uiPluginEntryURL, uiPluginRows, uiPluginMissingExports, uiPluginErrorDetail, uiPluginImportError, uiPluginMissingExportError, uiPluginMountError, uiPluginUnmountError, uiPluginState, uiPluginInitialState, uiPluginTransition, uiPluginEnableFailureEvent, uiPluginDisableEvent, uiPluginTeardown, uiPluginAbandonMount, uiPluginToggleAction, uiPluginToggleLabel, uiPluginStatusText, uiPluginHostAPI, UI_PLUGIN_API_VERSION, UI_PLUGIN_ENTRY_REASON, UI_PLUGIN_REQUIRED_EXPORTS };
+  module.exports = {
+    parseEventBlock, toolSummary, toolLabel, toolActivityLabel, candidateLabel, reloadCopy, valueOrDash,
+    pluginStatusLabel, pluginRows, parseInline, parseMarkdownBlocks,
+    isSessionID, parseSessionHash, sessionHash, sessionTitle, sessionTime, relativeTime, runCountLabel,
+    runStatusLabel, sessionRows, argumentsText, toolCallFacts, replaySession, runPayload,
+    uiPluginText, uiPluginNameValid, uiPluginEntrySafe, uiPluginEntryURL, uiPluginRows, uiPluginMissingExports,
+    uiPluginErrorDetail, uiPluginImportError, uiPluginMissingExportError, uiPluginMountError, uiPluginUnmountError,
+    uiPluginState, uiPluginInitialState, uiPluginTransition, uiPluginEnableFailureEvent, uiPluginDisableEvent,
+    uiPluginTeardown, uiPluginAbandonMount, uiPluginToggleAction, uiPluginToggleLabel, uiPluginStatusText,
+    uiPluginHostAPI, UI_PLUGIN_API_VERSION, UI_PLUGIN_ENTRY_REASON, UI_PLUGIN_REQUIRED_EXPORTS,
+    capabilityPanelText, capabilityPanelEntryURL, capabilityPanelElementID, capabilityPanels,
+    capabilityPanelEntryError, capabilityPanelImportError, capabilityPanelMissingExportError,
+    capabilityPanelMountError, capabilityPanelUnmountError
+  };
 }
 
 if (typeof document !== 'undefined') {
@@ -693,13 +754,15 @@ if (typeof document !== 'undefined') {
   const sessionSidebar = $('session-sidebar');
   const sessionToggle = $('session-toggle');
   const sessionClose = $('session-close');
-  const memoryPanel = $('memory-panel');
+  // 贡献面板的入口插在扩展之前，所以这里要拿着这两个节点：一个是插入锚点，
+  // 一个说明页头顺序（贡献的面板都在扩展左边）。
+  const extensionsToggle = $('extensions-toggle');
+  const runtimeActions = document.querySelector('.runtime-actions');
   const sessionMedia = window.matchMedia('(max-width: 800px)');
   const panels = {
     runtime: { element: runtimeDrawer, toggle: runtimeToggle, close: runtimeClose, refresh: updateState },
-    extensions: { element: $('extensions-panel'), toggle: $('extensions-toggle'), close: $('extensions-close'), refresh: updateUIPlugins },
+    extensions: { element: $('extensions-panel'), toggle: extensionsToggle, close: $('extensions-close'), refresh: updateUIPlugins },
     sessions: { element: sessionSidebar, toggle: sessionToggle, close: sessionClose, refresh: updateSessions },
-    memory: { element: memoryPanel, toggle: $('memory-toggle'), close: $('memory-close'), refresh: updateMemory },
     settings: { element: $('settings-panel'), toggle: $('settings-toggle'), close: $('settings-close'), refresh: () => {} }
   };
   const appShell = document.querySelector('.app-shell');
@@ -715,9 +778,6 @@ if (typeof document !== 'undefined') {
   const sessionStatus = $('session-status');
   const sessionNotices = $('session-notices');
   const uiPluginList = $('ui-plugin-list');
-  const memoryList = $('memory-list');
-  const memoryEmpty = $('memory-empty');
-  const memoryStatus = $('memory-status');
   const uiPluginsEmpty = $('ui-plugins-empty');
   const uiPluginStatus = $('ui-plugins-status');
   const uiPluginsRetry = $('ui-plugins-retry');
@@ -1137,6 +1197,8 @@ if (typeof document !== 'undefined') {
     if (!activePanel) return;
     const panel = activePanel;
     activePanel = null;
+    // 面板可以带自己的收尾：贡献面板就在这里跑模块的 unmount 并移除容器。
+    if (typeof panel.teardown === 'function') panel.teardown();
     panel.element.classList.remove('is-open');
     panel.element.hidden = true;
     runtimeBackdrop.classList.remove('is-open');
@@ -1502,6 +1564,10 @@ if (typeof document !== 'undefined') {
     for (const item of (state.events || []).slice(-12).reverse()) {
       list.append(make('li', '', `${item.type} · ${item.message}`));
     }
+
+    // 页头入口与面板容器只随这一份状态变化。一次读不到状态时这里不会被调用，
+    // 所以"读不到"不会被当成"停用"，页头保持原样。
+    syncCapabilityPanels(capabilityPanels(state.capabilities));
   }
 
   async function updateState() {
@@ -1517,7 +1583,6 @@ if (typeof document !== 'undefined') {
     }
     // 各列表只跟随自己的可见性刷新，不再依赖运行详情。
     if (!sessionSidebar.hidden) updateSessions();
-    if (!memoryPanel.hidden) updateMemory();
   }
 
   // --- 会话侧栏与地址栏 ---------------------------------------------------
@@ -1762,99 +1827,235 @@ if (typeof document !== 'undefined') {
   sessionNew.addEventListener('click', newSession);
   window.addEventListener('hashchange', applySessionHash);
 
-  // --- 独立记忆面板 -------------------------------------------------------
+  // --- 能力贡献的面板 ------------------------------------------------------
   //
-  // The user's own view of the durable facts: what is stored, and a way to
-  // retract one. There is deliberately no way to add or edit a fact here — a
-  // fact is written by the model through luna_remember — and retracting posts
-  // the stored text and timestamp back unchanged, so the store can name exactly
-  // one fact rather than trusting the page to point at "the fourth one".
+  // 宿主不认识任何一个具体能力：它从 /api/state 只知道某个启用中的能力声明了
+  // 面板，以及面板模块的入口。入口与容器都跟着这份状态走；开合、背景遮罩、
+  // Escape、焦点约束和"一次只开一个"都由上面那套面板机制负责，这里只做三件事：
+  // 按状态建/拆入口与容器、打开时挂载模块、关闭时卸载。
 
-  let memoryView = { facts: [], retracted: [] };
-  let memoryReading = null;
-  let memoryRetracting = false;
+  const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
 
-  function setMemoryStatus(text, className = '') {
-    memoryStatus.textContent = text;
-    memoryStatus.className = `ui-plugin-status${className ? ` ${className}` : ''}`;
-    memoryStatus.hidden = !text;
+  // 面板 id 由能力自己给。加一层前缀再登记进 panels，就不会撞上宿主自己的
+  // runtime / extensions / sessions / settings。
+  const capabilityPanelKey = (id) => `capability:${id}`;
+
+  // 键是面板 id；每条记录是宿主为这个面板拥有的全部 DOM 与当前挂载状态。
+  const capabilityPanelNodes = new Map();
+
+  // 贡献面板的页头入口共用一个中性图标：具体是什么面板由 title 与 aria-label
+  // 说明，宿主不为某个能力画它自己的标志。
+  function capabilityPanelIcon() {
+    const svg = document.createElementNS(SVG_NAMESPACE, 'svg');
+    svg.setAttribute('class', 'ui-icon');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', '1.6');
+    svg.setAttribute('aria-hidden', 'true');
+    const frame = document.createElementNS(SVG_NAMESPACE, 'rect');
+    frame.setAttribute('x', '4');
+    frame.setAttribute('y', '5');
+    frame.setAttribute('width', '16');
+    frame.setAttribute('height', '14');
+    frame.setAttribute('rx', '2');
+    const divider = document.createElementNS(SVG_NAMESPACE, 'path');
+    divider.setAttribute('d', 'M4 10h16');
+    svg.append(frame, divider);
+    return svg;
   }
 
-  function memoryRowNode(row) {
-    const item = make('li', 'memory-item');
-    item.append(make('p', 'memory-text', row.text));
-    item.append(make('p', 'memory-meta', `${row.time} · 来自 ${row.session}`));
-    const button = make('button', 'memory-retract', '撤回');
-    button.type = 'button';
-    button.addEventListener('click', () => retractFact(row, button));
-    item.append(button);
-    return item;
+  // 一次挂载是否还算数：面板仍然开着，而且没有被"关闭后重新打开"打断过。
+  function capabilityPanelLive(record, generation) {
+    return record.open && record.generation === generation;
   }
 
-  function renderMemory(note = '') {
-    reconcileList(memoryList, memoryView.facts, (row) => JSON.stringify([row.at, row.text]), memoryRowNode, (item, row, index) => {
-      item.querySelector('.memory-meta').textContent = `${row.time} · 来自 ${row.session}`;
-      const button = item.querySelector('button');
-      button.dataset.memoryIndex = String(index);
-      button.disabled = memoryRetracting;
-    }, panels.memory.close);
-    memoryEmpty.hidden = memoryView.facts.length > 0;
-    const parts = [];
-    if (memoryView.retracted.length > 0) parts.push(`已撤回 ${memoryView.retracted.length} 条`);
-    if (note) parts.push(note);
-    setMemoryStatus(parts.join(' · '));
+  // 一次没有走通的挂载：容器由宿主移除，面板 body 里留下这一条失败本身，
+  // 而不是让整页报错。
+  function failCapabilityPanel(record, target, message) {
+    record.target = null;
+    record.module = null;
+    target.remove();
+    record.body.replaceChildren(make('p', 'capability-panel-error', message), record.log);
   }
 
-  function updateMemory(afterRetraction = false) {
-    if (memoryRetracting && !afterRetraction) return Promise.resolve(false);
-    if (memoryReading) return memoryReading;
-    memoryReading = (async () => {
-      try {
-        const response = await fetch('/api/memory', { cache: 'no-store' });
-        if (!response.ok) throw new Error(await errorMessage(response));
-        const payload = await response.json();
-        // 撤回前发出的轮询不能覆盖撤回中的状态；写入完成后再单独读取。
-        if (memoryRetracting && !afterRetraction) return false;
-        memoryView = memoryRows(payload);
-        renderMemory();
-        return true;
-      } catch (error) {
-        setMemoryStatus(`无法读取记忆：${error.message}`, 'failure');
-        return false;
-      } finally {
-        memoryReading = null;
-      }
-    })();
-    return memoryReading;
-  }
-
-  async function retractFact(row, button) {
-    if (memoryRetracting) return;
-    const payload = retractPayload(row);
-    if (payload === null) {
-      setMemoryStatus('这一条缺少时间或内容，无法撤回。', 'failure');
+  // 打开时才挂载：模块随每一次打开重新 import 并 mount，所以面板上的数据总是
+  // 这一次读到的，而不是上一次留下的。
+  async function mountCapabilityPanel(record) {
+    record.open = true;
+    if (record.module) return;
+    record.generation += 1;
+    const generation = record.generation;
+    const target = make('div', 'capability-panel-target');
+    record.body.replaceChildren(target, record.log);
+    record.target = target;
+    const url = capabilityPanelEntryURL(record.entry);
+    if (!url) {
+      failCapabilityPanel(record, target, capabilityPanelEntryError(record.title));
       return;
     }
-    const hadFocus = document.activeElement === button;
-    memoryRetracting = true;
-    for (const action of memoryList.querySelectorAll('button')) action.disabled = true;
+    const api = uiPluginHostAPI(UI_PLUGIN_API_VERSION, (message) => uiPluginLogLine(record, message));
+    let capabilityModule = null;
     try {
-      const response = await fetch('/api/memory/retract', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (!response.ok) throw new Error(await errorMessage(response));
-      await memoryReading;
-      if (await updateMemory(true)) renderMemory('这一条已撤回，下一次运行不再注入它。');
+      capabilityModule = await import(url);
     } catch (error) {
-      setMemoryStatus(`撤回失败：${error.message}`, 'failure');
-    } finally {
-      memoryRetracting = false;
-      for (const action of memoryList.querySelectorAll('button')) action.disabled = false;
-      if (hadFocus && activePanel === panels.memory && (document.activeElement === button || document.activeElement === document.body)) {
-        (canFocus(button) ? button : panels.memory.close).focus();
+      if (!capabilityPanelLive(record, generation)) return;
+      failCapabilityPanel(record, target, capabilityPanelImportError(record.title, uiPluginErrorDetail(error)));
+      return;
+    }
+    // 模块还没挂上就被关掉了：它已经被丢掉，这里不再挂载，免得它把自己的样式
+    // 或定时器留在一个已经不存在的容器上。
+    if (!capabilityPanelLive(record, generation)) return;
+    const missing = uiPluginMissingExports(capabilityModule);
+    if (missing.length) {
+      failCapabilityPanel(record, target, capabilityPanelMissingExportError(record.title, missing));
+      return;
+    }
+    try {
+      capabilityModule.mount(target, api);
+    } catch (error) {
+      failCapabilityPanel(record, target, capabilityPanelMountError(record.title, uiPluginErrorDetail(error)));
+      return;
+    }
+    record.module = capabilityModule;
+  }
+
+  // 关闭时的收尾：先跑模块自己的 unmount，再移除宿主创建的容器并丢掉模块引用，
+  // 所以下次打开是一次全新的挂载。容器由宿主移除，不取决于模块是否听话；模块
+  // 清理失败时把这一条记进面板自己的日志，而不是被吞掉。
+  function teardownCapabilityPanel(record) {
+    record.open = false;
+    record.generation += 1;
+    const target = record.target;
+    const capabilityModule = record.module;
+    record.target = null;
+    record.module = null;
+    if (!target) return;
+    let detail = '';
+    if (capabilityModule && typeof capabilityModule.unmount === 'function') {
+      try {
+        capabilityModule.unmount(target);
+      } catch (error) {
+        detail = uiPluginErrorDetail(error);
       }
+    }
+    target.remove();
+    record.body.replaceChildren(record.log);
+    if (detail) uiPluginLogLine(record, capabilityPanelUnmountError(record.title, detail));
+  }
+
+  function createCapabilityPanel(panel) {
+    const elementID = capabilityPanelElementID(panel.id);
+    const drawer = make('aside', 'runtime-drawer');
+    drawer.id = elementID;
+    drawer.setAttribute('role', 'dialog');
+    drawer.setAttribute('aria-modal', 'true');
+    drawer.setAttribute('aria-labelledby', `${elementID}-title`);
+    drawer.setAttribute('tabindex', '-1');
+    drawer.hidden = true;
+
+    const header = make('header', 'drawer-header');
+    const heading = make('h2', '', panel.title);
+    heading.id = `${elementID}-title`;
+    const close = make('button', 'icon-button', '关闭');
+    close.type = 'button';
+    close.setAttribute('aria-label', `关闭${panel.title}`);
+    header.append(heading, close);
+
+    const body = make('div', 'drawer-body');
+    // 模块自己的日志走宿主已有的那一条路径：有界，默认隐藏，不逐行播报。
+    const log = make('ul', 'ui-plugin-log');
+    log.hidden = true;
+    body.append(log);
+    drawer.append(header, body);
+
+    const button = make('button', 'icon-button capability-panel-toggle');
+    button.type = 'button';
+    button.setAttribute('aria-controls', elementID);
+    button.setAttribute('aria-expanded', 'false');
+    button.setAttribute('aria-label', panel.title);
+    button.setAttribute('title', panel.title);
+    button.append(capabilityPanelIcon());
+
+    const record = {
+      key: capabilityPanelKey(panel.id),
+      id: panel.id,
+      title: panel.title,
+      entry: panel.entry,
+      button,
+      drawer,
+      heading,
+      close,
+      body,
+      log,
+      target: null,
+      module: null,
+      open: false,
+      generation: 0,
+      panel: null
+    };
+    record.panel = {
+      element: drawer,
+      toggle: button,
+      close,
+      refresh: () => { mountCapabilityPanel(record); },
+      teardown: () => { teardownCapabilityPanel(record); }
+    };
+    button.addEventListener('click', () => openDrawer(record.panel));
+    close.addEventListener('click', () => closeDrawer());
+    capabilityPanelNodes.set(panel.id, record);
+    panels[record.key] = record.panel;
+    // 贡献面板固定在扩展之前：页头顺序与它们被声明的顺序一致。
+    runtimeActions.insertBefore(button, extensionsToggle);
+    document.body.append(drawer);
+    return record;
+  }
+
+  // 每一轮状态只更新它已经认识的面板：已存在的入口与容器不动，所以一个打开中
+  // 的面板不会被轮询重置。
+  function updateCapabilityPanel(record, panel) {
+    const titleChanged = record.title !== panel.title;
+    const entryChanged = record.entry !== panel.entry;
+    record.title = panel.title;
+    record.entry = panel.entry;
+    if (titleChanged) {
+      record.heading.textContent = panel.title;
+      record.button.setAttribute('aria-label', panel.title);
+      record.button.setAttribute('title', panel.title);
+      record.close.setAttribute('aria-label', `关闭${panel.title}`);
+    }
+    // 入口换了就重来一次：已经挂载的模块不能继续代表新的入口。
+    if (entryChanged && activePanel === record.panel) {
+      teardownCapabilityPanel(record);
+      mountCapabilityPanel(record);
+    }
+  }
+
+  // 能力停用或消失：入口与面板一起走。开着的先关掉，挂载过的先 unmount，
+  // 然后宿主把自己建的按钮、容器和登记一并移除。
+  function removeCapabilityPanel(id, record) {
+    if (activePanel === record.panel) closeDrawer(false);
+    teardownCapabilityPanel(record);
+    record.button.remove();
+    record.drawer.remove();
+    delete panels[record.key];
+    capabilityPanelNodes.delete(id);
+  }
+
+  // syncCapabilityPanels makes the header entries and the panel containers match
+  // the capabilities the kernel reports as enabled. It runs on every state read
+  // and is idempotent: an entry that is already there is left alone (an open
+  // panel is not reset), one that disappeared is removed together with its
+  // panel, and a new one is created in the order the kernel registered it.
+  function syncCapabilityPanels(list) {
+    const wanted = new Map(list.map((panel) => [panel.id, panel]));
+    for (const [id, record] of [...capabilityPanelNodes]) {
+      if (!wanted.has(id)) removeCapabilityPanel(id, record);
+    }
+    for (const [id, panel] of wanted) {
+      const record = capabilityPanelNodes.get(id);
+      if (record) updateCapabilityPanel(record, panel);
+      else createCapabilityPanel(panel);
     }
   }
 

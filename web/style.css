@@ -161,13 +161,13 @@ body {
 /* 只给宿主自己的控件加基础样式与游标，不给插件里任意原生 button 强加全局规则。
    button 默认不继承字体，所以这里显式列出宿主用到的类。 */
 .luna-button, .icon-button, .send-button, .session-new, .session-row, .sidebar-settings, .ui-plugin-toggle,
-.ui-plugin-retry, .memory-retract, .latest-button, .retry-button, .settings-tab,
+.ui-plugin-retry, .latest-button, .retry-button, .settings-tab,
 .reload-controls button, .composer textarea, .settings-field select {
   font: inherit;
   cursor: pointer;
 }
 .luna-button:disabled, .send-button:disabled, .icon-button:disabled, .session-new:disabled,
-.ui-plugin-toggle:disabled, .memory-retract:disabled, .reload-controls button:disabled {
+.ui-plugin-toggle:disabled, .reload-controls button:disabled {
   cursor: not-allowed;
   opacity: .46;
 }
@@ -191,7 +191,6 @@ body {
 .session-new:focus-visible,
 .sidebar-settings:focus-visible,
 .tool-row summary:focus-visible,
-.memory-retract:focus-visible,
 .technical-detail summary:focus-visible,
 .lifecycle-detail summary:focus-visible,
 .run-error-detail summary:focus-visible,
@@ -904,31 +903,12 @@ body {
 }
 .ui-plugin-retry:hover { background: var(--luna-hover); color: var(--luna-text); }
 
-/* --- 记忆与回放提示 --------------------------------------------------------- */
+/* --- 能力贡献的面板与回放提示 -----------------------------------------------
+   宿主只提供入口与容器；面板内容与它自己的布局样式随模块同行，
+   所以这里没有针对任何具体能力的规则。 */
 
-.memory-list { display: grid; gap: var(--luna-space-2); margin: var(--luna-space-3) 0 0; padding: 0; list-style: none; }
-.memory-item {
-  display: grid;
-  gap: var(--luna-space-1);
-  min-width: 0;
-  padding: var(--luna-space-2) var(--luna-space-3);
-  border-radius: var(--luna-radius-md);
-  background: var(--luna-raised);
-}
-.memory-text { margin: 0; color: var(--luna-text); font-size: var(--luna-font-ui); line-height: 1.7; overflow-wrap: anywhere; }
-.memory-meta { margin: 0; color: var(--luna-text-muted); font-size: var(--luna-font-label); }
-.memory-retract {
-  justify-self: start;
-  min-height: var(--luna-control-sm);
-  padding: 0 var(--luna-space-2);
-  border: 0;
-  border-radius: var(--luna-radius-sm);
-  background: transparent;
-  color: var(--luna-text-muted);
-  font-size: var(--luna-font-meta);
-}
-.memory-retract:hover { background: var(--luna-hover); color: var(--luna-danger); }
-.memory-retract:disabled { opacity: .6; }
+.capability-panel-target { font-size: var(--luna-font-meta); line-height: 1.7; overflow-wrap: anywhere; }
+.capability-panel-error { margin: 0; color: var(--luna-danger); font-size: var(--luna-font-meta); line-height: 1.7; overflow-wrap: anywhere; }
 .session-notices { margin-bottom: var(--luna-space-4); }
 .session-notice {
   margin: 0 0 var(--luna-space-2);
@@ -995,7 +975,7 @@ body {
   .icon-button { width: 44px; height: 44px; }
   .icon-button::after { inset: 0; }
   .send-button { width: 44px; height: 44px; }
-  .session-new, .sidebar-settings, .memory-retract, .ui-plugin-toggle {
+  .session-new, .sidebar-settings, .ui-plugin-toggle {
     min-height: 44px;
     height: 44px;
   }
