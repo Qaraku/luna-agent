@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
+	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 )
 
 // fakeCapability is a minimal contributed capability for the HTTP layer: it
@@ -260,5 +262,51 @@ func TestNoCapabilitiesConfigured(t *testing.T) {
 	}
 	if w := capabilityRequest(t, h, http.MethodGet, "/api/notes", false); w.Code != http.StatusNotFound {
 		t.Fatalf("status=%d, want 404 without a registry", w.Code)
+	}
+}
+
+// 用真实能力配真实内核走一遍：面板样式表必须能从能力自己的路由真的拿到，而且
+// 响应上仍然挂着那条严格 CSP —— 面板样式能生效，靠的是"同源样式表"，不是放行
+// 内联样式。这条路径一旦退回注入 <style>，真实服务下面板就是无样式的。
+func TestTheMemoryPanelStylesheetIsReachableThroughTheKernel(t *testing.T) {
+	capability, err := memory.New(filepath.Join(t.TempDir(), ".runtime"))
+	if err != nil {
+		t.Fatalf("memory.New: %v", err)
+	}
+	reg := plugin.NewRegistry(plugin.PermissionStateWrite)
+	if err := reg.Register(capability); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := reg.Enable(memory.PluginID); err != nil {
+		t.Fatalf("enable: %v", err)
+	}
+	p := &fakePlugins{state: pluginState(pluginhost.ToolTextTransform, pluginhost.ToolReadFile)}
+	h := New(p, fakeRunner{}, newTestStore(t),
+		Info{BoundHost: "127.0.0.1:43210", Model: "fake-model", ProviderHost: "provider.test", WebDir: "../../web"},
+		WithCapabilities(reg))
+
+	w := capabilityRequest(t, h, http.MethodGet, memory.PanelStylePath, false)
+	if w.Code != http.StatusOK {
+		t.Fatalf("stylesheet status=%d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/css") {
+		t.Fatalf("stylesheet content-type=%q, want a CSS type", ct)
+	}
+	if strings.TrimSpace(w.Body.String()) == "" {
+		t.Fatal("the stylesheet the kernel served is empty")
+	}
+	csp := w.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "default-src 'self'") || strings.Contains(csp, "unsafe-inline") {
+		t.Fatalf("the strict CSP must stay the policy this asset lives under: %q", csp)
+	}
+	if w := capabilityRequest(t, h, http.MethodGet, memory.PanelEntryPath, false); w.Code != http.StatusOK {
+		t.Fatalf("panel module status=%d, want 200", w.Code)
+	}
+	// 停用能力，样式表和模块一起下线：面板样式不留在服务里。
+	if w := capabilityRequest(t, h, http.MethodPost, "/api/plugins/memory/disable", true); w.Code != http.StatusOK {
+		t.Fatalf("disable status=%d (body=%s)", w.Code, w.Body.String())
+	}
+	if w := capabilityRequest(t, h, http.MethodGet, memory.PanelStylePath, false); w.Code != http.StatusNotFound {
+		t.Fatalf("a disabled capability still served its stylesheet: %d", w.Code)
 	}
 }

@@ -9,20 +9,19 @@
 //
 // It uses the same mount(target, api) / unmount(target) contract as every other
 // browser module, and the host's own classes for the shared look; its layout
-// rules travel with it so the host stylesheet has no memory-specific rules.
+// rules come from the capability's own stylesheet route, so the host
+// stylesheet has no memory-specific rules and disabling the capability takes
+// the panel's look away with its content.
 
 const FACTS_URL = '/api/memory';
 const RETRACT_URL = '/api/memory/retract';
 
-const STYLE = `
-.memory-panel-hint { margin: 0 0 12px; }
-.memory-panel-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
-.memory-panel-item { display: grid; gap: 4px; padding: 10px 12px; border: 1px solid var(--luna-border-weak); border-radius: var(--luna-radius-6); background: var(--luna-surface); }
-.memory-panel-text { margin: 0; overflow-wrap: anywhere; }
-.memory-panel-meta { margin: 0; font-size: var(--luna-font-12); color: var(--luna-text-muted); }
-.memory-panel-retract { justify-self: start; }
-.memory-panel-empty, .memory-panel-status { margin: 8px 0 0; font-size: var(--luna-font-12); color: var(--luna-text-muted); }
-`;
+// The panel's rules are a separate asset of this capability, linked from the
+// module's own URL so the two always move together. They are linked rather than
+// injected as a <style> element because the service's CSP is
+// `default-src 'self'`: a same-origin stylesheet is allowed, an inline style
+// element is refused, and a refused one leaves the panel unstyled.
+const STYLE_URL = new URL('panel.css', import.meta.url).href;
 
 // One mount's state. A module instance lives in the container the host created,
 // so the state is keyed by that container and released on unmount.
@@ -30,9 +29,10 @@ const states = new WeakMap();
 
 export function mount(target, api) {
   const log = api && typeof api.log === 'function' ? api.log : () => {};
-  const style = document.createElement('style');
-  style.textContent = STYLE;
-  document.head.append(style);
+  const link = document.createElement('link');
+  link.rel = 'stylesheet';
+  link.href = STYLE_URL;
+  document.head.append(link);
 
   const hint = document.createElement('p');
   hint.className = 'memory-panel-hint';
@@ -53,7 +53,7 @@ export function mount(target, api) {
   target.append(hint, list, empty, status);
 
   const state = {
-    style,
+    link,
     list,
     empty,
     status,
@@ -77,7 +77,7 @@ export function unmount(target) {
   if (state.pending) clearTimeout(state.pending);
   // The stylesheet travels with the module, so it leaves with it; the host still
   // removes the container it created.
-  state.style.remove();
+  state.link.remove();
   target.replaceChildren();
 }
 

@@ -37,6 +37,13 @@ const (
 	PanelTitle     = "记忆"
 	PanelEntryPath = "/api/memory/panel.js"
 
+	// PanelStylePath is the stylesheet the panel module links. It is a route of
+	// this capability rather than a rule in the host stylesheet — the panel's
+	// look travels with the code that renders it — and it exists as a file
+	// because the service's CSP (`default-src 'self'`) allows a same-origin
+	// stylesheet while it refuses an injected <style> element.
+	PanelStylePath = "/api/memory/panel.css"
+
 	// stateNamespace is the state directory the plugin writes into. It is the
 	// repository's existing convention: the default state root is the repository
 	// root and the plugin's own file inside it keeps the name memory.jsonl, so
@@ -50,7 +57,8 @@ const (
 )
 
 // Plugin is the official Memory contribution: one write-only tool, one injected
-// context block and the user's two routes over the same store.
+// context block, the user's routes over the same store, and the browser panel
+// with its module and stylesheet.
 //
 // The store is the plugin's own state, not something the Kernel manages: the
 // Kernel hands over a state directory and knows nothing about the file inside
@@ -95,6 +103,7 @@ func Descriptor() plugin.Descriptor {
 			{Kind: plugin.ContributionRoute, ID: MemoryRoutePath},
 			{Kind: plugin.ContributionRoute, ID: RetractRoutePath},
 			{Kind: plugin.ContributionRoute, ID: PanelEntryPath},
+			{Kind: plugin.ContributionRoute, ID: PanelStylePath},
 			{Kind: plugin.ContributionPanel, ID: PanelID},
 		},
 		Claims: []plugin.Claim{
@@ -117,13 +126,15 @@ func (p *Plugin) Tools() []plugin.Tool {
 	return []plugin.Tool{p.tool}
 }
 
-// Routes returns the two HTTP entries. The Kernel owns the Host and Origin
-// checks and the method matching; each route only serves its own method.
+// Routes returns the capability's HTTP entries: the user's two data routes plus
+// the panel's module and stylesheet. The Kernel owns the Host and Origin checks
+// and the method matching; each route only serves its own method.
 func (p *Plugin) Routes() []plugin.Route {
 	return []plugin.Route{
 		factsRoute{store: p.store},
 		retractRoute{store: p.store},
 		panelRoute{},
+		panelStyleRoute{},
 	}
 }
 

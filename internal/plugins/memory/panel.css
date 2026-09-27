@@ -1,0 +1,20 @@
+/* The Memory panel's layout rules, served from the capability's own route.
+ *
+ * They live in a file rather than an injected <style> element because the
+ * service's CSP is `default-src 'self'`: a same-origin stylesheet loads, an
+ * inline style element is refused. Keeping them here, next to the module that
+ * uses them, is what makes disabling the capability take the panel's look away
+ * with its content.
+ *
+ * Every --luna-* token named below is defined in the host stylesheet; a name
+ * that is not defined there is silently dropped by the browser, so the
+ * references are checked against web/style.css by a test.
+ */
+
+.memory-panel-hint { margin: 0 0 var(--luna-space-3); }
+.memory-panel-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--luna-space-2); }
+.memory-panel-item { display: grid; gap: var(--luna-space-1); padding: var(--luna-space-2) var(--luna-space-3); border: 1px solid var(--luna-border-weak); border-radius: var(--luna-radius-sm); background: var(--luna-surface); }
+.memory-panel-text { margin: 0; overflow-wrap: anywhere; }
+.memory-panel-meta { margin: 0; font-size: var(--luna-font-meta); color: var(--luna-text-muted); }
+.memory-panel-retract { justify-self: start; }
+.memory-panel-empty, .memory-panel-status { margin: var(--luna-space-2) 0 0; font-size: var(--luna-font-meta); color: var(--luna-text-muted); }
