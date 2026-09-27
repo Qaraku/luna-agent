@@ -41,6 +41,11 @@ func (s *Server) requiresOrigin(method, path string) bool {
 	case "/api/reload", "/api/runs":
 		return true
 	}
+	if _, ok := cancelRunPath(path); ok {
+		// Stopping the active run is a kernel mutation in the same way starting
+		// one is, so it carries the same Origin requirement as POST /api/runs.
+		return true
+	}
 	if strings.HasPrefix(path, pluginStatePrefix) {
 		// A state change is a mutation; a request with a read method to the same
 		// path is a wrong-method request and is answered 405.

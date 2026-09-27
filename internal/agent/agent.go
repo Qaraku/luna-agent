@@ -111,9 +111,14 @@ type ToolStarted struct {
 // generation, version and process id are omitted rather than reported as zero.
 // Every plugin-backed call still carries all three.
 type ToolFinished struct {
-	RunID      string `json:"run_id"`
-	Name       string `json:"name"`
-	Result     string `json:"result"`
+	RunID  string `json:"run_id"`
+	Name   string `json:"name"`
+	Result string `json:"result"`
+	// DurationMS is how long the call took, measured by the runtime from the
+	// tool.started event that opened it. A client cannot measure this: it does
+	// not know when the call began on the server, and a client that guessed
+	// would be reporting its own latency as the tool's.
+	DurationMS int64  `json:"duration_ms"`
 	Generation uint64 `json:"generation,omitempty"`
 	Version    string `json:"version,omitempty"`
 	PluginPID  int    `json:"plugin_pid,omitempty"`
@@ -122,6 +127,7 @@ type ToolFailed struct {
 	RunID      string `json:"run_id"`
 	Name       string `json:"name"`
 	Error      string `json:"error"`
+	DurationMS int64  `json:"duration_ms"`
 	Generation uint64 `json:"generation,omitempty"`
 	Version    string `json:"version,omitempty"`
 	PluginPID  int    `json:"plugin_pid,omitempty"`
@@ -133,6 +139,87 @@ type RunFinished struct {
 type RunFailed struct {
 	RunID string `json:"run_id"`
 	Error string `json:"error"`
+}
+
+// RunCancelled is the terminal event of a run that was stopped instead of
+// broken: a Stop request, or the run deadline. The durable vocabulary does not
+// grow with it — store.StatusCancelled already covers both, and the reason
+// distinguishes them only for whoever is watching the run.
+type RunCancelled struct {
+	RunID  string `json:"run_id"`
+	Reason string `json:"reason"`
+}
+
+// AssistantReasoning is a delta of reasoning the provider chose to expose, in the
+// same shape as AssistantDelta and on its own event because it is a different
+// kind of content: it is streamed, it is shown as part of the run's timeline, and
+// it never becomes the answer. A provider that reports no reasoning produces no
+// such event — nothing here is ever invented or inferred.
+type AssistantReasoning struct {
+	Text string `json:"text"`
+}
+
+// UsageUpdated reports what one model call cost, when the provider reports it at
+// all. Nothing in the runtime depends on it: a provider that stays silent simply
+// produces no such event, and tokens the runtime was not told about are never
+// estimated.
+type UsageUpdated struct {
+	RunID           string `json:"run_id"`
+	InputTokens     int    `json:"input_tokens"`
+	OutputTokens    int    `json:"output_tokens"`
+	TotalTokens     int    `json:"total_tokens"`
+	CachedTokens    int    `json:"cached_tokens,omitempty"`
+	ReasoningTokens int    `json:"reasoning_tokens,omitempty"`
+}
+
+const (
+	// CancelReasonUser is the reason of a run the caller stopped: the Stop
+	// endpoint, or the request context that owned the stream ending.
+	CancelReasonUser = "user"
+	// CancelReasonTimeout is the reason of a run the run deadline stopped.
+	CancelReasonTimeout = "timeout"
+)
+
+// IsTerminalEvent reports whether an event type ends a run. The terminal
+// vocabulary lives here, next to the events themselves, so the writer that
+// enforces "exactly one terminal event" cannot drift from the events that
+// implement it.
+func IsTerminalEvent(eventType string) bool {
+	switch eventType {
+	case "run.finished", "run.failed", "run.cancelled":
+		return true
+	}
+	return false
+}
+
+// TerminalEvent is the one event that ends a run. A run that did not succeed
+// with an ended context was stopped, not broken, so it is reported as
+// run.cancelled with the reason the request side set; anything else is a real
+// failure.
+func TerminalEvent(ctx context.Context, runID, answer string, err error) Event {
+	if err != nil {
+		if reason, stopped := cancelReason(ctx, err); stopped {
+			return Event{Type: "run.cancelled", Data: RunCancelled{RunID: runID, Reason: reason}}
+		}
+		return Event{Type: "run.failed", Data: RunFailed{RunID: runID, Error: err.Error()}}
+	}
+	return Event{Type: "run.finished", Data: RunFinished{RunID: runID, Answer: answer}}
+}
+
+// cancelReason names why a run that did not succeed was stopped rather than
+// broken. The run's own context is the authority, not the error text: a
+// cancellation can surface from the iterator as any wrapped error, while a
+// context that ended is unambiguous — and the early terminal synthesis in the
+// HTTP layer, which sees only an error and no event, needs the same answer.
+func cancelReason(ctx context.Context, err error) (string, bool) {
+	cause := context.Cause(ctx)
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(cause, context.DeadlineExceeded):
+		return CancelReasonTimeout, true
+	case errors.Is(err, context.Canceled), cause != nil:
+		return CancelReasonUser, true
+	}
+	return "", false
 }
 
 type Invoker interface {
@@ -164,12 +251,52 @@ func isInfrastructure(err error) bool {
 // explain it to the user or try a different call. An infrastructure failure ends
 // the run, because a model cannot be told anything useful about a plugin that is
 // not there.
-func refuse(ctx context.Context, name string, out pluginhost.Output, err error) (string, error) {
-	emit(ctx, Event{Type: "tool.failed", Data: ToolFailed{RunID: runID(ctx), Name: name, Error: err.Error(), Generation: out.Generation, Version: out.Version, PluginPID: out.PluginPID}})
+func refuse(ctx context.Context, name string, out pluginhost.Output, err error, startedAt time.Time) (string, error) {
+	emit(ctx, Event{Type: "tool.failed", Data: ToolFailed{RunID: runID(ctx), Name: name, Error: err.Error(), DurationMS: callDurationMS(startedAt), Generation: out.Generation, Version: out.Version, PluginPID: out.PluginPID}})
 	if isInfrastructure(err) {
 		return "", err
 	}
 	return refusalPrefix + err.Error(), nil
+}
+
+// callDurationMS is how long one tool call has taken so far, measured from the
+// tool.started event the wrapper emitted when it accepted the call. The runtime
+// times the call because it is the only side that knows when the call began.
+func callDurationMS(startedAt time.Time) int64 { return time.Since(startedAt).Milliseconds() }
+
+// stopCall closes a tool call the run's own cancellation interrupted. The call
+// still ends in the event stream, so the browser can finish it and show how long
+// it ran, but the error ends the run instead of reaching the model as a refusal:
+// the tool did not decline anything, the run was stopped, and telling the model
+// otherwise would be a false claim about what happened.
+func stopCall(ctx context.Context, name string, reason error, out pluginhost.Output, startedAt time.Time) (string, error) {
+	emit(ctx, Event{Type: "tool.failed", Data: ToolFailed{RunID: runID(ctx), Name: name, Error: reason.Error(), DurationMS: callDurationMS(startedAt), Generation: out.Generation, Version: out.Version, PluginPID: out.PluginPID}})
+	return "", reason
+}
+
+// emitUsage forwards a usage block one model call reported. Providers differ:
+// the OpenAI-compatible path asks for it with StreamOptions.IncludeUsage, and a
+// provider that reports nothing produces no event rather than zeros.
+func emitUsage(ctx context.Context, runID string, usage *schema.TokenUsage) {
+	if usage == nil {
+		return
+	}
+	emit(ctx, Event{Type: "usage.updated", Data: UsageUpdated{
+		RunID:           runID,
+		InputTokens:     usage.PromptTokens,
+		OutputTokens:    usage.CompletionTokens,
+		TotalTokens:     usage.TotalTokens,
+		CachedTokens:    usage.PromptTokenDetails.CachedTokens,
+		ReasoningTokens: usage.CompletionTokensDetails.ReasoningTokens,
+	}})
+}
+
+// emitMessageUsage is emitUsage for a call that arrived whole.
+func emitMessageUsage(ctx context.Context, runID string, message *schema.Message) {
+	if message == nil || message.ResponseMeta == nil {
+		return
+	}
+	emitUsage(ctx, runID, message.ResponseMeta.Usage)
 }
 
 // FileReader is the host-side file tool. The wrapper hands it the raw path from
@@ -221,6 +348,7 @@ func (t *TextTransformTool) InvokableRun(ctx context.Context, arguments string, 
 	if err := json.Unmarshal([]byte(arguments), &raw); err != nil {
 		raw = arguments
 	}
+	startedAt := time.Now()
 	emit(ctx, Event{Type: "tool.started", Data: ToolStarted{RunID: runID(ctx), Name: ToolName, Arguments: raw}})
 	var in struct {
 		Text string `json:"text"`
@@ -230,13 +358,16 @@ func (t *TextTransformTool) InvokableRun(ctx context.Context, arguments string, 
 		if err == nil {
 			err = fmt.Errorf("text is required")
 		}
-		return refuse(ctx, ToolName, pluginhost.Output{}, err)
+		return refuse(ctx, ToolName, pluginhost.Output{}, err, startedAt)
 	}
 	out, err := t.invoker.Invoke(ctx, pluginhost.Input{Text: in.Text})
 	if err != nil {
-		return refuse(ctx, ToolName, out, err)
+		if stopped := ctx.Err(); stopped != nil {
+			return stopCall(ctx, ToolName, stopped, out, startedAt)
+		}
+		return refuse(ctx, ToolName, out, err, startedAt)
 	}
-	emit(ctx, Event{Type: "tool.finished", Data: ToolFinished{RunID: runID(ctx), Name: ToolName, Result: out.Result, Generation: out.Generation, Version: out.Version, PluginPID: out.PluginPID}})
+	emit(ctx, Event{Type: "tool.finished", Data: ToolFinished{RunID: runID(ctx), Name: ToolName, Result: out.Result, DurationMS: callDurationMS(startedAt), Generation: out.Generation, Version: out.Version, PluginPID: out.PluginPID}})
 	// Only the transformed text is model-visible. Plugin generation, version and
 	// process identity stay in the event stream for the UI, so they cannot reach
 	// a user-facing answer through the model's context.
@@ -265,6 +396,7 @@ func (t *ReadFileTool) InvokableRun(ctx context.Context, arguments string, _ ...
 	if err := json.Unmarshal([]byte(arguments), &raw); err != nil {
 		raw = arguments
 	}
+	startedAt := time.Now()
 	emit(ctx, Event{Type: "tool.started", Data: ToolStarted{RunID: runID(ctx), Name: ReadFileToolName, Arguments: raw}})
 	var in struct {
 		Path string `json:"path"`
@@ -274,15 +406,18 @@ func (t *ReadFileTool) InvokableRun(ctx context.Context, arguments string, _ ...
 		if err == nil {
 			err = fmt.Errorf("path is required")
 		}
-		return refuse(ctx, ReadFileToolName, pluginhost.Output{}, err)
+		return refuse(ctx, ReadFileToolName, pluginhost.Output{}, err, startedAt)
 	}
 	// The requested path is passed through unchanged: the host resolves and
 	// validates it against the read root before any plugin sees it.
 	out, err := t.reader.ReadFile(ctx, pluginhost.ReadRequest{Path: in.Path})
 	if err != nil {
-		return refuse(ctx, ReadFileToolName, out, err)
+		if stopped := ctx.Err(); stopped != nil {
+			return stopCall(ctx, ReadFileToolName, stopped, out, startedAt)
+		}
+		return refuse(ctx, ReadFileToolName, out, err, startedAt)
 	}
-	emit(ctx, Event{Type: "tool.finished", Data: ToolFinished{RunID: runID(ctx), Name: ReadFileToolName, Result: out.Result, Generation: out.Generation, Version: out.Version, PluginPID: out.PluginPID}})
+	emit(ctx, Event{Type: "tool.finished", Data: ToolFinished{RunID: runID(ctx), Name: ReadFileToolName, Result: out.Result, DurationMS: callDurationMS(startedAt), Generation: out.Generation, Version: out.Version, PluginPID: out.PluginPID}})
 	// As with the transform tool, only the file text is model-visible; the
 	// serving generation, version and process identity stay in the event stream.
 	return out.Result, nil
@@ -474,11 +609,7 @@ func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err
 			// survive a restart.
 			err = appendErr
 		}
-		if err != nil {
-			emit(ctx, Event{Type: "run.failed", Data: RunFailed{RunID: req.RunID, Error: err.Error()}})
-			return
-		}
-		emit(ctx, Event{Type: "run.finished", Data: RunFinished{RunID: req.RunID, Answer: answer}})
+		emit(ctx, TerminalEvent(ctx, req.RunID, answer, err))
 	}()
 	// The user message is persisted before the model runs, so a crash mid-run
 	// still records what was asked; assembly drops this run's own records
@@ -514,8 +645,20 @@ func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err
 			continue
 		}
 		if mv.IsStreaming {
+			// There is deliberately no model.started event here. The stream
+			// handle is not a reliable ordering point: Eino hands the model
+			// stream to two consumers through Copy(2) — this loop and the
+			// graph's own tool branch — so a turn's tool can start before this
+			// loop is handed the handle, and "started" would be reported after
+			// its own tool call. A marker whose order is decided by the
+			// scheduler does not belong in the event stream; the browser
+			// derives "waiting for the model" from run.started, tool.finished
+			// and the first delta, all of which are in order.
+			if cancelErr := ctx.Err(); cancelErr != nil {
+				return "", cancelErr
+			}
 			sr := mv.MessageStream
-			var content []string
+			var turn strings.Builder
 			hasToolCalls := false
 			for {
 				chunk, e := sr.Recv()
@@ -533,20 +676,47 @@ func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err
 					hasToolCalls = true
 				}
 				if chunk.Content != "" {
-					content = append(content, chunk.Content)
+					// Delta out as it arrives: this is what makes the answer
+					// visible while it is being written. Whether this turn is
+					// the answer is only knowable when it ends, so a turn that
+					// turns out to carry tool calls is demoted by the browser to
+					// a run note; the accumulation below is unaffected, and the
+					// answer stays the one in run.finished.
+					emit(ctx, Event{Type: "assistant.delta", Data: AssistantDelta{Text: chunk.Content}})
+					turn.WriteString(chunk.Content)
+				}
+				// Reasoning the provider exposed is streamed on its own event and
+				// kept out of the answer: it is the run's reasoning, not its
+				// reply. It arrives before the content of the same turn, which is
+				// why the timeline can show thinking and then the answer.
+				if chunk.ReasoningContent != "" {
+					emit(ctx, Event{Type: "assistant.reasoning", Data: AssistantReasoning{Text: chunk.ReasoningContent}})
+				}
+				if usage := chunk.ResponseMeta; usage != nil {
+					emitUsage(ctx, req.RunID, usage.Usage)
 				}
 			}
 			sr.Close()
 			if !hasToolCalls {
-				for _, text := range content {
-					b.WriteString(text)
-					emit(ctx, Event{Type: "assistant.delta", Data: AssistantDelta{Text: text}})
-				}
+				b.WriteString(turn.String())
 			}
-		} else if mv.Message != nil && len(mv.Message.ToolCalls) == 0 && mv.Message.Content != "" {
-			b.WriteString(mv.Message.Content)
-			emit(ctx, Event{Type: "assistant.delta", Data: AssistantDelta{Text: mv.Message.Content}})
+		} else if mv.Message != nil {
+			emitMessageUsage(ctx, req.RunID, mv.Message)
+			if mv.Message.ReasoningContent != "" {
+				emit(ctx, Event{Type: "assistant.reasoning", Data: AssistantReasoning{Text: mv.Message.ReasoningContent}})
+			}
+			if len(mv.Message.ToolCalls) == 0 && mv.Message.Content != "" {
+				b.WriteString(mv.Message.Content)
+				emit(ctx, Event{Type: "assistant.delta", Data: AssistantDelta{Text: mv.Message.Content}})
+			}
 		}
+	}
+	// A run whose context ended was stopped, and the terminal event is the
+	// run's own word for how it ended: partial text must never be handed
+	// forward as a finished answer, even if the iterator ended without an
+	// error of its own.
+	if cancelErr := ctx.Err(); cancelErr != nil {
+		return "", cancelErr
 	}
 	if err := recorder.Err(); err != nil {
 		return "", err

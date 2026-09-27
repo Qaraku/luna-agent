@@ -185,7 +185,11 @@ func assistantDeltaTexts(events []Event) []string {
 	return texts
 }
 
-func TestRunSuppressesStreamingContentBeforeToolCall(t *testing.T) {
+// TestToolCallTurnTextBeforeTheToolCallIsStreamed is the twin of the test below
+// for the other order a provider may use inside one turn: the text arrives
+// before the tool call. Both orders stream the text, and in neither order does it
+// become the answer.
+func TestToolCallTurnTextBeforeTheToolCallIsStreamed(t *testing.T) {
 	m := toolTurnModel{
 		first: []*schema.Message{
 			{Role: schema.Assistant, Content: "transient"},
@@ -205,12 +209,17 @@ func TestRunSuppressesStreamingContentBeforeToolCall(t *testing.T) {
 	if answer != "final answer" {
 		t.Fatalf("answer=%q", answer)
 	}
-	if got := assistantDeltaTexts(sink.events); len(got) != 1 || got[0] != "final answer" {
+	if got := assistantDeltaTexts(sink.events); strings.Join(got, ",") != "transient,final answer" {
 		t.Fatalf("assistant deltas=%q", got)
 	}
 }
 
-func TestRunSuppressesStreamingContentAfterToolCall(t *testing.T) {
+// TestToolCallTurnTextIsStreamedButIsNotTheAnswer pins both halves of the
+// streaming contract: what a tool-call turn writes is streamed as it is written,
+// so the user is not staring at a spinner, and it still never becomes the answer.
+// The browser demotes it to a run note when the tool call follows it; the
+// runtime's answer stays the text of the turn that had no tool calls.
+func TestToolCallTurnTextIsStreamedButIsNotTheAnswer(t *testing.T) {
 	m := toolTurnModel{
 		first: []*schema.Message{
 			toolCallChunk(),
@@ -230,7 +239,7 @@ func TestRunSuppressesStreamingContentAfterToolCall(t *testing.T) {
 	if answer != "final answer" {
 		t.Fatalf("answer=%q", answer)
 	}
-	if got := assistantDeltaTexts(sink.events); len(got) != 1 || got[0] != "final answer" {
+	if got := assistantDeltaTexts(sink.events); strings.Join(got, ",") != "transient,final answer" {
 		t.Fatalf("assistant deltas=%q", got)
 	}
 }
@@ -705,5 +714,323 @@ func TestARefusedToolCallStillAnswersTheUser(t *testing.T) {
 	want := []string{"run.started", "tool.started", "tool.failed", "assistant.delta", "run.finished"}
 	if strings.Join(types, ",") != strings.Join(want, ",") {
 		t.Fatalf("events=%v", types)
+	}
+}
+
+// TestTerminalEventSaysWhyTheRunEnded pins the one place that decides which event
+// ends a run. A stopped run is not a broken one, and the reason has to separate a
+// caller pressing Stop from the run's own deadline.
+func TestTerminalEventSaysWhyTheRunEnded(t *testing.T) {
+	stopped, stop := context.WithCancelCause(context.Background())
+	stop(errors.New("stopped by the caller"))
+	defer stop(nil)
+	expired, expire := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer expire()
+
+	tests := []struct {
+		name       string
+		ctx        context.Context
+		err        error
+		wantType   string
+		wantReason string
+	}{
+		{"answered", context.Background(), nil, "run.finished", ""},
+		{"stopped by the caller", stopped, context.Canceled, "run.cancelled", CancelReasonUser},
+		{"stopped, surfaced as some other error", stopped, errors.New("stream closed"), "run.cancelled", CancelReasonUser},
+		{"stopped by the deadline", expired, context.DeadlineExceeded, "run.cancelled", CancelReasonTimeout},
+		{"broken", context.Background(), errors.New("model unavailable"), "run.failed", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			event := TerminalEvent(tc.ctx, "run-1", "the answer", tc.err)
+			if event.Type != tc.wantType {
+				t.Fatalf("type=%s want=%s", event.Type, tc.wantType)
+			}
+			if !IsTerminalEvent(event.Type) {
+				t.Fatalf("%s is not a terminal event", event.Type)
+			}
+			if tc.wantReason == "" {
+				return
+			}
+			cancelled, ok := event.Data.(RunCancelled)
+			if !ok || cancelled.Reason != tc.wantReason || cancelled.RunID != "run-1" {
+				t.Fatalf("data=%#v want reason=%s", event.Data, tc.wantReason)
+			}
+		})
+	}
+}
+
+// blockingInvoker holds one call open until the run's context ends, so the test
+// can stop a run while a tool is genuinely in flight.
+type blockingInvoker struct {
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingInvoker) Invoke(ctx context.Context, _ pluginhost.Input) (pluginhost.Output, error) {
+	b.once.Do(func() { close(b.entered) })
+	<-ctx.Done()
+	return pluginhost.Output{}, ctx.Err()
+}
+
+// transformCallModel always asks for the transform tool, which is enough to put a
+// real call in flight.
+type transformCallModel struct{}
+
+func (transformCallModel) WithTools([]*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+	return transformCallModel{}, nil
+}
+func (transformCallModel) Generate(context.Context, []*schema.Message, ...model.Option) (*schema.Message, error) {
+	return schema.AssistantMessage("", []schema.ToolCall{{ID: "call-1", Type: "function", Function: schema.FunctionCall{Name: ToolName, Arguments: `{"text":"hi"}`}}}), nil
+}
+func (t transformCallModel) Stream(ctx context.Context, in []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	msg, err := t.Generate(ctx, in, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return schema.StreamReaderFromArray([]*schema.Message{msg}), nil
+}
+
+// TestStoppingARunDuringAToolCallEndsTheCallAndTheRun covers what Stop has to
+// handle when a tool is in flight: the call closes with its duration, the run
+// ends as cancelled, and the model is never told the tool declined a call it did
+// not decline.
+func TestStoppingARunDuringAToolCallEndsTheCallAndTheRun(t *testing.T) {
+	invoker := &blockingInvoker{entered: make(chan struct{})}
+	r, err := NewRunner(context.Background(), transformCallModel{}, invoker, &recordingReader{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &collectingSink{}
+	ctx, stop := context.WithCancelCause(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = r.Run(ctx, RunRequest{Message: "transform this", RunID: "run-stop", Sink: sink})
+	}()
+	select {
+	case <-invoker.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the tool call never started")
+	}
+	stop(errors.New("stopped while the tool ran"))
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run did not end after the stop")
+	}
+
+	sink.mu.Lock()
+	events := append([]Event{}, sink.events...)
+	sink.mu.Unlock()
+	types := make([]string, 0, len(events))
+	for _, e := range events {
+		types = append(types, e.Type)
+	}
+	terminals := 0
+	for _, e := range events {
+		if IsTerminalEvent(e.Type) {
+			terminals++
+		}
+	}
+	if terminals != 1 {
+		t.Fatalf("terminal events=%d types=%v", terminals, types)
+	}
+	last := events[len(events)-1]
+	cancelled, ok := last.Data.(RunCancelled)
+	if last.Type != "run.cancelled" || !ok || cancelled.Reason != CancelReasonUser {
+		t.Fatalf("terminal event=%#v types=%v", last, types)
+	}
+	failures := 0
+	for _, e := range events {
+		if e.Type == "run.finished" {
+			t.Fatalf("a stopped run reported an answer: %v", types)
+		}
+		if e.Type != "tool.failed" {
+			continue
+		}
+		failures++
+		failed, ok := e.Data.(ToolFailed)
+		if !ok {
+			t.Fatalf("tool.failed data=%#v", e.Data)
+		}
+		if failed.DurationMS < 0 || failed.Name != ToolName {
+			t.Fatalf("tool.failed=%+v", failed)
+		}
+		if strings.HasPrefix(failed.Error, refusalPrefix) {
+			t.Fatalf("a stopped call was reported to the model as a refusal: %q", failed.Error)
+		}
+	}
+	if failures != 1 {
+		t.Fatalf("tool.failed events=%d types=%v", failures, types)
+	}
+}
+
+// stagedModel streams chunks only when the test sends them, so a test can tell
+// whether a delta reached the sink while the turn was still open. An unbuffered
+// pipe makes each send wait for the reader, which is what keeps the order of the
+// test's own observations meaningful.
+type stagedModel struct {
+	chunks  chan *schema.Message
+	started chan struct{}
+	once    sync.Once
+}
+
+func (m *stagedModel) WithTools([]*schema.ToolInfo) (model.ToolCallingChatModel, error) {
+	return m, nil
+}
+func (m *stagedModel) Generate(context.Context, []*schema.Message, ...model.Option) (*schema.Message, error) {
+	return nil, errors.New("Generate is not used when streaming")
+}
+func (m *stagedModel) Stream(context.Context, []*schema.Message, ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	sr, sw := schema.Pipe[*schema.Message](0)
+	go func() {
+		defer sw.Close()
+		m.once.Do(func() { close(m.started) })
+		for chunk := range m.chunks {
+			sw.Send(chunk, nil)
+		}
+	}()
+	return sr, nil
+}
+
+// TestAnswerStreamsWhileTheTurnIsOpen is the regression guard for real streaming:
+// the first delta has to reach the sink before the second chunk exists at all. A
+// runtime that collects a whole turn and emits it afterwards passes every test
+// that only checks for assistant.delta events, and fails this one.
+func TestAnswerStreamsWhileTheTurnIsOpen(t *testing.T) {
+	m := &stagedModel{chunks: make(chan *schema.Message), started: make(chan struct{})}
+	r, err := NewRunner(context.Background(), m, &fakeInvoker{}, &recordingReader{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &collectingSink{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := r.Run(context.Background(), RunRequest{Message: "hi", RunID: "run-stream", Sink: sink}); err != nil {
+			t.Errorf("run: %v", err)
+		}
+	}()
+	select {
+	case <-m.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the model was never called")
+	}
+	waitForDelta := func() bool {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			sink.mu.Lock()
+			found := false
+			for _, e := range sink.events {
+				if e.Type == "assistant.delta" {
+					found = true
+					break
+				}
+			}
+			sink.mu.Unlock()
+			if found {
+				return true
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		return false
+	}
+
+	m.chunks <- schema.AssistantMessage("hello ", nil)
+	if !waitForDelta() {
+		t.Fatal("the first delta only arrived after the turn ended: the answer is not streamed")
+	}
+
+	// The second chunk also carries usage, which the runtime reports only because
+	// the provider reported it.
+	last := schema.AssistantMessage("world", nil)
+	last.ResponseMeta = &schema.ResponseMeta{Usage: &schema.TokenUsage{
+		PromptTokens:            11,
+		CompletionTokens:        2,
+		TotalTokens:             13,
+		PromptTokenDetails:      schema.PromptTokenDetails{CachedTokens: 5},
+		CompletionTokensDetails: schema.CompletionTokensDetails{ReasoningTokens: 1},
+	}}
+	m.chunks <- last
+	close(m.chunks)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run never finished")
+	}
+
+	sink.mu.Lock()
+	events := append([]Event{}, sink.events...)
+	sink.mu.Unlock()
+	types := make([]string, 0, len(events))
+	for _, e := range events {
+		types = append(types, e.Type)
+	}
+	want := []string{"run.started", "assistant.delta", "assistant.delta", "usage.updated", "run.finished"}
+	if strings.Join(types, ",") != strings.Join(want, ",") {
+		t.Fatalf("types=%v want=%v", types, want)
+	}
+	if answer := events[len(events)-1].Data.(RunFinished).Answer; answer != "hello world" {
+		t.Fatalf("answer=%q", answer)
+	}
+	usage, ok := events[3].Data.(UsageUpdated)
+	if !ok {
+		t.Fatalf("usage event data=%#v", events[3].Data)
+	}
+	if usage.InputTokens != 11 || usage.OutputTokens != 2 || usage.TotalTokens != 13 || usage.CachedTokens != 5 || usage.ReasoningTokens != 1 {
+		t.Fatalf("usage=%+v", usage)
+	}
+}
+
+// TestReasoningIsStreamedAndKeptOutOfTheAnswer pins both halves of the reasoning
+// contract: what the provider exposes is streamed on its own event, in order
+// before the turn's text, and none of it becomes the answer.
+func TestReasoningIsStreamedAndKeptOutOfTheAnswer(t *testing.T) {
+	m := &stagedModel{chunks: make(chan *schema.Message), started: make(chan struct{})}
+	r, err := NewRunner(context.Background(), m, &fakeInvoker{}, &recordingReader{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &collectingSink{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := r.Run(context.Background(), RunRequest{Message: "hi", RunID: "run-think", Sink: sink}); err != nil {
+			t.Errorf("run: %v", err)
+		}
+	}()
+	select {
+	case <-m.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the model was never called")
+	}
+	thinking := schema.AssistantMessage("", nil)
+	thinking.ReasoningContent = "先算一下…"
+	m.chunks <- thinking
+	m.chunks <- schema.AssistantMessage("答案是 42。", nil)
+	close(m.chunks)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run never finished")
+	}
+
+	sink.mu.Lock()
+	events := append([]Event{}, sink.events...)
+	sink.mu.Unlock()
+	types := make([]string, 0, len(events))
+	for _, e := range events {
+		types = append(types, e.Type)
+	}
+	want := []string{"run.started", "assistant.reasoning", "assistant.delta", "run.finished"}
+	if strings.Join(types, ",") != strings.Join(want, ",") {
+		t.Fatalf("types=%v want=%v", types, want)
+	}
+	if got := events[1].Data.(AssistantReasoning).Text; got != "先算一下…" {
+		t.Fatalf("reasoning=%q", got)
+	}
+	if answer := events[len(events)-1].Data.(RunFinished).Answer; answer != "答案是 42。" {
+		t.Fatalf("answer=%q", answer)
 	}
 }

@@ -120,6 +120,27 @@ func pluginsReady(records []pluginhost.Record) bool {
 
 var runTimeout = 60 * time.Second
 
+// errRunStopped is the cause a Stop request cancels the active run with. The
+// value never reaches a client: the wire reason is the fixed word "user".
+var errRunStopped = errors.New("run stopped by user")
+
+// errStreamAbandoned is the cause the run is cancelled with when its SSE
+// response can no longer be written — the client disconnected, or a write
+// failed. The run is stopped the same way a Stop request stops it: a run whose
+// output nobody can read must not keep a process alive.
+var errStreamAbandoned = errors.New("run stream is no longer writable")
+
+// streamSinkCapacity is how many run events may be buffered ahead of the SSE
+// writer.
+//
+// Backpressure here is blocking and never dropping: a dropped assistant.delta
+// corrupts the answer the user sees, so a full sink slows the run down instead
+// of losing an event. The capacity is sized for the streaming contract, where a
+// model turn produces one event per chunk — an order of magnitude more events
+// than the per-turn events this started with — so the writer can fall behind by
+// a whole burst before the run feels it.
+const streamSinkCapacity = 512
+
 // Option configures what a Server can reach.
 type Option func(*Server)
 
@@ -138,9 +159,15 @@ type Server struct {
 	busy         bool
 	runID        string
 	sessionID    string
-	eventMu      sync.Mutex
-	events       []LifecycleEvent
-	connected    atomic.Bool
+	// cancelRun ends the active run's context with a cause, which is what makes
+	// a run stoppable from outside. It is set and cleared inside the same
+	// critical section as the run slot itself: a busy flag without a handle
+	// would name a run nobody can stop, and a handle without a run would name
+	// nothing at all.
+	cancelRun context.CancelCauseFunc
+	eventMu   sync.Mutex
+	events    []LifecycleEvent
+	connected atomic.Bool
 }
 
 func Listen(addr string) (net.Listener, error) {
@@ -271,6 +298,14 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.static(w, r)
 	default:
+		if id, ok := cancelRunPath(r.URL.Path); ok {
+			if r.Method != http.MethodPost {
+				method(w, http.MethodPost)
+				return
+			}
+			s.cancel(w, id)
+			return
+		}
 		if id, action, ok := pluginStatePath(r.URL.Path); ok {
 			if r.Method != http.MethodPost {
 				method(w, http.MethodPost)
@@ -479,6 +514,47 @@ func newRunID() string {
 	}
 	return hex.EncodeToString(b[:])
 }
+
+// cancelResponse is the frozen 202 shape of POST /api/runs/{id}/cancel.
+type cancelResponse struct {
+	RunID string `json:"run_id"`
+	State string `json:"state"`
+}
+
+// cancelRunPath splits /api/runs/{id}/cancel. The id is handed on unread: the
+// run slot is the only thing that knows whether a run with that id is active,
+// so a malformed or unknown id is answered there rather than guessed at here.
+func cancelRunPath(path string) (string, bool) {
+	rest, ok := strings.CutPrefix(path, "/api/runs/")
+	if !ok {
+		return "", false
+	}
+	id, ok := strings.CutSuffix(rest, "/cancel")
+	if !ok || id == "" || strings.Contains(id, "/") {
+		return "", false
+	}
+	return id, true
+}
+
+// cancel stops the active run. The request carries no body: stopping a run is a
+// property of the run slot, and a caller has nothing to say about it beyond
+// which run it means.
+//
+// A stop that names a run which is not the active one is a 404 and never a
+// guess. Stopping twice is not an error: the context of a cancelling run is
+// already ended, so a repeated request is answered the same way as the first.
+func (s *Server) cancel(w http.ResponseWriter, id string) {
+	s.runMu.Lock()
+	active := s.busy && s.runID == id
+	stop := s.cancelRun
+	s.runMu.Unlock()
+	if !active || stop == nil {
+		fail(w, 404, fmt.Errorf("no active run %q to cancel", id))
+		return
+	}
+	stop(errRunStopped)
+	send(w, 202, cancelResponse{RunID: id, State: "cancelling"})
+}
 func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Message   string `json:"message"`
@@ -504,6 +580,19 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The run context carries both ends of the run: a deadline, and a cancel
+	// handle the Stop endpoint uses. They are two contexts because they mean two
+	// different things — an expired deadline and a caller who changed their mind
+	// — and the first cancellation is the one that decides the cause the runner
+	// reports.
+	runCtx, cancelTimeout := context.WithTimeout(r.Context(), runTimeout)
+	defer cancelTimeout()
+	runCtx, cancelRun := context.WithCancelCause(runCtx)
+	// Releasing the run context is this handler's job on every path, including
+	// the admission rejection below that never publishes the handle. It runs
+	// after the runner has returned, so it never stops a run that is still
+	// reporting how it ended.
+	defer cancelRun(errStreamAbandoned)
 	s.runMu.Lock()
 	if s.busy {
 		s.runMu.Unlock()
@@ -513,12 +602,14 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	id := newRunID()
 	s.busy = true
 	s.runID = id
+	s.cancelRun = cancelRun
 	s.runMu.Unlock()
 	defer func() {
 		s.runMu.Lock()
 		s.busy = false
 		s.runID = ""
 		s.sessionID = ""
+		s.cancelRun = nil
 		s.runMu.Unlock()
 	}()
 	// A run without a session id starts a session; its id reaches the client on
@@ -545,9 +636,7 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(200)
 	flusher.Flush()
 	s.addEvent("run_started", "run "+id+" started")
-	runCtx, cancel := context.WithTimeout(r.Context(), runTimeout)
-	defer cancel()
-	sink := &streamSink{ctx: runCtx, events: make(chan agent.Event, 32)}
+	sink := &streamSink{ctx: runCtx, events: make(chan agent.Event, streamSinkCapacity)}
 	result := make(chan runResult, 1)
 	go func() {
 		answer, err := s.runner.Run(runCtx, agent.RunRequest{RunID: id, SessionID: sessionID, Message: in.Message, Sink: sink})
@@ -563,17 +652,18 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	for events != nil || resultCh != nil {
 		select {
 		case <-done:
+			// The run context ended, so the run is already stopping; only the
+			// stream's writability is left to record.
 			if r.Context().Err() != nil {
 				canWrite = false
 			}
-			cancel()
 			done = nil
 		case ev, ok := <-events:
 			if !ok {
 				events = nil
 				continue
 			}
-			isTerminal := ev.Type == "run.finished" || ev.Type == "run.failed"
+			isTerminal := agent.IsTerminalEvent(ev.Type)
 			if isTerminal {
 				if terminal > 0 {
 					continue
@@ -583,11 +673,11 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 			if canWrite {
 				if r.Context().Err() != nil {
 					canWrite = false
-					cancel()
+					cancelRun(errStreamAbandoned)
 					done = nil
 				} else if err := writeSSE(w, flusher, ev); err != nil {
 					canWrite = false
-					cancel()
+					cancelRun(errStreamAbandoned)
 					done = nil
 				}
 			}
@@ -595,25 +685,27 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 			resultCh = nil
 		}
 	}
-	if terminal == 0 && canWrite {
-		typ := "run.finished"
-		data := any(agent.RunFinished{RunID: id, Answer: out.answer})
-		if out.err != nil {
-			typ = "run.failed"
-			data = agent.RunFailed{RunID: id, Error: out.err.Error()}
-		}
-		if r.Context().Err() != nil {
+	// The run's own terminal event is the runner's word for how it ended. The
+	// synthesis below exists only for a runner that wrote none, and it uses the
+	// same classification, so a stopped run is never reported as a broken one.
+	outcome := agent.TerminalEvent(runCtx, id, out.answer, out.err)
+	if terminal == 0 {
+		if canWrite && r.Context().Err() != nil {
 			canWrite = false
-			cancel()
-		} else {
-			_ = writeSSE(w, flusher, agent.Event{Type: typ, Data: data})
+			cancelRun(errStreamAbandoned)
+		}
+		if canWrite {
+			_ = writeSSE(w, flusher, outcome)
 		}
 		terminal = 1
 	}
-	if out.err == nil {
+	switch outcome.Type {
+	case "run.finished":
 		s.connected.Store(true)
 		s.addEvent("run_finished", "run "+id+" finished")
-	} else {
+	case "run.cancelled":
+		s.addEvent("run_cancelled", "run "+id+" cancelled")
+	default:
 		s.addEvent("run_failed", "run "+id+" failed")
 	}
 }

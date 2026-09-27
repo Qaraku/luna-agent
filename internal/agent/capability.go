@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Qaraku/luna-agent/internal/plugin"
+	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
@@ -57,14 +59,18 @@ func (t contributedTool) InvokableRun(ctx context.Context, arguments string, _ .
 	if err := json.Unmarshal([]byte(arguments), &raw); err != nil {
 		raw = arguments
 	}
+	startedAt := time.Now()
 	emit(ctx, Event{Type: "tool.started", Data: ToolStarted{RunID: runID(ctx), Name: t.tool.Name(), Arguments: raw}})
 	result, err := t.tool.Invoke(ctx, arguments)
 	if err != nil {
-		return refuseCapability(ctx, t.tool.Name(), err)
+		if stopped := ctx.Err(); stopped != nil {
+			return stopCall(ctx, t.tool.Name(), stopped, pluginhost.Output{}, startedAt)
+		}
+		return refuseCapability(ctx, t.tool.Name(), err, startedAt)
 	}
 	// No generation, version or plugin process id: those belong to the process
 	// deployment form, and this call had none.
-	emit(ctx, Event{Type: "tool.finished", Data: ToolFinished{RunID: runID(ctx), Name: t.tool.Name(), Result: result}})
+	emit(ctx, Event{Type: "tool.finished", Data: ToolFinished{RunID: runID(ctx), Name: t.tool.Name(), Result: result, DurationMS: callDurationMS(startedAt)}})
 	return result, nil
 }
 
@@ -72,8 +78,8 @@ func (t contributedTool) InvokableRun(ctx context.Context, arguments string, _ .
 // A capability that says it cannot serve the call ends the round, because the
 // model cannot act on a broken store; everything else is the call's own result
 // and the round continues.
-func refuseCapability(ctx context.Context, name string, err error) (string, error) {
-	emit(ctx, Event{Type: "tool.failed", Data: ToolFailed{RunID: runID(ctx), Name: name, Error: err.Error()}})
+func refuseCapability(ctx context.Context, name string, err error, startedAt time.Time) (string, error) {
+	emit(ctx, Event{Type: "tool.failed", Data: ToolFailed{RunID: runID(ctx), Name: name, Error: err.Error(), DurationMS: callDurationMS(startedAt)}})
 	if plugin.IsUnavailable(err) {
 		return "", err
 	}

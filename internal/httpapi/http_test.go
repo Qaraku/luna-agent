@@ -115,8 +115,18 @@ func TestRunTimeoutCoversRunnerInvocation(t *testing.T) {
 	if elapsed > time.Second {
 		t.Fatalf("run timeout was not bounded: %v", elapsed)
 	}
-	if strings.Count(w.Body.String(), "event: run.failed") != 1 {
-		t.Fatalf("body=%s", w.Body.String())
+	// A deadline is not a failure: the run reports itself as cancelled with the
+	// reason that distinguishes it from a user pressing Stop. This also covers
+	// the synthesised terminal event, because the runner above returns without
+	// emitting one itself.
+	body := w.Body.String()
+	if strings.Count(body, "event: run.cancelled") != 1 || !strings.Contains(body, `"reason":"timeout"`) {
+		t.Fatalf("body=%s", body)
+	}
+	// Exactly one terminal event, whichever kind it is.
+	terminals := strings.Count(body, "event: run.finished") + strings.Count(body, "event: run.failed") + strings.Count(body, "event: run.cancelled")
+	if terminals != 1 {
+		t.Fatalf("terminal events=%d body=%s", terminals, body)
 	}
 }
 
@@ -133,6 +143,117 @@ func (r cancelAwareRunner) Run(ctx context.Context, req agent.RunRequest) (strin
 	<-r.release
 	req.Sink.Emit(agent.Event{Type: "assistant.delta", Data: agent.AssistantDelta{Text: "late"}})
 	return "", ctx.Err()
+}
+
+// stoppableRunner owns one run and emits no terminal event of its own, so the
+// terminal event a Stop produces comes from the HTTP layer's synthesis — the
+// path a real Stop depends on.
+type stoppableRunner struct {
+	runID   chan string
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r stoppableRunner) Run(ctx context.Context, req agent.RunRequest) (string, error) {
+	req.Sink.Emit(agent.Event{Type: "run.started", Data: agent.RunStarted{RunID: req.RunID}})
+	r.runID <- req.RunID
+	close(r.started)
+	<-ctx.Done()
+	<-r.release
+	return "", ctx.Err()
+}
+
+// syncWriter records a stream the handler writes from another goroutine.
+type syncWriter struct {
+	mu   sync.Mutex
+	body strings.Builder
+	head http.Header
+}
+
+func newSyncWriter() *syncWriter          { return &syncWriter{head: make(http.Header)} }
+func (w *syncWriter) Header() http.Header { return w.head }
+func (w *syncWriter) WriteHeader(int)     {}
+func (w *syncWriter) Flush()              {}
+func (w *syncWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.Write(p)
+}
+func (w *syncWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.String()
+}
+
+// TestCancelStopsTheNamedRunAndEndsTheStreamOnce covers the Stop entry point at
+// the HTTP layer: which request may stop a run, what it answers, what the stream
+// ends with, and that a stop can never guess.
+func TestCancelStopsTheNamedRunAndEndsTheStreamOnce(t *testing.T) {
+	runner := stoppableRunner{runID: make(chan string, 1), started: make(chan struct{}), release: make(chan struct{})}
+	h := testHandler(t, runner)
+
+	stream := newSyncWriter()
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:43210/api/runs", strings.NewReader(`{"message":"do it"}`))
+		r.Host = "127.0.0.1:43210"
+		r.Header.Set("Origin", "http://127.0.0.1:43210")
+		h.ServeHTTP(stream, r)
+	}()
+	var id string
+	select {
+	case id = <-runner.runID:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the run never started")
+	}
+
+	// A stop naming another run is refused, and stops nothing.
+	if wrong := request(t, h, http.MethodPost, "/api/runs/"+id+"zz/cancel", "", true); wrong.Code != http.StatusNotFound {
+		t.Fatalf("stop naming another run status=%d body=%s", wrong.Code, wrong.Body.String())
+	}
+	if strings.Contains(stream.String(), "event: run.cancelled") {
+		t.Fatal("a stop naming another run stopped the active one")
+	}
+	// A cross-site stop is refused before it reaches the run.
+	if foreign := request(t, h, http.MethodPost, "/api/runs/"+id+"/cancel", "", false); foreign.Code != http.StatusForbidden {
+		t.Fatalf("cross-site stop status=%d body=%s", foreign.Code, foreign.Body.String())
+	}
+
+	stopped202 := request(t, h, http.MethodPost, "/api/runs/"+id+"/cancel", "", true)
+	if stopped202.Code != http.StatusAccepted {
+		t.Fatalf("stop status=%d body=%s", stopped202.Code, stopped202.Body.String())
+	}
+	var decoded cancelResponse
+	if err := json.Unmarshal(stopped202.Body.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode stop response: %v", err)
+	}
+	if decoded.RunID != id || decoded.State != "cancelling" {
+		t.Fatalf("stop response=%+v want run_id=%s state=cancelling", decoded, id)
+	}
+	// Pressing Stop again while the run is winding down is not an error.
+	if again := request(t, h, http.MethodPost, "/api/runs/"+id+"/cancel", "", true); again.Code != http.StatusAccepted {
+		t.Fatalf("second stop status=%d body=%s", again.Code, again.Body.String())
+	}
+
+	close(runner.release)
+	select {
+	case <-stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stream did not end after Stop")
+	}
+	out := stream.String()
+	if strings.Count(out, "event: run.cancelled") != 1 || !strings.Contains(out, `"reason":"user"`) {
+		t.Fatalf("stream=%s", out)
+	}
+	terminals := strings.Count(out, "event: run.finished") + strings.Count(out, "event: run.failed") + strings.Count(out, "event: run.cancelled")
+	if terminals != 1 {
+		t.Fatalf("terminal events=%d stream=%s", terminals, out)
+	}
+	// Once the run is over there is nothing left to stop.
+	if late := request(t, h, http.MethodPost, "/api/runs/"+id+"/cancel", "", true); late.Code != http.StatusNotFound {
+		t.Fatalf("late stop status=%d body=%s", late.Code, late.Body.String())
+	}
 }
 
 type disconnectWriter struct {
