@@ -352,7 +352,13 @@ provider 与模型不需要。探测失败不算服务错误，它是一次回�
 - **未绑定工作区的回退**有端到端证据：`.evidence/tools/smoke-tools.py` **37 项判据、0 失败、10/10 工具**（比上一批多 6 项）。新增的第四个隔离实例把 `-root` 与 `-read-root` 都指向临时夹具、`settings.yaml` 里打开 terminal 与 filewrite、**不给任何会话绑定 workspace**：`luna_run` 的 `pwd` 返回夹具根、`luna_write_file` 在夹具根里真的写出文件并被读回，随后同一会话绑定 workspace 之后 `pwd` 改回 workspace 的目录。修复前的**负对照**留在 `.evidence/tools/smoke-tools.before-fix.txt`：用不含该修复的 `HEAD~1` 二进制跑同一脚本，这两条判据失败，失败原文正是「没有工作目录」的拒绝。
 - 正则模式的**缺陷侧验证**：把新加的正则分支短路后，4 条新用例立刻失败（`TestSearchReadsTheQueryAsAPatternWhenTheCallAsksForIt`、`TestTheSameQueryReadsDifferentlyInEachMode`、`TestSearchRegexStatesTheSameCapsAndComposesWithTrimIndent`、`TestSearchRegexRefusesAPatternItCannotCompile`），改回后全绿。
 
-**未验证 / 已知边界**：联网与正则的端到端判据（联网：默认关闭→开启、不依赖外网的地址拒绝、一次真实公网抓取；正则：模式命中、非法模式被拒）尚未跑完，完成后补进本节的判据计数。在补完之前，这两项的证据是单元与宿主层测试（`internal/plugins/web`、`internal/fileread`、`internal/pluginhost`）加上主树门禁，不是进程级证据。联网还缺两样：真实路由下的 https 与 6to4/NAT64 行为只被单元测试覆盖，代理路径也只由注入的代理函数验证过（`http.ProxyFromEnvironment` 每进程只读一次环境，进程内不可注入）。
+**未验证 / 已知边界**：
+
+- 联网的端到端判据在 `.evidence/tools/smoke-tools.py` 里：同一份记录 **50 项判据、0 失败、11/11 工具**（留存记录就是助手自己那一次运行；换一次运行输出只有随机端口与标记不同）。其中联网相关的是：默认关闭时交给模型的清单里没有 `luna_web_fetch`、开启后出现；`http://127.0.0.1:<端口>/` 与 `http://[::1]/` 被点名 loopback 拒绝**并且那个只监听 loopback 的端口一次请求也没收到**（拒绝不是文案）；`file://` 被点名 scheme 拒绝；私有段、link-local、6to4、NAT64 各被点名拒绝；换成代理的实例把 **2.16 MB** 的响应交给它，结果读前 1 MiB 并报出还有 1111508 字节没读、`start_offset` 真的能读出下一段；直连（起实例时清掉全部代理变量）抓取 `https://example.com/` 拿到含 `Example Domain` 的文本。
+- 正则模式的端到端判据在同一份记录里：判别用的查询是「字面量那句注释把中间几个字换成 `.*`」——**默认读法下不命中、`mode: regex` 下命中 `host.go` 并说明这次按模式读**；未知 `mode` 值与不能编译的模式都以 `the tool refused this call: ` 返回（后者带上 Go 自己的 `error parsing regexp`），且这一轮仍以 `run.finished` 结束。
+- **一处夹具保真度**：超长响应体与分页那两条用的是脚本自己的 loopback 代理加一个公开段地址字面量（`203.0.113.5`），因此它们证明的是上限行为与「说清还有多少没读」，**不证明目标真的是那个地址**。
+- 仍未验证：`https` 与 6to4/NAT64 在真实路由下的行为只有单元测试覆盖；真实模型会不会正确使用 `mode`、会不会滥用抓取，**没有真实 provider 跑过**。
+- **准入竞争（新发现，尚未决定怎么修）**：一次运行的终止事件写进流之后、run handler 清掉「忙」标志之前有一个小窗口，客户端在这个窗口里紧接着发下一次运行会拿到 `409 another run is active`。一次 30+ 轮的自动化验证里撞到过一次（脚本为此加了带上限的重试，那只是等待、不是判据）。两条修法：服务端在写出终止事件之前释放准入位，或客户端在 409 后重试一次。
 
 ## 构建方式
 
