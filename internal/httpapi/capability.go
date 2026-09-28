@@ -203,6 +203,23 @@ func capabilityViewOf(entry plugin.Entry) capabilityView {
 	return view
 }
 
+// CapabilityPreference 记录用户对能力启停的选择。装配根提供它：选择属于用户，存在哪个
+// 文件里是它的事。没有一个时，启停只影响这个进程（现状），行为不变。
+//
+// SetEnabled 只负责"把这次选择写下来"：要么写成了，要么报错，没有第三种结果。它不判断
+// 这个 id 是否存在、也不判断这次迁移是否允许——那是注册表的事，见 setPluginState。
+type CapabilityPreference interface {
+	// SetEnabled 记下用户希望这个能力处于 enabled 状态。返回错误表示这次选择没有
+	// 被记下，此时什么也没有改变。
+	SetEnabled(id string, enabled bool) error
+}
+
+// WithCapabilityPreference 提供记下用户选择的地方。没有它时，启停只改这个进程的运行
+// 态、不落盘，与这个 seam 出现之前完全一致。
+func WithCapabilityPreference(pref CapabilityPreference) Option {
+	return func(s *Server) { s.capabilityPref = pref }
+}
+
 // setPluginState enables or disables a built-in capability.
 //
 // Disabling takes the capability's tools, context blocks, routes and panels out
@@ -213,8 +230,25 @@ func (s *Server) setPluginState(w http.ResponseWriter, id, action string) {
 		fail(w, 500, fmt.Errorf("no capability registry is configured"))
 		return
 	}
+	enabled := action == "enable"
+	// 先写选择、再改运行态，顺序不能反。
+	//
+	// 这两样东西的寿命不一样：选择是持久的，它决定下次启动时这个能力在不在；运行态
+	// 只属于这个进程。反过来先改运行态，写盘失败就会留下"进程里已经是新状态、重启后
+	// 又退回旧状态"的结果，而请求回的是失败——"请求失败"与"已经改了"于是分不开，
+	// 用户既不敢重试也不能相信那句失败。先写盘时失败只可能停在写盘这一步，运行态一
+	// 个字节没动，500 就等于"什么都没发生"，重试是安全的。
+	//
+	// 注册表自己的拒绝（未知 id、不允许的迁移）发生在这之后，仍按现在那样报 409，
+	// 运行态同样没被碰过：写在文件里的只是用户这次的要求，这一层的职责是把它记下来。
+	if s.capabilityPref != nil {
+		if err := s.capabilityPref.SetEnabled(id, enabled); err != nil {
+			fail(w, 500, err)
+			return
+		}
+	}
 	var err error
-	if action == "enable" {
+	if enabled {
 		err = s.capabilities.Enable(id)
 	} else {
 		err = s.capabilities.Disable(id)

@@ -215,6 +215,9 @@ type Server struct {
 	runner       Runner
 	sessions     Sessions
 	capabilities *plugin.Registry
+	// capabilityPref 是用户对能力启停的选择，由装配根提供（见 capability.go 的
+	// CapabilityPreference）。为 nil 时启停只影响这个进程的现状，不落盘。
+	capabilityPref CapabilityPreference
 	// skills is the Skills capability as the interface uses it: which skills
 	// are installed and which of them the user turned off. It is supplied by
 	// the composition root, which also owns where that preference is stored.
