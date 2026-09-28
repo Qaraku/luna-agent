@@ -50,6 +50,11 @@ func (s *Server) requiresOrigin(method, path string) bool {
 		// installation's key on an outbound call, so a foreign page must not be
 		// able to make Luna do it.
 		return true
+	case writeDirsPath:
+		// Deciding which directories may be written in is what the write tools
+		// obey, so it is a mutation in the same way saving a provider is. A read
+		// method to this path is a wrong-method request and is answered 405.
+		return !isReadMethod(method)
 	}
 	if _, ok := cancelRunPath(path); ok {
 		// Stopping the active run is a kernel mutation in the same way starting

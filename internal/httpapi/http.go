@@ -218,6 +218,10 @@ type Server struct {
 	// capabilityPref 是用户对能力启停的选择，由装配根提供（见 capability.go 的
 	// CapabilityPreference）。为 nil 时启停只影响这个进程的现状，不落盘。
 	capabilityPref CapabilityPreference
+	// writeDirs 是用户定下的"允许写入的目录"，由装配根提供（见 write_dirs.go 的
+	// WriteDirPreference）。为 nil 时这份偏好读不到也写不了，接口明确报错，不返回一
+	// 张与"什么都不许写"分不开的空表。
+	writeDirs WriteDirPreference
 	// skills is the Skills capability as the interface uses it: which skills
 	// are installed and which of them the user turned off. It is supplied by
 	// the composition root, which also owns where that preference is stored.
@@ -449,6 +453,15 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			s.createWorkspace(w, r)
 		default:
 			method(w, "GET, POST")
+		}
+	case writeDirsPath:
+		switch r.Method {
+		case http.MethodGet:
+			s.getWriteDirs(w)
+		case http.MethodPut:
+			s.setWriteDirs(w, r)
+		default:
+			method(w, "GET, PUT")
 		}
 	case "/api/runs":
 		if r.Method != http.MethodPost {
