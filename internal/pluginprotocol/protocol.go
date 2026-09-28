@@ -15,10 +15,12 @@ var Handshake = plugin.HandshakeConfig{ProtocolVersion: 1, MagicCookieKey: "LUNA
 // MaxLineBytes serve the directory-listing plugin, where Path is the same kind
 // of validated absolute path — a directory — and the two caps bound how much of
 // Path/Query/MaxMatches/MaxFiles/MaxFileBytes serve the search plugin, where
-// Path is a validated absolute file or directory, Query is the literal to look
+// Path is a validated absolute file or directory, Query is the text to look
 // for, MaxLineBytes bounds one rendered line and the other three bound how many
 // matches are rendered, how many files are read and how large a file may be
-// before it is skipped. Path/Pattern/MaxPaths/MaxScanned serve the name-search
+// before it is skipped; Mode says how Query is to be read, and an empty Mode is
+// the literal default the search has always had. Path/Pattern/MaxPaths/MaxScanned
+// serve the name-search
 // plugin, where Path is a validated absolute file or directory, Pattern is the
 // glob matched against one entry name, MaxLineBytes bounds one rendered line,
 // MaxPaths bounds how many matching paths are rendered and MaxScanned how many
@@ -39,10 +41,19 @@ type Input struct {
 	// answers a range read with a silently cut result.
 	StartLine int `json:"start_line"`
 	MaxLines  int `json:"max_lines"`
-	// Query is the literal a search looks for. It is data, not a pattern: the
-	// plugin passes it to fileread.Search, which matches it with a substring
-	// test, so nothing in it is interpreted.
+	// Query is the text a search looks for. It is data, not a pattern, unless
+	// Mode explicitly says otherwise: in the default mode the plugin passes it
+	// to fileread.Search, which matches it with a substring test, so nothing in
+	// it is interpreted.
 	Query string `json:"query"`
+	// Mode says how a search is to read Query. It is empty when the request
+	// named no mode, which is the literal default — not a third mode — and
+	// fileread.ModeRegex when the request asked for the query to be compiled as
+	// an RE2 regular expression. Any other value is a malformed call: a plugin
+	// passes it through and fileread refuses it rather than reading it as the
+	// default, so a request that asked for a mode the search does not have can
+	// never be answered as though it had asked for literal text.
+	Mode string `json:"mode"`
 	// MaxEntries and MaxLineBytes carry the listing caps: at most that many
 	// entries are rendered, and one rendered line is at most that many bytes.
 	// A plugin that is sent no cap falls back to its own default rather than

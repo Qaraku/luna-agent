@@ -857,6 +857,278 @@ func TestSearchQueryRejections(t *testing.T) {
 	}
 }
 
+// A search reads its query the way the call asks it to, and the mode is the only
+// knob for that: the two declared values are accepted, an unnamed mode is the
+// literal default, and anything else is refused by name rather than read as the
+// default. The refusal is decided before any path is looked at, so an unknown mode
+// is named even when the path could not be searched either.
+func TestSearchModesAreTheOnlyModes(t *testing.T) {
+	for _, mode := range []string{"", ModeLiteral, ModeRegex} {
+		if err := ValidateMode(mode); err != nil {
+			t.Fatalf("ValidateMode(%q) = %v", mode, err)
+		}
+	}
+	root, _ := searchRoot(t)
+	for _, mode := range []string{"Regex", "regexp", "pattern", "glob", "literal ", " literal", "0", "did you mean literal?"} {
+		t.Run(mode, func(t *testing.T) {
+			if err := ValidateMode(mode); !errors.Is(err, ErrModeInvalid) {
+				t.Fatalf("ValidateMode(%q) = %v, want ErrModeInvalid", mode, err)
+			} else if !strings.Contains(err.Error(), fmt.Sprintf("%q", mode)) {
+				t.Fatalf("the refusal must name the value it refused: %v", err)
+			}
+			got, err := Search(filepath.Join(root, "absent"), "x", SearchOptions{Mode: mode})
+			if !errors.Is(err, ErrModeInvalid) {
+				t.Fatalf("Search with mode %q error = %v, want ErrModeInvalid", mode, err)
+			}
+			if got != "" {
+				t.Fatalf("a refused mode returned %q", got)
+			}
+		})
+	}
+}
+
+// A search that names no mode is a literal search, exactly as it was before the
+// mode existed: the same result, the same copy, and nothing in it mentioning
+// patterns. This is the contract the mode was added without changing.
+func TestSearchNamesNoModeAndReadsTheQueryAsLiteralText(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "dotted.txt"), "see docs/a.md for the file\n")
+	unnamed, err := Search(root, "docs/a.md", SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	named, err := Search(root, "docs/a.md", SearchOptions{Mode: ModeLiteral})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unnamed != named {
+		t.Fatalf("naming the default changed the result:\nunnamed:\n%snamed:\n%s", unnamed, named)
+	}
+	// The literal header is the header it has always been, to the character.
+	if want := `1 match for "docs/a.md" in 1 file:`; firstLine(unnamed) != want {
+		t.Fatalf("literal header = %q, want %q", firstLine(unnamed), want)
+	}
+	// A pattern the model might reach for is searched as its own characters, so a
+	// star is a star — and the result still says nothing about patterns having
+	// been an option.
+	pattern, err := Search(root, `docs/.*\.md`, SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(pattern, `no matches for "docs/.*\\.md" in 1 file.`) {
+		t.Fatalf("a pattern-looking query must be searched as a literal:\n%s", pattern)
+	}
+	if strings.Contains(pattern, "regular expression") {
+		t.Fatalf("a literal result must not talk about patterns:\n%s", pattern)
+	}
+}
+
+// regexRoot builds the two files the pattern cases are read against: one with
+// lines that a pattern can single out, and one whose only interesting match would
+// have to span a line break.
+func regexRoot(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "lines.txt"), "alpha\nbeta42\ngamma delta\nGAMMA\n")
+	mustWrite(t, filepath.Join(root, "two-lines.txt"), "one\ntwo\n")
+	return root
+}
+
+// With the regex mode the query is an RE2 pattern matched against one line at a
+// time: the header says which mode read it, the notes say what a pattern is
+// matched against, and a pattern that would need two lines cannot match, because
+// no line holds both of them.
+func TestSearchReadsTheQueryAsAPatternWhenTheCallAsksForIt(t *testing.T) {
+	root := regexRoot(t)
+	cases := []struct {
+		name  string
+		file  string
+		query string
+		// want is the "path:line" prefix of every match, in order.
+		want   []string
+		noHits bool
+	}{
+		{"anchored to the line", "lines.txt", `^alpha$`, []string{"lines.txt:1"}, false},
+		{"a character class", "lines.txt", `[0-9]+`, []string{"lines.txt:2"}, false},
+		{"alternation", "lines.txt", `delta|GAMMA`, []string{"lines.txt:3", "lines.txt:4"}, false},
+		{"an inline flag", "lines.txt", `(?i)gamma`, []string{"lines.txt:3", "lines.txt:4"}, false},
+		{"nothing matching", "lines.txt", `zzz.*zzz`, nil, true},
+		{"the end of a line", "two-lines.txt", `^two$`, []string{"two-lines.txt:2"}, false},
+		{"a pattern that would need two lines", "two-lines.txt", `one.*two`, nil, true},
+		{"a pattern that would need two lines even with the dot rule off", "two-lines.txt", `(?s)one.two`, nil, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Search(filepath.Join(root, tc.file), tc.query, SearchOptions{Mode: ModeRegex})
+			if err != nil {
+				t.Fatal(err)
+			}
+			header := firstLine(got)
+			if !strings.Contains(header, " as a regular expression in ") {
+				t.Fatalf("the header must say the query was read as a pattern: %q", header)
+			}
+			if !strings.Contains(header, fmt.Sprintf("%q", tc.query)) {
+				t.Fatalf("the header must name the query it read: %q", header)
+			}
+			if !strings.Contains(header, "the pattern was matched inside single lines") {
+				t.Fatalf("the result must say a pattern is matched line by line: %q", header)
+			}
+			hits := searchHits(t, got)
+			if tc.noHits {
+				if len(hits) != 0 || !strings.HasPrefix(header, "no matches for ") {
+					t.Fatalf("hits = %v, header = %q:\n%s", hits, header, got)
+				}
+				return
+			}
+			if strings.Join(hits, " ") != strings.Join(tc.want, " ") {
+				t.Fatalf("hits = %v, want %v:\n%s", hits, tc.want, got)
+			}
+		})
+	}
+}
+
+// The mode is the only thing that changes the answer: the same text that matches
+// as a pattern is nothing as a literal, and the same literal is nothing as a
+// pattern. Neither call can be read as the other.
+func TestTheSameQueryReadsDifferentlyInEachMode(t *testing.T) {
+	root := regexRoot(t)
+	file := filepath.Join(root, "lines.txt")
+	literal, err := Search(file, `[0-9]+`, SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(literal, `no matches for "[0-9]+" in 1 file.`) {
+		t.Fatalf("a pattern-looking literal must be searched as its own characters:\n%s", literal)
+	}
+	pattern, err := Search(file, `[0-9]+`, SearchOptions{Mode: ModeRegex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(pattern, "lines.txt:2: beta42") {
+		t.Fatalf("the pattern must match the line the literal did not:\n%s", pattern)
+	}
+	// And the reverse: a plain literal matches the line it is written on, and its
+	// header is not a pattern header.
+	plain, err := Search(file, "beta42", SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstLine(plain) != `1 match for "beta42" in 1 file:` || !strings.Contains(plain, "lines.txt:2") {
+		t.Fatalf("a plain literal must match as it always did:\n%s", plain)
+	}
+}
+
+// A pattern search is bounded by the same caps a literal search is, names the cap
+// that stopped it the same way, and composes with the rendering options the
+// candidates choose between.
+func TestSearchRegexStatesTheSameCapsAndComposesWithTrimIndent(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "many.txt"), "  n1\nn2\nn3\n")
+	got, err := Search(root, `n[0-9]`, SearchOptions{Mode: ModeRegex, MaxMatches: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `1 match for "n[0-9]" as a regular expression in 1 file (the pattern was matched inside single lines; the search stopped at 1 match; the remaining paths were not searched):`
+	if firstLine(got) != want {
+		t.Fatalf("header = %q, want %q:\n%s", firstLine(got), want, got)
+	}
+	if !strings.Contains(got, "many.txt:1:   n1") {
+		t.Fatalf("the matched line must keep its indentation by default:\n%s", got)
+	}
+	trimmed, err := Search(root, `n[0-9]`, SearchOptions{Mode: ModeRegex, MaxMatches: 1, TrimIndent: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstLine(trimmed) != want {
+		t.Fatalf("trimming the indent changed the header: %q", firstLine(trimmed))
+	}
+	if !strings.Contains(trimmed, "many.txt:1: n1") {
+		t.Fatalf("TrimIndent must render a matched line without its indentation:\n%s", trimmed)
+	}
+}
+
+// A pattern the search cannot compile is a refusal, not an empty result: it
+// carries Go's own explanation of what is wrong with it, and nothing is
+// searched. A literal search for the same text is unaffected and simply finds
+// nothing, which is the answer a broken pattern must not be mistaken for.
+func TestSearchRegexRefusesAPatternItCannotCompile(t *testing.T) {
+	root := regexRoot(t)
+	file := filepath.Join(root, "lines.txt")
+	for _, query := range []string{"[", "(", "*", "a**", "(?P<", "[z-a]"} {
+		t.Run(query, func(t *testing.T) {
+			got, err := Search(file, query, SearchOptions{Mode: ModeRegex})
+			if err == nil {
+				t.Fatalf("Search(%q) = %q, want a refusal", query, got)
+			}
+			if !errors.Is(err, ErrQueryPatternInvalid) {
+				t.Fatalf("Search(%q) error = %v, want ErrQueryPatternInvalid", query, err)
+			}
+			if !strings.Contains(err.Error(), "error parsing regexp") {
+				t.Fatalf("the refusal must carry Go's own explanation: %v", err)
+			}
+			if !strings.Contains(err.Error(), ErrQueryPatternInvalid.Error()) {
+				t.Fatalf("the refusal must say what it refused: %v", err)
+			}
+			if got != "" {
+				t.Fatalf("a refused pattern returned %q", got)
+			}
+		})
+	}
+	literal, err := Search(file, "[", SearchOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(literal, `no matches for "[" in 1 file.`) {
+		t.Fatalf("the same text as a literal must simply find nothing:\n%s", literal)
+	}
+}
+
+// The query is checked the same way in both modes and before it is compiled: the
+// rejections are the ones a literal search already made, the size limit is named
+// in the refusal, and a pattern at the limit that is a valid pattern still runs.
+func TestSearchRegexQueryRejectionsAreTheSameRejections(t *testing.T) {
+	root := regexRoot(t)
+	file := filepath.Join(root, "lines.txt")
+	cases := []struct {
+		name  string
+		query string
+		want  error
+	}{
+		{"empty", "", ErrQueryEmpty},
+		{"blank", "   ", ErrQueryEmpty},
+		{"nul byte", "a\x00b", ErrQueryInvalid},
+		{"line break", "a\nb", ErrQueryInvalid},
+		{"carriage return", "a\rb", ErrQueryInvalid},
+		{"too long", strings.Repeat("q", MaxQueryBytes+1), ErrQueryTooLarge},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Search(file, tc.query, SearchOptions{Mode: ModeRegex})
+			if err == nil {
+				t.Fatalf("Search(%q) = %q, want an error", tc.query, got)
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("Search(%q) error = %v, want %v", tc.query, err, tc.want)
+			}
+			if got != "" {
+				t.Fatalf("a refused query returned %q", got)
+			}
+			// The too-long refusal is the one that has to state the size it
+			// refused, so the model can see the limit rather than guess it.
+			if errors.Is(err, ErrQueryTooLarge) && !strings.Contains(err.Error(), fmt.Sprintf("%d", MaxQueryBytes)) {
+				t.Fatalf("the size error must state the limit: %v", err)
+			}
+		})
+	}
+	atLimit := "a" + strings.Repeat("b", MaxQueryBytes-1)
+	if len(atLimit) != MaxQueryBytes {
+		t.Fatalf("the fixture is %d bytes, want %d", len(atLimit), MaxQueryBytes)
+	}
+	if _, err := Search(file, atLimit, SearchOptions{Mode: ModeRegex}); err != nil {
+		t.Fatalf("a valid pattern at the limit was refused: %v", err)
+	}
+}
+
 func TestSearchRefusesAPathItCannotSearch(t *testing.T) {
 	root, _ := searchRoot(t)
 	if _, err := Search(filepath.Join(root, "absent"), "x", SearchOptions{}); !errors.Is(err, ErrNotSearchable) {

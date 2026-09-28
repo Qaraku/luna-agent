@@ -228,16 +228,24 @@ type ListRequest struct {
 	DelayMS int
 }
 
-// SearchRequest is a literal-search request from the core. Path is the raw,
+// SearchRequest is a search request from the core. Path is the raw,
 // model-supplied path, on the same terms as ReadRequest and ListRequest: the
 // host validates it against the roots the call names and the plugin only ever
 // sees the resolved absolute path — of a file or of a directory. Query is the
-// raw, model-supplied literal, validated here as well, and there is deliberately
-// no pattern, depth or filter knob: a search walks below the path it was given
-// and stops at its caps, and no request can widen that.
+// raw, model-supplied query, validated here as well, and Mode says how it is to
+// be read: empty (the default when the call named none) or "literal" matches it
+// as data, and "regex" asks for it to be read as an RE2 pattern. Mode is part of
+// the query's meaning rather than a knob that widens the search, so a value the
+// search does not have is refused here rather than read as the default; there is
+// deliberately no depth or filter knob, because a search walks below the path it
+// was given and stops at its caps, and no request can widen that.
 type SearchRequest struct {
 	Path  string
 	Query string
+	// Mode is the raw, model-supplied mode. See fileread.ModeLiteral and
+	// fileread.ModeRegex for the two values, and fileread.ValidateMode for what
+	// an unnamed mode means.
+	Mode string
 	// Roots are the directories this call may search, on the same terms as
 	// ReadRequest.Roots.
 	Roots []string
@@ -567,26 +575,32 @@ func (h *Host) ListDir(ctx context.Context, req ListRequest) (Output, error) {
 	return h.invoke(ctx, ToolListDir, Input{Path: resolved.Path, MaxEntries: h.opts.ListMaxEntries, MaxLineBytes: h.opts.ListMaxLineBytes, DelayMS: req.DelayMS})
 }
 
-// SearchFiles calls the literal-search tool. The requested path is validated
-// here, on the host side, exactly as a read or a listing path is — same
-// normalization, same containment, same symbolic-link resolution, through
-// fileread.ResolveSearchInRoots, against the same roots — and so is the query,
-// which is refused here if it is empty or too long rather than reaching a plugin
-// that would have to invent an answer. The plugin is handed only the resolved
-// absolute path, the literal and the four caps.
+// SearchFiles calls the search tool. The requested path is validated here, on
+// the host side, exactly as a read or a listing path is — same normalization,
+// same containment, same symbolic-link resolution, through
+// fileread.ResolveSearchInRoots, against the same roots — and so are the query
+// and the mode, which are refused here if the query is empty or too long or if
+// the mode is one the search does not have, rather than reaching a plugin that
+// would have to invent an answer. The plugin is handed only the resolved absolute
+// path, the query, the mode and the four caps.
 //
 // A refusal (an absolute path, a `..` escape, a path outside every root,
-// something that exists as neither a file nor a directory, an empty query) is
-// therefore made before any RPC, so no plugin process ever sees a path none of
-// the roots holds. Where the search may look afterwards is bounded by the
-// plugin's walk, which follows no symbolic link at all, so the search cannot
-// leave a root by another route either.
+// something that exists as neither a file nor a directory, an empty query, an
+// unknown mode) is therefore made before any RPC, so no plugin process ever sees
+// a path none of the roots holds. Where the search may look afterwards is bounded
+// by the plugin's walk, which follows no symbolic link at all, so the search
+// cannot leave a root by another route either. Whether the query compiles as a
+// pattern is checked on the plugin side, once, by the same fileread search the
+// host validated the mode against; the host does not compile it a second time.
 func (h *Host) SearchFiles(ctx context.Context, req SearchRequest) (Output, error) {
 	if len(req.Path) > 4096 {
 		return Output{}, fmt.Errorf("path must not exceed 4096 bytes")
 	}
 	if req.DelayMS < 0 || req.DelayMS > pluginprotocol.MaxDelayMS {
 		return Output{}, fmt.Errorf("delay_ms must be 0..%d", pluginprotocol.MaxDelayMS)
+	}
+	if err := fileread.ValidateMode(req.Mode); err != nil {
+		return Output{}, err
 	}
 	if err := fileread.ValidateQuery(req.Query); err != nil {
 		return Output{}, err
@@ -595,11 +609,11 @@ func (h *Host) SearchFiles(ctx context.Context, req SearchRequest) (Output, erro
 	if err != nil {
 		return Output{}, err
 	}
-	return h.invoke(ctx, ToolSearchFiles, Input{Path: resolved.Path, Query: req.Query, MaxMatches: h.opts.SearchMaxMatches, MaxLineBytes: h.opts.SearchMaxLineBytes, MaxFiles: h.opts.SearchMaxFiles, MaxFileBytes: h.opts.SearchMaxFileBytes, DelayMS: req.DelayMS})
+	return h.invoke(ctx, ToolSearchFiles, Input{Path: resolved.Path, Query: req.Query, Mode: req.Mode, MaxMatches: h.opts.SearchMaxMatches, MaxLineBytes: h.opts.SearchMaxLineBytes, MaxFiles: h.opts.SearchMaxFiles, MaxFileBytes: h.opts.SearchMaxFileBytes, DelayMS: req.DelayMS})
 }
 
 // FindFiles calls the name-search tool. The requested path is validated here,
-// on the host side, exactly as a read, a listing or a literal search validates
+// on the host side, exactly as a read, a listing or a search validates
 // one — same normalization, same containment, same symbolic-link resolution,
 // through fileread.ResolveSearchInRoots, which is shared with the literal
 // search because the requirement is the same one: the starting path must be one

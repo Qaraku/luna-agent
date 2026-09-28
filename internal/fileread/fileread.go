@@ -26,10 +26,11 @@
 //     oversize file is refused instead of truncated and refuses binary content,
 //     List renders exactly one level — it never enters a subdirectory and never
 //     follows a symbolic link — and states every cap it hit instead of cutting
-//     the list silently, Search matches one literal per line, never follows
-//     a symbolic link, and states every cap it hit — including that its walk
-//     stopped, because a search that stopped cannot say how many matches it did
-//     not find — and Find matches one glob against one entry name, never enters
+//     the list silently, Search matches one query per line — as literal text by
+//     default, and as an RE2 pattern when the call asks for that mode — never
+//     follows a symbolic link, and states every cap it hit — including that its
+//     walk stopped, because a search that stopped cannot say how many matches it
+//     did not find — and Find matches one glob against one entry name, never enters
 //     a symbolic link, and states every cap it hit, including that its walk
 //     stopped, for the same reason.
 //
@@ -48,6 +49,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 )
@@ -78,8 +80,31 @@ const (
 
 // MaxQueryBytes is the longest literal one search accepts. A longer literal is
 // refused rather than cut, because a cut query would match text the model never
-// asked about.
+// asked about. It bounds the query in every mode: a pattern is text like any
+// other, and a query too long to state is refused before it is compiled rather
+// than cut into a different pattern.
 const MaxQueryBytes = 256
+
+// The search modes. A search reads its query one way or the other, and which way
+// is a parameter of the call rather than a guess made from what the query looks
+// like:
+//
+//   - ModeLiteral is the default, and what a call that names no mode gets. The
+//     query is data: nothing in it is interpreted, so a dot is a dot and looking
+//     for `docs/a.md` cannot also match `docsXaYmd`.
+//   - ModeRegex is the explicit opt-in. The same field is then read as an RE2
+//     pattern, and Go's regexp compiles it into a finite automaton, so the cost
+//     of a call is bounded by the text it is run against and never by
+//     backtracking over the model's own pattern.
+//
+// There is no third mode and no inference between the two: a call that asks for
+// a mode the tool does not have is refused with the value it named (see
+// ErrModeInvalid) instead of being answered as though it had asked for literal
+// text.
+const (
+	ModeLiteral = "literal"
+	ModeRegex   = "regex"
+)
 
 // Rejections are sentinel errors so callers and tests can classify a refusal
 // without matching on message text.
@@ -127,15 +152,28 @@ var (
 	// regular file nor a directory — or is a symbolic link, which a search
 	// never follows.
 	ErrNotSearchable = errors.New("path is neither a regular file nor a directory")
-	// ErrQueryEmpty reports an empty (or whitespace-only) literal, which would
-	// match every line.
+	// ErrQueryEmpty reports an empty (or whitespace-only) query, which would
+	// match every line. Its message is deliberately unchanged and mode-neutral
+	// enough to read in both: an empty query is refused the same way whatever
+	// mode was asked for.
 	ErrQueryEmpty = errors.New("a literal query is required")
-	// ErrQueryTooLarge reports a literal longer than MaxQueryBytes.
+	// ErrQueryTooLarge reports a query longer than MaxQueryBytes.
 	ErrQueryTooLarge = errors.New("the query is longer than the limit")
-	// ErrQueryInvalid reports a literal the search cannot represent: one with a
+	// ErrQueryInvalid reports a query the search cannot represent: one with a
 	// NUL byte, or one with a line break, since a match is decided within one
-	// line and such a literal could never match anything.
+	// line and such a query could never match anything in either mode.
 	ErrQueryInvalid = errors.New("the query must be one line of text without NUL bytes")
+	// ErrModeInvalid reports a search mode the tool does not have. The value
+	// the call named is stated rather than silently read as the default: a call
+	// that asked for a mode this search cannot run must not come back as though
+	// the call had asked for literal text.
+	ErrModeInvalid = errors.New("the search mode is not one this search has")
+	// ErrQueryPatternInvalid reports a query that is not a valid regular
+	// expression, carrying Go's own explanation of what is wrong with it. It is
+	// a refusal rather than an empty result for the same reason an empty query
+	// is one: a pattern the search could not compile would otherwise come back
+	// as "no matches" and read as an answer about the text.
+	ErrQueryPatternInvalid = errors.New("the query is not a valid regular expression")
 )
 
 // Resolve validates a requested file path against the read root and returns the
@@ -346,12 +384,17 @@ func rootHoldingTarget(roots []string, requested string) (Resolved, bool) {
 	return Resolved{}, false
 }
 
-// ValidateQuery checks one literal query before any work is done with it. It
-// lives here, next to the search that consumes it, so the host can refuse a
-// query on the same terms the plugin would: an empty literal matches every line
-// and says nothing, and a literal the search cannot represent — with a NUL byte,
-// or with a line break, since a match is decided within one line — would come
-// back as an empty result that looked like an answer.
+// ValidateQuery checks one query before any work is done with it. It lives here,
+// next to the search that consumes it, so the host can refuse a query on the
+// same terms the plugin would: an empty query matches every line and says
+// nothing, and a query the search cannot represent — with a NUL byte, or with a
+// line break, since a match is decided within one line — would come back as an
+// empty result that looked like an answer.
+//
+// It applies to the query in every mode, and it is the same check either way: a
+// pattern is one line of text like a literal is, and the size that is refused is
+// the size of the text the call asked to match, not of whatever the text would
+// come to mean.
 func ValidateQuery(query string) error {
 	switch {
 	case strings.TrimSpace(query) == "":
@@ -364,6 +407,37 @@ func ValidateQuery(query string) error {
 		return fmt.Errorf("%w: it contains a line break", ErrQueryInvalid)
 	}
 	return nil
+}
+
+// ValidateMode checks one search mode before any work is done with it, so the
+// host can refuse a mode on the same terms the plugin would and a call never
+// reaches a candidate that would have to invent an answer for it.
+//
+// An empty mode is how the protocol says "the call named none", and it means the
+// default: a search that was not told how to read its query reads it as literal
+// text. That is deliberately a value of its own rather than a third mode: what a
+// call gets when it names nothing is not a policy the model can select, it is the
+// tool's default, and it is the same default every layer falls back to.
+//
+// Any other value is refused with the value itself, because the alternative is
+// answering a call that asked for something the search does not have as though
+// it had asked for literal text — a silent substitution the caller could never
+// see in the result.
+func ValidateMode(mode string) error {
+	switch mode {
+	case "", ModeLiteral, ModeRegex:
+		return nil
+	}
+	return fmt.Errorf("%w: %q is not %q or %q", ErrModeInvalid, mode, ModeLiteral, ModeRegex)
+}
+
+// modeOrDefault maps a mode a call may or may not have named onto the mode the
+// search actually runs: nothing named is literal text.
+func modeOrDefault(mode string) string {
+	if mode == "" {
+		return ModeLiteral
+	}
+	return mode
 }
 
 // resolveWithinRoot is the single place a model-supplied path is interpreted:
@@ -992,20 +1066,39 @@ type SearchOptions struct {
 	// renderings state the same path, line number and line text; the choice is
 	// what makes a candidate replacement observable in the tool result.
 	TrimIndent bool
+	// Mode says how the query is read: ModeLiteral (the default, and what an
+	// empty Mode means) matches it as data, and ModeRegex compiles it as an RE2
+	// pattern. A value that is neither is refused rather than treated as the
+	// default, so a call that asked for a mode this search does not have is
+	// never answered as though it had asked for literal text.
+	Mode string
 }
 
-// Search renders a literal search for query under path. path is an absolute
-// path the host already validated against the read root: no path is interpreted
-// here, and nothing outside path is ever entered.
+// Search renders a search for query under path, reading the query the way opts.Mode
+// says. ModeLiteral is the default: the query is data and nothing in it is
+// interpreted. ModeRegex compiles it with regexp.Compile — RE2, a linear-time
+// engine that never backtracks — and the mode is stated in the header, because a
+// "no matches" from a pattern has to be distinguishable from a pattern that was
+// refused. Anything else is refused by ValidateMode before any file is read.
 //
-// The match is literal — strings.Contains against one line at a time — and that
-// is deliberate. A regular expression would decide the cost of the call from the
-// model's own query, so a question the tool cannot answer ("no such text") could
-// become a pattern that backtracks until the call times out and reports a plugin
-// failure instead of an empty result; and it would silently read a plain query as
-// a pattern, so looking for `docs/architecture.md` would also match
-// `docsXarchitecture.md`. A literal can do neither. A model that wants a pattern
-// can search for its literals one at a time.
+// Both modes are line-oriented and both match one line at a time, so neither can
+// match across a line boundary: the pattern is run against each line's own text,
+// with the line terminator already removed, which also means `^` and `$` anchor
+// to the ends of that line as the model would expect. A query with a line break
+// in it is refused for exactly that reason (see ValidateQuery). One matching line
+// renders one match, whether the pattern could match it in more than one place.
+//
+// The literal mode stays the default deliberately. A pattern decides what a call
+// costs from the model's own input, and a search that read every query as a
+// pattern would answer a plain query about text: looking for `docs/architecture.md`
+// would also match `docsXarchitecture.md`. RE2 bounds the cost, so the timeout
+// argument against a pattern language is not the one that applies here; the
+// default is instead about not reading a query as something it was not written as.
+// The mode is therefore explicit — the model says which one it means — and the
+// result says which one it got.
+//
+// path is an absolute path the host already validated against the read root: no
+// path is interpreted here, and nothing outside path is ever entered.
 //
 // A directory is walked depth-first in path order, and the walk cannot leave the
 // read root: the host resolved the starting path inside the root, no symbolic
@@ -1021,8 +1114,25 @@ type SearchOptions struct {
 // remaining paths were not searched, because a search that stopped cannot count
 // the matches it did not find.
 func Search(path, query string, opts SearchOptions) (string, error) {
+	if err := ValidateMode(opts.Mode); err != nil {
+		return "", err
+	}
+	opts.Mode = modeOrDefault(opts.Mode)
 	if err := ValidateQuery(query); err != nil {
 		return "", err
+	}
+	// A pattern is compiled once, before the walk, so an unevaluable pattern is
+	// refused as the call it was rather than coming back as an empty result. The
+	// error carries Go's own explanation, and Go's regexp is RE2: matching never
+	// backtracks, so a pattern that looks expensive cannot turn the search into a
+	// call that runs until it is killed.
+	var pattern *regexp.Regexp
+	if opts.Mode == ModeRegex {
+		compiled, err := regexp.Compile(query)
+		if err != nil {
+			return "", fmt.Errorf("%w: %s", ErrQueryPatternInvalid, err)
+		}
+		pattern = compiled
 	}
 	if opts.MaxMatches <= 0 {
 		opts.MaxMatches = DefaultSearchMatches
@@ -1040,7 +1150,7 @@ func Search(path, query string, opts SearchOptions) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("%w: %s", ErrNotSearchable, pathError(err))
 	}
-	s := &searcher{query: query, opts: opts, start: path}
+	s := &searcher{query: query, pattern: pattern, opts: opts, start: path}
 	switch {
 	case start.Mode()&fs.ModeSymlink != 0:
 		// A search never follows a symbolic link, including as its own starting
@@ -1063,8 +1173,13 @@ func Search(path, query string, opts SearchOptions) (string, error) {
 // result has to state about what was looked at and what was left out.
 type searcher struct {
 	query string
-	opts  SearchOptions
-	start string
+	// pattern is the compiled query in ModeRegex and nil in ModeLiteral, where
+	// the query is matched as data. One field decides how a line is matched, so
+	// there is no path through collect that could match differently from the mode
+	// the result states.
+	pattern *regexp.Regexp
+	opts    SearchOptions
+	start   string
 
 	matches []string
 
@@ -1152,17 +1267,19 @@ func (s *searcher) consider(path string, size int64) (stop bool) {
 }
 
 // collect renders the matching lines of one file, in line order, and reports
-// whether the match cap ended the search.
+// whether the match cap ended the search. Which lines match is the mode's: with
+// pattern set the line is tested against the compiled pattern, and without it the
+// line is tested with a substring test against the literal. Either way the test
+// is run on one line's own text, with the line terminator already removed, so a
+// match never spans a line and a CRLF file renders like an LF one.
 func (s *searcher) collect(path, text string) (stop bool) {
 	name, err := filepath.Rel(s.start, path)
 	if err != nil || name == "." {
 		name = filepath.Base(path)
 	}
 	for i, line := range strings.Split(text, "\n") {
-		// A line terminator is not part of the text a match is decided on, so a
-		// CRLF file renders like an LF one.
 		line = strings.TrimSuffix(line, "\r")
-		if !strings.Contains(line, s.query) {
+		if !s.lineMatches(line) {
 			continue
 		}
 		if len(s.matches) == s.opts.MaxMatches {
@@ -1178,13 +1295,25 @@ func (s *searcher) collect(path, text string) (stop bool) {
 	return false
 }
 
+// lineMatches reports whether one line's text matches the query under the mode
+// the call named. The two branches are the whole of the mode's behaviour: the
+// pattern branch never runs in literal mode and the literal branch never runs in
+// regex mode.
+func (s *searcher) lineMatches(line string) bool {
+	if s.pattern != nil {
+		return s.pattern.MatchString(line)
+	}
+	return strings.Contains(line, s.query)
+}
+
 // render states what the search found and what it cost: how many matches in how
 // many files, followed by every cap it reached and everything it did not search.
 // A result that hid either half would describe a smaller question than the one
-// that was asked.
+// that was asked. In regex mode the header also names the mode, because "no
+// matches" has to be distinguishable from a pattern the search could not read.
 func (s *searcher) render() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s for %q in %s", matchCount(len(s.matches)), s.query, plural(s.files, "file"))
+	fmt.Fprintf(&b, "%s for %q%s in %s", matchCount(len(s.matches)), s.query, s.modePhrase(), plural(s.files, "file"))
 	if notes := s.notes(); len(notes) > 0 {
 		fmt.Fprintf(&b, " (%s)", strings.Join(notes, "; "))
 	}
@@ -1200,11 +1329,30 @@ func (s *searcher) render() string {
 	return b.String()
 }
 
+// modePhrase states in the header how the query was read, and it is empty in
+// literal mode on purpose: a literal search's header is what it has always been,
+// and literal is what a call that names no mode means, so the phrase would be
+// telling the model something it already asked for. The one thing a header must
+// never leave ambiguous is a pattern, since "no matches" and "that pattern is not
+// one" would otherwise read the same.
+func (s *searcher) modePhrase() string {
+	if s.opts.Mode == ModeRegex {
+		return " as a regular expression"
+	}
+	return ""
+}
+
 // notes lists what the result has to say besides the matches, in a fixed order:
-// first what was passed over, which is what the file count means, and then the
-// cap that ended the walk.
+// first how the query was read, then what was passed over, which is what the file
+// count means, and then the cap that ended the walk.
 func (s *searcher) notes() []string {
-	notes := make([]string, 0, 6)
+	notes := make([]string, 0, 7)
+	if s.opts.Mode == ModeRegex {
+		// The header says the query was read as a pattern; this says what a
+		// pattern is matched against, which is one line at a time and never a
+		// run of lines.
+		notes = append(notes, "the pattern was matched inside single lines")
+	}
 	if s.binary > 0 {
 		notes = append(notes, fmt.Sprintf("%s skipped as binary", plural(s.binary, "file")))
 	}
