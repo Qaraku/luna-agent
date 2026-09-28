@@ -73,6 +73,11 @@ const (
 	// PermissionProcessExec 允许能力在本次运行的工作目录里执行命令。它与 state.write
 	// 一样是显式授权项：注册表没有这条授权时，申请它的能力注册失败。
 	PermissionProcessExec PermissionKind = "process.exec"
+	// PermissionFilesystemWrite 允许能力在用户显式允许写入的目录里新建或覆盖文件。
+	// 它管的只是“能不能改盘上的文件”，范围仍由两层收窄：本次运行的工作目录，以及用户
+	// 在设置里逐个标为可写的目录。它与前两项一样是显式授权项：注册表没有这条授权时，
+	// 申请它的能力注册失败。
+	PermissionFilesystemWrite PermissionKind = "fs.write"
 )
 
 // Permission 是插件对某个受控能力的申请。是否可授予由注册表持有的授权表决定；
