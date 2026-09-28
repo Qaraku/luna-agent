@@ -11,6 +11,8 @@ permissions:
 jobs:
   gates:
     runs-on: ubuntu-latest
+    env:
+      LUNA_REQUIRE_SANDBOX_TESTS: "1"
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -20,6 +22,9 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Install terminal isolation dependency
+        run: timeout 180s sudo apt-get update && timeout 180s sudo apt-get install -y bubblewrap
 
       - name: Check formatting
         run: test -z "$(gofmt -l internal cmd plugins)"

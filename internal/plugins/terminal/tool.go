@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -36,16 +35,16 @@ const (
 
 // runDescription 是模型可见的工具描述：说清它跑什么、在哪里跑、边界是什么、什么时候用。
 // 与 internal/plugins/memory/tool.go 的描述同一种语言与口气。
-const runDescription = "Run one shell command on this machine and return what happened: its exit code, how long it took, the directory it ran in, and its standard output and standard error, labelled `stdout:` and `stderr:`. The command is passed to `sh -lc`, so a pipeline, a redirection or several commands separated by `;` are all part of the one command you give. Use it when the task needs the machine to actually do something — build, run tests, inspect a repository with git or another command-line tool, or find out something only a command can answer — rather than when one of the file tools already answers it. `cwd` is where the command runs: a path relative to one of the directories this session works in, resolved against exactly the same boundary the file tools obey, so a command can neither be started outside it nor reach anything the file tools could not; with no `cwd` the command runs in the first of those directories. `timeout_s` bounds the run: 30 seconds by default and 120 at most, and when the time is up the command and its whole process group are killed — the answer then says it was stopped instead of presenting a killed process as a finished one. Output is capped in total across both streams, and when the cap is reached the answer says which stream was cut, what is shown and how much was withheld. The command gets a minimal environment (only PATH, HOME and TMPDIR) and no standard input, so it cannot read anything interactively and the rest of this process's environment does not leak into it."
+const runDescription = "Run one shell command using sh -c inside Linux Bubblewrap isolation and report its exit code, duration, cwd, stdout and stderr. Use it for computation, inspecting a project, or tests that fit these boundaries. The directories this session works in are mounted read-only: this tool cannot modify host files, even in allowed write directories; use luna_write_file for authorized text changes. cwd is relative to those working directories, as with the file tools, and defaults to the first available directory. System runtime files are read-only, HOME is private, and only the private /tmp is writable (512 MiB, discarded after the call). The minimal environment is PATH, HOME and TMPDIR; host profiles, credentials and user caches are not inherited. Host networking, host processes and pathname Unix sockets are inaccessible; commands that need those resources will fail. Temporary results are not copied back. timeout_s defaults to 30 seconds, at most 120; stopping the command terminates its sandbox, including descendants. Output is capped across stdout and stderr and reports withheld bytes. If Bubblewrap or the required isolation cannot start, the tool is unavailable: it never falls back to an unrestricted shell. This is not a virtual machine or protection against kernel vulnerabilities or all resource exhaustion."
 
 // RunTool 是 luna_run：模型在本次运行的工作目录里执行一条命令的唯一入口。
 //
 // 它不持有跨调用共享的状态，工作目录与超时都来自每次调用；它也不解释路径，cwd 交给
 // fileread 的边界检查。
-type RunTool struct{}
+type RunTool struct{ sandboxPath string }
 
 // NewRunTool 建这个工具。
-func NewRunTool() *RunTool { return &RunTool{} }
+func NewRunTool() *RunTool { return &RunTool{sandboxPath: sandboxExecutable} }
 
 func (t *RunTool) Name() string { return RunToolName }
 
@@ -57,7 +56,7 @@ func (t *RunTool) Schema() *jsonschema.Schema { return runSchema() }
 // 关闭，所以未声明的参数在触及任何进程之前就被拒绝。
 func runSchema() *jsonschema.Schema {
 	type args struct {
-		Command  string `json:"command" jsonschema_description:"The one command to run, passed to sh -lc; a pipeline or a redirection is part of it"`
+		Command  string `json:"command" jsonschema_description:"The one command to run, passed to sh -c inside isolation; a pipeline or a redirection is part of it"`
 		Cwd      string `json:"cwd,omitempty" jsonschema_description:"Where to run it, as a path relative to one of the directories this session works in. Optional: the first of those directories is the default"`
 		TimeoutS int    `json:"timeout_s,omitempty" jsonschema_description:"How many seconds the command may run, 30 by default and 120 at most"`
 	}
@@ -96,7 +95,7 @@ func (t *RunTool) Invoke(ctx context.Context, arguments string) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	return t.run(ctx, dir, in.Command, timeout)
+	return t.run(ctx, roots, dir, in.Command, timeout)
 }
 
 // resolveDir 定下命令的工作目录。给了 cwd 就交给 fileread 的多 root 边界检查——与文件
@@ -120,8 +119,8 @@ func resolveDir(roots []string, cwd string) (string, error) {
 // 时拒绝，并说清是因为没有可用的工作目录。
 func defaultDir(roots []string) (string, error) {
 	for _, root := range roots {
-		if info, err := os.Stat(root); err == nil && info.IsDir() {
-			return root, nil
+		if resolved, err := fileread.ResolveDirInRoots([]string{root}, "."); err == nil {
+			return resolved.Path, nil
 		}
 	}
 	return "", errors.New("none of this run's working directories exists")
@@ -145,12 +144,19 @@ func resolveTimeout(requested int) (time.Duration, error) {
 //
 // 结束的三种方式分工明确：命令自己跑完，报退出码；超过 timeout 被停掉，报“被停止了”
 // （仍然是结果，不是错误）；ctx 被取消，报 ctx 的错误，由内核当作结束整轮而不是拒绝。
-func (t *RunTool) run(ctx context.Context, dir, command string, timeout time.Duration) (string, error) {
-	cmd := exec.Command("sh", "-lc", command)
-	cmd.Dir = dir
+func (t *RunTool) run(ctx context.Context, roots []string, dir, command string, timeout time.Duration) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	sandbox, err := prepareSandbox(t.sandboxPath, roots, dir, command)
+	if err != nil {
+		return "", err
+	}
+	defer sandbox.close()
+	cmd := sandbox.cmd
+
 	// 不接 stdin：命令读不到任何交互输入，也不会把运行挂在一句永远等不到的输入上。
 	cmd.Stdin = nil
-	cmd.Env = commandEnv()
 	// 自成一个进程组，超时或被取消时才能杀掉整组：一条管道、一个后台任务、一层子
 	// shell 都在这一组里，只杀直接子进程会把它们留下继续跑。
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -160,10 +166,11 @@ func (t *RunTool) run(ctx context.Context, dir, command string, timeout time.Dur
 
 	started := time.Now()
 	if err := cmd.Start(); err != nil {
-		// 连 sh 都起不来是宿主侧的问题，不是模型这次调用的内容问题：标记成基础设施
+		// 隔离进程起不来是宿主侧的问题，不是模型这次调用的内容问题：标记成基础设施
 		// 故障，让内核结束整轮，而不是回给模型一句“工具拒绝了这次调用”。
-		return "", plugin.Unavailable(fmt.Errorf("start the command: %w", err))
+		return "", plugin.Unavailable(fmt.Errorf("start isolated terminal (%s): %w", sandboxExecutable, err))
 	}
+	sandbox.closeParentFiles()
 	pgid := cmd.Process.Pid
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
@@ -192,6 +199,9 @@ func (t *RunTool) run(ctx context.Context, dir, command string, timeout time.Dur
 	if timedOut {
 		killGroup(pgid)
 		waitOrGiveUp(waited)
+	}
+	if !sandbox.ready() {
+		return "", plugin.Unavailable(errors.New("terminal isolation did not start: Bubblewrap and its required namespace/seccomp features must be available; no unsandboxed command was run"))
 	}
 	return t.render(cmd, dir, time.Since(started), timeout, timedOut, capture), nil
 }
@@ -235,21 +245,9 @@ func waitOrGiveUp(waited <-chan error) {
 	}
 }
 
-// commandEnv 是交给命令的环境。只放运行一条命令真正需要的三项，父进程的其余变量一律
-// 不带过去：放开命令执行不等于把整个宿主环境交给模型构造的命令。
-//
-// 这是有意的收窄，代价是一条依赖其它变量的命令（例如 LANG 决定输出编码、GOPATH 决定
-// 构建缓存位置）行为可能与用户在终端里看到的不同。它与 timeout_s 同一个取舍：范围写
-// 死在这里，不靠父进程恰好带了什么。
+// commandEnv 不继承宿主 PATH/HOME/TMPDIR；运行时路径固定，HOME 与临时目录只存在于隔离环境。
 func commandEnv() []string {
-	env := []string{"PATH=" + os.Getenv("PATH")}
-	if home := os.Getenv("HOME"); home != "" {
-		env = append(env, "HOME="+home)
-	}
-	if tmp := os.Getenv("TMPDIR"); tmp != "" {
-		env = append(env, "TMPDIR="+tmp)
-	}
-	return env
+	return []string{"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=/tmp/home", "TMPDIR=/tmp"}
 }
 
 // stdoutStream 与 stderrStream 是 outputCapture 里两路输出的下标。

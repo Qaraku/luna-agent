@@ -73,6 +73,7 @@ func resolved(t *testing.T, path string) string {
 // The ordinary case: a command runs, its standard output comes back labelled, and the
 // result names the directory it actually ran in.
 func TestRunExecutesACommandAndReportsItsExitCodeOutputAndCwd(t *testing.T) {
+	requireSandbox(t)
 	root := t.TempDir()
 	got, err := NewRunTool().Invoke(runCtx(root), args(t, map[string]any{
 		"command": `printf hi; printf boom >&2`,
@@ -90,6 +91,7 @@ func TestRunExecutesACommandAndReportsItsExitCodeOutputAndCwd(t *testing.T) {
 // A non-zero exit is the answer to a call that worked, not a failure of it: the model
 // must be able to read the exit code and decide what to do.
 func TestRunReportsANonZeroExitCodeAsAResult(t *testing.T) {
+	requireSandbox(t)
 	root := t.TempDir()
 	got, err := NewRunTool().Invoke(runCtx(root), args(t, map[string]any{"command": "exit 3"}))
 	if err != nil {
@@ -132,6 +134,7 @@ func TestRunRefusesACwdOutsideTheWorkingDirectory(t *testing.T) {
 
 // A cwd inside the working directory selects where the command runs.
 func TestRunUsesACwdInsideTheWorkingDirectory(t *testing.T) {
+	requireSandbox(t)
 	root := t.TempDir()
 	sub := filepath.Join(root, "sub")
 	if err := os.MkdirAll(sub, 0o700); err != nil {
@@ -152,38 +155,27 @@ func TestRunUsesACwdInsideTheWorkingDirectory(t *testing.T) {
 // A command that outlives its timeout is stopped, and the stop reaches the whole process
 // group: a subshell that kept writing proves nothing outlived the kill.
 func TestRunStopsACommandThatTimesOutAndKillsItsProcessGroup(t *testing.T) {
+	requireSandbox(t)
 	root := t.TempDir()
-	command := `echo $$ > shell.pid; ( while true; do printf tick >> ticks.txt; sleep 0.05; done )`
-	got, err := NewRunTool().Invoke(runCtx(root), args(t, map[string]any{
-		"command":   command,
-		"timeout_s": 1,
-	}))
+	tool, pidFile := trackedSandboxTool(t)
+	got, err := tool.Invoke(runCtx(root), args(t, map[string]any{"command": "setsid sh -c 'sleep 30' & wait", "timeout_s": 1}))
 	if err != nil {
-		t.Fatalf("a stopped command is a result, not an error: %v", err)
+		t.Fatal(err)
 	}
 	for _, want := range []string{"stopped", "timeout", "process group"} {
 		if !strings.Contains(got, want) {
-			t.Fatalf("result %q does not say the command was stopped (%q)", got, want)
+			t.Errorf("missing %q: %s", want, got)
 		}
 	}
-
-	pid := readPid(t, filepath.Join(root, "shell.pid"))
-	waitUntilGone(t, pid)
-
-	// The subshell wrote to this file every 50ms while it was alive; if it were still
-	// alive after the call returned, the file would keep growing.
-	ticks := filepath.Join(root, "ticks.txt")
-	size := fileSize(t, ticks)
-	time.Sleep(400 * time.Millisecond)
-	if grew := fileSize(t, ticks); grew != size {
-		t.Fatalf("a process outlived the stop: %s grew from %d to %d bytes", ticks, size, grew)
-	}
+	// 沙箱里的 $$ 是命名空间 PID，不能拿它给宿主发信号。跟踪的是包装器的宿主 PID。
+	waitUntilGone(t, readPid(t, pidFile))
 }
 
 // Output over the cap is stated, with what was shown and what was withheld: a result
 // that quietly carried only the beginning would describe a smaller run than the one
 // that happened.
 func TestRunStatesWhenTheOutputCapIsReached(t *testing.T) {
+	requireSandbox(t)
 	root := t.TempDir()
 	const total = 40000
 	got, err := NewRunTool().Invoke(runCtx(root), args(t, map[string]any{
@@ -265,23 +257,37 @@ func TestRunRefusesATimeoutOutsideTheAcceptedRange(t *testing.T) {
 // A cancelled run hands the context's own error back to the kernel, which treats it as
 // the end of the round rather than as this call's refusal.
 func TestRunReturnsTheContextErrorWhenTheRunIsCancelled(t *testing.T) {
+	requireSandbox(t)
 	root := t.TempDir()
+	tool, pidFile := trackedSandboxTool(t)
 	ctx, cancel := context.WithCancel(runCtx(root))
 	defer cancel()
+	done := make(chan error, 1)
 	go func() {
-		time.Sleep(150 * time.Millisecond)
-		cancel()
+		_, err := tool.Invoke(ctx, args(t, map[string]any{"command": "setsid sh -c 'sleep 30' & wait", "timeout_s": 60}))
+		done <- err
 	}()
-
-	_, err := NewRunTool().Invoke(ctx, args(t, map[string]any{
-		"command":   `echo $$ > shell.pid; sleep 30`,
-		"timeout_s": 60,
-	}))
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled", err)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if data, err := os.ReadFile(pidFile); err == nil && len(strings.TrimSpace(string(data))) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("isolated process did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	// The stop reaches the process group here too.
-	waitUntilGone(t, readPid(t, filepath.Join(root, "shell.pid")))
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("cancelled command did not return")
+	}
+	waitUntilGone(t, readPid(t, pidFile))
 }
 
 // The tool's public shape: the name the model calls, the one required parameter, no
@@ -322,7 +328,7 @@ func TestRunToolSchemaAndDescriptionShape(t *testing.T) {
 
 	text := tool.Description()
 	for _, want := range []string{
-		"sh -lc",
+		"sh -c",
 		"exit code",
 		"stdout",
 		"stderr",

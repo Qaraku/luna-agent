@@ -165,13 +165,17 @@ Skills 是**程序性知识**：做某类事的方式。它由内置的 `skills`
 
 ### 能力：Terminal
 
-Terminal 让模型**执行一条命令**：只贡献一个工具 `luna_run`，不认领路由、面板或状态，并显式申请 `plugin.PermissionProcessExec`——注册表没有这项授权时注册阶段就拒绝它，内置能力不享有特权。它是**默认关闭**的两个能力之一：能在你的机器上起进程这件事，必须由用户明确打开。
+Terminal 仍只贡献 `luna_run`，显式申请 `plugin.PermissionProcessExec`，不贡献路由、面板或持久状态，默认关闭。现在模型程序只在 Linux Bubblewrap 隔离环境执行；Kernel 仍只负责工具装配与错误分类，不理解终端业务。
 
-- **落脚点就是工作目录**：`cwd` 交给 `internal/fileread` 的多根边界解析（与文件工具同一套实现），所以命令的工作目录与文件工具能读到的地方是同一个范围；省略 `cwd` 时落在第一个存在的工作目录，一个都没有就拒绝。
-- **一条命令、一个进程组**：`sh -lc` 执行，自成进程组，超时或被取消时杀**整组**并等它收尾——只杀直接子进程会把管道与后台任务留下继续跑。
-- **环境与输入被收窄**：只带 `PATH`/`HOME`/`TMPDIR`，不接 stdin，所以命令不能交互、也不会把宿主的其余环境变量带过去。
-- **上限自己说清**：stdout 与 stderr 共享一个 32 KiB 预算，越过的字节只计数并写进结果（哪一路、截在哪里、还有多少没给出）；`timeout_s` 默认 30 秒、上限 120 秒，超范围**拒绝而不是静默改小**；被停掉的命令报"被停掉了"，不把一个被杀掉的进程说成正常结束。
-- **没有沙箱**：它是"在本次运行的工作目录里跑一条命令"，不是容器、不做权限降级、也不限制命令能访问的网络与系统资源。用户打开它等于信任模型会用它做该做的事——这是当前实现的真实边界，不是承诺。
+- **信任边界**：宿主 Kernel、能力实现、固定 `/usr/bin/bwrap` 和系统运行时属于可信部分；模型提供的 shell 程序不可信。依赖路径不来自模型或 HTTP 参数。此机制不用于加载不可信的宿主插件。
+- **文件边界**：`cwd` 与工作区规范化复用 `internal/fileread`。规范化后的工作区只读挂载，系统 `/usr`、`/bin`、`/lib*` 等运行时只读，根与 `/proc`、`/dev` 只读；只有本次调用的私有 `/tmp` 可写（512 MiB），HOME 为其中的私有目录。拒绝覆盖运行时、进程/设备视图、私有 HOME 或整个宿主 HOME 的工作区。shell 内路径受可见挂载集合约束，不宣称与文件工具逐个相对路径的解析过程完全相同。
+- **宿主写入不交给 shell**：即便用户配置了可写目录，Terminal 也不继承宿主写权限；写文件仍由 `luna_write_file` 执行。避免把任意 shell 的删目录、换符号链接等能力混入已有文本写入授权；现有模型工具本身仍按顺序执行，本轮不改变这个规则。
+- **进程与网络**：隔离 user/PID/network/IPC/UTS namespace，移除 capabilities、禁止嵌套 user namespace，另起终端 session；`--die-with-parent` 与 PID namespace 补齐进程组之外的后代清理。网络 namespace 不能阻止连接已挂载的宿主 Unix socket，因此附加 seccomp cBPF 拒绝 AF_UNIX socket，保留匿名 socketpair 与隔离网络内通信。过滤器检查 syscall 架构并拒绝 x32 ABI 绕行。
+- **启动完成不可猜测**：`sandbox_linux.go` 创建参数和过滤器；固定只读系统 shell 的 bootstrap 在隔离内经专用 FD 报告 ready，关掉 FD 后才 exec 模型命令。Bubblewrap 的 child-pid 事件可能早于挂载成功，不能当作 ready。依赖缺失、平台不支持、内核拒绝隔离或没有 ready 都标记 `plugin.ErrUnavailable`，从不降级到宿主 shell。真正执行后的非零退出码仍是普通工具结果。
+- **原有限制保留**：参数仍是 `command`、`cwd`、`timeout_s`；使用 `sh -c` 而非登录 shell，不继承宿主 PATH/HOME/TMPDIR 和其他环境；没有 stdin。超时默认 30 秒、最多 120 秒，stdout/stderr 合计最多 32 KiB，并明确说明截断与停止。
+- **范围与局限**：当前实现包含 Linux amd64/arm64，amd64 已实机验证、arm64 已交叉编译但未实机验证；其他平台 fail closed。没有虚拟机级内核隔离，也没有完整的 CPU/RAM/进程数硬配额。工作区中的数据本身仍是授权输入；不自动映射用户配置、凭据或依赖缓存。普通应用启动和其他能力不依赖 Bubblewrap，Terminal 在实际调用时验证隔离是否能建立。
+
+验证入口：`internal/plugins/terminal/sandbox_test.go` 使用合成文件、真实 TCP/Unix socket 监听器和实际进程证明拒绝不是文案；覆盖只读嵌套挂载、私有临时目录、权限下降、缺依赖/未 ready、超时/取消及正常退出清理脱离进程组的后台任务。CI 设置 `LUNA_REQUIRE_SANDBOX_TESTS=1`，环境不能隔离时测试失败而非跳过。安装参数语义参考本机 `bwrap(1)`（0.12.0）和 [Bubblewrap 上游](https://github.com/containers/bubblewrap)。
 
 ### 能力：文件写入
 
@@ -408,7 +412,7 @@ Eino 的 `ToolsNode` 配置为 `ExecuteSequentially: true`。如果一个模型�
   │                                  └─ 能力贡献的工具（进程内，由注册表的启用状态决定）
   │                                       ├─ luna_remember / luna_recall（Memory）──> internal/plugins/memory（仅追加 JSONL）
   │                                       ├─ luna_skill_view（Skills）──> skill 自己的目录（复用读侧边界）
-  │                                       ├─ luna_run（Terminal，默认关闭）──> sh -lc，工作目录内，自成进程组
+  │                                       ├─ luna_run（Terminal，默认关闭）──> Bubblewrap → sh -c（工作区只读、临时目录私有）
   │                                       ├─ luna_write_file（文件写入，默认关闭）──> 允许写入的目录内，结果带 diff
   │                                       └─ luna_web_fetch（联网，默认关闭）──> 只走公开地址的 http(s) 文本响应
   └─ SSE 事件 <──────── Luna 自有的运行局部事件出口
@@ -558,7 +562,7 @@ data: <JSON payload>
 
 **能力批次**（记忆可读回、跑一条命令的 Terminal、写一个文件的文件写入）同样由确定性门禁覆盖，另加三处隔离验证。**工具自检** `.evidence/tools/smoke-tools.py`（31 项判据、0 失败、**10/10 工具**）用真二进制 + 假 provider 注入 tool_call，断言真事件流：每个工具都被真的调用并拿回内容而不是基础设施错误；四个读工具各有一条越界探针，被拒之后整轮继续；交给模型的工具清单由白名单与能力贡献**推导**，不写死个数。`luna_run` 在 `settings.yaml` 点名之前不在清单里；点名之后一条命令真的跑起来（`exit code 0` 与它自己的 stdout 标记）、`cwd` 越界被拒、`sleep 30` 在约一秒内被停掉且结果说明整组被杀。`luna_write_file` 同样先默认关闭；能力开了但一个目录也没允许时每次调用都被拒（文案指向设置页），磁盘上什么都不留；`PUT /api/write-dirs` 允许一个目录之后，**同一个进程、不重启**真的新建了文件、结果里的 diff 与磁盘字节一致；覆盖保留 `0640`；工作目录之外、以及工作目录内但不在允许清单里的路径都被拒且磁盘不变。第二处 `.evidence/tools/verify-capability-choice.py`（13 项）证明能力选择是**持久的**而不是进程的属性：全新安装时 Terminal 是 `registered`，`POST /api/plugins/terminal/enable` 既写盘又改运行态，**同一个 HOME 上的新进程**起来时它已经是启用的，关闭同样持久。浏览器那次用真实无头 Chromium 对着确定性夹具跑（30 项，此前 21 项），新增判据覆盖设置页「允许写入的目录」小节：清单与工作区候选渲染出来、点「移除」提交的是剩余的那份、点候选「允许」提交的是并集并按应答重渲染、**不是绝对路径就在地报错且一个请求都不发**、服务端拒绝时状态行显示的是它的原话而不是状态码且什么都没改。**没有一条判据来自界面自报的状态**：服务层读的是事件流、请求体与磁盘，浏览器层读的是真实 DOM 与夹具记下的请求体。
 
-**未验证 / 已知边界**：`luna_run` **不是沙箱**（不限制命令能访问的网络与系统资源、不做权限降级）；diff 不是最小编辑脚本，分散改动时中间的未变行会各出现一次；写入授权指向**路径**，允许的目录被改名或移动之后那条授权不再匹配，需要重新允许；真实模型会不会正确使用这两件新工具（选对命令、写对文件、不滥用）没有真实 provider 跑过——目前只有假 provider 驱动的事件流证据。
+**未验证 / 已知边界**：终端早期无隔离的实现已由上述 Bubblewrap 机制替代，但它仍不是虚拟机，也没有完整的资源配额；diff 不是最小编辑脚本，分散改动时中间的未变行会各出现一次；写入授权指向**路径**，允许的目录被改名或移动之后那条授权不再匹配，需要重新允许；真实模型会不会正确使用这两件新工具（选对命令、写对文件、不滥用）没有真实 provider 跑过——目前只有假 provider 驱动的事件流证据。
 
 留存证据中没有出现 API key。这是对所描述本地架构的时点验证，不是对每个 OpenAI 兼容 provider 或浏览器的保证，也不是完整的可访问性、负载或生产安全评估。
 
