@@ -1,15 +1,44 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/Qaraku/luna-agent/internal/agent"
 	"github.com/Qaraku/luna-agent/internal/store"
 	"github.com/Qaraku/luna-agent/internal/workspace"
 )
+
+// countingRunner records how many runs reached it, so a test can tell "refused
+// before anything started" apart from "answered with an error after starting".
+type countingRunner struct{ runs int }
+
+func (r *countingRunner) Run(_ context.Context, req agent.RunRequest) (string, error) {
+	r.runs++
+	req.Sink.Emit(agent.Event{Type: "run.started", Data: agent.RunStarted{RunID: req.RunID, SessionID: req.SessionID}})
+	req.Sink.Emit(agent.Event{Type: "run.finished", Data: agent.RunFinished{RunID: req.RunID, Answer: "hello"}})
+	return "hello", nil
+}
+
+// serverWithWorkspaces is handlerWithWorkspaces with a runner the test can count
+// through, for the cases where "did anything start at all" is the question.
+func serverWithWorkspaces(t *testing.T, runs Runner) (http.Handler, *store.Store, *workspace.Store) {
+	t.Helper()
+	sessions := newTestStore(t)
+	items, err := workspace.Open(filepath.Join(t.TempDir(), workspace.FileName))
+	if err != nil {
+		t.Fatalf("open workspace store: %v", err)
+	}
+	p := &fakePlugins{state: everyAllowlistedTool()}
+	h := New(p, runs, sessions, Info{BoundHost: "127.0.0.1:43210", Model: "fake-model", ProviderHost: "provider.test", WebDir: "../../web"}, WithWorkspaces(items))
+	return h, sessions, items
+}
 
 // handlerWithWorkspaces builds a server over a real workspace store in a
 // temporary file, so the wire behaviour is tested against the store the
@@ -201,6 +230,62 @@ func TestSessionWorkspaceRefusesUnknownTargets(t *testing.T) {
 	}
 	if w := request(t, h, http.MethodPost, "/api/sessions/"+id+"/workspace", `{"workspace":""}`, false); w.Code != 403 {
 		t.Fatalf("no Origin: status = %d, want 403", w.Code)
+	}
+}
+
+// A binding that no longer names a workspace fails the run instead of falling back,
+// and it fails before anything has started. The fallback is the configured root, a
+// different and possibly wider place to read, so a session that asked for one
+// directory must not quietly get the whole checkout — and because the refusal happens
+// at admission, no run, no stream and no session record come out of it either.
+func TestARunBoundToAWorkspaceThatIsGoneIsRefusedBeforeItStarts(t *testing.T) {
+	runs := &countingRunner{}
+	h, sessions, _ := serverWithWorkspaces(t, runs)
+	id := seedSession(t, sessions, "bound to something gone")
+	const gone = "0123456789abcdef01234567"
+	if err := sessions.AppendConfig(id, store.ConfigRecord{Type: store.TypeConfig, Workspace: gone}); err != nil {
+		t.Fatalf("append config: %v", err)
+	}
+
+	w := request(t, h, http.MethodPost, "/api/runs", `{"message":"do it","session_id":"`+id+`"}`, true)
+	if w.Code != 409 {
+		t.Fatalf("status = %d, want 409 (body %s)", w.Code, w.Body)
+	}
+	if !strings.Contains(w.Body.String(), gone) {
+		t.Fatalf("body = %s, want it to name the workspace so the user knows what to unbind", w.Body)
+	}
+	if runs.runs != 0 {
+		t.Fatalf("runs = %d, want the refusal to happen before anything started", runs.runs)
+	}
+}
+
+// A workspace whose directory was deleted is a different thing from a workspace that
+// is gone, and the boundary is deliberately here: the binding still names a
+// workspace, so the run starts, and the vanished directory surfaces per call — a file
+// tool says it cannot find it — instead of turning into a broken binding. Pinned so
+// that this stays a decision rather than drifting into either direction.
+func TestAWorkspaceDirectoryThatVanishedDoesNotBreakTheBinding(t *testing.T) {
+	dir := t.TempDir()
+	runs := &countingRunner{}
+	h, sessions, items := serverWithWorkspaces(t, runs)
+	created, err := items.Create("luna", []string{dir})
+	if err != nil {
+		t.Fatalf("create workspace: %v", err)
+	}
+	id := seedSession(t, sessions, "bound to a directory that goes away")
+	if w := request(t, h, http.MethodPost, "/api/sessions/"+id+"/workspace", `{"workspace":"`+created.ID+`"}`, true); w.Code != 200 {
+		t.Fatalf("bind: status = %d, body %s", w.Code, w.Body)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("remove the directory: %v", err)
+	}
+
+	w := request(t, h, http.MethodPost, "/api/runs", `{"message":"do it","session_id":"`+id+`"}`, true)
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want the run to start: the workspace is there, its directory is not (body %s)", w.Code, w.Body)
+	}
+	if runs.runs != 1 {
+		t.Fatalf("runs = %d, want exactly one", runs.runs)
 	}
 }
 
