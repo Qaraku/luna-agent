@@ -2,47 +2,49 @@
 
 [![CI](https://github.com/Qaraku/luna-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Qaraku/luna-agent/actions/workflows/ci.yml)
 
-A local, single-user agent kernel in Go built around one bet: **tools live in their own processes, and the host swaps them without restarting.**
+Luna Agent 是一个用 Go 编写、面向本地单用户的智能体内核，核心思路是：**工具在独立进程中运行，宿主无需重启即可替换它们。**
 
-Most agent frameworks load tools into the host process. Changing a tool means restarting the agent, and a crashing tool can take the whole agent down with it. Luna Agent runs each tool as a [HashiCorp `go-plugin`](https://github.com/hashicorp/go-plugin) subprocess, validates a replacement candidate before publishing it, pins in-flight calls to the generation that started them, and keeps the previous version serving if the candidate fails.
+许多智能体框架将工具加载到宿主进程中，更改工具需要重启智能体，工具崩溃也可能拖垮整个进程。Luna Agent 通过 [HashiCorp `go-plugin`](https://github.com/hashicorp/go-plugin) 运行子进程工具：先验证替换候选，再统一发布；正在执行的调用固定使用启动时的代次，候选验证失败则由旧版本继续服务。
 
-This is a bounded kernel slice, not a production agent platform. Runs are single-flight, and each run's transcript is appended to a session file on disk.
+项目目前聚焦边界明确的内核实现，不是生产级智能体平台。同一时间只允许一轮运行，每轮记录以追加方式写入磁盘上的会话文件。
 
-## Architecture
+<a id="architecture"></a>
+
+## 架构
 
 ```mermaid
 flowchart LR
-    subgraph Browser["Browser · no build step"]
+    subgraph Browser["浏览器 · 无需构建"]
         UI["web/ · index.html, app.js, style.css"]
     end
 
-    subgraph Host["Luna host process"]
-        API["internal/httpapi<br/>loopback HTTP + SSE"]
+    subgraph Host["Luna 宿主进程"]
+        API["internal/httpapi<br/>回环 HTTP + SSE"]
         Agent["internal/agent<br/>Eino ChatModelAgent"]
-        PH["internal/pluginhost<br/>per-tool generation pinning"]
-        Mem["internal/plugins/memory<br/>built-in capability · own facts"]
-        Store["internal/store<br/>append-only sessions"]
-        UIP["internal/uiplugin<br/>UI plugin listing + file serving"]
+        PH["internal/pluginhost<br/>按工具固定调用代次"]
+        Mem["internal/plugins/memory<br/>内置记忆能力 · 自主管理事实"]
+        Store["internal/store<br/>仅追加的会话记录"]
+        UIP["internal/uiplugin<br/>界面插件列表与文件服务"]
     end
 
-    subgraph Plugins["Tool plugin subprocesses"]
+    subgraph Plugins["工具插件子进程"]
         T1["luna_text_transform · v1"]
         R1["luna_read_file · v1"]
         D1["luna_list_dir · v1"]
         S1["luna_search_files · v1"]
         F1["luna_find_files · v1"]
-        C["candidate build · v2 for every tool"]
+        C["候选构建 · 各工具的 v2"]
     end
 
-    subgraph UIPlugins["UI plugin directories · no process"]
-        UIPlug["plugins/ui/&lt;name&gt; · plugin.json + ES module"]
+    subgraph UIPlugins["界面插件目录 · 无独立进程"]
+        UIPlug["plugins/ui/&lt;name&gt; · plugin.json + ES 模块"]
     end
 
-    UI <-->|"app-owned events"| API
+    UI <-->|"应用自定义事件"| API
     API --> Agent
     API --> Store
     API --> UIP
-    Agent -->|"luna_remember (capability-contributed, no process)"| Mem
+    Agent -->|"luna_remember（能力贡献，无子进程）"| Mem
     Agent -->|"luna_text_transform"| PH
     Agent -->|"luna_read_file"| PH
     Agent -->|"luna_list_dir"| PH
@@ -53,59 +55,61 @@ flowchart LR
     PH -->|"net/rpc"| D1
     PH -->|"net/rpc"| S1
     PH -->|"net/rpc"| F1
-    PH -.->|"build + handshake, then publish"| C
-    UIP -->|"mount / unmount in the page"| UIPlug
+    PH -.->|"构建与握手后发布"| C
+    UIP -->|"在页面中挂载与卸载"| UIPlug
 ```
 
-Plugin sources live at `plugins/<tool>/<candidate>/`, so both the tool and the candidate are part of the path the core compiles.
+插件源码位于 `plugins/<tool>/<candidate>/`，核心根据工具名和候选名确定编译路径。
 
-Each layer has one owner and an explicit contract:
+各层职责与接口边界如下：
 
-1. **The Go core** owns runs, cancellation, budgets, tool-subprocess lifecycle, the event stream, and the session transcripts on disk. The bounded memory facts are the Memory capability's own state, not something the core owns. Eino types never cross the HTTP boundary.
-2. **Each plugin process** owns one tool implementation. It receives only the environment it needs, never the model credentials.
-3. **The browser UI** observes and controls the core through a small app-owned HTTP/SSE contract. Model output, tool arguments, and tool results reach the DOM only through `createElement` / `textContent`. A UI plugin is code the core serves and the page runs in its own container, under the narrow `mount`/`unmount` API described below.
+1. **Go 核心**负责运行、取消、预算、工具子进程生命周期、事件流和磁盘会话记录。受上限约束的记忆事实由记忆（Memory）能力自行管理，不属于核心状态。Eino 类型不跨越 HTTP 边界。
+2. **插件进程**各自负责一个工具的实现，只接收必要的环境变量，不接收模型凭据。
+3. **浏览器界面**通过应用自定义的 HTTP/SSE（服务器发送事件）接口观察和控制核心。模型输出、工具参数和结果只通过 `createElement` / `textContent` 进入 DOM。界面插件由核心提供文件，在页面分配的容器内运行，使用下文说明的有限 `mount` / `unmount` 接口。
 
-See [docs/architecture.md](docs/architecture.md) for ownership and reload semantics, and [docs/roadmap.md](docs/roadmap.md) for scope.
+职责划分与热重载语义见 [架构说明](docs/architecture.md)，项目范围见 [路线图](docs/roadmap.md)。
 
 ## 日常界面
 
 - **会话**：桌面左侧会话列表和“新建会话”，可以一键折叠、也可以拖动右边缘调整宽度；折叠后页头左边出现展开入口。折叠状态和宽度只存在浏览器本地。窄屏仍然按抽屉处理，通过页头“会话”按钮打开列表，选中后回到对话。
-- **设置**：侧栏底部的“设置”打开一个独立模态，左侧是分类导航（外观 / 模型服务 / 能力 / 技能 / 工作区 / 界面扩展 / 诊断），右侧是内容面，内部自己滚动；关闭后回到原来的会话上下文。凡是“Luna 有什么、在用什么”的入口都在这里。“能力”列出内核当前注册的能力——各自的部署形态、是否在服务、贡献了哪些工具与上下文块、哪些路由与面板，并可在这里启用或停用，以及直接打开某个能力贡献的面板；声明与权限属于开发者信息，收在每行下面默认折叠的次级块里。停用只是把这些从服务里取下并如实重绘，能力自己的数据不动。“模型服务”编辑这台机器的 provider 列表——每个 provider 的名字、接口地址、密钥、默认模型与其他模型，标出使用中的那一个，新增、编辑与删除都在这里，删除要二次确认；密钥只写不读，界面上只有“是否已设置 + 末四位”。同一页只读显示当前在用的模型、provider 与两个运行预算，并列出当前 provider 可用的模型、把当前会话切到其中一个；档位未设置时如实写作“未发送”，而不是补一个默认值。“工作区”列出本机定义过的工作区（一组目录），标出当前会话在用的那个并可以换；没有绑定时说清楚文件工具回到启动时的读取根。
-- **工作目录与项目规则**：内置的 Workspace 能力向模型贡献两条上下文——这个会话在哪些目录里工作（只用目录名，不写宿主绝对路径），以及这些目录自己的规则。**一个 Workspace 是一个或多个目录的集合**（例如同时包含 `luna-agent` 和 `luna-agent-dev`），会话与它关联；每个目录的 `AGENTS.md` 作为“规则”进入上下文（默认文件名，`-rules-file` 仍可覆盖单根回退时的取值）。文件不存在只意味着那个目录没有规则；超限或不可读会被报告而不是截断。**没有关联 Workspace 的会话走回退**，与旧行为一致（安装根/`-read-root` 的单根身份与规则），所以已有会话不会因为这次改动而变。`AGENTS.md` 的读取复用文件工具那套边界（`internal/fileread`，根就是那个目录），能力不新增权限声明。**Workspace 不是权限范围**：它是“在哪些目录里工作”，不是“允许读写什么”——权限是以后独立设计的另一件事。
-- **记忆**：页头的“记忆”入口来自 Memory 能力贡献的面板——宿主按 `/api/state` 的 `capabilities[]` 渲染入口与容器，打开时加载能力自己的模块。面板的主体是生效中的事实（每条带来源与时间，可以就地撤回），已撤回的那些只占一行摘要，点开才列出：撤回记录是存储的事实，不是用户在主要界面上要看的一屏内容。不提供新增或编辑。
+- **设置**：侧栏底部的“设置”打开一个独立模态，左侧是分类导航（外观 / 模型服务 / 能力 / 技能 / 工作区 / 界面扩展 / 诊断），右侧是内容面，内部自己滚动；关闭后回到原来的会话上下文。凡是“Luna 有什么、在用什么”的入口都在这里。“能力”列出内核当前注册的能力——各自的部署形态、是否在服务、贡献了哪些工具与上下文块、哪些路由与面板，并可在这里启用或停用，以及直接打开某个能力贡献的面板；声明与权限属于开发者信息，收在每行下面默认折叠的次级块里。停用只是把这些从服务里取下并如实重绘，能力自己的数据不动。“模型服务”编辑这台机器的模型服务提供方（provider）列表——每个提供方的名字、接口地址、密钥、默认模型与其他模型，标出使用中的那一个，新增、编辑与删除都在这里，删除要二次确认；密钥只写不读，界面上只有“是否已设置 + 末四位”。同一页只读显示当前在用的模型、提供方与两个运行预算，并列出当前提供方可用的模型、把当前会话切到其中一个；档位未设置时如实写作“未发送”，而不是补一个默认值。“工作区”列出本机定义过的工作区（一组目录），标出当前会话在用的那个并可以换；没有绑定时说清楚文件工具回到启动时的读取根。
+- **工作目录与项目规则**：内置的工作区（Workspace）能力向模型贡献两条上下文——这个会话在哪些目录里工作（只用目录名，不写宿主绝对路径），以及这些目录自己的规则。**一个工作区是一个或多个目录的集合**（例如同时包含 `luna-agent` 和 `luna-agent-dev`），会话与它关联；每个目录的 `AGENTS.md` 作为“规则”进入上下文（默认文件名，`-rules-file` 仍可覆盖单根回退时的取值）。文件不存在只意味着那个目录没有规则；超限或不可读会被报告而不是截断。**没有关联工作区的会话走回退**，与旧行为一致（安装根/`-read-root` 的单根身份与规则），所以已有会话不会因为这次改动而变。`AGENTS.md` 的读取复用文件工具那套边界（`internal/fileread`，根就是那个目录），能力不新增权限声明。**工作区不等于写入授权**：它描述“在哪些目录里工作”；写入仍需单独授权，终端也不会因此获得宿主写权限。
+- **记忆**：页头的“记忆”入口来自记忆能力贡献的面板——宿主按 `/api/state` 的 `capabilities[]` 渲染入口与容器，打开时加载能力自己的模块。面板的主体是生效中的事实（每条带来源与时间，可以就地撤回），已撤回的那些只占一行摘要，点开才列出：撤回记录是存储的事实，不是用户在主要界面上要看的一屏内容。不提供新增或编辑。
 - **界面扩展**：本地界面插件的管理与内容展示在设置的“界面扩展”分类里，不再占用页头入口；启用状态仍然在刷新后重置。
-- **外观**：在设置的“外观”分类里选择“跟随系统”“浅色”“深色”。切换只改根 token，不重建会话或插件；插件可复用宿主的语义颜色、字体和基础控件样式。
+- **外观**：在设置的“外观”分类里选择“跟随系统”“浅色”“深色”。切换只改根级主题变量，不重建会话或插件；插件可复用宿主的语义颜色、字体和基础控件样式。
 - **运行详情**：页头的这个抽屉只说这一次运行用什么、还有多少余地——模型、提供方、思考档位、两个运行预算、会话状态与运行中的会话。**开发与排查用的东西不在它里面**：工具插件的代次与进程、候选版本的验证与替换、生命周期事件都在设置的“诊断”分类里，页头不再有第二个内置开关（能力贡献的面板入口与窄屏的会话抽屉不在此列）。
 
 会话列表的标题单行省略，右侧的相对时间固定不收缩，因此侧栏只纵向滚动；折叠状态、宽度和主题是浏览器本地保存的三项界面偏好。
 
 界面插件与主页面同源运行，受限的宿主接口不是安全沙箱。只启用可信的本地插件；主题与样式契约见 [架构说明](docs/architecture.md#界面主题与插件样式)。
 
-## What the kernel does
+<a id="what-the-kernel-does"></a>
 
-- An Eino `ChatModelAgent` named `luna` with automatic tool choice, a 64-turn model ceiling (`max_iterations`), and sequential execution when one model turn contains multiple tool calls.
-- OpenAI-compatible configuration read from the process environment and, where the file states a value, from `$XDG_CONFIG_HOME/luna/config.yaml`; the file wins and the environment fills in the rest.
-- Eleven model-visible tools, in two kinds. The five **plugin-backed** tools are replaceable at runtime and are each backed by an allowlisted subprocess candidate, so all five use the same `v1` / `v2` / `broken` vocabulary and a replacement has one shape whatever the tool does. The other six are contributed by **built-in capabilities**: they are not subprocesses, so they have no candidate, no generation and no process to replace, their call events carry no process identity, and a `broken` reload cannot take them away from the agent. `luna_remember` and `luna_recall` belong to Memory, `luna_skill_view` to Skills, `luna_run` to Terminal, `luna_write_file` to File writing and `luna_web_fetch` to Web. The last three do not run on their own: they are off until the user turns them on in the settings page, and while any of them is on, that page is also where its reach is decided — which directories a command may be started in, which directories a file may be written in, and, for the fetch tool, nothing: the capability refuses everything that is not a public http(s) text response by itself.
+## 当前能力
 
-  | Tool | Kind | `v1` returns | `v2` returns |
+- 使用名为 `luna` 的 Eino `ChatModelAgent`，自动选择工具；模型调用默认最多 64 轮（`max_iterations`），同一模型轮次中的多个工具调用按顺序执行。
+- 支持兼容 OpenAI 的模型服务接口。接口地址、密钥和模型由设置页写入 `provider.yaml`；运行预算与思考档位从环境变量及 `$XDG_CONFIG_HOME/luna/config.yaml` 读取，文件中的有效值优先，未设置的部分由环境变量补充。
+- 共提供十一种模型可见工具，分为两类。五种**子进程插件工具**可在运行时替换，均使用白名单内的 `v1` / `v2` / `broken` 候选，替换流程与具体工具职责无关。另外六种由**内置能力贡献**，不运行在子进程中，因此没有候选、代次或待替换的进程，调用事件也不携带进程标识；`broken` 重载不会将它们从智能体中移除。`luna_remember` 和 `luna_recall` 属于记忆能力，`luna_skill_view` 属于技能（Skills）能力，`luna_run` 属于终端（Terminal）能力，`luna_write_file` 属于文件写入（File writing）能力，`luna_web_fetch` 属于网页读取（Web）能力。后三种默认停用，需用户在设置页启用；命令的工作目录和文件可写目录受各自边界约束。网页读取无需用户维护地址白名单，能力自身拒绝非公网的 HTTP(S) 地址和非文本响应。
+
+  | 工具 | 类型 | `v1` 返回内容 | `v2` 返回内容 |
   |---|---|---|---|
-  | `luna_text_transform` | plugin-backed | the input with surrounding whitespace trimmed | trimmed, uppercased, prefixed with `Luna · ` |
-  | `luna_read_file` | plugin-backed | the text of a host-validated file inside the read root, or of one line range of it | the same text with `CRLF` and lone `CR` normalized to `LF` |
-  | `luna_list_dir` | plugin-backed | one level of a host-validated directory inside the read root by default, or as many as five levels when the call names a depth: each entry with its kind, and a size for regular files | the same listing with every size as an exact byte count |
-  | `luna_search_files` | plugin-backed | literal matches inside a host-validated directory in the read root, as `path:line: text` | the same matches with each line's leading indentation stripped |
-  | `luna_find_files` | plugin-backed | the entries whose name matches a glob, at any depth below a host-validated directory in the read root, one line per match with its kind, a size for regular files and its path | the same matches with every size as an exact byte count |
-  | `luna_remember` | capability-contributed | appends one fact | — (no candidates) |
-  | `luna_recall` | capability-contributed | 列出或按字面量检索生效事实，支持有界分页并说明剩余范围 | — (no candidates) |
-  | `luna_skill_view` | capability-contributed | the body of one skill, or of one file inside that skill's own directory | — (no candidates) |
-  | `luna_run` | capability-contributed | Bubblewrap 内经 `sh -c` 执行；工作区只读、临时目录私有，返回退出码与两路输出 | — (no candidates) |
-  | `luna_write_file` | capability-contributed | one text file created or replaced inside a directory the user allowed, with the diff of the change | — (no candidates) |
-  | `luna_web_fetch` | capability-contributed | the readable text of one http(s) URL, with every cap it hit named | — (no candidates) |
+  | `luna_text_transform` | 子进程插件 | 去除输入首尾空白后的文本 | 去除首尾空白、转为大写，并加上 `Luna · ` 前缀 |
+  | `luna_read_file` | 子进程插件 | 宿主校验过的读取根内文件文本，或指定行范围的文本 | 同样的文本，但将 `CRLF` 和单独的 `CR` 统一为 `LF` |
+  | `luna_list_dir` | 子进程插件 | 默认列出宿主校验过的读取根内目录的一层；指定深度时最多五层，每项带类型，普通文件还带大小 | 同样的列表，但文件大小均为精确字节数 |
+  | `luna_search_files` | 子进程插件 | 在宿主校验过的读取根内目录中进行字面量搜索，按 `path:line: text` 返回匹配行 | 同样的匹配结果，但去除每行开头的缩进 |
+  | `luna_find_files` | 子进程插件 | 在宿主校验过的读取根内目录下递归查找名称匹配通配模式的条目，每项一行，带类型、路径及普通文件大小 | 同样的匹配结果，但文件大小均为精确字节数 |
+  | `luna_remember` | 内置能力贡献 | 追加一条事实 | —（无候选版本） |
+  | `luna_recall` | 内置能力贡献 | 列出或按字面量检索生效事实，支持有界分页并说明剩余范围 | —（无候选版本） |
+  | `luna_skill_view` | 内置能力贡献 | 某个技能的正文，或该技能目录内一个文件的内容 | —（无候选版本） |
+  | `luna_run` | 内置能力贡献 | 在 Bubblewrap 内经 `sh -c` 执行；工作区只读、临时目录私有，返回退出码、标准输出与标准错误 | —（无候选版本） |
+  | `luna_write_file` | 内置能力贡献 | 在用户授权的目录内创建或替换一个文本文件，并返回修改差异 | —（无候选版本） |
+  | `luna_web_fetch` | 内置能力贡献 | 一个 HTTP(S) 网页的可读文本，并说明触及的各项上限 | —（无候选版本） |
 
-  `broken` refuses the plugin handshake for every plugin-backed tool, so a failed replacement stays observable on all five.
+  `broken` 会拒绝所有子进程插件工具的握手，因此五种工具都能观察到替换失败的行为。
 
-- The agent remembers durable facts, and that is a capability's business rather than the kernel's. `luna_remember` is contributed by the built-in Memory capability, which owns its own store and its own rules; the file is still an append-only JSONL `.runtime/memory.jsonl` by default — one line is one fact, carrying its type (`fact`), text, timestamp and the session that wrote it — and the file name inside its state directory is the capability's own choice, not a kernel setting. `-state-dir` moves the state root the capability keeps that directory under (default: the user's data root when nothing is there yet; a checkout that still holds `.runtime/memory.jsonl` keeps writing there, so existing data needs no migration and nothing is moved); there is no `-memory-file` flag any more. Writes are bounded to 200 facts and 32 KiB of encoded lines overall, with 500 characters on a single fact, dropping the oldest first — every complete line counts, retractions included, so retracting in a loop cannot grow the file. The stored facts are re-read on every run and injected as one context block the capability contributes: the kernel labels it as reference data rather than instructions and truncates on line boundaries inside the block's budget, and the capability keeps the most recent facts, capped at 50 facts and 8 KiB of rendered lines; newlines inside a fact are collapsed, so stored text cannot open a prompt line of its own. Memory is reached by the model through two tools, and neither of them edits or removes anything: `luna_remember` appends one fact, and `luna_recall` lists the facts in effect right now with the time each was recorded — capped like every other model-visible result, and saying where it stopped when the cap is reached. Retracting a fact is still the user's action in the Memory panel. A memory file that cannot be read fails the run instead of running as if nothing were remembered.
+- 智能体可记住持久事实，这是记忆能力的职责，不属于内核业务。`luna_remember` 由内置记忆能力贡献，存储和规则均由该能力自主管理。文件默认仍为仅追加的 JSONL（每行一条 JSON 记录）`.runtime/memory.jsonl`，每条事实包含类型（`fact`）、文本、时间戳和来源会话；状态目录内的文件名由能力自行选择，不是内核配置。`-state-dir` 指定能力状态根目录：默认使用用户数据根；已有 `.runtime/memory.jsonl` 的仓库副本继续写入原位置，不迁移数据。已不再提供 `-memory-file` 参数。存储最多保留 200 条事实、合计 32 KiB 的编码记录，每条事实最多 500 个字符，超限时先淘汰最旧内容；所有完整行都计入上限，包括撤回记录，反复撤回不会使文件无限增长。每轮运行重新读取事实，由能力贡献一个上下文块；内核将它标为参考数据而非指令，并在预算内按行截断。注入内容保留最新最多 50 条、渲染后最多 8 KiB；事实内部换行会被合并，防止存储文本另起提示词行。模型通过两个工具使用记忆：`luna_remember` 追加事实，`luna_recall` 列出或检索当前生效的事实及记录时间，结果受上限约束并说明截断位置。两者都不能编辑或撤回事实，撤回仍由用户在记忆面板执行。记忆文件不可读会导致本轮失败，不会当作空记忆继续运行。
 
-- 用户通过 Memory 能力贡献的面板查看和撤回事实；`GET /api/memory` 与 `POST /api/memory/retract` 也是这个能力贡献的接口，内核只负责挂载与守卫。`GET /api/memory` 列出生效与已撤回的事实；`POST /api/memory/retract` 按文本和时间戳共同匹配目标。撤回只追加记录，不就地修改事实；读取和上下文注入时排除被撤回的事实。字节上限计算所有记录，压缩重写时一起移除事实及对应撤回记录，避免反复撤回导致文件无限增长。模型侧现在有两个工具：`luna_remember` 追加一条、`luna_recall` 列出或检索此刻生效的事实（只读，每次调用现读，可分页）。仍然没有编辑或撤回工具——撤回依旧是用户在产品面板里做的事。
+- 用户通过记忆能力贡献的面板查看和撤回事实；`GET /api/memory` 与 `POST /api/memory/retract` 也是这个能力贡献的接口，内核只负责挂载与守卫。`GET /api/memory` 列出生效与已撤回的事实；`POST /api/memory/retract` 按文本和时间戳共同匹配目标。撤回只追加记录，不就地修改事实；读取和上下文注入时排除被撤回的事实。字节上限计算所有记录，压缩重写时一起移除事实及对应撤回记录，避免反复撤回导致文件无限增长。模型侧现在有两个工具：`luna_remember` 追加一条、`luna_recall` 列出或检索此刻生效的事实（只读，每次调用现读，可分页）。仍然没有编辑或撤回工具——撤回依旧是用户在产品面板里做的事。
 - **记忆检索与分页**：`luna_recall` 不传参数时仍返回最新最多 50 条，页内从旧到新；需要更早的事实时可传 `{"offset":50}`。新增的可选参数如下，检索针对**整个生效集合**，不是只搜索默认窗口：
 
   | 参数 | 行为 |
@@ -114,42 +118,54 @@ See [docs/architecture.md](docs/architecture.md) for ownership and reload semant
   | `offset` | 从较新端跳过多少条**匹配事实**，默认 `0`；每页仍从旧到新展示 |
   | `limit` | 每页最多返回 `1..50` 条，默认 `50` |
 
-  例如 `{"query":"乌龙茶","limit":10}`；结果说明生效总数、匹配数、本页数量及剩余较旧匹配数。有下一页时给出 `next_offset`，继续时保持相同查询；没有下一页明确标为 `none`。超出末尾是空页，不会被说成“记忆为空”。每次调用重新读取有效集合，新增或撤回可能移动 offset，**不是冻结快照**。检索不会修改记忆，也不读取会话全文；默认空参数、`{}` 及原有根 `null` 调用保持兼容。
+  例如 `{"query":"乌龙茶","limit":10}`；结果说明生效总数、匹配数、本页数量及剩余较旧匹配数。有下一页时给出 `next_offset`，继续时保持相同查询；没有下一页明确标为 `none`。超出末尾是空页，不会被说成“记忆为空”。每次调用重新读取有效集合，新增或撤回可能改变分页偏移量（`offset`），**不是冻结快照**。检索不会修改记忆，也不读取会话全文；默认空参数、`{}` 及原有根 `null` 调用保持兼容。
 
 
-- Skills are directories of instructions the model can consult, contributed by the built-in Skills capability. A skill is a directory under a skills root — `$XDG_DATA_HOME/luna/skills` by default, plus any `-skills-dir` — holding a `SKILL.md` whose YAML frontmatter names it (`name` must equal the directory name) and describes it (`description`, up to 1024 characters). Discovery reads only the frontmatter and contributes the resulting list as one context block, which the kernel labels as procedural knowledge rather than as reference data or as project rules; the body is not loaded until the model asks for it, which is what keeps a library of skills from filling the prompt. `luna_skill_view` returns either the `SKILL.md` body (frontmatter stripped) or one file inside that skill's own directory, and it reuses the file tools' boundary with the skill's directory as its root: a path that leaves the skill is refused before anything is read, and over-limit or binary content is refused rather than truncated. A skill file larger than 256 KiB is reported as a problem instead of being read, an unknown frontmatter field is ignored — a skill is third-party content, and one field from a newer tool should not make it unusable — and two skills with the same name resolve by scope (`builtin` < `user` < `project`), with the shadowed one reported rather than dropped. Turning a skill off is a user choice rather than a state change of the capability, so it is stored in `$XDG_CONFIG_HOME/luna/settings.yaml` — a file Luna writes, unlike `config.yaml`, which is the user's to edit — and it takes effect on the next run: an off skill is out of the manifest and `luna_skill_view` refuses it by saying it is turned off, not that it does not exist.
+- 技能是一组供模型按需查阅的指令目录，由内置技能能力提供。技能位于技能根目录下，默认是 `$XDG_DATA_HOME/luna/skills`，也可通过 `-skills-dir` 补充。每个技能目录包含 `SKILL.md`，文件头部的 YAML 元数据需提供名称（`name` 必须与目录名相同）和描述（`description`，最多 1024 个字符）。发现阶段只读取元数据，将技能列表作为上下文块提供；内核将它标为过程知识，而不是参考数据或项目规则。模型请求时才加载正文，避免整个技能库占满提示词。`luna_skill_view` 可返回去掉元数据的 `SKILL.md` 正文，或该技能目录内一个文件的内容；它以技能目录为根复用文件工具的边界校验，越界路径在读取前拒绝，超限或二进制内容明确拒绝，不截断。技能文件超过 256 KiB 时报告问题，不读取内容；未知元数据字段会被忽略，避免第三方技能因新增字段而无法使用。同名技能按作用域覆盖：`builtin`（内置）< `user`（用户）< `project`（项目），被覆盖项仍会报告，不会静默丢弃。停用单个技能是用户偏好，不是停用整个能力，保存在 `$XDG_CONFIG_HOME/luna/settings.yaml` 中；该文件由 Luna 写入，与用户手动编辑的 `config.yaml` 不同。偏好在下一轮生效：停用的技能从清单移除，`luna_skill_view` 会明确说明它已停用，而不是说它不存在。
 
-- The same file carries the other choices the product asks for: which capabilities the user turned on (`capabilities.enabled`, absence meaning off) and which directories Luna may write in (`write.dirs`, absence meaning nowhere). All of them survive a restart, and each is written down before the running state changes, so a change that reports failure is one that did not happen — retrying it is safe, which is the only reason a failure is worth reporting at all.
+- 同一份设置文件还保存用户启用的能力（`capabilities.enabled`，未指定即停用）和允许写入的目录（`write.dirs`，未指定即不允许写入任何目录）。这些选择在重启后保留，并且先持久化、再改变运行状态；保存失败意味着变更未生效，可以安全重试。
 
-- The model's **read** tools are bounded and read-only, and the four of them share one boundary. `luna_read_file` reads one file, `luna_list_dir` lists one directory, `luna_search_files` searches one directory for text, literally by default and as an RE2 pattern when the call asks for that mode, and `luna_find_files` finds entries by name below one directory, and each takes a path relative to the directories the session works in — **the directories of the workspace the session is bound to, tried in order**; a session bound to none falls back to the single configured root, which is the behaviour every session had before workspaces existed. The host is the only place that path is interpreted: it normalizes it, rejects absolute paths and `..` escapes, resolves symbolic links, and refuses anything that is not still inside one of those directories — so neither a listing, a search nor a find can reach somewhere a read cannot, a path that escapes one directory is not rescued by a sibling, and an out-of-bounds path is refused before any plugin runs. A single read above the 256 KiB cap is refused with an explicit error instead of being truncated, and content with a NUL byte is refused as binary. A file too large to read whole is not a dead end: `start_line` (counting from 1) and `max_lines` read one range of it, scanned line by line rather than by reading the file and cutting it — which would defeat the very cap it is working around. The result says which lines it returned and how many were left unread, and a `start_line` past the last line is refused with the file's line count instead of returning nothing. A listing is one level deep unless the call names a `depth` between 1 and 5, which lists that many levels in one call; a value outside that range is refused rather than clamped, because a clamped depth would answer a call about levels it never asked for. Below the first level each line is the entry's path relative to the directory named, with a subdirectory's own entries on the lines right after it. Each entry carries its kind (`dir`, `file`, `link`, `other`) and a size for regular files, directories come first and then files and links, each sorted by name, and one listing examines at most 20000 entries and renders at most 200 of them in lines of at most 160 bytes — saying which cap it reached and how much was left unexamined instead of quietly returning a prefix. It never follows a symbolic link, at any depth. A search reads its query literally unless the call sets `mode` to `regex`, which compiles the same query as an RE2 pattern matched against one line at a time. Go's regexp is a linear-time engine that never backtracks, so the old worry about a pattern running away until it timed out does not apply; what keeps the literal reading as the default is that a plain query read as a pattern matches things nobody asked for — `docs/architecture.md` would also match `docsXarchitecture.md`. A query that is not a valid pattern is refused rather than reported as no matches, any mode value other than `literal` or `regex` is refused rather than read as the default, and the header says which way the query was read. A search is bounded by matched lines, line length, files read and one file's size, skipping binary content by the same NUL rule; reaching any of those bounds is reported with how much was left unsearched rather than returned as if it were the whole answer. A name search matches a glob (`*`, `?`, `[abc]`) against the whole entry name rather than testing a substring, so `main.go` matches only that file and `*_test.go` matches Go test files at any depth; it renders one line per match with the entry's kind, a size for regular files and its path relative to where the find started, marking a directory with a trailing slash so a match that is a directory cannot be mistaken for a file, and it never follows a symbolic link — a link is reported by its own name and never entered. It is bounded by rendered paths, line length and entries examined, and it states the cap it reached and that the remaining entries were not examined instead of reporting a prefix as the whole tree. An empty pattern, a pattern aimed at a path and a pattern that is not a valid glob are refused before any directory is read. The plugin receives an already-validated absolute path plus the caps and never interprets a path itself. The fallback root defaults to the resolved repository root and can be pointed elsewhere with `-read-root`. Memory is not a filesystem capability the model holds either: it writes through the tool its capability contributes, never through a path.
+- 模型的四种**读取工具**只读、有上限，并共用同一套边界。`luna_read_file` 读取文件，`luna_list_dir` 列出目录，`luna_search_files` 搜索目录中的文本（默认按字面量，可显式选择 RE2 正则模式），`luna_find_files` 按名称查找目录下的条目。路径均相对于会话的工作目录：**按顺序尝试会话绑定工作区中的目录**；未绑定工作区时回退到单一配置根，保持原有会话的行为。路径只由宿主解释：先规范化，拒绝绝对路径和 `..` 越界，再解析符号链接，确认目标仍在允许的目录内。列目录、搜索和查找都不能超出读取范围；一个目录中的越界路径不会被兄弟目录救回，越界调用在插件运行前就会被拒绝。
 
-- The model can also **change** files, and only through capabilities the user turned on. `luna_write_file` creates or replaces one text file and answers with the diff; `luna_run` starts an isolated command with read-only workspaces; it is not a second host-file writer. Both are off until they are turned on in the settings page — a capability that changes files or starts processes on someone's machine is one they have to have asked for — and turning one on is not the end of the question. The write tool needs a second answer, read from `settings.yaml` on **every call**, so that a directory allowed while a conversation is going takes effect on the model's next call rather than at the next start-up. The grant narrows the run's working directories and never widens them: a path a read may not reach is not one a write may reach. A write lands where a read of the same path would look: when some directory the run works in already holds the name, that directory wins, and among several the first of them wins — so editing what was just read edits that file, rather than creating a second file of the same name in another directory.
+  整文件读取超过 256 KiB 时明确拒绝，不截断；含 NUL 字节的内容按二进制拒绝。大文件可用 `start_line`（从 1 开始）和 `max_lines` 读取指定行范围：逐行扫描，不先整读再截取。结果说明返回了哪些行、还剩多少行；起始行超出文件末尾时返回拒绝及总行数，而不是空结果。
 
-  Its boundary is the read boundary, applied by the same code: the path is normalized once, an absolute path and a `..` climb are refused, symbolic links are resolved, and a target that is itself a link is refused — a rename would replace the link rather than the file it names. It writes text only, up to the same 256 KiB one read can return, keeps an existing file's permission bits, creates no directory, removes no file, and a call that would change nothing writes nothing instead of moving the file's modification time. Every refusal leaves the disk as it was and names the question that failed: "nothing has been allowed yet" and "this directory is not among what you allowed" are two sentences, because they ask the user for two different things. The diff in the answer is the two cheap ends of a diff and nothing more — the lines both versions share are dropped at the front and at the back, and what is left is one block of `-` lines then `+` lines. That is deliberately not a minimal edit script, and it is cut at 8 KiB with the limit named and the missing bytes counted, since a diff that stopped mid-change without saying so would be read as the whole of it.
+  目录列表默认只列一层，也可指定 `depth` 为 1 到 5，一次列出相应层数。超出范围会拒绝，不会强行限制到最近有效值。第一层以下使用相对于所选目录的路径，子目录内容紧跟在目录条目后。每项带类型（`dir`、`file`、`link`、`other`），普通文件还带大小；目录优先，其后为文件和链接，各组按名称排序。单次最多检查 20000 个条目、展示 200 个条目，每行最多 160 字节；达到上限时说明触及哪项上限及未检查范围，不会静默返回部分内容。任何深度都不跟随符号链接。
 
-- **终端的隔离边界**：`luna_run` 使用 Linux Bubblewrap 启动 `sh -c`，不是把宿主 shell 直接交给模型。可见文件由只读工作区、固定的只读系统运行时和私有临时目录组成；`cwd` 仍先经过文件工具共用的路径校验。宿主 HOME、登录配置、凭据和用户缓存不会自动映射。`/tmp` 仅属于本次调用、上限 512 MiB，结果不自动回写；即便已授权可写目录，Terminal 也不直接写宿主文件，修改文本请用 `luna_write_file`。宿主网络、宿主 PID 和 pathname Unix socket 被隔离；沙箱内部回环通信及匿名 socketpair 可用。保留默认 30 秒/最多 120 秒超时与两路合计 32 KiB 输出上限。隔离启动失败按工具不可服务处理，**绝不回退到裸 shell**。
+  内容搜索默认按字面量理解查询；`mode` 为 `regex` 时，将查询编译为 RE2 正则表达式，逐行匹配。Go 正则引擎采用线性时间算法，不回溯。默认使用字面量不是为了回避正则回溯，而是避免意外匹配，例如将 `docs/architecture.md` 当正则时也会匹配 `docsXarchitecture.md`。无效表达式会被拒绝，不会当作无匹配；`mode` 只接受 `literal` 和 `regex`，结果头部会说明实际使用的模式。搜索受匹配行数、行长度、读取文件数和单文件大小约束，按同样的 NUL 规则跳过二进制内容；触及上限时说明未搜索范围，不会把部分结果当作完整答案。
 
-- The model can also **read pages off the network**, through the same kind of capability: `luna_web_fetch` is off until the user turns it on, and what it may reach is decided by the capability rather than by a list anyone has to maintain. It fetches one URL, follows at most five redirects, spends at most 20 seconds, reads at most 1 MiB of the body and returns at most 16 KiB of text, and every one of those caps is named in the answer when it is the thing that stopped the call. What comes back is the text of the page — headings, list items and link targets kept, scripts and navigation chrome dropped — which is a heuristic reader, not a faithful rendering, and the tool description says so. A URL that is not http(s) is refused, and so is any host that is, or resolves to, something other than a public address: loopback, private ranges, link-local and IPv6 unique-local are the ways back into this machine and into the local network, so they are refused whether they are written as an address or reached through a name, and so are the prefixes that merely carry another address inside them (6to4, NAT64), and again at the point of connecting so a redirect or a name that changed its mind cannot slip past. A response that is not text is refused with the type it was. A proxy is honoured when the process was started with one (`HTTP_PROXY` / `HTTPS_PROXY`); there is no setting for it, so a proxied deployment sets it where it starts Luna.
+  名称查找用通配模式（glob，如 `*`、`?`、`[abc]`）匹配完整条目名，而不是子串：`main.go` 只匹配该名称，`*_test.go` 可匹配任意深度的 Go 测试文件。每项一行，带类型、普通文件大小及相对查找起点的路径；目录以尾部斜杠标记，不会与文件混淆。符号链接只按自身名称报告，不进入目标。查找受返回路径数、行长度和检查条目数约束，达到上限会明确说明剩余条目未检查。空模式、针对路径的模式和无效通配模式均在读取目录前拒绝。
 
-- Validated hot reload: build, start, handshake, and metadata checks all complete for every allowlisted plugin tool before the new generations are published together. In-flight calls stay pinned to their original generation until it drains.
-- A loopback-only HTTP service with guarded mutation origins, bounded request bodies, and a default 15-minute whole-run deadline (`run_timeout`).
-- Public, app-owned SSE events instead of Eino or plugin RPC structs, with exactly one terminal event per writable stream.
-- **连续会话的完成边界**：HTTP 层等 Runner 退出并收齐事件后，先释放运行准入，再发出唯一终止事件。收到终止事件后可以直接发送下一句，不必为上一轮的收尾自动重试；Runner 尚未退出时仍拒绝并发运行。
-- Runs are persisted. Each session is one append-only JSONL file under `-sessions-dir` (default `<data>/sessions` — the user's data root; a checkout that already holds sessions in the previous `<root>/.runtime/sessions/` keeps using that location, and startup says which one it chose); one line is one record, written by a single `Write` call, so a crash can lose only an unterminated tail fragment and never a completed record. A run appends the user message before the model runs, one record per tool call, the assistant answer, and one record carrying the run's status. A run whose transcript cannot be written is reported as failed instead of as a success.
-- A session's history is replayed into the model. The input for a turn is the system prompt — the instruction plus the context blocks the enabled capabilities contribute, each labelled by the kernel as reference data rather than instructions and truncated on line boundaries inside its own budget — then the session's prior messages in order, then this turn's user message, capped at the most recent 40 messages and 64 KiB of message text, dropping the oldest first. Summarization and retrieval are not implemented: history is replayed and memory is injected whole under its own caps, never searched.
+  插件只接收已验证的绝对路径与各项上限，不自行解释路径。回退根默认是解析后的仓库根，可用 `-read-root` 指定。记忆也不赋予模型任意文件写入能力：模型通过记忆能力贡献的工具写入，而不是提供文件路径。
+
+- 模型也能**修改文件**，但只能使用用户主动启用的能力。`luna_write_file` 创建或替换一个文本文件并返回差异；`luna_run` 在只读工作区中运行隔离命令，不是另一个宿主文件写入入口。两者默认停用，必须在设置页启用。写入工具还需要目录授权，且**每次调用**都重新读取 `settings.yaml`：对话中新增的授权从下一次工具调用生效，无需重启。授权只能缩小本轮工作目录的可写范围，不能扩大范围；读不到的路径也不能写入。写入目标与读取同一路径时一致：如果工作目录中已有同名目标，优先使用包含该目标的目录；多处存在时取顺序中的第一个，避免把刚读过的文件误写成另一个目录中的同名副本。
+
+  写入复用读取的路径校验代码：规范化路径，拒绝绝对路径和 `..` 越界，解析符号链接；目标本身是链接时也拒绝，因为重命名会替换链接而非链接指向的文件。仅写文本，上限为 256 KiB；保留已有文件权限，不创建目录，不删除文件；内容无变化时不写入，也不更新修改时间。拒绝调用时磁盘保持不变，错误会区分“尚未授权任何目录”和“此目录不在授权范围”，让用户知道需要处理什么。返回的差异只去掉两端共同的行，中间剩余内容先列 `-` 行、再列 `+` 行，不保证最小编辑序列。差异输出最多 8 KiB，截断时说明上限和省略的字节数，不会把不完整差异当作全部变化。
+
+- **终端的隔离边界**：`luna_run` 使用 Linux Bubblewrap 启动 `sh -c`，不是把宿主 shell 直接交给模型。可见文件由只读工作区、固定的只读系统运行时和私有临时目录组成；`cwd` 仍先经过文件工具共用的路径校验。宿主主目录（HOME）、登录配置、凭据和用户缓存不会自动映射。`/tmp` 仅属于本次调用、上限 512 MiB，结果不自动回写；即便已授权可写目录，终端也不直接写宿主文件，修改文本请用 `luna_write_file`。宿主网络、宿主进程（PID）和文件路径型 Unix 套接字（pathname Unix socket）被隔离；沙箱内部回环通信及匿名套接字对（socketpair）可用。保留默认 30 秒/最多 120 秒超时与两路合计 32 KiB 输出上限。隔离启动失败按工具不可服务处理，**绝不回退到裸 shell**。
+
+- 模型可通过网页读取能力**获取网络页面**。`luna_web_fetch` 默认停用，需用户启用；可访问范围由能力自身判断，无需维护地址列表。每次获取一个 URL，最多跟随五次重定向、耗时 20 秒、读取 1 MiB 响应正文并返回 16 KiB 文本，触及任一上限都会在结果中说明。返回内容保留标题、列表项和链接目标，去掉脚本及导航等页面装饰；这是启发式文本提取，不是忠实的页面渲染，工具说明会明确这一点。只接受 HTTP(S)，拒绝本身是或解析为非公网地址的主机，包括回环、私有网段、链路本地和 IPv6 唯一本地地址，也拒绝嵌入其他地址的前缀（6to4、NAT64）。这些检查同样在实际连接时执行，防止重定向或 DNS 解析变化绕过限制。非文本响应会被拒绝，并报告内容类型。进程启动时设置的 `HTTP_PROXY` / `HTTPS_PROXY` 会生效；界面不提供代理设置，需在启动环境中配置。
+
+- **验证后热重载**：白名单内所有插件工具完成构建、启动、握手和元数据检查后，才统一发布新代次；进行中的调用始终使用原代次，直到调用结束后再回收旧进程。
+- HTTP 服务仅监听回环地址，变更请求受来源校验保护，请求体有大小上限；整轮运行默认限时 15 分钟（`run_timeout`）。
+- SSE 使用应用自定义的公开事件，不暴露 Eino 或插件 RPC（远程过程调用）结构；每个可写事件流恰好发送一个终止事件。
+- **连续会话的完成边界**：HTTP 层等运行器（Runner）退出并收齐事件后，先释放运行准入，再发出唯一终止事件。收到终止事件后可以直接发送下一句，不必为上一轮的收尾自动重试；运行器尚未退出时仍拒绝并发运行。
+- **运行记录持久化**：每个会话对应 `-sessions-dir` 下一个仅追加的 JSONL 文件，默认位于用户数据根下的 `<data>/sessions`；已有 `<root>/.runtime/sessions/` 的仓库副本继续使用原位置，启动时说明最终选择。每条记录用一次 `Write` 写成一整行；异常中断留下的未完成尾行不会作为完整记录读取。模型运行前先追加用户消息，随后记录每次工具调用、助手回答和本轮状态。无法写入记录时本轮报告失败，不会假报成功。
+- **会话历史回放**：每轮输入依次为系统提示词、会话已有消息和当前用户消息。系统提示词包含基础指令及已启用能力贡献的上下文块；内核按各块类型标注用途，并在各自预算内按行截断。历史最多保留最近 40 条消息和 64 KiB 消息文本，超限先丢弃最旧消息。尚未实现会话历史的摘要或检索；历史按顺序回放，记忆则在自身上限内注入最近事实，不按相关性筛选。这与模型主动调用 `luna_recall` 进行字面量检索是两回事。
 - **长会话读取**：会话日志逐行校验；列表只聚合摘要，模型历史只保留消息，不先加载整份工具调用记录。完整回放仍返回全部记录，已有大行和残行规则不变；不新增缓存或索引，读取仍需扫描日志。
 
-- The browser surface is extensible at runtime. A UI plugin is a directory `plugins/ui/<name>/` holding `plugin.json` and an ES module exporting `mount(target, api)` and `unmount(target)`; the host hands `mount` a container element and a narrow API (a log callback and the host version), lists what it found over `GET /api/ui-plugins` while reporting the directories it skipped and why, and serves each plugin's files from inside that plugin's own directory under the same containment validator the file tool uses. `unmount` owns the plugin's listeners and timers, but the host removes the container even when `unmount` throws, and reports it, so no half-mounted state survives. Enable state is deliberately not persisted: after a refresh every plugin is off.
+- **运行时界面扩展**：界面插件是 `plugins/ui/<name>/` 目录，包含 `plugin.json` 和导出 `mount(target, api)`、`unmount(target)` 的 ES 模块。宿主向 `mount` 提供容器元素和有限接口（日志回调及宿主版本），通过 `GET /api/ui-plugins` 列出发现的插件，同时报告跳过的目录及原因。文件只能从插件自己的目录提供，边界校验复用文件工具的实现。插件通过 `unmount` 清理自身监听器和定时器；即使它抛错，宿主仍移除容器并报告错误，避免残留半挂载状态。启用状态不持久化，刷新后全部停用。
 
-- A tool call can fail in two ways, and only one of them ends the run. A **refusal** — a rejected path, the file-read size cap, binary content, a malformed argument — is reported to the UI as `tool.failed` and handed to the model as the call's result, so the run continues and the model explains the reason in the user's language. An **infrastructure** failure — no active plugin, an RPC timeout or cancellation that terminated the plugin, a plugin process that is gone — is raised as an error and ends the run as `run.failed`, because a model cannot be told anything useful about a plugin that is not there.
+- **工具失败分为两类**。路径拒绝、读取超限、二进制内容、参数格式错误等属于**调用拒绝**：界面收到 `tool.failed`，模型收到拒绝原因作为工具结果，本轮继续，由模型用用户语言解释。无可用插件、导致插件终止的 RPC 超时或取消、插件进程消失等属于**基础设施故障**：以错误结束本轮，产生 `run.failed`，而不是让模型继续调用已无法服务的插件。
 
-- A **capability** is the product surface; the kernel only runs it. One capability declares what it contributes — tools, context blocks, HTTP routes, browser panels — together with its resource claims (route prefix, panel id, state namespace) and the permissions it needs, and it has a lifecycle state (`registered` / `enabled` / `disabled` / `failed`). Registration rejects a name another capability already claimed, an exposure the descriptor did not declare, and a permission the kernel does not grant, so a descriptor cannot lie about what it does. `GET /api/state` reports every registered capability under `capabilities[]` (`id`, `title`, `deployment`, `state`, `contributions`, `claims`, `permissions`, `panels`) and carries none of the data that capability keeps. `POST /api/plugins/{id}/enable|disable` changes that state: disabling takes the capability's tools, context block, routes and panels out of service together and never deletes its data — removing data is a separate, explicit operation — and a transition the current state does not allow is `409`. Three capabilities are assembled this way — Memory, Workspace and Skills — and being built in is a deployment choice, not a privilege. A capability's tools leave the model's tool set on the next run after it is disabled: the agent is rebuilt when the list it was built from is no longer current.
+- **能力**承载用户可感知的产品功能，内核只负责运行机制。每个能力声明贡献的工具、上下文块、HTTP 路由和浏览器面板，以及资源占用声明（路由前缀、面板标识、状态命名空间）和所需权限。其生命周期状态为 `registered` / `enabled` / `disabled` / `failed`。注册时拒绝重复占用的名称、未在描述中声明的接口和未经内核授权的权限。`GET /api/state` 通过 `capabilities[]` 返回所有已注册能力的 `id`、`title`、`deployment`、`state`、`contributions`、`claims`、`permissions`、`panels`，不包含能力存储的数据。`POST /api/plugins/{id}/enable|disable` 切换状态；停用会一起移除工具、上下文、路由和面板，**不删除数据**，清理数据必须单独明确操作；不允许的状态转换返回 `409`。记忆、工作区和技能等能力均按这一机制装配，内置只是部署选择，不代表额外特权。停用后，其工具从下一轮的模型工具集中移除；装配清单变化时会重建智能体。
 
-## Quick start
+<a id="quick-start"></a>
 
-Requirements: Go 1.24 or newer, and Node.js 22 only if you want to run the browser-JavaScript tests.
+## 快速开始
 
-启用 Terminal 还需要 Linux amd64/arm64、`/usr/bin/bwrap`（Bubblewrap）及可用的 user namespace/seccomp。本次实机验证为 Linux amd64 + Bubblewrap 0.12.0；其他能力不依赖它。缺失依赖或系统禁止隔离时应用仍可运行，但 Terminal 调用明确失败。Debian/Ubuntu 可通过系统包管理器安装 `bubblewrap`；CI 会安装它，并要求隔离测试真正执行。
+环境要求：Go 1.24 或更新版本；只有运行浏览器 JavaScript 测试时才需要 Node.js 22。
+
+启用终端能力还需要 Linux amd64/arm64、`/usr/bin/bwrap`（Bubblewrap）、可用的用户命名空间（user namespace）和系统调用过滤机制（seccomp）。已有实机验证环境为 Linux amd64 + Bubblewrap 0.12.0；其他能力不依赖它。缺失依赖或系统禁止隔离时应用仍可运行，但终端调用明确失败。Debian/Ubuntu 可通过系统包管理器安装 `bubblewrap`；CI（持续集成）会安装它，并要求隔离测试真正执行。
 
 ```sh
 git clone https://github.com/Qaraku/luna-agent
@@ -158,53 +174,45 @@ cd luna-agent
 go run ./cmd/luna -addr 127.0.0.1:0
 ```
 
-The process prints the bound address and the root it resolved:
+进程会打印实际监听地址和解析后的根目录：
 
 ```text
 LISTEN_URL=http://127.0.0.1:<port>
 ROOT=/path/to/repo
 ```
 
-Open that URL, then open **Settings → 模型服务**. One row per provider there: a
-name, an endpoint, an API key and the models that endpoint serves, with the one in
-use marked. Luna writes the list to its own `provider.yaml` in the configuration
-directory, so a first run works with nothing configured: the page that configures
-it is served by the same process.
+打开该地址，进入**设置 → 模型服务**。每行对应一个模型服务提供方，包含名称、接口地址、API 密钥及可用模型，并标出当前使用项。Luna 将列表写入配置目录中的 `provider.yaml`。因此首次启动无需预先配置模型服务，也能打开设置页完成配置。
 
-A second provider is another row, and choosing which one to use is one click on
-the row; the next message uses it. Nothing is restarted for that: the provider is
-read when a run starts, not when the process does. The page can also ask the
-endpoint which models it serves (`获取模型列表`), and it offers them as the model to
-use while still accepting a name typed by hand.
+添加另一个模型服务只需新增一行；点击选择后，下一条消息就使用它，无需重启，因为配置在每轮开始时读取，而不是只在进程启动时读取。页面还可通过“获取模型列表”查询接口，并允许选择返回的模型或手动填写名称。
 
-Roots are resolved in this order: an explicit `-root` (which must hold `web/index.html` and `plugins/`), then the executable's grandparent — the `<repo>/.runtime/luna` layout — then the working directory, which is the candidate that makes `go run ./cmd/luna` work from a fresh checkout.
+根目录按以下顺序确定：显式指定的 `-root`（必须包含 `web/index.html` 和 `plugins/`）、可执行文件的上两级目录（对应 `<repo>/.runtime/luna` 布局）、当前工作目录。最后一项使新克隆的仓库可直接运行 `go run ./cmd/luna`。
 
-Sessions are written under the user's data root at `sessions/`; `-sessions-dir` points them at another directory. A checkout whose sessions still live in `.runtime/sessions/` keeps using that location, so an existing installation never moves on its own — startup logs one line per decision saying which location is in use, and where the data would live after a move. Memory facts live in the Memory capability's state root at `.runtime/memory.jsonl` — the namespace is the capability's own claim and the file name is its own choice, not a kernel setting — and that root defaults to the data root, or stays at `.runtime/memory.jsonl` under the resolved root when the file is already there. `-state-dir` moves the state root.
+会话默认写入用户数据根下的 `sessions/`，可用 `-sessions-dir` 改到其他目录。已有 `.runtime/sessions/` 的仓库副本继续使用原位置，不会自行搬迁；启动日志会说明所选位置及迁移后的目标位置。记忆事实保存在记忆能力状态根下的 `.runtime/memory.jsonl`，命名空间和文件名由该能力决定，不是内核配置。状态根默认使用用户数据根；若解析后的仓库根下已有 `.runtime/memory.jsonl`，则继续使用该位置。可用 `-state-dir` 指定状态根。
 
-The same commands work for the conventional layout, where the binary lives at `<repo>/.runtime/luna`:
+也可以先编译，将二进制文件放在约定的 `<repo>/.runtime/luna` 位置：
 
 ```sh
 mkdir -p .runtime && go build -o .runtime/luna ./cmd/luna
 ./.runtime/luna -addr 127.0.0.1:0
 ```
 
-Runtime candidate builds need the Go toolchain on `PATH`, because each reload compiles the replacement plugin.
+每次热重载都会编译替换插件，因此运行时的 `PATH` 中也必须能找到 Go 工具链。
 
-### Configuration
+<a id="configuration"></a>
 
-Where Luna calls and with which key is a setting of the installation, not
-something a launcher exports. It is stored in Luna's own file, written by the
-settings page: a list of named providers, and which of them a run is sent to.
+### 配置
+
+Luna 调用哪个模型服务、使用哪把密钥，属于当前安装实例的配置，不由启动脚本的环境变量决定。设置页将具名模型服务列表和当前使用项写入 Luna 管理的文件：
 
 ```yaml
-# ~/.config/luna/provider.yaml   (0600; Luna writes this one)
-active: deepseek                   # the provider a run is sent to
+# ~/.config/luna/provider.yaml   （权限 0600，由 Luna 写入）
+active: deepseek                   # 当前运行使用的模型服务
 providers:
   deepseek:
     base_url: https://api.deepseek.com/v1
-    api_key: sk-...                # written by the settings page, never returned to the browser
-    model: deepseek-chat           # what a run asks for by default
-    models:                        # the others /model can switch to
+    api_key: sk-...                # 由设置页写入，不向浏览器返回完整密钥
+    model: deepseek-chat           # 默认请求的模型
+    models:                       # 可通过 /model 切换的其他模型
       - deepseek-reasoner
   local:
     base_url: http://127.0.0.1:11434/v1
@@ -212,100 +220,85 @@ providers:
     model: qwen3
 ```
 
-An empty provider list is a Luna that has not been configured yet; one provider
-listed without `active` naming it (or an `active` that names nothing) is refused,
-because a run would not know where to go.
+模型服务列表为空表示尚未配置；列表非空却没有用 `active` 指定有效条目时会拒绝配置，避免本轮运行无法确定目标。
 
-A file an earlier version wrote — `base_url`, `api_key` and `model` at the top
-level, before providers had names — is still read, as one provider named
-`default`. An installation that was already configured keeps working, and the next
-save writes the shape above.
+仍兼容旧版在顶层直接保存 `base_url`、`api_key`、`model` 的格式，读取时将其视为名为 `default` 的模型服务。已有安装可继续使用，下一次保存时才写成上面的新格式。
 
-Nothing about this file can stop Luna. A file that cannot be read is logged once
-at startup, the process serves anyway, and the reason is what the settings page
-shows, what `/api/state` reports and what a run fails with — exiting would put the
-one surface that can repair the file out of reach. Either way the file is left as
-it is; repairing it is the reader's decision, not a silent rewrite.
+模型服务配置文件不可读时，Luna 会在启动时记录一次错误，但仍提供页面；设置页、`/api/state` 和运行失败信息会报告原因。原文件保持不变，不会静默重写。当前设置接口不能绕过读取错误直接覆盖损坏文件，修复仍需用户处理，不能把“页面可打开”理解为已经支持自动恢复。
 
-`config.yaml`, the file a person edits by hand, stays theirs: Luna reads it and
-never rewrites it, comments included. It holds the two run budgets and the
-reasoning level, and it cannot state an endpoint, a key or a model: two answers to
-"which provider does this call" is one too many, and the settings page is where
-that answer is written.
+`config.yaml` 由用户手动编辑，Luna 只读、不重写，也不会改动其中的注释。它保存两个运行预算和思考档位，不接受接口地址、密钥或模型；模型服务配置统一由设置页管理，避免多个来源互相覆盖。
 
 ```yaml
 # ~/.config/luna/config.yaml
 reasoning_effort: high
-max_iterations: 64            # how many model turns one run may take
-run_timeout: 20m              # how long one run may take
+max_iterations: 64            # 每轮运行最多调用模型的次数
+run_timeout: 20m              # 每轮运行的最长时间
 ```
 
-A missing file is not an error, an empty file is an empty configuration, and an
-unknown key is refused rather than ignored — a misspelled setting that does
-nothing is worse than one that fails to load. Startup says which file it read.
+文件不存在不算错误，空文件视为空配置；未知字段会被拒绝，而不是静默忽略，避免拼错的配置不生效却没有提示。启动时会说明读取了哪个文件。
 
-A Luna with no provider at all is not an error either: it starts, says what is
-unset, and serves the page that sets it. A run started meanwhile fails with a
-sentence naming the missing settings rather than with a provider error — and once
-the page saves a provider, that run works without a restart, because the file is
-read when a run starts.
+尚未配置模型服务也不影响启动，Luna 会说明缺少哪些设置并提供设置页。此时发起运行会得到明确的缺项说明，而不是模型服务端的错误。保存有效配置后，下一轮即可使用，无需重启。
 
-| Variable | Required | Notes |
+| 环境变量 | 必填 | 说明 |
 |---|---|---|
-| `LUNA_HOME` | no | One directory holding everything: configuration, sessions, capability state and cache. Setting it overrides every XDG root and every previous location, so a development checkout can keep its files next to itself (`LUNA_HOME=$PWD/.runtime`). A relative value is refused rather than ignored. Startup prints it |
-| `LUNA_REASONING_EFFORT` | no | How hard the model should think before it answers, sent as the API's own `reasoning_effort`. One of `minimal`, `low`, `medium`, `high`, `none`. Unset means the field is not sent at all, so a provider that does not define it is unaffected. Whether a level changes anything is the provider's business: against `api.deepseek.com` it is accepted and makes no measurable difference |
-| `LUNA_MAX_ITERATIONS` | no | How many model turns one run may take before it is stopped as a runaway loop (`max_iterations` in the file overrides it). A backstop, not a work budget: the default is 64 turns, which one turn may spend on several tool calls, and a task that needs more can be given more. Reaching it fails the run with a message naming the number and this variable |
-| `LUNA_RUN_TIMEOUT` | no | How long one run may take, as a Go duration such as `20m` or `90s` (`run_timeout` in the file overrides it). Default `15m`. Reaching it ends the run as `run.cancelled` with the reason `timeout`, which is not a failure |
+| `LUNA_HOME` | 否 | 将配置、会话、能力状态和缓存统一放在一个目录。设置后覆盖所有 XDG 根目录及旧位置，开发时可用 `LUNA_HOME=$PWD/.runtime` 将数据放在仓库旁。相对路径会被拒绝，启动时打印实际位置 |
+| `LUNA_REASONING_EFFORT` | 否 | 通过 API 的 `reasoning_effort` 指定思考档位，可选 `minimal`、`low`、`medium`、`high`、`none`。未设置时完全不发送该字段，不影响未定义它的服务。具体效果由服务决定；已有对 `api.deepseek.com` 的验证中，该字段被接受，但未观察到可测量差异 |
+| `LUNA_MAX_ITERATIONS` | 否 | 每轮运行的模型调用次数上限，文件中的 `max_iterations` 优先。默认 64 次，单次模型响应可包含多个工具调用；复杂任务可提高上限。达到上限时本轮失败，错误说明限制值和此变量名 |
+| `LUNA_RUN_TIMEOUT` | 否 | 每轮运行最长时间，采用 Go 时长格式，如 `20m`、`90s`，文件中的 `run_timeout` 优先。默认 `15m`；超时以 `run.cancelled` 结束，原因为 `timeout`，不记为运行失败 |
 
-There is no environment variable for the endpoint, the key or the model: which
-provider a Luna calls is a property of that installation, and one variable that
-could silently override it would be a second answer to the same question.
+接口地址、密钥和模型不提供环境变量入口，以免环境变量静默覆盖这台安装实例已保存的模型服务配置。
 
-Startup errors name the missing variable but never print its value.
+启动错误只说明缺少的变量名，不打印变量值。
 
-## Local API
+<a id="local-api"></a>
 
-| Method | Path | Purpose |
+## 本地 API
+
+| 方法 | 路径 | 用途 |
 |---|---|---|
-| `GET` | `/healthz` | Configuration readiness plus an active generation for every allowlisted plugin tool; implies no provider call |
-| `GET` | `/api/state` | Bounded runtime state: model name, provider host, host PID, one plugin record per allowlisted plugin tool (tool name, candidate, version, generation, plugin PID, status, in-flight calls), busy flag, the two run budgets it enforces (`max_iterations`, `run_timeout_ms`), the reasoning tier it was started with (omitted when none was chosen), the current run and session ids (empty when idle), `provider_missing` (what a run started now would still lack) and `provider_problem` (why the provider file could not be read, when it could not be — the model and provider host are then what this process started with), lifecycle events, and `capabilities[]` — one entry per registered capability carrying its `id`, `title`, `deployment`, `state`, `contributions`, `claims`, `permissions` and `panels`. No API key, and none of any capability's stored data |
-| `GET` | `/api/commands` | The composer's command table: one entry per command with `name`, `summary`, `usage`, `category`, `aliases`, `args` (`none` / `text` / `options`), `options` when the command takes a fixed set, and `busy` (`allow` / `reject`, i.e. whether it works while a run is active). The browser draws its candidates and its help list from this, so the table is described once. `/model` is derived from the provider in use and appears only when it serves at least one model, so its options follow a provider saved a moment ago. No commands is an empty list |
-| `GET` | `/api/provider` | The provider file as the interface sees it: `active` (the name a run is sent to, empty when none is), `providers[]` (each `name`, `base_url`, `model`, `models`, `key_set`, `key_hint`, sorted by name), `configured` (whether a run started now would work), `missing` (what saving would still leave unset, in the file's own field names: `provider`, or the active entry's fields) and the file's name. The key itself is never in the answer — only whether one is set and its last four characters. There is no field saying a restart is needed: the file this describes is the file the next run reads |
-| `PUT` | `/api/provider` | `{"active":"...","providers":[{"name":"...","base_url":"...","model":"...","models":[...],"api_key":"...","clear_api_key":false}]}` replaces the whole file, so a provider the body no longer lists is removed. An empty `api_key` keeps the stored key of the provider with the same name, because the browser is never given one; `"clear_api_key":true` is how a key is removed. A name that appears twice, or an `active` that names nothing, is `400` with the reason and nothing is written. A mutation, so it requires the exact origin |
-| `POST` | `/api/provider/models` | Asks one endpoint which models it serves and answers `{"models":[...],"problem":""}`; a failure comes back as the provider's own words in `problem`, not as an HTTP error, because the page shows them next to the field that caused them. `name` says which provider is being edited, and `base_url`/`api_key` may carry values the form is halfway through typing — whatever is left out comes from the stored provider of that name, so a form can be tested without retyping the key. Requires the exact origin: it spends this installation's key on an outbound call |
-| `GET` | `/api/models` | The models a run started now may be sent to — `name`, `provider` (the provider's name), and `default` on the first entry — plus which one a session would use and where that choice came from: `{"name":"...","origin":"session"\|"global"}`. It follows the provider file, so a provider saved a moment ago is what this reports. `?session=<id>` names the session; without it the answer describes the running configuration alone. An unknown session is `404`, a malformed one `400` |
-| `GET` | `/api/skills` | Every skill discovery found, in discovery order: `name`, `description`, `scope`, `enabled`, and `disabled_reason` when it is turned off. A long description is truncated with the fact stated rather than cut silently. No skills is an empty list |
-| `POST` | `/api/skills/{name}/enable` · `/disable` | Turns one skill off or on and returns its new state. The preference is written to `$XDG_CONFIG_HOME/luna/settings.yaml` — Luna's own file, since it is the side that writes it — and the running list follows immediately, without a rebuild: the manifest is read once per run. An unknown name is `404` (nothing is stored for a skill that is not there), and both are mutations, so they require the exact origin |
-| `POST` | `/api/sessions/{id}/model` | `{"model":"..."}` — records which model this session's next runs use, as an appended `config` record in the session's own file, so the choice survives a restart and travels with the session. A model the configuration does not have is `400`, an unknown session `404`, and it is a mutation, so it requires the exact origin. The record is merged with the session's current one, so choosing a model never detaches the workspace |
-| `GET` | `/api/workspaces` | The workspaces — each a named set of directories — as `{"workspaces":[{"id":"...","name":"...","dirs":["..."]}]}`. No workspaces is an empty list |
-| `POST` | `/api/workspaces` | `{"name":"...","dirs":["..."]}` defines one and returns it. `name` is optional (the first directory's base name is used), directories must be absolute and are de-duplicated in order, and at least one is required: a workspace that holds nothing is not a boundary. A duplicate name is `409`, anything else wrong is `400` with the reason |
-| `POST` | `/api/sessions/{id}/workspace` | `{"workspace":"<id>"}` binds a session to a workspace, or `{"workspace":""}` unbinds it — the state every session starts in, and it has to stay reachable. The record is merged with the session's current one, so binding a workspace never drops the model choice. An unknown workspace or session is `404`, and it requires the exact origin |
-| `GET` | `/api/sessions` | Session summaries, newest first: `id`, `title`, `updated_at`, `run_count` |
-| `GET` | `/api/sessions/{id}` | One session for replay: `id`, `title`, `created_at`, `updated_at`, `run_count`, `truncated`, `workspace` (the workspace this session works in, or `null`), and its `records` in file order. An unknown id is `404`, a malformed one `400` |
-| `POST` | `/api/reload` | `{"candidate":"v1\|v2\|broken"}` — builds and validates the candidate for every allowlisted plugin tool, then publishes them as one generation, or fails leaving every plugin-backed tool on its previous generation. It replaces subprocess candidate generations only: it never touches a capability's state or contributions |
-| `POST` | `/api/plugins/{id}/enable` | Enables a built-in capability: its tools, context block, routes and panels come back into service. An unknown id or a transition its state does not allow is `409` |
-| `POST` | `/api/plugins/{id}/disable` | Takes those contributions out of service together and leaves everything the capability stored where it was. Disabling is not deleting, and it is not a reload |
-| `POST` | `/api/runs` | `{"message":"...","session_id":"..."}` — `session_id` is optional and must name an existing session: an unknown id is `404` and a malformed one `400`, both before admission. When it is omitted a session is created and its id arrives on `run.started`. `text/event-stream` response using the event types in [docs/architecture.md](docs/architecture.md) |
-| `POST` | `/api/runs/{id}/cancel` | Stops the active run when the id names it: `202` with `{"run_id":"...","state":"cancelling"}`, and the stream ends with `run.cancelled`. An id that is not the active run, or a stop after the run ended, is `404` — the id is never guessed at. Repeated presses while the run is winding down get the same `202` |
-| `GET` | `/api/ui-plugins` | The discoverable UI plugins plus every directory that was skipped and the reason. A malformed plugin is reported, never silently omitted, and never turns the listing into a `500` |
-| `GET` | `/api/ui-plugins/<name>/<file>` | One file from inside that plugin's own directory, contained after normalization and after symlink resolution; an unknown extension is refused rather than guessed into a `Content-Type` |
-| `GET` | `/api/memory` | Contributed by the Memory capability. The facts in effect and the retracted ones, without the storage record type. The model has no equivalent endpoint, because memory reaches it only through the injection |
-| `POST` | `/api/memory/retract` | Contributed by the Memory capability. `{"at":"...","text":"..."}` — takes exactly the fact those two identify out of the effective set: `200` when it was in effect, `404` when it was not, `400` on a malformed request |
-| `GET` | `/api/memory/panel.js`, `/api/memory/panel.css` | The panel's own assets, contributed by the Memory capability and served from its own routes. The stylesheet is served as a file rather than injected as a `<style>` element, which the server's Content-Security-Policy refuses |
+| `GET` | `/healthz` | 检查配置就绪状态，以及白名单内每个插件工具是否有活跃代次；不会调用模型服务 |
+| `GET` | `/api/state` | 返回有界运行状态：模型名、服务主机名、宿主 PID（进程编号）、各插件工具记录（工具名、候选、版本、代次、插件 PID、状态、进行中的调用数）、忙碌标记、两个运行预算（`max_iterations`、`run_timeout_ms`）、启动时的思考档位（未选择则省略）、当前运行与会话标识（空闲时为空）、缺失配置 `provider_missing`、文件读取问题 `provider_problem`、生命周期事件，以及 `capabilities[]`。配置不可读时，模型和服务主机名仍为进程启动时的值。每个能力条目含 `id`、`title`、`deployment`、`state`、`contributions`、`claims`、`permissions`、`panels`，不含 API 密钥或能力存储的数据 |
+| `GET` | `/api/commands` | 返回输入框命令表，每项含 `name`、`summary`、`usage`、`category`、`aliases`、`args`（`none` / `text` / `options`）、固定候选集合 `options`（适用时）及 `busy`（`allow` / `reject`，表示运行中能否使用）。浏览器据此渲染候选与帮助，不重复维护命令定义。`/model` 取自当前模型服务，仅在至少有一个模型时出现，随配置保存更新；无命令时返回空列表 |
+| `GET` | `/api/provider` | 返回模型服务配置的界面视图：`active`（当前服务名，未选时为空）、按名称排序的 `providers[]`（各项含 `name`、`base_url`、`model`、`models`、`key_set`、`key_hint`）、`configured`（当前能否发起运行）、`missing`（仍缺少的配置，使用文件字段名 `provider` 或当前条目字段）及文件名。完整密钥不返回，只提供是否设置及末四位。没有“需要重启”字段，因为下一轮会直接读取该文件 |
+| `PUT` | `/api/provider` | `{"active":"...","providers":[{"name":"...","base_url":"...","model":"...","models":[...],"api_key":"...","clear_api_key":false}]}` 整体替换配置，请求中不再列出的服务会被移除。空 `api_key` 保留同名服务已有密钥；`"clear_api_key":true` 才会清除密钥。名称重复或 `active` 指向不存在的条目时返回 `400` 及原因，不写文件。属于变更请求，需来源精确匹配 |
+| `POST` | `/api/provider/models` | 查询某个接口支持的模型，返回 `{"models":[...],"problem":""}`；服务端错误写入 `problem`，不作为 HTTP 错误，便于页面在字段旁展示原因。`name` 指定正在编辑的服务，`base_url` / `api_key` 可使用表单尚未保存的值；省略项从同名已保存条目读取，无需重新输入密钥。此操作会使用当前安装实例的密钥发起外部请求，因此需来源精确匹配 |
+| `GET` | `/api/models` | 返回当前可选模型：`name`、`provider`（服务名），首项标记 `default`；同时返回会话将使用的模型及来源 `{"name":"...","origin":"session"\|"global"}`。读取当前模型服务配置，保存后立即反映。`?session=<id>` 指定会话，省略时只描述全局配置；会话不存在返回 `404`，标识格式错误返回 `400` |
+| `GET` | `/api/skills` | 按发现顺序列出技能：`name`、`description`、`scope`、`enabled`，停用时含 `disabled_reason`。描述过长会截断并说明，不会静默截断；无技能时返回空列表 |
+| `POST` | `/api/skills/{name}/enable` · `/disable` | 启用或停用单个技能并返回新状态。偏好写入 `$XDG_CONFIG_HOME/luna/settings.yaml`，运行时列表随即更新，无需重新构建；技能清单每轮读取。未知名称返回 `404`，不会保存不存在技能的偏好；两者均为变更请求，需来源精确匹配 |
+| `POST` | `/api/sessions/{id}/model` | `{"model":"..."}` 指定会话后续运行使用的模型，以 `config` 记录追加到会话文件，重启后保留并随会话保存。模型不在配置中返回 `400`，会话不存在返回 `404`；需来源精确匹配。记录与现有会话配置合并，不会解除工作区绑定 |
+| `GET` | `/api/workspaces` | 返回具名工作目录集合：`{"workspaces":[{"id":"...","name":"...","dirs":["..."]}]}`；无工作区时返回空列表 |
+| `POST` | `/api/workspaces` | `{"name":"...","dirs":["..."]}` 创建并返回工作区。`name` 可省略，默认使用首个目录的基本名称；目录必须为绝对路径，按原顺序去重，至少保留一个。名称重复返回 `409`，其他参数错误返回 `400` 及原因 |
+| `POST` | `/api/sessions/{id}/workspace` | `{"workspace":"<id>"}` 绑定工作区，`{"workspace":""}` 解除绑定，恢复会话初始状态。与现有配置合并，不丢失模型选择；工作区或会话不存在返回 `404`，需来源精确匹配 |
+| `GET` | `/api/sessions` | 按更新时间从新到旧返回会话摘要：`id`、`title`、`updated_at`、`run_count` |
+| `GET` | `/api/sessions/{id}` | 返回用于回放的会话：`id`、`title`、`created_at`、`updated_at`、`run_count`、`truncated`、`workspace`（当前工作区或 `null`），以及按文件顺序排列的 `records`。会话不存在返回 `404`，标识格式错误返回 `400` |
+| `POST` | `/api/reload` | `{"candidate":"v1\|v2\|broken"}` 为所有白名单插件工具构建并验证候选，通过后统一发布新代次；失败时所有工具保留旧代次。只替换子进程候选代次，不改变能力状态或贡献 |
+| `POST` | `/api/plugins/{id}/enable` | 启用内置能力，恢复其工具、上下文块、路由和面板。标识未知或当前状态不允许转换时返回 `409` |
+| `POST` | `/api/plugins/{id}/disable` | 一起停用该能力的所有贡献，保留已存储数据。停用不是删除，也不是热重载 |
+| `POST` | `/api/runs` | `{"message":"...","session_id":"..."}` 发起运行。`session_id` 可省略；提供时必须指向已有会话，不存在返回 `404`，格式错误返回 `400`，均在运行准入前拒绝。省略时新建会话，通过 `run.started` 返回标识。响应为 `text/event-stream`，事件类型见 [架构说明](docs/architecture.md) |
+| `POST` | `/api/runs/{id}/cancel` | 停止标识匹配的当前运行，返回 `202` 和 `{"run_id":"...","state":"cancelling"}`，事件流以 `run.cancelled` 结束。标识不属于当前运行或运行已结束时返回 `404`，不猜测目标；结束过程中重复取消仍返回同样的 `202` |
+| `GET` | `/api/ui-plugins` | 返回可发现的界面插件及所有被跳过的目录和原因。格式错误的插件会被报告，不会静默忽略，也不会使整个列表返回 `500` |
+| `GET` | `/api/ui-plugins/<name>/<file>` | 提供插件目录内的单个文件，规范化和解析符号链接后都必须在目录边界内；未知扩展名会拒绝，不猜测 `Content-Type` |
+| `GET` | `/api/memory` | 由记忆能力提供，列出生效和已撤回的事实，不暴露存储记录类型。模型不直接调用此 HTTP 接口，而是通过上下文注入及 `luna_recall` 工具读取记忆 |
+| `POST` | `/api/memory/retract` | 由记忆能力提供。`{"at":"...","text":"..."}` 按时间戳和文本共同确定并撤回一条生效事实：成功返回 `200`，事实未生效返回 `404`，请求格式错误返回 `400` |
+| `GET` | `/api/memory/panel.js`, `/api/memory/panel.css` | 记忆能力通过自己的路由提供面板资源。样式作为文件加载，不注入 `<style>` 元素，因为服务端内容安全策略（Content-Security-Policy）禁止后者 |
 
-Mutation requests must come from the exact bound browser origin. There is no CORS support and no public-network mode.
+变更请求的浏览器来源（Origin）必须与实际监听地址精确匹配。不支持跨源资源共享（CORS），也不提供公网部署模式。
 
-## Observing a hot reload
+<a id="observing-a-hot-reload"></a>
 
-1. Ask Luna to transform text and confirm the tool result comes back as `moon light`; ask it to read a file inside the read root and confirm the file text comes back; ask it what a directory inside the read root holds and confirm the entries come back with their kind and size. Settings → Diagnostics lists one row per plugin record, each with its own version, generation and plugin PID; the tool a built-in capability contributes has no row, because there is no process identity to report.
-2. `POST /api/reload` with `{"candidate":"v2"}`. All five plugin-backed tools move to a new generation with new plugin PIDs: the next transform returns `Luna · MOON LIGHT`, a file whose lines end in `CRLF` comes back with `LF`, and a file size in a listing comes back as an exact byte count.
-3. `POST /api/reload` with `{"candidate":"broken"}`. The reload fails and all five plugin-backed tools keep serving `v2`, because a candidate is published for every plugin-backed tool or for none. Memory is unaffected by a reload either way: it is a built-in capability, so it has no candidate generation to replace and a reload never touches a capability's contributions or state.
+## 观察热重载
 
-Assert on the tool result rather than on model prose: the tool result identifies the serving generation deterministically.
+1. 让 Luna 转换文本，确认工具结果为 `moon light`；再让它读取根目录内的文件、列出目录，确认返回文本及条目类型和大小。**设置 → 诊断**中每个插件各占一行，显示版本、代次和插件 PID。内置能力贡献的工具没有独立进程，因此不出现在这些插件记录中。
+2. 向 `POST /api/reload` 发送 `{"candidate":"v2"}`。五种子进程插件工具一起切换到新代次及新插件 PID：文本转换返回 `Luna · MOON LIGHT`，文件中的 `CRLF` 转为 `LF`，目录列表中的文件大小以精确字节数返回。
+3. 向 `POST /api/reload` 发送 `{"candidate":"broken"}`。重载失败，五种工具都继续使用 `v2`；候选要么全部发布，要么全部不发布。无论成功与否，重载都不影响记忆，因为内置能力没有待替换的候选代次，重载也不改变能力贡献或状态。
 
-## Verification
+应核对工具结果，而不是模型的自然语言回答；工具结果能确定实际服务的代次。
 
-完整发布检查使用以下命令；本次导航调整的实际验证范围见下方说明：
+<a id="verification"></a>
+
+## 验证
+
+常用检查命令如下；完整发布检查以 [协作规则](AGENTS.md#验证与运行) 为准。下方是既有测试覆盖与历史验证记录，不代表本轮文档调整重新执行了这些检查：
 
 ```sh
 go test -race ./...
@@ -315,52 +308,58 @@ node --check web/app.js
 node --test web/app.test.cjs
 ```
 
-本次界面重做通过 JavaScript 语法检查与 50 项 Node 测试。隔离 Chromium 使用确定性接口夹具验证了会话切换与刷新恢复、记忆查看与撤回、轮询焦点保持、运行中禁用会话切换、草稿保留、抽屉键盘操作、窄屏缩放，以及本轮新增的明暗主题与跟随系统、显式选择的持久化和存储失败回退、选中项与侧栏背景的区分、主要文字的自选对比度（均不低于 4.5:1）、1440px 与 390px 下没有元素越出视口，还有真实计数器插件在切换主题时保留挂载实例、停用时释放定时器。这不代表真实模型或 Go 服务的端到端验收。
+此前的界面重做通过 JavaScript 语法检查与 50 项 Node 测试。隔离 Chromium 使用确定性接口夹具验证了会话切换与刷新恢复、记忆查看与撤回、轮询焦点保持、运行中禁用会话切换、草稿保留、抽屉键盘操作、窄屏缩放，以及当时新增的明暗主题与跟随系统、显式选择的持久化和存储失败回退、选中项与侧栏背景的区分、主要文字的自选对比度（均不低于 4.5:1）、1440px 与 390px 下没有元素越出视口，还有真实计数器插件在切换主题时保留挂载实例、停用时释放定时器。这不代表真实模型或 Go 服务的端到端验收。
 
 以下为既有测试覆盖与历史验证记录：
 
-Go unit and integration coverage includes configuration alias handling, one process per allowlisted tool, real subprocess replacement and draining, broken-candidate rollback with the active generation kept serving, RPC timeout termination, a plugin process killed mid-call classified as infrastructure, host-side file-read path validation (absolute paths, `..` escapes, symlink escape, non-regular files, the size cap and binary content), the same host-side validation for a directory listing (a path that is not a directory or does not exist is refused, a listing is one level unless the call names a depth, a symbolic link is never entered at any depth, and whichever of its three caps it reached is stated in the result instead of truncating it silently), the same validation for a name search (a pattern is anchored to the whole entry name, a matched directory is marked, a symbolic link is never entered, and the path and pattern caps are stated instead of the answer being cut), a refusal reaching the model as the call's result while an infrastructure failure still ends the run, strict tool schemas and trailing-JSON rejection, sequential tool execution, streaming of assistant text as it arrives, with a tool-call turn's own text demoted to a run note rather than becoming the answer, deterministic fake-model Eino event mapping, whole-run timeout and cancellation cleanup, exactly-one SSE terminal semantics, UI plugin listing and containment, and HTTP guards. A focused post-disconnect race regression also passed 50 repeated race-detector runs.
+Go 单元与集成测试覆盖：配置别名处理；白名单工具各自独立进程；真实子进程替换及旧调用排空；损坏候选回滚并保留活跃代次；RPC 超时终止；调用中插件进程被杀时归类为基础设施故障；宿主文件读取边界（绝对路径、`..` 越界、符号链接逃逸、非普通文件、大小上限和二进制内容）；目录列表的同等校验（非目录或不存在路径拒绝、默认一层或显式深度、任何深度不跟随链接、明确说明三项上限）；名称查找校验（完整名称匹配、目录标记、不跟随链接、明确说明路径与模式上限）；调用拒绝作为结果返回模型而基础设施故障终止运行；严格工具参数结构和尾随 JSON 拒绝；顺序工具执行；助手文本流式输出，工具调用轮次的文本作为运行备注而非最终回答；假模型下确定性的 Eino 事件映射；整轮超时和取消清理；SSE 恰好一个终止事件；界面插件列表与目录边界；HTTP 守卫。断连后的专项竞态回归曾通过 50 次重复竞态检测。
 
-Separate end-to-end validation completed the checks that deterministic tests cannot provide:
+历史端到端验证还覆盖了确定性测试无法替代的路径：
 
-- A live request using model `deepseek-flash` at provider host `api.deepseek.com` selected `luna_text_transform` automatically, without forced provider `tool_choice`. The active `v1` plugin returned `moon light` with the serving generation and plugin PID reported by the application. After reload, `v2` used a new generation and plugin PID and returned `Luna · MOON LIGHT`. A `broken` reload failed without replacing `v2`, which remained callable.
-- Real headless Chromium interaction exercised the UI through the `v1`, `v2`, and failed `broken` paths, preserved a composer draft during polling/reload, produced no page errors, and showed no horizontal overflow at desktop width or a 390 px viewport.
-- Desktop Preview independently opened the running loopback application and read visible model, provider, host, and plugin metadata.
-- A clean copy of the tree started with `go run ./cmd/luna` from a temporary directory, served the UI, and published plugin generation 1.
-- A final independent review found no security concerns or logic errors.
+- 使用 `api.deepseek.com` 的 `deepseek-flash` 模型发起真实请求，未强制指定 `tool_choice`，模型自动选择了 `luna_text_transform`。`v1` 返回 `moon light`，应用报告对应代次与插件 PID；重载后 `v2` 使用新代次和 PID，返回 `Luna · MOON LIGHT`。`broken` 重载失败后，`v2` 仍可调用。
+- 真实无头 Chromium 交互验证了 `v1`、`v2` 和 `broken` 失败路径；轮询与重载期间输入草稿保留，无页面错误，桌面和 390 px 视口均无横向溢出。
+- Desktop Preview（桌面预览）独立打开了运行中的回环地址应用，读取了界面可见的模型、服务提供方、宿主和插件元数据。
+- 在临时目录中的干净代码副本执行 `go run ./cmd/luna`，成功提供界面并发布插件代次 1。
+- 当时的最终独立审查未发现安全问题或逻辑错误。
 
-The live-provider, headless-Chromium, Desktop Preview and clean-checkout checks above were captured for the one-tool kernel. The two-tool change re-ran the Go race, vet, root-build, Go-format, Node syntax and Node test gates listed at the top of this section; it did not re-run a live provider or a real browser.
+上述真实模型服务、无头 Chromium、桌面预览和干净仓库验证针对的是最初只有一个工具的内核。增加第二个工具时，只重新执行了 Go 竞态测试、静态检查、根应用构建、Go 格式检查、Node 语法检查和测试，没有再次调用真实模型或运行真实浏览器。
 
-The session change re-ran those same gates and nothing more. No server and no model provider were run for it, so the session endpoints, the append-only store under a real crash, the history replay and the terminal-event contract are not claimed as end-to-end verified, and no browser was exercised against them by that change. The session front end arrived in the following `web/` commit, which re-ran the same gates plus the browser-JavaScript suite.
+会话后端改动也只重新执行了上述检查，没有启动服务或调用模型。因此，当时不声称会话接口、真实崩溃下的仅追加存储、历史回放和终止事件契约已通过端到端验证，也未用浏览器验证这些路径。后续 `web/` 提交加入会话前端，并重新执行相同检查及浏览器 JavaScript 测试。
 
-The runtime UI plugin change re-ran those same gates and nothing more. No server, no model provider and no browser were run for it either, so the plugin listing, the file serving, the mount/unmount cycle and the host-side teardown are not claimed as end-to-end verified.
+运行时界面插件改动同样只执行了上述检查，没有启动服务、调用模型或运行浏览器，因此当时未声称插件列表、文件服务、挂载与卸载及宿主清理已通过端到端验证。
 
 最初的记忆后端改动由确定性检查覆盖，包括 `internal/plugins/memory` 包和 `internal/agent` 中的记忆路径测试；当时没有运行服务、真实模型或浏览器，因此没有验证真实崩溃下的文件行为、真实模型请求中的注入或真实运行中的记忆事件。当前界面已支持通过页头“记忆”入口查看与撤回事实，但不支持新增或编辑。记忆工具由内置能力贡献并由内核统一装配和包装，不是子进程工具，因此不出现在 `/api/state` 的插件记录或 `/healthz` 的插件就绪要求中。
 
-The tool-refusal change is covered by the same gates on this tree, and no provider was called for it. It came out of a user-run acceptance pass, where asking for a file that is not there ended the whole run with the host's raw error and no answer at all, and the message a missing file produced read as an internal phrase rather than a reason. A refusal is now the call's result, so the run continues and the model explains it; an infrastructure failure still ends the run. Each half was also checked from the defect side, by restoring the previous behaviour in a copy of the tree and confirming the new tests fail there.
+工具拒绝处理改动通过相同检查，未调用模型服务。问题来自用户验收：读取不存在的文件会用宿主原始错误终止整轮，既没有模型回答，错误也难以理解。修改后，拒绝作为工具结果返回，本轮继续，由模型解释；基础设施故障仍终止本轮。还曾在代码副本中恢复旧行为，确认两类回归测试会失败，证明测试确实能捕获缺陷。
 
-The memory view and retraction change is covered by the same deterministic gates on this tree. Its tests pin the fold — a retraction takes exactly one fact out of the effective set, matched by text and timestamp together — the refusal to retract a fact that is not in effect, the survival of a retraction across a reopen, the byte cap counting retraction records so that retracting in a loop cannot grow the file, and a rewrite compacting a retraction away together with the fact it removed. The endpoint tests pin the view shape, the `400`, `404` and Origin cases, and that a corrupt memory file is reported rather than shown as empty. No provider was called for it.
+记忆查看与撤回改动通过相同确定性检查。测试覆盖：按文本与时间戳共同匹配、一次只移除一个生效事实；拒绝撤回未生效事实；重新打开后撤回仍生效；字节上限计入撤回记录，防止反复撤回使文件无限增长；压缩重写时同时清理事实及对应撤回记录。接口测试覆盖返回结构、`400`、`404` 和 Origin 校验，以及损坏文件必须报错而不能显示为空。未调用模型服务。
 
-The named-provider change is covered by the same deterministic gates on this tree, plus two isolated passes (`.evidence/provider-list/`). The service-level pass runs a real binary against two fake OpenAI-compatible endpoints under an isolated `LUNA_HOME` (38 checks): a fresh installation with no `provider.yaml`, saving a provider **while the process runs** and the next run reaching that endpoint with no restart in between, switching `active` and the next run reaching the other endpoint, a save refused for naming a provider that is not there writing nothing, the key never appearing in an answer or in the startup log, and no `OPENAI_*` variable anywhere in the environment. It also starts on a `provider.yaml` an earlier version wrote (read as one provider named `default`, and left byte-for-byte alone), and on one it cannot read at all (logged once, reported per request and per run as `provider_problem`, and again left alone) — the first of those two was a real defect: restarting onto this change exited, which is how the file a version owns and stops on was found. The browser pass runs real headless Chromium against the deterministic fixture (21 checks): the list rendered from the server with the entry in use marked, the key never rendered, adding a provider and submitting the whole file, switching which one is in use, probing for models, and a reload showing what the server holds. The previous pass had shipped "save, then restart Luna" as a documented limitation; both passes exist to show it is gone rather than to restate it.
+具名模型服务配置改动通过相同确定性检查，并完成两组隔离验证（`.evidence/provider-list/`）。服务级验证在独立 `LUNA_HOME` 下运行真实二进制，对接两个假的兼容 OpenAI 接口，共 38 项检查：首次启动没有 `provider.yaml`；**进程运行期间**保存服务后，下一轮直接访问该接口，无需重启；切换 `active` 后下一轮访问另一个接口；引用不存在服务的保存请求被拒绝且不写文件；响应和启动日志不出现完整密钥；环境中没有 `OPENAI_*` 变量。还验证了旧格式配置（按 `default` 读取，原文件逐字节不变）和不可读配置（启动时记录一次，每次请求和运行通过 `provider_problem` 报告，原文件不变）。旧格式曾导致升级后重启退出，此验证覆盖了该缺陷。浏览器验证使用真实无头 Chromium 和确定性接口夹具，共 21 项检查：服务列表和当前项标记、密钥不渲染、新增后提交完整列表、切换服务、获取模型列表、刷新后显示服务端数据。两组验证确认此前“保存后必须重启”的限制已移除。
 
-历史能力批次记录（终端尚未隔离时）：The capability batch — memory the model can read back, a terminal that runs one command, and a capability that writes one file — is covered by the same deterministic gates plus three isolated passes. The tool self-check (`.evidence/tools/smoke-tools.py`, **31 checks, no failures, 10 of 10 tools**) drives a real binary while a fake provider injects tool calls, and asserts on the real event stream: every tool is really called and answers with content rather than an infrastructure error, the four read tools each get an out-of-bounds probe that comes back as a refusal the round survives, and the tool list is derived from the allowlist and the capability contributions rather than written down as a number. `luna_run` is absent from the tools handed to the model until the settings file names the capability; once it does, a command really runs (`exit code 0` and its own stdout marker), a `cwd` outside the run's directories is refused, and a `sleep 30` is stopped in about a second with the answer saying the whole process group was killed. `luna_write_file` is likewise absent until enabled, refuses every call while no directory has been allowed, and after `PUT /api/write-dirs` allows one — **in the same process, with no restart** — really creates the file, with a diff whose bytes match what is on disk; an overwrite keeps `0640`; and a path outside the run's directories, or inside them but not allowed, is refused with the disk left unchanged. A second pass (`.evidence/tools/verify-capability-choice.py`, 13 checks) shows a capability choice is persistent rather than a property of the process: the terminal capability is `registered` on a fresh installation, `POST /api/plugins/terminal/enable` writes `settings.yaml` and changes the running state, a **new process on the same home** starts with it already enabled, and disabling it is persistent in the same way. The browser pass runs real headless Chromium against the deterministic fixture (30 checks, up from 21) and now covers the write-directory section: the stored list and the workspace candidates render, removing a row submits the remaining list, allowing a candidate submits the union and re-renders from the answer, a path that is not absolute is refused in place without sending a request, and a save the server refuses shows the server's own sentence instead of a status code while changing nothing.
+**历史能力批次记录（终端尚未隔离时）**：模型可读回记忆、终端执行单条命令、单文件写入这批能力通过相同确定性检查，并完成三组隔离验证。工具自检（`.evidence/tools/smoke-tools.py`，**31 项检查、无失败、当时的 10 种工具全部覆盖**）运行真实二进制，由假模型服务注入工具调用，并断言真实事件流：每个工具都实际执行并返回内容，而非基础设施错误；四种读取工具的越界探针均被拒绝但不终止本轮；工具清单由白名单和能力贡献动态生成，不写死数量。设置未启用终端时，模型工具集中没有 `luna_run`；启用后命令实际执行（`exit code 0` 和标准输出标记），越界 `cwd` 被拒绝，`sleep 30` 约一秒后被停止，结果说明整个进程组被终止。`luna_write_file` 同样在启用前不可见，未授权目录时拒绝调用；通过 `PUT /api/write-dirs` 授权后，**同一进程内无需重启**即可创建文件，差异与磁盘内容一致，覆盖文件保留 `0640` 权限，工作目录外或未授权目录中的写入被拒绝且磁盘不变。第二组（`.evidence/tools/verify-capability-choice.py`，13 项检查）验证能力偏好持久化：新安装的终端状态为 `registered`，`POST /api/plugins/terminal/enable` 写入 `settings.yaml` 后更新运行状态，**使用同一数据目录的新进程**启动后仍已启用；停用也同样持久化。浏览器验证在确定性夹具上使用真实无头 Chromium，共 30 项检查（此前为 21 项），新增可写目录测试：已保存目录与工作区候选正确显示；删除条目提交剩余列表；授权候选提交合并列表并按响应重绘；非绝对路径在页面内拒绝且不发请求；保存失败显示服务端原因而非仅显示状态码，并保持原状态。
 
-No API key appeared in the retained verification evidence. These results are point-in-time evidence for the tested provider and headless Chromium path, not a production-readiness claim, a compatibility guarantee for every OpenAI-compatible provider, or a complete accessibility/cross-browser audit.
+保留的验证证据中未出现 API 密钥。这些结果只证明当时所测模型服务和无头 Chromium 路径的行为，不代表生产就绪、不保证所有兼容 OpenAI 的服务都可用，也不是完整的无障碍或跨浏览器审计。
 
-## Historical spike
+<a id="historical-spike"></a>
 
-[`spikes/001-plugin-kernel/`](spikes/001-plugin-kernel/README.md) is the original verified subprocess/net-rpc experiment. It records generation pinning, drain-before-exit, same-version rebuilds, and failed-candidate rollback before any of it was ported into the root application.
+## 历史实验
 
-The spike is a separate Go module and historical evidence. The root application does not import it.
+[`spikes/001-plugin-kernel/`](spikes/001-plugin-kernel/README.md) 是最初经过验证的子进程与 net/rpc 实验，记录了移植到根应用之前的调用代次固定、调用排空后退出、同版本重建和候选失败回滚。
 
-## Boundaries
+该实验是独立 Go 模块，仅作为历史证据，根应用不导入它。
 
-终端隔离不等于虚拟机，也不意味着可以放心运行任意恶意代码：仍共用宿主内核，没有完整的 CPU/RAM/进程数配额。用户明确加入工作区的文件是授权输入，不能把凭据放进工作区后期待沙箱识别其敏感性；固定系统运行时也是可读的。它不会自动使用宿主依赖缓存或网络，依赖 Unix socket、用户全局配置或宿主写权限的命令会失败。需要本地依赖缓存时，可由用户明确加入只读工作区并在命令中指定；不要为了便利映射整个主目录。子进程工具、内置能力和同源界面插件仍须是可信代码，不能把“插件在另一个进程”当作安全沙箱。
+<a id="boundaries"></a>
 
-The slice deliberately excludes multi-agent orchestration, browser-supplied plugin code or paths, a plugin marketplace, an installation path that adds a UI plugin from the browser, persisted UI plugin enablement, production authentication, tenant isolation, public deployment, cross-origin API access, and retries that could duplicate model or tool effects. Command execution, file writing and network fetching are no longer excluded, but they are bounded rather than arbitrary: each is a capability that is off until the user turns it on, files can be written only inside directories the user allowed, commands run only inside the directories the session works in and have their own timeout and output caps, and the fetch tool reaches only public http(s) addresses and only text responses, with its time, size and redirect caps named in the answer. There is still no search tool and no browser automation behind the model, and nothing schedules a call on its own. Reasoning the provider itself exposes is streamed to the browser as run content (it never becomes the answer); nothing infers reasoning a provider does not report.
+## 能力边界
+
+终端隔离不等于虚拟机，也不意味着可以放心运行任意恶意代码：仍共用宿主内核，没有完整的 CPU、内存和进程数配额。用户明确加入工作区的文件是授权输入，不能把凭据放进工作区后期待沙箱识别其敏感性；固定系统运行时也是可读的。它不会自动使用宿主依赖缓存或网络，依赖 Unix 套接字、用户全局配置或宿主写权限的命令会失败。需要本地依赖缓存时，可由用户明确加入只读工作区并在命令中指定；不要为了便利映射整个主目录。子进程工具、内置能力和同源界面插件仍须是可信代码，不能把“插件在另一个进程”当作安全沙箱。
+
+当前范围不包含多智能体编排、浏览器提交插件代码或路径、插件市场、从浏览器安装界面插件、持久化界面插件启用状态、生产级身份认证、多租户隔离、公网部署、跨源 API 访问，以及可能重复模型或工具副作用的自动重试。命令执行、文件写入和网页读取已纳入范围，但都有边界：默认停用，需用户启用；只在已授权目录内写文件；命令从会话工作目录内启动，受独立超时和输出上限约束；网页读取只访问公网 HTTP(S) 文本响应，并说明触及的时间、大小和重定向上限。模型仍没有网络搜索工具或浏览器自动化能力，系统也不会自行定时发起调用。服务提供方主动返回的推理内容会流式显示为运行内容，但不会成为最终回答；未返回的推理不会被推测或补造。
 
 记忆采用有上限的事实存储，支持字面量检索与分页，但不包含向量嵌入或相关性排序；每轮注入的是上限内最近的事实，而非最相关的事实。系统不会自动从对话抽取事实，只有模型调用 `luna_remember` 时才写入。模型能追加、也能列出和检索此刻生效的事实（`luna_recall`），但改不了也删不了；用户可从页头“记忆”入口查看和撤回，无需手工编辑文件。撤回仍为追加记录，事实继续保存在本地文件中。记忆不区分用户身份，也不提供跨用户隔离，仅适合本地单用户场景。
 
-## License
+<a id="license"></a>
 
-MIT — see [LICENSE](LICENSE).
+## 许可证
+
+采用 MIT 许可证，详见 [LICENSE](LICENSE)。
