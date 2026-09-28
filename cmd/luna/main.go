@@ -26,6 +26,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	skillsplugin "github.com/Qaraku/luna-agent/internal/plugins/skills"
+	"github.com/Qaraku/luna-agent/internal/plugins/terminal"
 	"github.com/Qaraku/luna-agent/internal/plugins/workspace"
 	"github.com/Qaraku/luna-agent/internal/provider"
 	"github.com/Qaraku/luna-agent/internal/settings"
@@ -494,6 +495,28 @@ func skillRoots(paths layout.Paths, extra repeatedPath) []skills.Root {
 	return roots
 }
 
+// registerTerminal registers the terminal capability and, when the user has asked
+// for it, turns it on.
+//
+// It is registered either way on purpose: a capability nobody can see is one
+// nobody can turn on, so the settings page lists it and the setting decides
+// whether it runs. Registering it also asks for process execution, which the
+// registry grants only because this process's authority includes it — a capability
+// that runs commands is not a privileged built-in, it is one with a permission the
+// composition root granted.
+func registerTerminal(registry *plugin.Registry, enabled bool) error {
+	if err := registry.Register(terminal.New()); err != nil {
+		return fmt.Errorf("register terminal capability: %w", err)
+	}
+	if !enabled {
+		return nil
+	}
+	if err := registry.Enable(terminal.PluginID); err != nil {
+		return fmt.Errorf("enable terminal capability: %w", err)
+	}
+	return nil
+}
+
 func run() error {
 	addr := flag.String("addr", "127.0.0.1:0", "literal loopback listen address")
 	rootFlag := flag.String("root", "", "repository root holding web/ and plugins/ (default: auto-detect)")
@@ -588,7 +611,12 @@ func run() error {
 	// Memory capability is the first one: a built-in plugin that claims a state
 	// namespace, which the kernel resolves into a directory under whichever state
 	// root is in use — the kernel never learns which file it keeps inside.
-	registry := plugin.NewRegistry(plugin.PermissionStateWrite)
+	// Two abilities are grantable here: a capability may keep its own state in a
+	// directory the kernel resolves for it, and it may run commands in the
+	// directories this run works in. Granting one is what lets a capability ask
+	// for it at all; whether this machine's user has turned the capability on is
+	// a separate question, and the settings file answers it below.
+	registry := plugin.NewRegistry(plugin.PermissionStateWrite, plugin.PermissionProcessExec)
 	memoryDir, err := plugin.StateDirFor(memory.Descriptor(), statePath)
 	if err != nil {
 		return fmt.Errorf("resolve memory state directory: %w", err)
@@ -655,6 +683,12 @@ func run() error {
 	if err := registry.Enable(skillsplugin.PluginID); err != nil {
 		return fmt.Errorf("enable skills capability: %w", err)
 	}
+	// The terminal capability is the first one that does not run on its own: the
+	// user's settings say whether it is on, and a capability that starts processes
+	// on someone's machine is one they have to have asked for.
+	if err := registerTerminal(registry, userSettings.CapabilityEnabled(terminal.PluginID)); err != nil {
+		return err
+	}
 	listener, err := httpapi.Listen(*addr)
 	if err != nil {
 		return err
@@ -699,7 +733,11 @@ func run() error {
 	// 运行预算与 HTTP 写入截止时间必须互相说得通：一次运行有权用到它自己的预算为止，
 	// 所以写入截止时间要**高于**预算，而不是替预算结束运行（见 writeDeadlineFor）。
 	runTimeout := httpapi.RunTimeoutFor(cfg.RunTimeout)
-	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Missing: cfg.Missing, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(newSkillCatalog(skillSet, settingsPath, userSettings)), httpapi.WithWorkspaces(workspaceStore), httpapi.WithProvider(runtime), httpapi.WithConfigSource(runtime), httpapi.WithRunTimeout(runTimeout))
+	// The user's choices live in one file and have one writer: skills and
+	// capabilities are both written there, and the same value serves both seams
+	// the HTTP layer uses.
+	prefs := newUserPreferences(skillSet, settingsPath, userSettings)
+	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Missing: cfg.Missing, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(prefs), httpapi.WithCapabilityPreference(prefs), httpapi.WithWorkspaces(workspaceStore), httpapi.WithProvider(runtime), httpapi.WithConfigSource(runtime), httpapi.WithRunTimeout(runTimeout))
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: writeDeadlineFor(runTimeout), IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() {

@@ -9,13 +9,19 @@ import (
 	"github.com/Qaraku/luna-agent/internal/settings"
 )
 
-// skillCatalog is the Skills capability as the HTTP layer uses it.
+// userPreferences is the settings file as this process uses it: the choices the
+// user made in the product, and the one place they are written down.
 //
-// It lives in the composition root because turning a skill off is two things at
-// once — a preference to store and a change to what the next run reads — and
-// this is the only layer that holds both. The HTTP layer is given the list and
-// the ability to change one, and learns nothing about where either lives.
-type skillCatalog struct {
+// It lives in the composition root because a choice is two things at once — a
+// preference to store and a change to what the next run reads — and this is the
+// only layer that holds both. The HTTP layer is given what it needs to list and
+// change one, and learns nothing about where any of it lives.
+//
+// One type owns the file on purpose: skills and capabilities are written to the
+// same file, and two writers with two locks would drop whichever choice finished
+// first. The mutex is what makes each change a whole rewrite of the choices as
+// they stand, rather than a rewrite of the one the caller happened to see.
+type userPreferences struct {
 	capability *skillsplugin.Plugin
 	path       string
 
@@ -23,13 +29,33 @@ type skillCatalog struct {
 	settings settings.Settings
 }
 
-func newSkillCatalog(capability *skillsplugin.Plugin, path string, current settings.Settings) *skillCatalog {
-	return &skillCatalog{capability: capability, path: path, settings: current}
+func newUserPreferences(capability *skillsplugin.Plugin, path string, current settings.Settings) *userPreferences {
+	return &userPreferences{capability: capability, path: path, settings: current}
+}
+
+// SetEnabled records the user's choice about one capability, which is the other
+// thing this file carries.
+//
+// The file is written first and the caller changes the running capability second,
+// the same order and the same reason as SetState: a failed write must leave
+// nothing changed, so a request that reports failure is one that can be retried
+// without wondering what it already did. Whether the capability exists, and
+// whether this transition is allowed, is the registry's business — this records
+// what the user asked for.
+func (c *userPreferences) SetEnabled(id string, enabled bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	next := c.settings.WithCapabilityEnabled(id, enabled)
+	if err := settings.Save(c.path, next); err != nil {
+		return err
+	}
+	c.settings = next
+	return nil
 }
 
 // Skills lists every discovered skill with its state, which is what the
 // settings page renders.
-func (c *skillCatalog) Skills() []httpapi.SkillRef {
+func (c *userPreferences) Skills() []httpapi.SkillRef {
 	statuses := c.capability.Skills()
 	refs := make([]httpapi.SkillRef, 0, len(statuses))
 	for _, status := range statuses {
@@ -49,7 +75,7 @@ func (c *skillCatalog) Skills() []httpapi.SkillRef {
 // A name that was never discovered changes nothing either. The settings file is
 // a record of what the user asked for, and asking for something that is not
 // there is a mistake worth refusing rather than storing.
-func (c *skillCatalog) SetState(name string, enabled bool) (httpapi.SkillRef, bool, error) {
+func (c *userPreferences) SetState(name string, enabled bool) (httpapi.SkillRef, bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

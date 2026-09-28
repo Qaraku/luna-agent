@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -12,8 +13,10 @@ import (
 	"github.com/Qaraku/luna-agent/internal/layout"
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
+	"github.com/Qaraku/luna-agent/internal/plugins/terminal"
 	"github.com/Qaraku/luna-agent/internal/plugins/workspace"
 	"github.com/Qaraku/luna-agent/internal/provider"
+	"github.com/Qaraku/luna-agent/internal/settings"
 	"github.com/Qaraku/luna-agent/internal/skills"
 )
 
@@ -661,6 +664,96 @@ func TestSkillsDirMayBeRepeatedAndRejectsAnEmptyValue(t *testing.T) {
 	}
 	if !strings.Contains(dirs.String(), "/one") {
 		t.Fatalf("String()=%q, want it to report what was set", dirs.String())
+	}
+}
+
+// toolsOf 是注册表此刻能让模型看到的工具名：只有启用中的能力贡献的工具算数。
+func toolsOf(registry *plugin.Registry) []string {
+	var names []string
+	for _, entry := range registry.Enabled() {
+		provider, ok := entry.Plugin.(plugin.ToolProvider)
+		if !ok {
+			continue
+		}
+		for _, tool := range provider.Tools() {
+			names = append(names, tool.Name())
+		}
+	}
+	return names
+}
+
+// 命令执行默认关闭：能力始终注册（否则设置页没有可打开的东西），但只有用户在设置里显式
+// 打开时才启用。没有 process.exec 授权的注册表连注册都不接受——内置不是特权。
+func TestTheTerminalCapabilityIsOffUntilTheSettingsSaySo(t *testing.T) {
+	t.Run("a capability nobody asked for is not running", func(t *testing.T) {
+		registry := plugin.NewRegistry(plugin.PermissionStateWrite, plugin.PermissionProcessExec)
+		if err := registerTerminal(registry, false); err != nil {
+			t.Fatal(err)
+		}
+		entry, found := registry.Entry(terminal.PluginID)
+		if !found {
+			t.Fatal("the terminal capability was not registered, so the settings page has nothing to turn on")
+		}
+		if entry.State != plugin.StateRegistered {
+			t.Fatalf("state = %q, want %q", entry.State, plugin.StateRegistered)
+		}
+		if tools := toolsOf(registry); slices.Contains(tools, terminal.RunToolName) {
+			t.Fatalf("tools = %v, want no %s", tools, terminal.RunToolName)
+		}
+	})
+	t.Run("the user's choice turns it on", func(t *testing.T) {
+		registry := plugin.NewRegistry(plugin.PermissionStateWrite, plugin.PermissionProcessExec)
+		if err := registerTerminal(registry, true); err != nil {
+			t.Fatal(err)
+		}
+		entry, _ := registry.Entry(terminal.PluginID)
+		if entry.State != plugin.StateEnabled {
+			t.Fatalf("state = %q, want %q", entry.State, plugin.StateEnabled)
+		}
+		if tools := toolsOf(registry); !slices.Contains(tools, terminal.RunToolName) {
+			t.Fatalf("tools = %v, want %s", tools, terminal.RunToolName)
+		}
+	})
+	t.Run("a registry that did not grant it refuses it", func(t *testing.T) {
+		registry := plugin.NewRegistry(plugin.PermissionStateWrite)
+		if err := registerTerminal(registry, true); err == nil {
+			t.Fatal("a registry that did not grant process execution accepted the terminal capability")
+		}
+	})
+}
+
+// 用户在设置页做的选择写进 settings.yaml，重启后仍然生效；写盘失败时报错且一个字节没改，
+// 于是设置页可以把这次请求当成没发生过。
+func TestACapabilityChoiceIsRecordedWithoutLosingTheOthers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "luna", settings.FileName)
+	prefs := newUserPreferences(nil, path, settings.Settings{Skills: settings.Skills{Disabled: []string{"alpha"}}})
+
+	if err := prefs.SetEnabled(terminal.PluginID, true); err != nil {
+		t.Fatal(err)
+	}
+	// 第二次选择不是从磁盘重读，而是接着上一次的结果：同一进程里连续两次选择都要留住。
+	if err := prefs.SetEnabled("another-capability", true); err != nil {
+		t.Fatal(err)
+	}
+	file, _, err := settings.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !file.CapabilityEnabled(terminal.PluginID) || !file.CapabilityEnabled("another-capability") {
+		t.Fatalf("enabled = %v, want both choices", file.EnabledCapabilities())
+	}
+	if names := file.DisabledSkills(); len(names) != 1 || names[0] != "alpha" {
+		t.Fatalf("disabled skills = %v, want the skill choice kept", names)
+	}
+
+	// 写不进去时必须报告失败：一个目录占着文件的位置，整文件重写到这里没有人能读懂。
+	blocked := filepath.Join(t.TempDir(), "luna", settings.FileName)
+	if err := os.MkdirAll(blocked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	blockedPrefs := newUserPreferences(nil, blocked, settings.Settings{})
+	if err := blockedPrefs.SetEnabled(terminal.PluginID, true); err == nil {
+		t.Fatal("a choice that could not be written was reported as recorded")
 	}
 }
 
