@@ -1350,6 +1350,51 @@ function providerRequestBody(view, active, draft) {
   return { active: String(active ?? ''), providers };
 }
 
+// 「允许写入的目录」是用户在设置里定下的一份清单：模型只能在这些目录里新建或覆盖
+// 文件，所以它只会比工作区更窄。下面这几个纯函数是界面与这份清单之间的形状，服务端
+// 仍然会规范化、去重并拒绝不合法的条目 —— 界面上的检查只是让用户少跑一趟请求。
+const WRITE_DIR_MAX_CHARS = 44;
+
+// 路径就是路径：这里不拼接、不做相对解析，只认绝对路径（以 / 开头）。非绝对路径的
+// 条目服务端也会拒，所以本地这一下检查的意义是就地报错、不发请求。
+function writeDirAbsolute(value) {
+  return typeof value === 'string' && value.trim().startsWith('/');
+}
+
+// 一行放不下很长的路径：中段省略，长度有上限；原样的路径留在元素的 title 上。
+function writeDirText(dir) {
+  const text = String(dir ?? '');
+  if (text.length <= WRITE_DIR_MAX_CHARS) return text;
+  const head = Math.ceil((WRITE_DIR_MAX_CHARS - 1) / 2);
+  return `${text.slice(0, head)}…${text.slice(text.length - (WRITE_DIR_MAX_CHARS - 1 - head))}`;
+}
+
+// 候选 = 工作区里的目录中还没有被允许的那些：顺序照工作区的顺序，同一个目录只出现
+// 一次。两个集合都由调用方给，这里不猜路径之间的关系。
+function writeDirCandidates(dirs, workspaceDirs) {
+  const allowed = new Set((Array.isArray(dirs) ? dirs : []).map((dir) => String(dir ?? '')));
+  const out = [];
+  for (const dir of Array.isArray(workspaceDirs) ? workspaceDirs : []) {
+    const text = String(dir ?? '');
+    if (!text || allowed.has(text) || out.includes(text)) continue;
+    out.push(text);
+  }
+  return out;
+}
+
+// 允许与不再允许都提交整份列表：这里只算那一份列表，结果以服务端的答复为准。
+function writeDirsWith(dirs, dir) {
+  const list = (Array.isArray(dirs) ? dirs : []).map((item) => String(item ?? '')).filter(Boolean);
+  if (dir && !list.includes(dir)) list.push(dir);
+  return list;
+}
+
+function writeDirsWithout(dirs, dir) {
+  return (Array.isArray(dirs) ? dirs : [])
+    .map((item) => String(item ?? ''))
+    .filter((item) => item && item !== dir);
+}
+
 if (typeof module !== 'undefined') {
   module.exports = {
     parseEventBlock, toolSummary, toolLabel, toolActivityLabel, candidateLabel, reloadCopy, valueOrDash,
@@ -1376,7 +1421,8 @@ if (typeof module !== 'undefined') {
     skillDescriptionText, skillScopeLabel, skillActionPath, skillRows,
     reasoningEffortView, REASONING_EFFORT_LEVELS,
     commandNames, findCommand, commandMenuItem, commandList, commandCandidates,
-    providerEndpointHost, providerModelsList, providerRequestBody
+    providerEndpointHost, providerModelsList, providerRequestBody,
+    WRITE_DIR_MAX_CHARS, writeDirAbsolute, writeDirText, writeDirCandidates, writeDirsWith, writeDirsWithout
   };
 }
 
@@ -2674,7 +2720,11 @@ if (typeof document !== 'undefined') {
   // 各自的小节里，这里只负责在它可见时触发一次。
   function loadSettingsPane(pane) {
     if (pane === 'settings-pane-skills') updateSkills();
-    else if (pane === 'settings-pane-workspace') updateWorkspaces();
+    else if (pane === 'settings-pane-workspace') {
+      updateWorkspaces();
+      // 允许写入的目录是同一分类里的另一节：它读自己的接口，候选区复用上面那份工作区。
+      updateWriteDirs();
+    }
     else if (pane === 'settings-pane-extensions') updateUIPlugins();
     else if (pane === 'settings-pane-model') {
       updateModelList();
@@ -3745,6 +3795,9 @@ if (typeof document !== 'undefined') {
       workspaceList.append(item);
     }
     workspaceEmpty.hidden = !listed || rows.length > 0;
+    // 写入那一节的候选区跟着这份工作区数据走：它在同一处刷新，不自己再读一次
+    // /api/workspaces（下面有两个提前返回，所以刷新点放在它们之前）。
+    renderWriteDirCandidates();
     // 会话还没有 id 时说清为什么不能绑：绑定必须写进一次会话的记录里。
     if (listed && rows.length && !isSessionID(currentSessionID)) {
       setWorkspaceStatus('这个会话还没有消息，还没有可以记录绑定的地方。先发一条消息，再回到这一页。');
@@ -3817,6 +3870,192 @@ if (typeof document !== 'undefined') {
   }
 
   workspaceRefresh.addEventListener('click', () => updateWorkspaces());
+
+  // --- 设置：允许写入的目录 ---------------------------------------------------
+  // 工作区说的是"这次工作在哪些目录里"，这一节说的是"Luna 可以改哪些目录里的文件"，
+  // 而且它只会比工作区更窄。服务端是唯一的事实来源：打开这一页读一次
+  // GET /api/write-dirs；每一次变更（移除一行、允许一个工作区目录、手填一个绝对路径）
+  // 立刻把整份列表 PUT 回去，界面按答复里的 dirs 重绘 —— 从不先改成乐观状态。
+
+  const writeDirsList = $('write-dirs-list');
+  const writeDirsEmpty = $('write-dirs-empty');
+  const writeDirsStatus = $('write-dirs-status');
+  const writeDirsAdd = $('write-dirs-add');
+  const writeDirsAddButton = $('write-dirs-add-button');
+  const writeDirsCandidates = $('write-dirs-candidates');
+  const writeDirsCandidatesEmpty = $('write-dirs-candidates-empty');
+  // 最近一次成功读到的载荷：重绘与按钮的可用性都来自它。
+  let writeDirsPayload = null;
+  // 成功读到过清单才谈得上"一个目录都没有"。读失败不算空态。
+  let writeDirsListed = false;
+  // 一次变更在途：这段时间里按钮不可点，重复点击不会发第二次请求。
+  let writeDirsBusy = false;
+  let writeDirsStatusTimer = null;
+
+  // 状态行兼错误行：说明性的话（正在保存…）自己消失，失败的那句留着 —— 一个人要改的
+  // 是他刚做的那件事，原因不能被定时器吃掉。
+  function setWriteDirsStatus(text, persist = false) {
+    if (writeDirsStatusTimer !== null) {
+      clearTimeout(writeDirsStatusTimer);
+      writeDirsStatusTimer = null;
+    }
+    writeDirsStatus.textContent = text;
+    writeDirsStatus.className = `luna-status write-dirs-status${persist ? ' failure' : ''}`;
+    if (!text || persist) return;
+    writeDirsStatusTimer = setTimeout(() => {
+      writeDirsStatusTimer = null;
+      writeDirsStatus.textContent = '';
+      writeDirsStatus.className = 'luna-status write-dirs-status';
+    }, 4000);
+  }
+
+  // 服务端最近一次报过的清单。读失败时它仍是上一次读到的那份：读不到不等于没有。
+  function allowedWriteDirs() {
+    if (!writeDirsListed || !writeDirsPayload || !Array.isArray(writeDirsPayload.dirs)) return [];
+    return writeDirsPayload.dirs.map((dir) => String(dir ?? '')).filter(Boolean);
+  }
+
+  // 候选区复用工作区那一页已经读到的那份数据（同一个分类里的一次读取），不另外请求
+  // 一次 /api/workspaces。
+  function workspaceDirectoryList() {
+    const rows = workspaceListed && workspacePayload && Array.isArray(workspacePayload.workspaces)
+      ? workspacePayload.workspaces : [];
+    const dirs = [];
+    for (const row of rows) {
+      for (const dir of Array.isArray(row.dirs) ? row.dirs : []) {
+        const text = textOr(dir);
+        if (text && !dirs.includes(text)) dirs.push(text);
+      }
+    }
+    return dirs;
+  }
+
+  // 一个目录一行：路径缩略显示、原文留在 title 上；按钮点一下就是一次提交。
+  function writeDirNode({ dir, className, label, action }) {
+    const item = make('li', `${className} luna-list-item`);
+    item.dataset.writeDir = dir;
+    const path = make('span', 'write-dirs-path', writeDirText(dir));
+    path.setAttribute('title', dir);
+    const button = make('button', `luna-button ${action === 'allow' ? 'write-dirs-allow' : 'write-dirs-remove'}`, label);
+    button.type = 'button';
+    button.disabled = writeDirsBusy;
+    button.setAttribute('aria-label', action === 'allow' ? `允许写入 ${dir}` : `不再允许写入 ${dir}`);
+    button.addEventListener('click', () => (action === 'allow' ? allowWriteDir(dir) : removeWriteDir(dir)));
+    item.append(path, button);
+    return item;
+  }
+
+  function renderWriteDirs(payload) {
+    if (payload !== undefined) writeDirsPayload = payload;
+    const dirs = allowedWriteDirs();
+    writeDirsList.replaceChildren();
+    for (const dir of dirs) {
+      writeDirsList.append(writeDirNode({ dir, className: 'write-dirs-row', label: '移除', action: 'remove' }));
+    }
+    // "还没有允许任何目录"只在确实读到过一份空清单时出现。
+    writeDirsEmpty.hidden = !(writeDirsListed && dirs.length === 0);
+    renderWriteDirCandidates();
+  }
+
+  // 候选区列出工作区里的目录中还没有被允许的那些：它跟着工作区那份数据走，所以两个
+  // 数据都到齐之后才谈得上"没有可选的"。
+  function renderWriteDirCandidates() {
+    const workspaceDirs = workspaceDirectoryList();
+    const candidates = writeDirCandidates(allowedWriteDirs(), workspaceDirs);
+    writeDirsCandidates.replaceChildren();
+    for (const dir of candidates) {
+      writeDirsCandidates.append(writeDirNode({ dir, className: 'write-dirs-candidate', label: '允许', action: 'allow' }));
+    }
+    writeDirsCandidatesEmpty.hidden = candidates.length > 0;
+    writeDirsCandidatesEmpty.textContent = workspaceDirs.length
+      ? '工作区里的目录都已经允许写入了。'
+      : '还没有读到工作区目录：这一节照样可以直接填一个绝对路径。';
+  }
+
+  async function updateWriteDirs() {
+    if (writeDirsBusy) return false;
+    try {
+      const response = await fetch('/api/write-dirs', { cache: 'no-store' });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      writeDirsListed = true;
+      renderWriteDirs(await response.json());
+      setWriteDirsStatus('');
+      return true;
+    } catch (error) {
+      // 读失败不把清单清空：上一次读到的那份留在屏幕上，原因写在状态行里。
+      renderWriteDirs();
+      setWriteDirsStatus(`读取允许写入的目录失败：${error.message}`, true);
+      return false;
+    }
+  }
+
+  // commitWriteDirs 是这一节唯一的写入路径：整份列表一次 PUT，答复里的 dirs 就是新的
+  // 清单。失败时服务端那句 error 原样显示，列表保持上一次读到的那份 —— 界面不先改成
+  // 乐观状态，也不替服务端猜它会怎么规范化。
+  async function commitWriteDirs(dirs, success) {
+    if (writeDirsBusy) return false;
+    writeDirsBusy = true;
+    renderWriteDirs();
+    setWriteDirsStatus('正在保存…');
+    let failure = '';
+    let payload = null;
+    try {
+      const response = await fetch('/api/write-dirs', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dirs })
+      });
+      payload = await response.json().catch(() => ({}));
+      if (!response.ok) failure = payload.error || `HTTP ${response.status}`;
+    } catch (error) {
+      failure = error.message;
+    }
+    writeDirsBusy = false;
+    if (failure) {
+      renderWriteDirs();
+      setWriteDirsStatus(`保存失败：${failure}（列表仍是上一次读到的那份）`, true);
+      return false;
+    }
+    // 答复带着新的清单：它是这一节的唯一事实来源。答复里没有清单就留着原来那份。
+    if (payload && Array.isArray(payload.dirs)) renderWriteDirs(payload);
+    else renderWriteDirs();
+    setWriteDirsStatus(success || '');
+    return true;
+  }
+
+  async function removeWriteDir(dir) {
+    if (writeDirsBusy) return false;
+    return commitWriteDirs(writeDirsWithout(allowedWriteDirs(), dir), `已不再允许写入 ${dir}。`);
+  }
+
+  // 候选与手填的绝对路径走同一条路：加进现有清单，整份提交。
+  async function allowWriteDir(dir) {
+    if (writeDirsBusy) return false;
+    return commitWriteDirs(writeDirsWith(allowedWriteDirs(), dir), `已允许写入 ${dir}。`);
+  }
+
+  // 手填的那一栏先做一次本地检查：不是绝对路径就地说清、不发请求（服务端也会拒，
+  // 没必要跑一趟）；是就提交，成功之后才把输入框清掉。
+  async function submitWriteDir() {
+    const dir = writeDirsAdd.value.trim();
+    if (!writeDirAbsolute(dir)) {
+      setWriteDirsStatus('请填一个绝对路径，例如 /home/j/project：相对路径说不清它到底是哪一个目录。', true);
+      return;
+    }
+    if (allowedWriteDirs().includes(dir)) {
+      setWriteDirsStatus(`${dir} 已经在允许写入的清单里了。`, true);
+      return;
+    }
+    if (await allowWriteDir(dir)) writeDirsAdd.value = '';
+  }
+
+  writeDirsAddButton.addEventListener('click', submitWriteDir);
+  // 回车与「允许」是同一个入口：这一行不是一份需要"保存"的表单，填完就是一次操作。
+  writeDirsAdd.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    submitWriteDir();
+  });
 
   // --- 设置：本会话用哪个模型 -------------------------------------------------
   // /model 命令与这一页做的是同一件事，走同一个接口：切换写进会话自己的记录，

@@ -165,6 +165,23 @@
             <ul id="workspace-list" class="luna-list workspace-list"></ul>
             <p id="workspace-empty" class="luna-muted" hidden>还没有定义任何工作区。</p>
             <div><button id="workspace-refresh" class="luna-button" type="button">重新读取工作区</button></div>
+            <!-- 写入这一节与上面分开解释：工作区说"这次工作在哪些目录里"，这一节说
+                 "Luna 可以改哪些目录里的文件"，而且它只会更窄。每次变更立即提交整份
+                 列表，所以这里没有"保存"按钮。 -->
+            <h4>允许写入的目录</h4>
+            <p class="luna-muted">Luna 只能在这些目录里新建或覆盖文件：工作区说的是这次工作在哪些目录里，这一节说的是它可以改哪些目录里的文件，而且只会比工作区更窄。这里每一条都是一个绝对路径，不在工作区里的目录不必放进来。</p>
+            <p id="write-dirs-status" class="luna-status write-dirs-status" role="status"></p>
+            <ul id="write-dirs-list" class="luna-list write-dirs-list"></ul>
+            <p id="write-dirs-empty" class="luna-muted" hidden>还没有允许任何目录，Luna 什么也写不了。</p>
+            <div class="write-dirs-add-row">
+              <label class="sr-only" for="write-dirs-add">要允许写入的绝对路径</label>
+              <input id="write-dirs-add" class="luna-input" type="text" spellcheck="false" placeholder="/home/j/project">
+              <button id="write-dirs-add-button" class="luna-button" type="button">允许</button>
+            </div>
+            <h4>工作区里的目录</h4>
+            <p class="luna-muted">当前工作区里还没被允许写入的目录，点一下就是一条。</p>
+            <ul id="write-dirs-candidates" class="luna-list write-dirs-candidates"></ul>
+            <p id="write-dirs-candidates-empty" class="luna-muted" hidden>工作区里的目录都已经允许写入了。</p>
           </section>
           <section id="settings-pane-extensions" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-extensions" tabindex="0" hidden>
             <div class="section-heading">

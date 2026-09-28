@@ -1304,6 +1304,23 @@ body {
 .workspace-status.failure,
 .model-switch-status.failure { color: var(--luna-danger); }
 
+/* --- 设置：允许写入的目录 ---------------------------------------------------
+   工作区那一页的下一节：工作区说这次工作在哪些目录里，这一节说 Luna 可以改哪些
+   目录里的文件（只会更窄）。一行一个绝对路径，每个动作按钮点一下就是一次提交，
+   所以这里没有"保存"。路径缩略显示，原文留在 title 上。 */
+
+.write-dirs-list,
+.write-dirs-candidates { display: grid; gap: var(--luna-space-2); margin: 0; padding: 0; list-style: none; }
+.write-dirs-row,
+.write-dirs-candidate { display: flex; align-items: center; justify-content: space-between; gap: var(--luna-space-2); }
+.write-dirs-path { min-width: 0; color: var(--luna-text); font: var(--luna-font-meta)/1.6 var(--luna-font-mono); overflow-wrap: anywhere; }
+.write-dirs-remove,
+.write-dirs-allow { flex: 0 0 auto; min-height: var(--luna-control-sm); }
+.write-dirs-add-row { display: flex; align-items: center; gap: var(--luna-space-2); }
+.write-dirs-add-row .luna-input { flex: 1 1 auto; min-width: 0; }
+.write-dirs-status { min-height: 18px; }
+.write-dirs-status.failure { color: var(--luna-danger); }
+
 /* 设置里的小标题：一页之内再分一节（例如"这个会话用哪个模型"）。 */
 .settings-pane h4 { margin: var(--luna-space-4) 0 var(--luna-space-2); font-size: var(--luna-font-ui); font-weight: 600; }
 /* 能力的面板入口跟在状态之后，靠右对齐，与能力行的开关形成同一条右边线。 */

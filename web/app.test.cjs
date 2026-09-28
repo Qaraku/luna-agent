@@ -3836,3 +3836,307 @@ test('模型服务这一页的样式、结构与不写的写法', () => {
   assert.equal(/gradient\s*\(/i.test(block), false);
   assert.doesNotMatch(block, /#[0-9a-f]{3,8}\b/i, '颜色只来自 --luna-* token');
 });
+
+// --- 设置：允许写入的目录 ----------------------------------------------------
+// 这一节的契约：GET 读一次服务端持有的清单；每一次变更（移除一行、允许一个工作区
+// 目录、手填一个绝对路径）立刻 PUT 整份清单，界面按答复里的 dirs 重绘。失败时状态
+// 行说的是服务端那句 error，清单保持上一次读到的那份。
+
+// 夹具按冻结的接口形状回话：GET 回答服务端持有的清单，PUT 整份替换；条目不是规范化
+// 的绝对路径就 400 并点名那一条。读与写各自可以被"打成故障"，用来验失败路径。
+function writeDirsServer(initial = []) {
+  const server = {
+    dirs: [...initial], writes: [], reads: 0,
+    failRead: null, failWrite: null, normalize: (dirs) => dirs,
+  };
+  server.respond = async (url, options) => {
+    if (url !== '/api/write-dirs') return undefined;
+    if (!options || options.method !== 'PUT') {
+      server.reads += 1;
+      if (server.failRead) {
+        return { ok: false, status: server.failRead.status, json: async () => ({ error: server.failRead.error }) };
+      }
+      return { ok: true, json: async () => ({ dirs: server.dirs }) };
+    }
+    const body = JSON.parse(options.body);
+    server.writes.push(body);
+    if (server.failWrite) {
+      return { ok: false, status: server.failWrite.status, json: async () => ({ error: server.failWrite.error }) };
+    }
+    const entries = Array.isArray(body.dirs) ? body.dirs : [];
+    const badIndex = entries.findIndex((dir) => typeof dir !== 'string' || !dir.startsWith('/') || dir.split('/').includes('..'));
+    if (badIndex >= 0) {
+      const entry = entries[badIndex];
+      return { ok: false, status: 400, json: async () => ({ error: `write dirs: ${entry} is not a normalized absolute path` }) };
+    }
+    server.dirs = server.normalize(body.dirs);
+    return { ok: true, json: async () => ({ dirs: server.dirs }) };
+  };
+  return server;
+}
+
+// 这一节的基座：工作区那一页照旧走 /api/workspaces（同一个分类里已经在读的那份），
+// 允许写入的目录走 /api/write-dirs。
+function writeDirsHarness({ dirs = [], workspaceDirs = ['/home/j/probe/luna-agent'], workspaces = true } = {}) {
+  const server = writeDirsServer([...dirs]);
+  const h = navigationHarness({
+    respond: async (url, options) => {
+      const written = await server.respond(url, options);
+      if (written) return written;
+      if (workspaces && url === '/api/workspaces') {
+        return { ok: true, json: async () => ({ workspaces: [{ id: 'ws-one', name: 'luna-agent', dirs: workspaceDirs }] }) };
+      }
+      return undefined;
+    },
+  });
+  h.writeDirs = server;
+  return h;
+}
+
+async function openWorkspacePane(h) {
+  await h.settle();
+  await h.click('settings-toggle');
+  await h.click('settings-tab-workspace');
+  await h.settle();
+  await h.settle();
+}
+
+test('「允许写入的目录」列出服务端持有的清单，空清单说清 Luna 什么也写不了', async () => {
+  const { WRITE_DIR_MAX_CHARS } = require('./app.js');
+  const long = '/home/j/probe/luna-agent/some/really/long/nested/directory/path';
+  const h = writeDirsHarness({ dirs: ['/home/j/probe/luna-agent', long] });
+  await openWorkspacePane(h);
+  assert.equal(h.writeDirs.reads, 1, '打开这一页读一次');
+  assert.equal(h.$('settings-pane-workspace').contains(h.$('write-dirs-list')), true, '这一节在工作区分类里');
+
+  const rows = h.$('write-dirs-list').children;
+  assert.equal(rows.length, 2, '一行一个目录');
+  assert.equal(rows[0].querySelector('.write-dirs-path').textContent, '/home/j/probe/luna-agent');
+  assert.equal(rows[0].querySelector('.write-dirs-remove').textContent, '移除');
+  assert.equal(rows[0].querySelector('.write-dirs-remove').type, 'button', '点一下就是一次提交');
+  // 长路径在屏幕上是缩略的，原文留在 title 上。
+  const shown = rows[1].querySelector('.write-dirs-path');
+  assert.equal(shown.textContent.length, WRITE_DIR_MAX_CHARS);
+  assert.equal(shown.textContent.includes('…'), true);
+  assert.equal(shown.textContent === long, false);
+  assert.equal(shown.getAttribute('title'), long, 'title 里是原样的绝对路径');
+  assert.equal(h.$('write-dirs-empty').hidden, true, '有清单时不说空态');
+
+  const empty = writeDirsHarness({ dirs: [] });
+  await openWorkspacePane(empty);
+  assert.equal(empty.$('write-dirs-list').children.length, 0);
+  assert.equal(empty.$('write-dirs-empty').hidden, false);
+  assert.equal(empty.$('write-dirs-empty').textContent, '还没有允许任何目录，Luna 什么也写不了。');
+});
+
+test('移除一行后 PUT 的是剩余清单，界面按答复重绘', async () => {
+  const h = writeDirsHarness({
+    dirs: ['/home/j/probe/luna-agent', '/home/j/probe/scratch'],
+    workspaceDirs: ['/home/j/probe/luna-agent', '/home/j/probe/scratch'],
+  });
+  await openWorkspacePane(h);
+  const titles = () => h.$('write-dirs-list').children.map((row) => row.querySelector('.write-dirs-path').getAttribute('title'));
+  assert.deepEqual(titles(), ['/home/j/probe/luna-agent', '/home/j/probe/scratch']);
+
+  h.$('write-dirs-list').children[1].querySelector('.write-dirs-remove').click();
+  await providerFlush();
+  assert.deepEqual(h.writeDirs.writes, [{ dirs: ['/home/j/probe/luna-agent'] }], '单击就是一次提交，提交的是剩余的整份清单');
+  assert.deepEqual(titles(), ['/home/j/probe/luna-agent'], '界面按答复重绘');
+  // 移掉的那个又成了候选：它本来就是工作区目录。
+  assert.deepEqual(
+    h.$('write-dirs-candidates').children.map((row) => row.querySelector('.write-dirs-path').getAttribute('title')),
+    ['/home/j/probe/scratch']
+  );
+  assert.match(h.$('write-dirs-status').textContent, /已不再允许写入 \/home\/j\/probe\/scratch。/);
+  await h.settle();
+  assert.equal(h.$('write-dirs-status').textContent, '', '一次操作的结果自己消失');
+  assert.equal(h.$('write-dirs-status').classList.contains('failure'), false);
+});
+
+test('从一个工作区目录点「允许」后 PUT 的是并集，界面按答复里的顺序重绘', async () => {
+  const h = writeDirsHarness({
+    dirs: ['/home/j/probe/scratch'],
+    workspaceDirs: ['/home/j/probe/scratch', '/home/j/probe/luna-agent'],
+  });
+  // 服务端自己会规范化（顺序由它定）：答复里的清单才是界面的依据。
+  h.writeDirs.normalize = (dirs) => [...dirs].sort();
+  await openWorkspacePane(h);
+  assert.equal(h.calls.filter(({ url }) => url === '/api/workspaces').length, 1, '候选复用工作区那一份，不另读一次');
+  const candidates = h.$('write-dirs-candidates').children;
+  assert.deepEqual(
+    candidates.map((row) => row.querySelector('.write-dirs-path').getAttribute('title')),
+    ['/home/j/probe/luna-agent'], '已经允许的不再作为候选'
+  );
+  assert.equal(h.$('write-dirs-candidates-empty').hidden, true);
+
+  candidates[0].querySelector('.write-dirs-allow').click();
+  await providerFlush();
+  assert.deepEqual(h.writeDirs.writes, [{ dirs: ['/home/j/probe/scratch', '/home/j/probe/luna-agent'] }],
+    '提交的是现有清单加这一条（并集）');
+  assert.deepEqual(
+    h.$('write-dirs-list').children.map((row) => row.querySelector('.write-dirs-path').getAttribute('title')),
+    ['/home/j/probe/luna-agent', '/home/j/probe/scratch'], '顺序按答复，不按提交的那份'
+  );
+  assert.equal(h.$('write-dirs-candidates').children.length, 0);
+  assert.equal(h.$('write-dirs-candidates-empty').hidden, false);
+  assert.equal(h.$('write-dirs-candidates-empty').textContent, '工作区里的目录都已经允许写入了。');
+  await h.settle();
+  assert.equal(h.$('write-dirs-status').textContent, '');
+});
+
+test('手填相对路径时就地报错并且不发请求，绝对路径才提交', async () => {
+  const h = writeDirsHarness({ dirs: [], workspaces: false });
+  await openWorkspacePane(h);
+
+  h.$('write-dirs-add').value = 'logs';
+  h.$('write-dirs-add-button').click();
+  await providerFlush();
+  assert.equal(h.writeDirs.writes.length, 0, '不是绝对路径就不发请求');
+  assert.match(h.$('write-dirs-status').textContent, /绝对路径/);
+  assert.equal(h.$('write-dirs-status').classList.contains('failure'), true);
+  assert.equal(h.$('write-dirs-add').value, 'logs', '输入留在原地，改一个字就能重试');
+  // 空的一栏也是同一个答案：它不是一个绝对路径。
+  h.$('write-dirs-add').value = '   ';
+  h.$('write-dirs-add-button').click();
+  await providerFlush();
+  assert.equal(h.writeDirs.writes.length, 0);
+
+  h.$('write-dirs-add').value = '/home/j/probe/scratch';
+  h.$('write-dirs-add-button').click();
+  await providerFlush();
+  assert.deepEqual(h.writeDirs.writes, [{ dirs: ['/home/j/probe/scratch'] }]);
+  assert.equal(h.$('write-dirs-add').value, '', '提交成功之后输入框清空');
+  assert.deepEqual(
+    h.$('write-dirs-list').children.map((row) => row.querySelector('.write-dirs-path').getAttribute('title')),
+    ['/home/j/probe/scratch']
+  );
+
+  // 回车与「允许」是同一个入口。
+  h.$('write-dirs-add').value = '/home/j/probe/second';
+  h.$('write-dirs-add').emit('keydown', { key: 'Enter' });
+  await providerFlush();
+  assert.deepEqual(h.writeDirs.writes[1], { dirs: ['/home/j/probe/scratch', '/home/j/probe/second'] });
+});
+
+test('服务端拒一条时状态行说的是服务端那句原话，不是一个状态码', async () => {
+  const h = writeDirsHarness({ dirs: ['/home/j/probe/luna-agent'], workspaces: false });
+  await openWorkspacePane(h);
+
+  // 本地只检查"是不是绝对路径"：这条是绝对的，合不合法只有服务端说了算。
+  h.$('write-dirs-add').value = '/tmp/../etc';
+  h.$('write-dirs-add-button').click();
+  await providerFlush();
+  assert.equal(h.writeDirs.writes.length, 1, '绝对路径先发出去');
+  const reason = 'write dirs: /tmp/../etc is not a normalized absolute path';
+  const status = h.$('write-dirs-status').textContent;
+  assert.equal(status.includes(reason), true, '状态行是服务端那句话');
+  assert.equal(status.includes('HTTP 400'), false, '不是一个状态码');
+  assert.equal(h.$('write-dirs-status').classList.contains('failure'), true);
+  assert.deepEqual(
+    h.$('write-dirs-list').children.map((row) => row.querySelector('.write-dirs-path').getAttribute('title')),
+    ['/home/j/probe/luna-agent'], '被拒之后清单不变'
+  );
+  await h.settle();
+  assert.equal(h.$('write-dirs-status').textContent.includes(reason), true, '失败那句留着，不自己消失');
+});
+
+test('读不到清单时状态行说的是服务端那句原话，且不清空上一次读到的清单', async () => {
+  const h = writeDirsHarness({ dirs: ['/home/j/probe/luna-agent'], workspaces: false });
+  await openWorkspacePane(h);
+  assert.equal(h.$('write-dirs-list').children.length, 1);
+
+  const reason = 'write dirs: cannot read /home/j/.config/luna/write-dirs.json: permission denied';
+  h.writeDirs.failRead = { status: 500, error: reason };
+  h.$('settings-tab-workspace').click();
+  await providerFlush();
+  const status = h.$('write-dirs-status').textContent;
+  assert.equal(status.includes(reason), true, '状态行是服务端那句话');
+  assert.equal(status.includes('HTTP 500'), false);
+  assert.equal(h.$('write-dirs-status').classList.contains('failure'), true);
+  assert.equal(h.$('write-dirs-list').children.length, 1, '读失败不清空上一次读到的那份');
+  assert.equal(h.$('write-dirs-empty').hidden, true, '读失败不算空态');
+});
+
+test('保存失败时清单保持原样，状态行说的是服务端那句原话', async () => {
+  const h = writeDirsHarness({
+    dirs: ['/home/j/probe/luna-agent', '/home/j/probe/scratch'],
+    workspaces: false,
+  });
+  await openWorkspacePane(h);
+  const titles = () => h.$('write-dirs-list').children.map((row) => row.querySelector('.write-dirs-path').getAttribute('title'));
+  const before = titles();
+
+  const reason = 'write dirs: cannot write /home/j/.config/luna/write-dirs.json: permission denied';
+  h.writeDirs.failWrite = { status: 500, error: reason };
+  h.$('write-dirs-list').children[0].querySelector('.write-dirs-remove').click();
+  await providerFlush();
+  assert.equal(h.writeDirs.writes.length, 1, '请求发出去了');
+  assert.deepEqual(titles(), before, '失败时清单保持原样，不先改成乐观状态');
+  assert.deepEqual(h.writeDirs.dirs, before, '服务端那边也没变');
+  const status = h.$('write-dirs-status').textContent;
+  assert.equal(status.includes(reason), true, '状态行是服务端那句话');
+  assert.equal(status.includes('HTTP 500'), false);
+  assert.equal(h.$('write-dirs-status').classList.contains('failure'), true);
+});
+
+test('允许写入这一节的纯函数只认绝对路径，并为缩略显示留下原文', () => {
+  const {
+    WRITE_DIR_MAX_CHARS, writeDirAbsolute, writeDirText, writeDirCandidates, writeDirsWith, writeDirsWithout,
+  } = require('./app.js');
+  assert.equal(writeDirAbsolute('/home/j/probe'), true);
+  assert.equal(writeDirAbsolute('  /home/j/probe  '), true);
+  assert.equal(writeDirAbsolute('logs'), false);
+  assert.equal(writeDirAbsolute('~/probe'), false, '~ 不是绝对路径');
+  assert.equal(writeDirAbsolute('./here'), false);
+  assert.equal(writeDirAbsolute(''), false);
+  assert.equal(writeDirAbsolute(undefined), false);
+
+  // 缩略显示：短的原样，长的是有上限的一行，原文由调用方放进 title。
+  assert.equal(writeDirText('/home/j/probe'), '/home/j/probe');
+  const long = '/home/j/probe/luna-agent/some/really/long/nested/directory/path';
+  const shown = writeDirText(long);
+  assert.equal(shown.length, WRITE_DIR_MAX_CHARS);
+  assert.equal(shown.includes('…'), true);
+  assert.equal(long.startsWith(shown.slice(0, 10)), true);
+  assert.equal(long.endsWith(shown.slice(-10)), true);
+
+  // 候选是"工作区里有、清单里没有"的那些：顺序照工作区，重复只出现一次。
+  assert.deepEqual(writeDirCandidates(['/a'], ['/a', '/b', '/b', '/c']), ['/b', '/c']);
+  assert.deepEqual(writeDirCandidates(undefined, undefined), []);
+  assert.deepEqual(writeDirsWith(['/a'], '/b'), ['/a', '/b']);
+  assert.deepEqual(writeDirsWith(['/a'], '/a'), ['/a'], '已经在清单里的不再加一条');
+  assert.deepEqual(writeDirsWithout(['/a', '/b'], '/a'), ['/b']);
+  assert.deepEqual(writeDirsWithout(undefined, '/a'), []);
+});
+
+test('允许写入这一节的结构、空态文案与样式都在', () => {
+  const html = source('index.html');
+  const css = source('style.css');
+  const js = source('app.js');
+  const start = html.indexOf('id="settings-pane-workspace"');
+  const pane = html.slice(start, html.indexOf('</section>', start));
+  for (const id of ['write-dirs-status', 'write-dirs-list', 'write-dirs-empty',
+    'write-dirs-add', 'write-dirs-add-button', 'write-dirs-candidates', 'write-dirs-candidates-empty']) {
+    assert.match(pane, new RegExp(`id="${id}"`), `${id} 在工作区这一页里`);
+  }
+  assert.match(html, /<h4>允许写入的目录<\/h4>/);
+  assert.match(html, /id="write-dirs-empty"[^>]*hidden[^>]*>还没有允许任何目录，Luna 什么也写不了。/);
+  assert.match(html, /<label class="sr-only" for="write-dirs-add">/);
+  assert.equal(html.includes('style='), false, 'HTML 里不写内联样式');
+  assert.equal(/id="write-dirs-save"/.test(html), false, '每次变更立即提交，没有"保存"按钮');
+  assert.equal(js.includes('innerHTML'), false);
+
+  // 脚本建出来的每个 class 都在样式表里有规则。
+  for (const selector of ['.write-dirs-list', '.write-dirs-candidates', '.write-dirs-row', '.write-dirs-candidate',
+    '.write-dirs-path', '.write-dirs-remove', '.write-dirs-allow', '.write-dirs-add-row',
+    '.write-dirs-status', '.write-dirs-status.failure']) {
+    assert.ok(
+      [`${selector} {`, `${selector}:`, `${selector},`, `${selector}.`].some((form) => css.includes(form)),
+      `missing style ${selector}`
+    );
+  }
+  const block = css.slice(css.indexOf('/* --- 设置：允许写入的目录'), css.indexOf('/* 设置里的小标题'));
+  assert.ok(block.length > 0, '这一节的样式块必须在');
+  assert.equal(/gradient\s*\(/i.test(block), false);
+  assert.doesNotMatch(block, /#[0-9a-f]{3,8}\b/i, '颜色只来自 --luna-* token');
+});
