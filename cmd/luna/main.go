@@ -398,8 +398,8 @@ func run() error {
 	rootFlag := flag.String("root", "", "repository root holding web/ and plugins/ (default: auto-detect)")
 	readRoot := flag.String("read-root", "", "directory the file tools (luna_read_file, luna_list_dir, luna_search_files, luna_find_files) are bounded to (default: the resolved root)")
 	readLimit := flag.Int("read-limit", 0, "single-read cap in bytes for luna_read_file (default: 262144)")
-	sessionsFlag := flag.String("sessions-dir", "", "directory holding the append-only session files (default: <root>/.runtime/sessions/)")
-	stateFlag := flag.String("state-dir", "", "root directory holding capability state (default: <root>)")
+	sessionsFlag := flag.String("sessions-dir", "", "directory holding the append-only session files (default: chosen at startup — <data-dir>/sessions, or the previous <root>/.runtime/sessions/ while the sessions are still there; startup logs which one is in use)")
+	stateFlag := flag.String("state-dir", "", "root directory holding capability state (default: chosen at startup — <data-dir>, or the previous <root> while that is where the capability state already is; startup logs which one is in use)")
 	rulesFlag := flag.String("rules-file", "", "file holding the project rules the workspace capability contributes (default: none)")
 	configFlag := flag.String("config-file", "", "user configuration file to read (default: <config-dir>/config.yaml)")
 	skillDirs := repeatedPath{}
