@@ -83,7 +83,10 @@ func (t *RunTool) Invoke(ctx context.Context, arguments string) (string, error) 
 	}
 	roots := plugin.Roots(ctx)
 	if len(roots) == 0 {
-		return "", errors.New("this run works in no directory, so there is nowhere to run a command")
+		// A run with no working directory is a session that names no workspace. The fix
+		// belongs to the user, so the refusal says which control it is instead of only
+		// stating that there is nowhere to run.
+		return "", errors.New("this run works in no directory, so there is nowhere to run a command: this session is not bound to a workspace, and the user binds one on the settings page under 工作区")
 	}
 	dir, err := resolveDir(roots, in.Cwd)
 	if err != nil {

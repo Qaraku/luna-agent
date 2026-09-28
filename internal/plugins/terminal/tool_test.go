@@ -218,16 +218,20 @@ func TestRunRefusesWhenTheRunHasNoWorkingDirectory(t *testing.T) {
 	tests := []struct {
 		name string
 		ctx  context.Context
-		want string
+		want []string
 	}{
-		{"no roots were ever set", context.Background(), "no directory"},
-		{"the roots are empty", runCtx(), "no directory"},
-		{"every root is missing", runCtx(filepath.Join(t.TempDir(), "gone")), "working directories exists"},
+		// A run with no directory is a session that names no workspace, and the refusal
+		// has to point at the control that fixes it rather than only saying "nowhere".
+		{"no roots were ever set", context.Background(), []string{"no directory", "工作区"}},
+		{"the roots are empty", runCtx(), []string{"no directory", "工作区"}},
+		{"every root is missing", runCtx(filepath.Join(t.TempDir(), "gone")), []string{"working directories exists"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := NewRunTool().Invoke(tt.ctx, args(t, map[string]any{"command": "printf hi"}))
-			refused(t, err, tt.want)
+			for _, want := range tt.want {
+				refused(t, err, want)
+			}
 		})
 	}
 }

@@ -168,7 +168,10 @@ func (t *WriteTool) Invoke(ctx context.Context, arguments string) (string, error
 
 	roots := plugin.Roots(ctx)
 	if len(roots) == 0 {
-		return "", errors.New("this run has no working directory, so there is nowhere to write a file; nothing was written")
+		// A run with no working directory is a session that names no workspace. The fix
+		// belongs to the user, so the refusal names the control rather than only stating
+		// that there is nowhere to write.
+		return "", errors.New("this run has no working directory, so there is nowhere to write a file; nothing was written — this session is not bound to a workspace, and the user binds one on the settings page under 工作区")
 	}
 	target, err := fileread.ResolveWriteInRoots(roots, in.Path)
 	if err != nil {

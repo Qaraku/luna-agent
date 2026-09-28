@@ -341,7 +341,7 @@ func TestARefusedCallWritesNothingAndSaysWhy(t *testing.T) {
 			call: func(t *testing.T, f *fixture) (string, error) {
 				return f.callIn(t, []string{}, arguments(t, "notes.md", "hello\n", false))
 			},
-			want: []string{"no working directory"},
+			want: []string{"no working directory", "工作区"},
 		},
 		{
 			name: "an empty path",
