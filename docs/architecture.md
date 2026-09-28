@@ -107,6 +107,8 @@ providers:
 
 残缺的末行是唯一被容忍的缺陷。读取时丢弃未终止的尾部片段，并向客户端报告 `truncated: true`，而不是让会话失败；store 会在追加前截断该片段，因此新记录绝不会被并入其中。其他位置的格式错误记录是明确的 `ErrCorrupt` 错误，绝不是静默的空缺，并表现为 `500`。
 
+会话读取共用 `internal/store/scan.go` 的逐行校验路径，`store.go` 决定保留哪些记录：`Read` 保留完整回放，`List` 仅聚合摘要和最后的配置，`Messages` 仅保留消息。三者都校验未选中的记录，不能为了省内存忽略损坏的工具调用。扫描使用同一个已打开文件的内容与 metadata，以开始读取时的长度限制本次扫描，不追逐后续追加；这不是冻结文件内容的快照。长行缓冲可以增长并重用，不引入 Scanner 默认的 64 KiB 上限。额外缓冲由最大单行决定；完整回放和消息返回值仍占用对应输出所需内存，扫描时间仍随日志字节数增长。
+
 ### 能力：Memory
 
 Memory 是官方内置能力（`internal/plugins/memory`），不再属于内核业务：`fact`、`remember`、`retract`、注入块的渲染、存储上限、接口形状与面板文案都由它自己决定与测试。它贡献四类能力——两个工具（追加 `luna_remember` 与检索 `luna_recall`）、一个上下文块、四条路由（`GET /api/memory`、`POST /api/memory/retract`，以及面板自己的两个资产：`GET /api/memory/panel.js` 与 `GET /api/memory/panel.css`）与一个浏览器面板——外加一个状态命名空间 `.runtime`。面板的样式表走它自己的路由而不是注入 `<style>`：服务的 CSP 是 `default-src 'self'` 且没有 `style-src 'unsafe-inline'`，注入的样式表会被浏览器拒绝。模块用自己 URL 推导样式表地址，卸载时把 `<link>` 一并摘掉。

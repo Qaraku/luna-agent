@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -397,22 +398,24 @@ func (s *Store) Read(id string) (Session, error) {
 	if err := ValidateID(id); err != nil {
 		return Session{}, err
 	}
-	return s.readFile(s.path(id), id, true)
+	return s.readFile(s.path(id), id, true, nil)
 }
 
 // Messages returns the session's persisted messages in file order. It is the
 // read side the model context is assembled from, so the history is always the
 // history on disk rather than anything kept in memory.
 func (s *Store) Messages(id string) ([]MessageRecord, error) {
-	session, err := s.Read(id)
-	if err != nil {
+	if err := ValidateID(id); err != nil {
 		return nil, err
 	}
 	var messages []MessageRecord
-	for _, record := range session.Records {
+	_, err := s.readFile(s.path(id), id, false, func(record Record) {
 		if record.Message != nil {
 			messages = append(messages, *record.Message)
 		}
+	})
+	if err != nil {
+		return nil, err
 	}
 	return messages, nil
 }
@@ -434,7 +437,7 @@ func (s *Store) List() ([]Summary, error) {
 		if ValidateID(id) != nil {
 			continue
 		}
-		session, err := s.readFile(filepath.Join(s.dir, entry.Name()), id, false)
+		session, err := s.readFile(filepath.Join(s.dir, entry.Name()), id, false, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -452,9 +455,9 @@ func (s *Store) List() ([]Summary, error) {
 // path is the session file for an already validated id.
 func (s *Store) path(id string) string { return filepath.Join(s.dir, id+FileSuffix) }
 
-// readFile decodes one session file. keepRecords drops the decoded records for
-// the list view, where only the summary is needed.
-func (s *Store) readFile(path, id string, keepRecords bool) (Session, error) {
+// readFile 始终校验每条完整记录，但只保留调用方需要的内容：Read 保留全部，
+// List 只聚合元数据，Messages 通过 visit 收集消息。三条路径共用相同的解码规则。
+func (s *Store) readFile(path, id string, keepRecords bool, visit func(Record)) (Session, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -467,32 +470,21 @@ func (s *Store) readFile(path, id string, keepRecords bool) (Session, error) {
 	if err != nil {
 		return Session{}, fmt.Errorf("store: stat session file: %w", err)
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Session{}, fmt.Errorf("store: read session file: %w", err)
+	// 没有完整 header 的文件仍用文件名和同一描述符的时间作为回退，不能让
+	// 一次崩溃隐藏其他会话。保留空文件与只有残行时 Records 的原有 nil/[] 区别。
+	session := Session{ID: id, CreatedAt: info.ModTime(), UpdatedAt: info.ModTime()}
+	if keepRecords && info.Size() > 0 {
+		session.Records = []Record{}
 	}
-	records, truncated, err := parse(data, path)
-	if err != nil {
-		return Session{}, err
-	}
-	session := Session{ID: id, Records: records, Truncated: truncated}
-	if !keepRecords {
-		session.Records = nil
-	}
-	// A session file that lost its own first line to a torn write still has an
-	// authoritative identity: the file name is the id, and the file's own
-	// timestamps bound it. Reading it that way keeps one crash from hiding
-	// every other session.
-	session.CreatedAt, session.UpdatedAt = info.ModTime(), info.ModTime()
-	for _, record := range records {
-		if record.Session == nil {
-			continue
+	headerSeen := false
+	// 上限取开始读取时的长度，不追逐并发追加；内容与 metadata 来自同一个
+	// 已打开文件，不再重新按路径打开。上限内的未结束片段仍按残行处理。
+	truncated, err := scanRecords(io.LimitReader(file, info.Size()), path, func(record Record) {
+		if record.Session != nil && !headerSeen {
+			session.CreatedAt = record.Session.CreatedAt
+			session.Title = record.Session.Title
+			headerSeen = true
 		}
-		session.CreatedAt = record.Session.CreatedAt
-		session.Title = record.Session.Title
-		break
-	}
-	for _, record := range records {
 		if at := record.Time(); !at.IsZero() {
 			session.UpdatedAt = at
 		}
@@ -500,38 +492,21 @@ func (s *Store) readFile(path, id string, keepRecords bool) (Session, error) {
 			session.RunCount++
 		}
 		if record.Config != nil {
-			// Only the last one is kept: the statements are appended in order,
-			// so the newest is what the session now asks for.
 			latest := *record.Config
 			session.Config = &latest
 		}
+		if keepRecords {
+			session.Records = append(session.Records, record)
+		}
+		if visit != nil {
+			visit(record)
+		}
+	})
+	if err != nil {
+		return Session{}, err
 	}
+	session.Truncated = truncated
 	return session, nil
-}
-
-// parse splits a session file into records. Every complete line must decode:
-// only an unterminated trailing fragment is tolerated and reported, because a
-// single Write call with a trailing newline is what a record is.
-func parse(data []byte, path string) ([]Record, bool, error) {
-	if len(data) == 0 {
-		return nil, false, nil
-	}
-	lines := strings.Split(string(data), "\n")
-	trailing := lines[len(lines)-1]
-	lines = lines[:len(lines)-1]
-	truncated := trailing != ""
-	records := make([]Record, 0, len(lines))
-	for i, line := range lines {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		record, err := decodeLine(line)
-		if err != nil {
-			return nil, truncated, fmt.Errorf("%w %s line %d: %v", ErrCorrupt, filepath.Base(path), i+1, err)
-		}
-		records = append(records, record)
-	}
-	return records, truncated, nil
 }
 
 // line is the superset of the frozen record fields used for decoding.
@@ -558,9 +533,9 @@ type line struct {
 // decodeLine decodes one record. Unknown fields are ignored rather than
 // rejected: the format is frozen for readers, and ignoring an added field is
 // what lets a later slice extend the writer without invalidating old files.
-func decodeLine(text string) (Record, error) {
+func decodeLine(data []byte) (Record, error) {
 	var raw line
-	if err := json.Unmarshal([]byte(text), &raw); err != nil {
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return Record{}, err
 	}
 	switch raw.Type {
