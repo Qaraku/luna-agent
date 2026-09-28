@@ -3342,11 +3342,23 @@ if (typeof document !== 'undefined') {
     return '';
   }
 
+  // 读不出来时优先显示服务端自己的那句话：一个读不出或不合法的 provider.yaml 会给出
+  // 原因（哪条 provider、什么地方不对），而 "HTTP 500" 对要动手修它的人没有用。
+  async function providerFailure(response) {
+    try {
+      const payload = await response.json();
+      if (payload && payload.error) return payload.error;
+    } catch (error) {
+      // 不是 JSON 就退回状态码，但那句话仍然要说清是哪一次请求没成。
+    }
+    return `HTTP ${response.status}`;
+  }
+
   async function updateProvider({ quiet = false } = {}) {
     if (!quiet) setProviderStatus('正在读取…');
     try {
       const response = await fetch('/api/provider', { cache: 'no-store' });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      if (!response.ok) throw new Error(await providerFailure(response));
       const view = await response.json();
       renderProvider(view, { fromSave: false });
       const note = providerNote(view);

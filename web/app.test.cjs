@@ -3629,6 +3629,20 @@ test('「使用中」跟着服务端报的 active 走，不是本地记着的', 
   assert.equal(h.$('provider-name').value, 'deepseek', '重读不清掉正在编辑的内容');
 });
 
+// 读不出 provider 文件时，页面要说服务端那句话：一个不合法的 provider.yaml 会给出原因
+// （哪条 provider、什么地方不对），"HTTP 500" 对要动手修它的人没有用。
+test('读不出 provider 文件时页面显示服务端给的原因', async () => {
+  const reason = 'provider.yaml: active names the provider "nobody", which is not listed';
+  const h = navigationHarness({
+    respond: async (url) => (url === '/api/provider'
+      ? { ok: false, status: 500, json: async () => ({ error: reason }) }
+      : undefined)
+  });
+  await openProviderPane(h);
+  assert.match(h.$('provider-status').textContent, /active names the provider "nobody"/);
+  assert.equal(h.$('provider-status').textContent.includes('HTTP 500'), false);
+});
+
 test('保存提交整份文件：active 加全部 providers，成功后重新读命令表', async () => {
   const server = providerServer();
   const h = navigationHarness({ respond: server.respond });
