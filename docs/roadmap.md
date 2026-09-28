@@ -362,6 +362,16 @@ provider 与模型不需要。探测失败不算服务错误，它是一次回�
 - 仍未验证：`https` 与 6to4/NAT64 在真实路由下的行为只有单元测试覆盖；真实模型会不会正确使用 `mode`、会不会滥用抓取，**没有真实 provider 跑过**。
 - **准入竞争（已修复，未发布）**：过去终止事件已经写进流、run handler 却尚未清掉「忙」标志，紧接着的请求可能得到 `409 another run is active`。现在服务端暂存首个终止事件，待 Runner 退出并收齐事件后先释放准入，再发出终止事件；旧 handler 的延迟清理按 run ID 守卫，不能清掉新一轮。不以客户端重试掩盖竞态。`internal/httpapi/run_completion_test.go` 用确定性的 flush 回调覆盖同一会话收到 finished / failed / cancelled / 补发终止后立即继续、提前 emit 终止但 Runner 尚未退出、旧 handler 清理与新运行交错。旧实现回归测试失败，修复后相关生命周期测试以 `-race -count=20` 通过，`internal/httpapi`、`internal/agent`、`internal/store` 三包 race 回归通过；移除 run ID 守卫的临时缺陷版本会被“旧 handler 不得释放新运行”测试抓住。本次没有真实模型或浏览器端到端验证，不替代发布检查。
 
+## 未发布：记忆检索与分页
+
+`luna_recall` 新增可选的 `query`、`offset`、`limit`，让默认最新 50 条窗口之外、但仍在存储中的有效事实可以被找回。查询为忽略大小写的字面量子串，先筛选整个有效集合再分页；偏移从较新端计数，页内仍从旧到新。结果说明匹配与剩余范围，提供 `next_offset`，并区分空存储、无匹配与超出末尾的空页。每次调用现读，明确说明事实变化可能移动偏移，不伪装为冻结快照。
+
+默认调用及结果格式保持兼容，包括原有根 `null`；无新增工具、路由、依赖或 JSONL 迁移。Memory 注入窗口、仅追加与用户撤回语义不变；本切片不增加会话全文搜索、向量检索或自动总结。
+
+验证入口：`internal/plugins/memory/recall_test.go` 覆盖窗口外检索、逐页覆盖、Unicode/字面量、参数拒绝与只读；`kernel_integration_test.go` 用真实 Memory、Agent 工具包装与会话落盘，加假模型驱动，验证工具 schema、结果、失败调用记录和停用移除。发布验证和真实模型行为不由这些测试代替。
+
+**本切片验证**：先记录旧实现拒绝新参数的失败，再实现并使回归通过；将筛选错误地放在最新 50 条窗口之后的临时版本，会被“窗口外旧事实必须可找到”用例抓住。`go test -race ./internal/plugins/memory -run TestRecall -count=20` 通过，Memory、Agent、HTTP、插件注册和 Workspace 五个相关包的 race 回归及 vet 通过，gofmt 与 diff 检查无问题。额外验证长查询不会使空结果因回显输入而膨胀。没有新增依赖、真实模型调用或浏览器验收。
+
 ## 构建方式
 
 一次一个切片。切片通过编译加上聚焦的单元测试来验证；针对真实 provider 的端到端验证

@@ -37,7 +37,7 @@ const (
 	// recallDescription is the tool's model-visible description. It states when
 	// to reach for it and what it will not do, because a listing tool the model
 	// could mistake for a write is worse than no listing tool at all.
-	recallDescription = "List the facts about the user that are in effect right now, each with the time it was recorded. Use it when you want to confirm what you already know about the user, or when you are unsure whether something was stored before; it only reads and never changes anything. A fact the user retracted is not in the list. The list is capped, and a list that stopped at the cap says how many of how many it returned and where it stopped. No stored fact at all is an ordinary answer, not an error."
+	recallDescription = "List the facts about the user that are in effect right now, each with the time it was recorded. Use it when you want to confirm what you already know about the user, or when you are unsure whether something was stored before; it only reads and never changes anything. A fact the user retracted is not in the list. The list is capped, and a list that stopped at the cap says how many of how many it returned and where it stopped. No stored fact at all is an ordinary answer, not an error. With no arguments, return the newest 50 facts at most, displayed oldest first. To find older facts, query is an optional case-insensitive literal substring of fact text, not a regex; it searches all effective facts before paging. offset skips that many newer matching facts (default 0), and limit sets the page size (1..50, default 50). Each page is still displayed oldest first. Use next_offset with the same query to read the next older page; when a default listing stops at 50, start the next page at offset 50. Each call reads the current facts, so new or retracted facts may shift offsets; this is not a frozen snapshot."
 
 	// recallEmpty is the whole model-visible result of a recall over an empty
 	// store. An empty store is not a failure: it is a store that holds nothing
@@ -143,9 +143,8 @@ func (t *RememberTool) Invoke(ctx context.Context, arguments string) (string, er
 	return rememberConfirmation, nil
 }
 
-// RecallTool is the plugin's luna_recall: the read half of the model's reach
-// into the store, and a read-only one. It takes no parameter at all, so there
-// is no input that could name a fact to change or remove, and it never writes.
+// RecallTool 是 Memory 的只读入口：可按事实文本检索并分页读取当前生效集合。
+// 参数只能选择读取范围，不会编辑、撤回或写入任何事实。
 //
 // It emits nothing, for the same reason RememberTool does not: the event stream
 // belongs to the Kernel.
@@ -160,12 +159,11 @@ func (t *RecallTool) Description() string { return recallDescription }
 
 func (t *RecallTool) Schema() *jsonschema.Schema { return recallSchema() }
 
-// recallSchema is the exact public schema of the read tool: an object with no
-// parameters and no additional properties, so a call carrying anything is
-// refused before the store is reached.
+// recallSchema 声明可选的查询和分页参数；未声明字段在读取存储前拒绝。
+// 所有参数均可省略，原有空参数调用仍是同一个最新事实窗口。
 func recallSchema() *jsonschema.Schema {
 	r := jsonschema.Reflector{DoNotReference: true, AllowAdditionalProperties: false}
-	return r.Reflect(struct{}{})
+	return r.Reflect(recallOptions{})
 }
 
 // plural renders "1 fact" / "2 facts". It exists so the model-visible lines
@@ -216,12 +214,8 @@ func recallListing(facts []Fact) string {
 // a failed write is: a listing that quietly reported an empty memory would tell
 // the model it remembers nothing, which is not what happened.
 func (t *RecallTool) Invoke(_ context.Context, arguments string) (string, error) {
-	// The tool takes no parameters, so the model calling it with no arguments
-	// at all — an empty string — means the same as an empty object.
-	if strings.TrimSpace(arguments) == "" {
-		arguments = "{}"
-	}
-	if err := decodeOne(arguments, &struct{}{}); err != nil {
+	options, err := parseRecallOptions(arguments)
+	if err != nil {
 		return "", err
 	}
 	if t.store == nil {
@@ -231,5 +225,5 @@ func (t *RecallTool) Invoke(_ context.Context, arguments string) (string, error)
 	if err != nil {
 		return "", plugin.Unavailable(fmt.Errorf("read the stored facts: %w", err))
 	}
-	return recallListing(facts), nil
+	return recallPage(facts, options), nil
 }

@@ -450,9 +450,8 @@ func TestRecallOnAnEmptyStoreIsAnHonestEmptyAnswer(t *testing.T) {
 	}
 }
 
-// luna_recall is read-only: it takes no parameter, and calling it leaves the
-// store file byte for byte as it was.
-func TestRecallTakesNoParameterAndWritesNothing(t *testing.T) {
+// luna_recall 只有可选的读取参数；默认调用仍使存储文件保持逐字节不变。
+func TestRecallAcceptsOptionalReadParametersAndWritesNothing(t *testing.T) {
 	store := newRememberStore(t)
 	tool := NewRecallTool(store)
 	encoded, err := json.Marshal(tool.Schema())
@@ -466,8 +465,20 @@ func TestRecallTakesNoParameterAndWritesNothing(t *testing.T) {
 	if raw["type"] != "object" || raw["additionalProperties"] != false {
 		t.Fatalf("the read schema is not a strict object: %s", encoded)
 	}
-	if properties, ok := raw["properties"].(map[string]any); !ok || len(properties) != 0 {
-		t.Fatalf("the read tool exposes a parameter: %s", encoded)
+	properties, ok := raw["properties"].(map[string]any)
+	if !ok || len(properties) != 3 {
+		t.Fatalf("expected only query, offset and limit: %s", encoded)
+	}
+	for name, wantType := range map[string]string{"query": "string", "offset": "integer", "limit": "integer"} {
+		field, ok := properties[name].(map[string]any)
+		if !ok || field["type"] != wantType {
+			t.Fatalf("%s must be %s: %s", name, wantType, encoded)
+		}
+	}
+	if properties["offset"].(map[string]any)["minimum"] != float64(0) ||
+		properties["limit"].(map[string]any)["minimum"] != float64(1) ||
+		properties["limit"].(map[string]any)["maximum"] != float64(MaxRecallFacts) {
+		t.Fatalf("schema must expose the pagination bounds: %s", encoded)
 	}
 	if _, ok := raw["required"]; ok {
 		t.Fatalf("the read tool requires a parameter: %s", encoded)
@@ -480,8 +491,7 @@ func TestRecallTakesNoParameterAndWritesNothing(t *testing.T) {
 	if len(before) == 0 {
 		t.Fatal("the fixture wrote nothing to check the read against")
 	}
-	// A call with no arguments at all is the call a tool with no parameters
-	// gets, and it means the same as an empty object.
+	// 新增参数不能破坏已有的默认调用（包括历史上接受的根 null）。
 	for _, arguments := range []string{`{}`, ``, `  `, `null`} {
 		if _, err := tool.Invoke(runCtx("session-7"), arguments); err != nil {
 			t.Fatalf("arguments %q: %v", arguments, err)
@@ -492,9 +502,8 @@ func TestRecallTakesNoParameterAndWritesNothing(t *testing.T) {
 	}
 }
 
-// A call that carries anything at all is refused, and the refusal reaches
-// nothing: the read tool has no input that could name a fact.
-func TestRecallRefusesACallThatCarriesAnArgument(t *testing.T) {
+// 未知字段不能借读取入口变成写入或撤回操作。
+func TestRecallRefusesUnknownArguments(t *testing.T) {
 	for _, arguments := range []string{`{"text":"writes Go"}`, `{"action":"delete"}`, `{"at":"2026-09-25T10:00:00Z"}`, `[]`, `"text"`, `not json`, `{"text":"a"}{"text":"b"}`} {
 		store := newRememberStore(t)
 		_, err := NewRecallTool(store).Invoke(runCtx("session-7"), arguments)

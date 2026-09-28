@@ -15,12 +15,8 @@ const (
 	MaxInjectFacts = 50
 	MaxInjectBytes = 8 * 1024
 
-	// MaxRecallFacts bounds how many facts luna_recall returns in one call. It
-	// is declared here, next to the injection cap, and is the same number on
-	// purpose: a listing the model asked for is the same model-visible window
-	// one run may carry, not a second scale of its own. A listing that stops at
-	// it says so, so the model knows it is reading a window rather than the
-	// whole store.
+	// MaxRecallFacts 限制一次检索返回的事实条数，不限制检索范围；分页可以
+	// 继续读取较旧匹配。默认窗口与注入条数上限一致，注入策略本身不变。
 	MaxRecallFacts = MaxInjectFacts
 )
 
