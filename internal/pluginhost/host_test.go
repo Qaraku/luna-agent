@@ -479,6 +479,41 @@ func TestSearchFilesCarriesTheModeAcrossThePluginBoundary(t *testing.T) {
 	}
 }
 
+// Both new arguments cross the candidate boundary. A candidate that dropped one would answer
+// the call as though it had not been given at all, and every other test here runs v1, so this
+// switches to v2 and asks again. What is being checked is the argument, not the rendering: v2
+// renders sizes in exact bytes and trims indentation on purpose.
+func TestTheNewArgumentsReachTheV2CandidateToo(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "sub", "deep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "sub", "deep", "notes.md"), []byte("abc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := testHost(t, Options{ReadRoot: root, ReadLimit: 4096})
+	if err := h.Reload(context.Background(), "v2"); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	out, err := h.ListDir(ctx, ListRequest{Path: ".", Depth: 3})
+	if err != nil {
+		t.Fatalf("listing three levels deep on v2: %v", err)
+	}
+	if !strings.Contains(out.Result, filepath.Join("sub", "deep", "notes.md")) {
+		t.Fatalf("the v2 candidate did not list as deep as it was told to: %q", out.Result)
+	}
+
+	out, err = h.SearchFiles(ctx, SearchRequest{Path: ".", Query: "a.c", Mode: "regex"})
+	if err != nil {
+		t.Fatalf("regex search on v2: %v", err)
+	}
+	if !strings.Contains(out.Result, "notes.md") {
+		t.Fatalf("the v2 candidate did not read the query as a pattern: %q", out.Result)
+	}
+}
+
 // A file call is checked against the roots that call names, not against whatever
 // the host was built with: the working directories of the run decide what the
 // model may reach. A call that names none keeps the configured root, which is
