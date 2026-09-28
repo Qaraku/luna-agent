@@ -1045,10 +1045,7 @@ body {
 .section-heading span { color: var(--luna-text-muted); font-size: var(--luna-font-label); }
 .settings-field { display: grid; gap: var(--luna-space-2); }
 .settings-field label { color: var(--luna-text-muted); font-size: var(--luna-font-meta); }
-/* 模型服务那一页的表单：地址、密钥、模型三行加一排动作，行距与设置里其他表单一致。 */
-.provider-form { display: grid; gap: var(--luna-space-3); margin: var(--luna-space-3) 0; }
 .settings-actions { display: flex; gap: var(--luna-space-2); }
-.provider-status { min-height: 18px; }
 .availability { min-height: 18px; margin: var(--luna-space-3) 0 0; color: var(--luna-text-muted); font-size: var(--luna-font-meta); }
 .availability.ready { color: var(--luna-success); }
 .availability.unavailable { color: var(--luna-danger); }
@@ -1143,6 +1140,57 @@ body {
 .settings-pane { display: grid; align-content: start; gap: var(--luna-space-3); }
 .settings-pane h3 { margin: 0; font-size: var(--luna-font-ui); font-weight: 600; }
 .settings-pane:focus-visible { outline: none; }
+
+/* --- 设置：模型服务（可命名的多 provider）-----------------------------------
+   一页两段：上面是 provider 列表，一行一个名字与它自己的设置，标出正在使用的那
+   一个；下面是编辑选中那一行的表单。只有这张表单里的内容会在点“保存”时提交，
+   行内动作各自提交一次完整文件。 */
+
+.provider-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--luna-space-3); }
+.provider-empty { margin: 0; color: var(--luna-text-muted); font-size: var(--luna-font-meta); line-height: 1.7; }
+.provider-list { display: grid; gap: var(--luna-space-2); margin: var(--luna-space-3) 0; padding: 0; list-style: none; }
+.provider-row {
+  display: grid;
+  gap: var(--luna-space-2);
+  padding: var(--luna-space-3);
+  border: 1px solid var(--luna-border-weak);
+  border-radius: var(--luna-radius-md);
+  background: var(--luna-raised);
+}
+.provider-row.is-active { border-color: var(--luna-accent); }
+.provider-row.is-editing { border-style: dashed; }
+.provider-title { display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--luna-space-2); }
+.provider-name { color: var(--luna-text); font-size: var(--luna-font-ui); font-weight: 600; overflow-wrap: anywhere; }
+.provider-badge {
+  padding: 0 var(--luna-space-2);
+  border: 1px solid var(--luna-border-weak);
+  border-radius: var(--luna-radius-xs);
+  color: var(--luna-text-muted);
+  font-size: var(--luna-font-label);
+  line-height: 18px;
+}
+.provider-badge.is-active { border-color: var(--luna-accent); color: var(--luna-text); }
+.provider-meta { margin: 0; color: var(--luna-text-muted); font: var(--luna-font-meta)/1.6 var(--luna-font-mono); overflow-wrap: anywhere; }
+.provider-actions { display: flex; flex-wrap: wrap; gap: var(--luna-space-2); }
+/* 行内动作都是公共控件类的按钮：这里只给它们高度与位置。 */
+.provider-use,
+.provider-edit,
+.provider-remove,
+.provider-model-remove,
+.provider-candidate-use,
+.provider-candidate-add { min-height: var(--luna-control-sm); }
+.provider-remove { margin-left: auto; }
+.provider-remove.is-armed { border-color: var(--luna-danger); color: var(--luna-danger); }
+.provider-candidate-use { overflow-wrap: anywhere; text-align: left; }
+.provider-form { display: grid; gap: var(--luna-space-3); margin: var(--luna-space-3) 0 0; }
+.provider-form h4 { margin: 0; }
+.provider-models { display: grid; gap: var(--luna-space-2); margin: 0; padding: 0; list-style: none; }
+.provider-model-row { display: flex; align-items: center; justify-content: space-between; gap: var(--luna-space-2); }
+.provider-model-name { color: var(--luna-text); font: var(--luna-font-meta)/1.6 var(--luna-font-mono); overflow-wrap: anywhere; }
+.provider-candidates { display: grid; gap: var(--luna-space-2); margin: 0; padding: 0; list-style: none; }
+.provider-candidate { display: flex; align-items: center; justify-content: space-between; gap: var(--luna-space-2); }
+.provider-status { min-height: 18px; }
+.provider-status.failure { color: var(--luna-danger); }
 
 /* --- 设置：能力清单 ---------------------------------------------------------
    一行一个能力：名称、形态、是否在服务，以及它贡献的工具、上下文、路由与面板。

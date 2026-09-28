@@ -1291,6 +1291,65 @@ function commandCandidates(commands, draft) {
   return { mode: 'options', items };
 }
 
+// provider 是一份可命名的设置：名字 → 接口地址、密钥与模型。下面这几个纯函数就是
+// 界面与服务端之间的那份形状：整份文件替换，密钥字段空着表示沿用同名 provider 已
+// 保存的那个，所以"没重填"永远不等于"清空"。
+function providerEndpointHost(baseURL) {
+  const text = String(baseURL ?? '').trim();
+  if (!text) return '';
+  const match = text.match(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^/?#]*)/);
+  return match ? match[1] : text;
+}
+
+// providerModelsList 收的是"其他模型"：去掉空白、去掉与默认模型重复的名字，顺序照
+// 用户给的来。
+function providerModelsList(model, models) {
+  const wanted = String(model ?? '').trim();
+  const list = [];
+  for (const raw of models || []) {
+    const name = String(raw ?? '').trim();
+    if (!name || name === wanted || list.includes(name)) continue;
+    list.push(name);
+  }
+  return list;
+}
+
+// providerRequestBody 出的永远是整份文件：active 加全部 providers。不在数组里的
+// provider 就是被删掉的，所以改名字等于删掉旧的再加上新的。draft 是表单里正在编辑
+// 的那一份（可能还没保存过），按原名替换同名条目；没在编辑谁就传 null。
+function providerRequestBody(view, active, draft) {
+  const providers = [];
+  let draftBody = null;
+  if (draft) {
+    draftBody = {
+      name: String(draft.name ?? '').trim(),
+      base_url: String(draft.base_url ?? '').trim(),
+      model: String(draft.model ?? '').trim(),
+      models: providerModelsList(draft.model, draft.models),
+      api_key: String(draft.api_key ?? ''),
+      clear_api_key: false
+    };
+  }
+  let placed = false;
+  for (const row of (view && view.providers) || []) {
+    if (draftBody && draft.originalName && row.name === draft.originalName) {
+      placed = true;
+      providers.push(draftBody);
+      continue;
+    }
+    providers.push({
+      name: row.name,
+      base_url: row.base_url || '',
+      model: row.model || '',
+      models: [...(row.models || [])],
+      api_key: '',
+      clear_api_key: false
+    });
+  }
+  if (draftBody && !placed) providers.push(draftBody);
+  return { active: String(active ?? ''), providers };
+}
+
 if (typeof module !== 'undefined') {
   module.exports = {
     parseEventBlock, toolSummary, toolLabel, toolActivityLabel, candidateLabel, reloadCopy, valueOrDash,
@@ -1316,7 +1375,8 @@ if (typeof module !== 'undefined') {
     SKILLS_PATH, SKILL_SCOPE_LABELS, SKILL_DESCRIPTION_MAX_CHARS,
     skillDescriptionText, skillScopeLabel, skillActionPath, skillRows,
     reasoningEffortView, REASONING_EFFORT_LEVELS,
-    commandNames, findCommand, commandMenuItem, commandList, commandCandidates
+    commandNames, findCommand, commandMenuItem, commandList, commandCandidates,
+    providerEndpointHost, providerModelsList, providerRequestBody
   };
 }
 
@@ -3036,100 +3096,301 @@ if (typeof document !== 'undefined') {
     await updateState();
   }
 
-  // --- 设置：模型服务（可编辑）-----------------------------------------------
-  // 这台机器调用哪个接口、用哪个密钥、问哪个模型，是安装的设置而不是启动参数：
-  // 界面把它写进 Luna 自己的 provider.yaml，下一次启动读的就是它。密钥只写不读 ——
-  // GET /api/provider 只回答"是否已设置"和末四位，所以这个输入框永远是空的，
-  // 空的意思就是"沿用已保存的那个"。
+  // --- 设置：模型服务（可命名的多 provider）-----------------------------------
+  // provider 是一份可命名的设置：名字 → 接口地址、密钥与模型，整份文件保存在 Luna
+  // 自己的 provider.yaml 里。每次写入提交的都是完整文件（active 加全部 providers），
+  // 服务端答复的视图就是重绘的依据。密钥只写不读 —— GET 只回答"是否已设置"和末四位，
+  // 所以这个输入框永远是空的，空的意思是"沿用同名 provider 已保存的那个"。
   const providerForm = $('provider-form');
+  const providerFormTitle = $('provider-form-title');
+  const providerList = $('provider-list');
+  const providerEmpty = $('provider-empty');
+  const providerAdd = $('provider-add');
+  const providerName = $('provider-name');
   const providerBaseURL = $('provider-base-url');
   const providerAPIKey = $('provider-api-key');
   const providerModel = $('provider-model');
-  const providerModelOptions = $('provider-model-options');
+  const providerModelExtra = $('provider-model-extra');
+  const providerModelExtraAdd = $('provider-model-extra-add');
+  const providerModels = $('provider-models');
+  const providerCandidates = $('provider-candidates');
   const providerKeyState = $('provider-key-state');
   const providerProbe = $('provider-probe');
   const providerStatus = $('provider-status');
-  // 最近一次从服务端读到的设置：保存与探测都以它为基础，界面不自己记密钥。
+  // 最近一次从服务端读到的设置：列表、行内动作与提交都以它为基础。
   let providerView = null;
+  // 正在编辑的那一份（表单内容）：整页唯一还没提交的本地状态。
+  let providerDraft = null;
+  // 最近一次探测到的候选：只显示，点一行才设成默认模型。
+  let providerProbeModels = [];
+  // 已经点过一次删除的那一行：第二次点击同一行才真的删，不用浏览器原生的确认对话框
+  // （它会把页面交出去，也没法在这套界面里被断言）。
+  let providerDeleteArmed = '';
+  // 一次操作后自己消失的瞬时反馈；需要用户处理的那类保留到下一次操作。
+  const PROVIDER_STATUS_LINGER = 4000;
+  let providerStatusTimer = null;
 
-  function setProviderStatus(text, className = '') {
+  function setProviderStatus(text, persist = false) {
+    if (providerStatusTimer !== null) {
+      clearTimeout(providerStatusTimer);
+      providerStatusTimer = null;
+    }
     providerStatus.textContent = text;
-    providerStatus.className = `luna-status provider-status${className ? ` ${className}` : ''}`;
+    providerStatus.className = `luna-status provider-status${persist ? ' failure' : ''}`;
+    if (!text || persist) return;
+    providerStatusTimer = setTimeout(() => {
+      providerStatusTimer = null;
+      providerStatus.textContent = '';
+      providerStatus.className = 'luna-status provider-status';
+    }, PROVIDER_STATUS_LINGER);
   }
 
-  // setProviderModelOptions 填的是输入框自己的候选（datalist）：下拉里有接口给出的
-  // 名字，也可以直接手打一个不在列表里的。候选只在探测成功后更新，重读这一页不会
-  // 把它们清掉。
-  function setProviderModelOptions(names) {
-    providerModelOptions.replaceChildren();
-    for (const name of names || []) {
-      const option = document.createElement('option');
-      option.value = name;
-      providerModelOptions.append(option);
+  // readProviderForm 把表单当下的内容读进草稿：表单是这一份的唯一真相，用户名一栏
+  // 改了什么，后面显示与提交都跟着走。
+  function readProviderForm() {
+    if (!providerDraft) return null;
+    providerDraft.name = providerName.value;
+    providerDraft.base_url = providerBaseURL.value;
+    providerDraft.model = providerModel.value;
+    providerDraft.api_key = providerAPIKey.value;
+    return providerDraft;
+  }
+
+  function providerDraftFromSaved(row) {
+    return {
+      originalName: row.name || '',
+      name: row.name || '',
+      base_url: row.base_url || '',
+      model: row.model || '',
+      models: [...(row.models || [])],
+      key_set: Boolean(row.key_set),
+      key_hint: row.key_hint || '',
+      api_key: '',
+      isNew: false,
+    };
+  }
+
+  function providerDraftNew() {
+    return {
+      originalName: '', name: '', base_url: '', model: '', models: [],
+      key_set: false, key_hint: '', api_key: '', isNew: true,
+    };
+  }
+
+  function providerTitleText(draft) {
+    if (!draft) return '新建 provider';
+    const name = draft.name.trim();
+    if (!draft.originalName) return name ? `新建 provider「${name}」` : '新建 provider';
+    if (name && name !== draft.originalName) return `编辑 provider「${draft.originalName}」→「${name}」`;
+    return `编辑 provider「${name}」`;
+  }
+
+  // 密钥只写不读：这一行能说的是"有没有"和末四位。名字是密钥的一部分 —— 服务端按
+  // 同名沿用，所以改了名字等于新建一个 provider，旧密钥不会跟过去。
+  function providerKeyStateText(draft) {
+    if (!draft) return '';
+    const name = draft.name.trim();
+    const hint = draft.key_hint ? `（${draft.key_hint}）` : '';
+    if (draft.key_set && draft.originalName && name !== draft.originalName) {
+      return `「${draft.originalName}」已有一个密钥${hint}，但密钥跟着名字走：改成「${name}」要重新填一遍。`;
+    }
+    if (draft.key_set) return `已保存一个密钥${hint}。换密钥就填新的；界面取不回原值。`;
+    return '还没有密钥：填一个再保存。';
+  }
+
+  // providerRowMeta 只显示端点的主机名：完整地址在表单里编辑，列表这一行回答的是
+  // "这是哪个端点、有几个模型、有没有密钥"。
+  function providerRowMeta(row) {
+    const host = providerEndpointHost(row.base_url);
+    const count = (row.model ? 1 : 0) + (row.models || []).length;
+    const key = row.key_set ? `密钥已保存${row.key_hint ? ` ${row.key_hint}` : ''}` : '没有密钥';
+    return [host || '没有接口地址', `${count} 个模型`, key].join(' · ');
+  }
+
+  function renderProviderModels() {
+    providerModels.replaceChildren();
+    for (const name of providerDraft ? providerDraft.models : []) {
+      const item = make('li', 'provider-model-row');
+      item.append(make('span', 'provider-model-name', name));
+      const remove = make('button', 'luna-button provider-model-remove', '移除');
+      remove.type = 'button';
+      remove.addEventListener('click', () => {
+        providerDraft.models = providerDraft.models.filter((model) => model !== name);
+        renderProviderModels();
+      });
+      item.append(remove);
+      providerModels.append(item);
     }
   }
 
-  // renderProvider 只改内容，不重建输入框：重读这一页不会清掉正在输入的内容，也不会
-  // 把焦点移走。
-  function renderProvider(view) {
-    providerView = view;
-    providerBaseURL.value = view.base_url || '';
-    providerModel.value = view.model || '';
+  function renderProviderCandidates() {
+    providerCandidates.replaceChildren();
+    providerCandidates.hidden = providerProbeModels.length === 0;
+    for (const name of providerProbeModels) {
+      const item = make('li', 'provider-candidate');
+      const use = make('button', 'luna-button provider-candidate-use', name);
+      use.type = 'button';
+      use.addEventListener('click', () => {
+        if (!providerDraft) return;
+        providerDraft.model = name;
+        providerModel.value = name;
+        setProviderStatus(`「${name}」成为默认模型；保存后写进文件。`);
+      });
+      const add = make('button', 'luna-button provider-candidate-add', '+ 其他模型');
+      add.type = 'button';
+      add.addEventListener('click', () => addProviderModel(name));
+      item.append(use, add);
+      providerCandidates.append(item);
+    }
+  }
+
+  function addProviderModel(name) {
+    if (!providerDraft) return;
+    const wanted = String(name || '').trim();
+    if (!wanted) return;
+    if (!providerDraft.models.includes(wanted)) providerDraft.models.push(wanted);
+    renderProviderModels();
+    setProviderStatus(`「${wanted}」加进其他模型；保存后写进文件。`);
+  }
+
+  // renderProviderForm 把草稿写回表单：输入框不重建，只改值，重绘不会把焦点移走。
+  function renderProviderForm() {
+    const draft = providerDraft;
+    providerFormTitle.textContent = providerTitleText(draft);
+    providerName.value = draft ? draft.name : '';
+    providerBaseURL.value = draft ? draft.base_url : '';
+    providerModel.value = draft ? draft.model : '';
+    // 界面从来没有密钥原值，所以这个框永远空的；空的意思是沿用，不是清空。
     providerAPIKey.value = '';
-    if (view.key_set) {
-      providerAPIKey.placeholder = `已保存 ${view.key_hint}，留空即沿用`;
-      providerKeyState.textContent = `已保存一个密钥（${view.key_hint}）。换密钥就填新的；界面取不回原值。`;
-    } else {
-      providerAPIKey.placeholder = '还没有密钥';
-      providerKeyState.textContent = '还没有密钥。';
-    }
-    const notes = [];
-    if ((view.missing || []).length > 0) notes.push(`还缺 ${view.missing.join('、')}。`);
-    if (view.restart_needed) notes.push('已保存的设置与这个进程正在用的不同：重启 Luna 后生效。');
-    setProviderStatus(notes.join(' '));
-    return view;
+    providerAPIKey.placeholder = draft && draft.key_set
+      ? `留空 = 沿用已保存的密钥（${draft.key_hint}）`
+      : '留空 = 沿用已保存的密钥';
+    providerKeyState.textContent = providerKeyStateText(draft);
+    renderProviderModels();
+    renderProviderCandidates();
   }
 
-  async function updateProvider() {
-    setProviderStatus('正在读取…');
+  function providerRowNode(row) {
+    const item = make('li', 'provider-row');
+    const active = Boolean(providerView) && providerView.active === row.name;
+    if (active) item.classList.add('is-active');
+    if (providerDraft && providerDraft.originalName === row.name) item.classList.add('is-editing');
+    const title = make('div', 'provider-title');
+    title.append(make('span', 'provider-name', row.name));
+    if (active) title.append(make('span', 'provider-badge is-active', '使用中'));
+    const actions = make('div', 'provider-actions');
+    const name = row.name;
+    if (!active) {
+      const use = make('button', 'luna-button provider-use', '设为使用中');
+      use.type = 'button';
+      use.addEventListener('click', () => setProviderActive(name));
+      actions.append(use);
+    }
+    const edit = make('button', 'luna-button provider-edit', '编辑');
+    edit.type = 'button';
+    edit.addEventListener('click', () => selectProviderForEdit(name));
+    const remove = make('button', `luna-button provider-remove${providerDeleteArmed === name ? ' is-armed' : ''}`,
+      providerDeleteArmed === name ? '再点一次删除' : '删除');
+    remove.type = 'button';
+    remove.addEventListener('click', () => armOrDeleteProvider(name));
+    actions.append(edit, remove);
+    item.append(title, make('p', 'provider-meta', providerRowMeta(row)), actions);
+    return item;
+  }
+
+  // renderProviderList 每次按数据重绘：行显示什么由服务端答复决定，"使用中"跟着
+  // active 走，密钥只有是否已设置与末四位。
+  function renderProviderList() {
+    const rows = (providerView && providerView.providers) || [];
+    providerList.replaceChildren();
+    for (const row of rows) providerList.append(providerRowNode(row));
+    providerEmpty.hidden = rows.length > 0;
+  }
+
+  // renderProvider 是读与写共用的落点：视图换成服务端刚报的那一份，草稿按需对账。
+  // 读（fromSave=false）不动正在编辑的内容；一次成功的写（fromSave=true）之后，草稿
+  // 换成服务端存下来的那一份 —— 除非调用方说这一份草稿还没被写出去（keepDraft）。
+  function renderProvider(view, { fromSave = false, keepDraft = false } = {}) {
+    providerView = view;
+    const providers = view.providers || [];
+    if (providerDraft && fromSave && !keepDraft) {
+      const saved = providers.find((row) => row.name === providerDraft.name.trim());
+      // 表单里的名字在服务端答复里有对应的一份：草稿换成它，密钥的"有没有"跟着刷新。
+      if (saved) providerDraft = providerDraftFromSaved(saved);
+    }
+    // 正在编辑的那一份在文件里已经不存在了（被删掉、或改过名字后被替换）：换回还在
+    // 的一份。还没保存过的新 provider（没有原名）不在此列。
+    if (providerDraft && providerDraft.originalName
+      && !providers.some((row) => row.name === providerDraft.originalName || row.name === providerDraft.name.trim())) {
+      providerDraft = null;
+    }
+    if (!providerDraft) {
+      const wanted = providers.find((row) => row.name === view.active) || providers[0];
+      providerDraft = wanted ? providerDraftFromSaved(wanted) : providerDraftNew();
+    }
+    providerDeleteArmed = '';
+    renderProviderList();
+    renderProviderForm();
+  }
+
+  // providerNote 说的是"现在能不能聊"：还缺什么、以及有没有使用中的那个。没有可说的
+  // 就返回空 —— 空态由列表那一段自己说。
+  function providerNote(view) {
+    const missing = (view.missing || []).filter(Boolean);
+    if (missing.length) return `还缺 ${missing.join('、')}。`;
+    if (!view.active && (view.providers || []).length) return '现在没有使用中的 provider：在列表里点一个「设为使用中」。';
+    return '';
+  }
+
+  async function updateProvider({ quiet = false } = {}) {
+    if (!quiet) setProviderStatus('正在读取…');
     try {
       const response = await fetch('/api/provider', { cache: 'no-store' });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      renderProvider(await response.json());
+      const view = await response.json();
+      renderProvider(view, { fromSave: false });
+      const note = providerNote(view);
+      setProviderStatus(note, Boolean(note));
+      return view;
     } catch (error) {
-      setProviderStatus(`读不到模型服务设置：${error.message}`, 'failure');
+      setProviderStatus(`读不到模型服务设置：${error.message}`, true);
+      return null;
     }
   }
 
   // 探测由服务端发起：密钥在它手里，浏览器只收到一张模型名单。失败时把接口自己的
   // 话原样显示出来 —— 一个人要改的是他刚填的那个地址或密钥。
   async function probeProviderModels() {
+    const draft = readProviderForm();
+    if (!draft) return;
     providerProbe.disabled = true;
     setProviderStatus('正在向接口要模型列表…');
     try {
       const response = await fetch('/api/provider/models', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ base_url: providerBaseURL.value.trim(), api_key: providerAPIKey.value }),
+        // api_key 空 = 沿用这个 provider 已保存的密钥：界面拿不到原值。
+        body: JSON.stringify({ name: draft.name.trim(), base_url: draft.base_url.trim(), api_key: draft.api_key }),
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = await response.json();
-      setProviderModelOptions(payload.models || []);
-      if (payload.problem) setProviderStatus(`接口说：${payload.problem}`, 'failure');
-      else setProviderStatus(`接口给出了 ${(payload.models || []).length} 个模型：模型一栏可以下拉选，也可以自己填。`);
+      providerProbeModels = (payload.models || []).map((name) => String(name)).filter(Boolean);
+      renderProviderCandidates();
+      // 探测失败是答案，不是错误页：把接口自己的话放在用户正在看的地方。
+      if (payload.problem) setProviderStatus(`接口说：${payload.problem}`, true);
+      else setProviderStatus(`接口给出了 ${providerProbeModels.length} 个模型：点一个设为默认模型，或加进其他模型。`);
     } catch (error) {
-      setProviderStatus(`探测失败：${error.message}`, 'failure');
+      setProviderStatus(`探测失败：${error.message}`, true);
     } finally {
       providerProbe.disabled = false;
     }
   }
   providerProbe.addEventListener('click', probeProviderModels);
 
-  providerForm.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const body = { base_url: providerBaseURL.value.trim(), model: providerModel.value.trim() };
-    // 空输入框的意思是"沿用"：界面从来没有过原值，不能把"没重填"当成"清空"。
-    if (providerAPIKey.value) body.api_key = providerAPIKey.value;
+  // commitProvider 是这一页唯一的写入路径：一次 PUT 提交完整文件，接着用服务端答复
+  // 的视图重绘、再读一次服务端，最后重新读一遍命令表 —— /model 的候选跟着 provider
+  // 一起变。失败时把服务端那句 error 显示在用户正在看的地方。
+  async function commitProvider(body, { keepDraft = false, success } = {}) {
     setProviderStatus('正在保存…');
     try {
       const response = await fetch('/api/provider', {
@@ -3139,11 +3400,118 @@ if (typeof document !== 'undefined') {
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-      renderProvider(payload);
-      setProviderStatus(payload.restart_needed ? '已保存。重启 Luna 后这个进程才会用它。' : '已保存，这个进程正在用的就是它。');
+      renderProvider(payload, { fromSave: true, keepDraft });
     } catch (error) {
-      setProviderStatus(`保存失败：${error.message}`, 'failure');
+      setProviderStatus(`保存失败：${error.message}`, true);
+      return false;
     }
+    const fresh = await updateProvider({ quiet: true });
+    if (fresh && success) setProviderStatus(success(fresh));
+    loadCommands();
+    return true;
+  }
+
+  // 保存成功说的只有一件事：这份设置写下去就是接下来在用的。这句是一次操作的结果，
+  // 自己消失。
+  function providerSavedMessage(view) {
+    return `已写入 ${view.file || 'provider.yaml'}：存下来就是接下来在用的。`;
+  }
+
+  // 行内「设为使用中」：整份文件照服务端当前的样子提交，只换 active。表单里还没保存
+  // 的编辑留在原处（keepDraft），不会被这一下顺手写进去，也不会被答复冲掉。
+  async function setProviderActive(name) {
+    if (!providerView || providerView.active === name) return;
+    await commitProvider(providerRequestBody(providerView, name, null), {
+      keepDraft: true,
+      success: () => `接下来用的是「${name}」。`,
+    });
+  }
+
+  // 删除要两次点击：第一下只把这一行变成"再点一次删除"，第二下才真的删。删的正好是
+  // 使用中的那个时，先把"使用中"换成另一个 —— 没有别的就先让用户建一个，绝不提交
+  // 一份 active 指向不存在名字的文件。
+  function armOrDeleteProvider(name) {
+    if (providerDeleteArmed !== name) {
+      providerDeleteArmed = name;
+      renderProviderList();
+      return;
+    }
+    providerDeleteArmed = '';
+    deleteProvider(name);
+  }
+
+  async function deleteProvider(name) {
+    if (!providerView) return;
+    const rest = (providerView.providers || []).filter((row) => row.name !== name);
+    let active = providerView.active || '';
+    if (active === name) {
+      if (!rest.length) {
+        renderProviderList();
+        setProviderStatus(`「${name}」是正在使用的那个：先建另一个 provider，再删它。`, true);
+        return;
+      }
+      active = rest[0].name;
+    }
+    await commitProvider(providerRequestBody({ providers: rest }, active, null), { keepDraft: true });
+  }
+
+  // 编辑一行的内容：草稿换成它，表单跟着填。这一下不发请求，改动要等"保存"。
+  function selectProviderForEdit(name) {
+    const row = (providerView && providerView.providers || []).find((item) => item.name === name);
+    if (!row) return;
+    providerDraft = providerDraftFromSaved(row);
+    providerProbeModels = [];
+    providerDeleteArmed = '';
+    renderProviderList();
+    renderProviderForm();
+  }
+
+  // 「添加 provider」只是把表单清成一份新的：不写文件，名字必填，存了才存在。
+  providerAdd.addEventListener('click', () => {
+    providerDraft = providerDraftNew();
+    providerProbeModels = [];
+    providerDeleteArmed = '';
+    renderProviderList();
+    renderProviderForm();
+    providerName.value = '';
+    providerName.focus();
+  });
+
+  providerModelExtraAdd.addEventListener('click', () => {
+    addProviderModel(providerModelExtra.value);
+    providerModelExtra.value = '';
+  });
+
+  // 名字一栏改了就更新派生文案（标题与密钥那一行）：密钥跟着名字走，改名字要说出来。
+  providerName.addEventListener('input', () => {
+    if (!providerDraft) return;
+    providerDraft.name = providerName.value;
+    providerFormTitle.textContent = providerTitleText(providerDraft);
+    providerKeyState.textContent = providerKeyStateText(providerDraft);
+  });
+
+  providerForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (!providerView) {
+      setProviderStatus('还没读到这台机器的设置：等这一页读出来再保存。', true);
+      return;
+    }
+    const draft = readProviderForm();
+    if (!draft) return;
+    const name = draft.name.trim();
+    if (!name) {
+      setProviderStatus('保存失败：provider 要有名字。', true);
+      return;
+    }
+    if ((providerView.providers || []).some((row) => row.name === name && row.name !== draft.originalName)) {
+      setProviderStatus(`保存失败：已经有一个叫「${name}」的 provider 了。`, true);
+      return;
+    }
+    // active 不能指向不存在的名字：改名字的人正好在用这一份时，跟着新名字走；全新装
+    // 的那一份存下来就是接下来要用的。
+    let active = providerView.active || '';
+    if (!active || active === draft.originalName) active = name;
+    await commitProvider(providerRequestBody(providerView, active, draft), { success: providerSavedMessage });
   });
 
   // 模型服务参数是这台机器启动时定下的，界面只读显示：模型、提供方与思考档位来自

@@ -3475,112 +3475,350 @@ test('a capability panel that fails keeps its own message, unmount failure inclu
   assert.equal(capabilityPanelUnmountError('记忆', 'boom'), '能力面板 记忆 关闭时清理失败，容器已移除：boom');
 });
 
-test('设置里的模型服务可以读回地址与模型，密钥只说是"已设置"', async () => {
-  // 密钥只写不读：接口只回答"是否已设置"和末四位，所以输入框永远是空的，留空的意思
-  // 是沿用。这条用例钉住的是这三件事一起成立，而不是分开成立。
-  const h = navigationHarness({ respond: async (url) => {
-    if (url === '/api/provider') {
-      return { ok: true, json: async () => ({
-        base_url: 'https://api.test/v1', model: 'alpha', key_set: true, key_hint: '••••abcd',
-        configured: true, missing: [], file: 'provider.yaml', restart_needed: false,
-      }) };
+// provider 这一页的夹具：一份 GET /api/provider 的视图。密钥原值只存在于服务端手
+// 里，界面拿到的永远只有 key_set 与末四位。
+const providerSecret = 'sk-live-do-not-render-me';
+function providerFixture(overrides = {}) {
+  return {
+    active: 'deepseek',
+    providers: [
+      { name: 'deepseek', base_url: 'https://api.deepseek/v1', model: 'deepseek-chat',
+        models: ['deepseek-reasoner'], key_set: true, key_hint: '••••1234' },
+      { name: 'local', base_url: 'https://localhost:11434/v1', model: 'qwen',
+        models: [], key_set: false, key_hint: '' },
+    ],
+    configured: true,
+    missing: [],
+    file: 'provider.yaml',
+    ...overrides,
+  };
+}
+
+// providerServer 按冻结的接口语义回话：GET 回答当前视图；PUT 整份替换（不在
+// providers 里的就不存在了），api_key 空 = 沿用同名 provider 已保存的那个；探测回
+// 服务端手里那份候选。夹具里的 key_hint 只有末四位，原值从不出现。
+function providerServer(initial = providerFixture()) {
+  const before = new Map(initial.providers.map((row) => [row.name, row]));
+  const server = {
+    view: initial, writes: [], probes: [], probeResult: { models: [], problem: '' },
+  };
+  server.respond = async (url, options) => {
+    if (url === '/api/provider/models') {
+      server.probes.push(JSON.parse(options.body));
+      return { ok: true, json: async () => server.probeResult };
     }
-  } });
+    if (url !== '/api/provider') return undefined;
+    if (!options || options.method !== 'PUT') return { ok: true, json: async () => server.view };
+    const body = JSON.parse(options.body);
+    server.writes.push(body);
+    server.view = {
+      ...server.view,
+      active: body.active,
+      configured: Boolean(body.active),
+      missing: body.active ? [] : ['provider'],
+      providers: body.providers.map((row) => {
+        const saved = before.get(row.name);
+        return {
+          name: row.name, base_url: row.base_url, model: row.model, models: row.models,
+          key_set: row.api_key ? true : Boolean(saved && saved.key_set),
+          key_hint: row.api_key ? '••••0000' : (saved ? saved.key_hint : ''),
+        };
+      }),
+    };
+    return { ok: true, json: async () => server.view };
+  };
+  return server;
+}
+
+// flush 只推进任务队列，不排空基座的帧队列：瞬时反馈在自己的定时器到点之前还在屏
+// 幕上，这样用例看得到"一次操作的结果"这句话本身，settle() 之后看得到它消失。
+const providerFlush = async (times = 8) => {
+  for (let index = 0; index < times; index += 1) await new Promise((resolve) => setImmediate(resolve));
+};
+
+async function openProviderPane(h) {
   await h.settle();
   await h.click('settings-toggle');
   await h.click('settings-tab-model');
   await h.settle();
   await h.settle();
+}
 
-  assert.equal(h.$('provider-base-url').value, 'https://api.test/v1');
-  assert.equal(h.$('provider-model').value, 'alpha');
-  assert.equal(h.$('provider-api-key').value, '', '界面不回填密钥');
-  assert.match(h.$('provider-key-state').textContent, /••••abcd/);
-  assert.match(h.$('provider-api-key').placeholder, /留空即沿用/);
+test('provider 的写入形状是整份文件：空密钥沿用而不是清空，名字是密钥的一部分', () => {
+  const { providerEndpointHost, providerModelsList, providerRequestBody } = require('./app.js');
+  // 列表上只显示端点主机；不是 URL 就原样显示，不猜。
+  assert.equal(providerEndpointHost('https://api.test/v1'), 'api.test');
+  assert.equal(providerEndpointHost('  https://api.test:8443/v1/  '), 'api.test:8443');
+  assert.equal(providerEndpointHost('api.test/v1'), 'api.test/v1');
+  assert.equal(providerEndpointHost(''), '');
+  // "其他模型"去掉空白、去掉与默认模型重复的名字，也不留空名字。
+  assert.deepEqual(providerModelsList('alpha', ['beta', ' alpha ', '', 'beta', 'gamma']), ['beta', 'gamma']);
+  assert.deepEqual(providerModelsList('', undefined), []);
+
+  const view = providerFixture();
+  // 编辑其中一份：按原名替换，其他条目照原样带上（密钥留空 = 沿用）。
+  assert.deepEqual(
+    providerRequestBody(view, 'local', {
+      originalName: 'deepseek', name: 'deepseek', base_url: '  https://api.deepseek/v2 ',
+      model: ' m3 ', models: ['m2', 'm3'], api_key: 'new-key',
+    }),
+    {
+      active: 'local',
+      providers: [
+        { name: 'deepseek', base_url: 'https://api.deepseek/v2', model: 'm3', models: ['m2'], api_key: 'new-key', clear_api_key: false },
+        { name: 'local', base_url: 'https://localhost:11434/v1', model: 'qwen', models: [], api_key: '', clear_api_key: false },
+      ],
+    }
+  );
+  // 新建一份加在最后；改名 = 旧的离开数组、新的进来（不在数组里就是被删掉）。
+  const added = providerRequestBody(view, 'deepseek', { originalName: '', name: ' fresh ', base_url: ' https://f/v1 ', model: 'f', models: ['f2'], api_key: '' });
+  assert.deepEqual(added.providers.map((row) => row.name), ['deepseek', 'local', 'fresh']);
+  assert.deepEqual(added.providers.at(-1), { name: 'fresh', base_url: 'https://f/v1', model: 'f', models: ['f2'], api_key: '', clear_api_key: false });
+  // 没在编辑谁：整份照旧，active 就是这一次要写进去的那个名字。
+  assert.deepEqual(providerRequestBody(view, 'local', null).providers.map((row) => row.name), ['deepseek', 'local']);
 });
 
-test('保存模型服务时，空着的密钥不会被当成清空', async () => {
-  const h = navigationHarness({ respond: async (url, options) => {
-    if (url === '/api/provider' && options && options.method === 'PUT') {
-      return { ok: true, json: async () => ({
-        base_url: 'https://api.test/v1', model: 'alpha', key_set: true, key_hint: '••••abcd',
-        configured: false, missing: [], file: 'provider.yaml', restart_needed: true,
-      }) };
-    }
-    if (url === '/api/provider') {
-      return { ok: true, json: async () => ({
-        base_url: '', model: '', key_set: true, key_hint: '••••abcd',
-        configured: false, missing: ['base_url', 'model'], file: 'provider.yaml', restart_needed: true,
-      }) };
-    }
-  } });
-  await h.settle();
-  await h.click('settings-toggle');
+test('模型服务页把每个 provider 列成一行，标出使用中的那个，且从不渲染密钥原值', async () => {
+  const server = providerServer();
+  const h = navigationHarness({ respond: server.respond });
+  await openProviderPane(h);
+
+  const rows = () => h.$('provider-list').querySelectorAll('.provider-row');
+  assert.equal(rows().length, 2, '一行一个 provider');
+  assert.deepEqual(rows().map((row) => row.querySelector('.provider-name').textContent), ['deepseek', 'local']);
+  // 端点主机、模型数、有没有密钥（末四位）都在这一行里。
+  const meta = rows()[0].querySelector('.provider-meta').textContent;
+  assert.match(meta, /api\.deepseek/);
+  assert.match(meta, /2 个模型/);
+  assert.match(meta, /••••1234/);
+  assert.match(rows()[1].querySelector('.provider-meta').textContent, /没有密钥/);
+  // 「使用中」跟着数据走：只有它带徽标，也只有它没有"设为使用中"。
+  assert.equal(rows()[0].querySelectorAll('.provider-badge').length, 1);
+  assert.equal(rows()[1].querySelectorAll('.provider-badge').length, 0);
+  assert.equal(rows()[0].querySelectorAll('.provider-use').length, 0);
+  assert.equal(rows()[1].querySelectorAll('.provider-use').length, 1);
+  assert.equal(h.$('provider-empty').hidden, true, '有 provider 时不显示空态');
+
+  // 表单填的是选中的那一份（默认是使用中的那个）：名字、地址、默认模型、其他模型。
+  assert.equal(h.$('provider-name').value, 'deepseek');
+  assert.equal(h.$('provider-base-url').value, 'https://api.deepseek/v1');
+  assert.equal(h.$('provider-model').value, 'deepseek-chat');
+  assert.equal(h.$('provider-api-key').value, '', '界面不回填密钥');
+  assert.match(h.$('provider-api-key').placeholder, /留空 = 沿用/);
+  assert.match(h.$('provider-key-state').textContent, /••••1234/);
+  assert.deepEqual(h.$('provider-models').querySelectorAll('.provider-model-name').map((node) => node.textContent), ['deepseek-reasoner']);
+
+  // 密钥原值不在这台页面的任何位置：文本里只有末四位。
+  assert.equal(h.document.body.textContent.includes(providerSecret), false, '密钥原值不渲染');
+  assert.equal(h.$('provider-status').textContent, '', '能聊的时候状态行不写确认类文案');
+});
+
+test('「使用中」跟着服务端报的 active 走，不是本地记着的', async () => {
+  const server = providerServer();
+  const h = navigationHarness({ respond: server.respond });
+  await openProviderPane(h);
+  const badge = () => h.$('provider-list').querySelectorAll('.provider-badge').map((node) => node.closest('.provider-row').querySelector('.provider-name').textContent);
+  assert.deepEqual(badge(), ['deepseek']);
+
+  // 服务端那边换了使用中的那个：再读一次这一页，标记跟着数据走。
+  server.view = { ...server.view, active: 'local' };
   await h.click('settings-tab-model');
   await h.settle();
-  await h.settle();
-  assert.match(h.$('provider-status').textContent, /还缺 base_url、model/);
+  assert.deepEqual(badge(), ['local'], '标记来自答复里的 active');
+  // 表单不动：重读不会清掉正在编辑的那一份（人是先在表单里做事，才轮到后台重读）。
+  assert.equal(h.$('provider-name').value, 'deepseek', '重读不清掉正在编辑的内容');
+});
 
-  h.$('provider-base-url').value = 'https://api.test/v1';
-  h.$('provider-model').value = 'alpha';
+test('保存提交整份文件：active 加全部 providers，成功后重新读命令表', async () => {
+  const server = providerServer();
+  const h = navigationHarness({ respond: server.respond });
+  await openProviderPane(h);
+
+  // 编辑没有使用的那一份：改地址、加一个"其他模型"，密钥一栏不动。
+  h.$('provider-list').querySelectorAll('.provider-edit')[1].click();
+  await h.settle();
+  assert.equal(h.$('provider-name').value, 'local');
+  assert.equal(h.$('provider-form-title').textContent, '编辑 provider「local」');
+  h.$('provider-base-url').value = 'https://localhost:8080/v1';
+  h.$('provider-model-extra').value = 'qwen3';
+  h.$('provider-model-extra-add').click();
+  const commandsBefore = h.calls.filter(({ url }) => url === '/api/commands').length;
+  // 这一页自己的读次数：只数 GET，保存本身也是一次 /api/provider 调用。
+  const providerReads = () => h.calls.filter(({ url, options }) => url === '/api/provider' && !(options && options.method === 'PUT')).length;
+
+  h.$('provider-form').emit('submit');
+  await providerFlush();
+  assert.equal(server.writes.length, 1, '保存只发一次');
+  assert.deepEqual(server.writes[0], {
+    active: 'deepseek',
+    providers: [
+      { name: 'deepseek', base_url: 'https://api.deepseek/v1', model: 'deepseek-chat', models: ['deepseek-reasoner'], api_key: '', clear_api_key: false },
+      { name: 'local', base_url: 'https://localhost:8080/v1', model: 'qwen', models: ['qwen3'], api_key: '', clear_api_key: false },
+    ],
+  });
+  // 成功文案说清"存下来就是接下来在用的"，并且一个字都不提重启。
+  assert.match(h.$('provider-status').textContent, /已写入 provider\.yaml：存下来就是接下来在用的/);
+  assert.doesNotMatch(h.$('provider-status').textContent, /重启|启动参数/);
+  await h.settle();
+  // 保存后又读了一次服务端（列表与"使用中"永远是服务端报过的那一份），并重新读命
+  // 令表：/model 的候选跟着 provider 一起变。
+  assert.equal(providerReads(), 2, '保存后重新读一次设置');
+  assert.equal(h.calls.filter(({ url }) => url === '/api/commands').length, commandsBefore + 1, '保存后重新读一次命令表');
+  assert.match(h.$('provider-list').querySelectorAll('.provider-meta')[1].textContent, /localhost:8080/);
+});
+
+test('「添加 provider」从一份空表单开始：名字必填，存下去之前不发请求', async () => {
+  const server = providerServer();
+  const h = navigationHarness({ respond: server.respond });
+  await openProviderPane(h);
+
+  h.$('provider-add').click();
+  await h.settle();
+  assert.equal(h.$('provider-name').value, '');
+  assert.equal(h.$('provider-base-url').value, '');
+  assert.equal(h.$('provider-form-title').textContent, '新建 provider');
+  assert.equal(h.$('provider-model').value, '', '新的一份从空开始');
+
   h.$('provider-form').emit('submit');
   await h.settle();
+  assert.equal(server.writes.length, 0, '没有名字就不提交');
+  assert.equal(h.$('provider-status').textContent, '保存失败：provider 要有名字。');
+  assert.equal(h.$('provider-status').classList.contains('failure'), true);
+  // 这类要说给用户听的话保留到下一次操作，不自己消失。
   await h.settle();
-
-  const put = h.calls.filter(({ url, options }) => url === '/api/provider' && options && options.method === 'PUT');
-  assert.equal(put.length, 1, '保存只发一次');
-  assert.deepEqual(JSON.parse(put[0].options.body), { base_url: 'https://api.test/v1', model: 'alpha' });
-  assert.match(h.$('provider-status').textContent, /重启 Luna 后这个进程才会用它/);
+  assert.equal(h.$('provider-status').textContent, '保存失败：provider 要有名字。');
 });
 
-test('探测模型列表把候选放进模型一栏，失败时把接口自己的话显示出来', async () => {
-  const h = navigationHarness({ respond: async (url) => {
-    if (url === '/api/provider/models') {
-      return { ok: true, json: async () => ({ models: ['alpha', 'beta'], problem: '' }) };
-    }
-    if (url === '/api/provider') {
-      return { ok: true, json: async () => ({
-        base_url: 'https://api.test/v1', model: '', key_set: true, key_hint: '••••abcd',
-        configured: false, missing: ['model'], file: 'provider.yaml', restart_needed: false,
-      }) };
-    }
-  } });
-  await h.settle();
-  await h.click('settings-toggle');
-  await h.click('settings-tab-model');
-  await h.settle();
-  await h.settle();
-  await h.click('provider-probe');
-  await h.settle();
-  await h.settle();
+test('全新装的那一份 provider 存下来就成为接下来在用的那个', async () => {
+  const server = providerServer(providerFixture({ active: '', providers: [], configured: false, missing: ['provider'] }));
+  const h = navigationHarness({ respond: server.respond });
+  await openProviderPane(h);
+  assert.equal(h.$('provider-empty').hidden, false, '还没有 provider 时说明空态');
+  assert.match(h.$('provider-status').textContent, /还缺 provider/);
 
-  const options = h.$('provider-model-options').childNodes.map((node) => node.value);
-  assert.deepEqual(options, ['alpha', 'beta']);
-  assert.match(h.$('provider-status').textContent, /2 个模型/);
-  assert.equal(h.$('provider-probe').disabled, false, '探测结束后按钮可以再点');
+  h.$('provider-name').value = 'deepseek';
+  h.$('provider-base-url').value = 'https://api.deepseek/v1';
+  h.$('provider-model').value = 'deepseek-chat';
+  h.$('provider-form').emit('submit');
+  await h.settle();
+  assert.equal(server.writes.length, 1);
+  assert.equal(server.writes[0].active, 'deepseek', '存下来就是接下来在用的');
+  assert.deepEqual(server.writes[0].providers.map((row) => row.name), ['deepseek']);
+  assert.equal(h.$('provider-empty').hidden, true, '存下来之后列表里就有它了');
+  assert.equal(h.$('provider-list').querySelectorAll('.provider-badge').length, 1);
+});
+
+test('删除要两次点击，删掉使用中的那个会把「使用中」先交给还在的一份', async () => {
+  const server = providerServer();
+  const h = navigationHarness({ respond: server.respond });
+  await openProviderPane(h);
+  const remove = (index) => h.$('provider-list').querySelectorAll('.provider-remove')[index];
+
+  remove(0).click();
+  await h.settle();
+  assert.equal(server.writes.length, 0, '第一下只确认，不发请求');
+  assert.equal(remove(0).textContent, '再点一次删除');
+  assert.equal(remove(0).classList.contains('is-armed'), true);
+
+  remove(0).click();
+  await h.settle();
+  assert.equal(server.writes.length, 1);
+  assert.equal(server.writes[0].active, 'local', '「使用中」先交给还在的一份');
+  assert.deepEqual(server.writes[0].providers.map((row) => row.name), ['local']);
+  assert.deepEqual(h.$('provider-list').querySelectorAll('.provider-name').map((node) => node.textContent), ['local']);
+  assert.equal(h.$('provider-list').querySelectorAll('.provider-badge').length, 1, '还在的那份接着使用中');
+});
+
+test('只剩一个 provider 时删它会先说清楚要先建一个，绝不提交悬空的 active', async () => {
+  const server = providerServer(providerFixture({ providers: [providerFixture().providers[0]] }));
+  const h = navigationHarness({ respond: server.respond });
+  await openProviderPane(h);
+  const remove = () => h.$('provider-list').querySelector('.provider-remove');
+
+  remove().click();
+  await h.settle();
+  remove().click();
+  await h.settle();
+  assert.equal(server.writes.length, 0, 'active 不能指向一个不存在的名字');
+  assert.match(h.$('provider-status').textContent, /先建另一个 provider/);
+  assert.equal(h.$('provider-list').querySelectorAll('.provider-row').length, 1, '这一行还在');
+});
+
+test('获取模型列表把候选显示成可点的一行：点一个设为默认模型，或加进其他模型', async () => {
+  const server = providerServer();
+  server.probeResult = { models: ['probe-a', 'probe-b'], problem: '' };
+  const h = navigationHarness({ respond: server.respond });
+  await openProviderPane(h);
+
+  await h.click('provider-probe');
+  assert.deepEqual(server.probes, [
+    { name: 'deepseek', base_url: 'https://api.deepseek/v1', api_key: '' },
+  ], '密钥空着 = 沿用这个 provider 已保存的那个，界面从来没有原值');
+  const candidates = () => h.$('provider-candidates').querySelectorAll('.provider-candidate');
+  assert.deepEqual(candidates().map((row) => row.querySelector('.provider-candidate-use').textContent), ['probe-a', 'probe-b']);
+  assert.equal(h.$('provider-candidates').hidden, false);
+
+  candidates()[0].querySelector('.provider-candidate-use').click();
+  assert.equal(h.$('provider-model').value, 'probe-a', '点一个就是把它设成默认模型');
+  candidates()[1].querySelector('.provider-candidate-add').click();
+  assert.deepEqual(h.$('provider-models').querySelectorAll('.provider-model-name').map((node) => node.textContent),
+    ['deepseek-reasoner', 'probe-b'], '「+ 其他模型」把它加进这一份的其他模型里');
+  assert.equal(h.$('provider-candidates').hidden, false, '候选留在原处，不因为点过一次就消失');
+  // 一次操作的结果自己消失：不常驻在屏幕上。
+  await h.settle();
+  assert.equal(h.$('provider-status').textContent, '');
 });
 
 test('接口回绝探测时，界面显示的是接口说的话而不是一个笼统失败', async () => {
-  const h = navigationHarness({ respond: async (url) => {
-    if (url === '/api/provider/models') {
-      return { ok: true, json: async () => ({ models: [], problem: 'https://api.test/v1/models answered 401 Unauthorized: invalid key' }) };
-    }
-    if (url === '/api/provider') {
-      return { ok: true, json: async () => ({
-        base_url: 'https://api.test/v1', model: '', key_set: false, key_hint: '',
-        configured: false, missing: ['api_key', 'model'], file: 'provider.yaml', restart_needed: false,
-      }) };
-    }
-  } });
-  await h.settle();
-  await h.click('settings-toggle');
-  await h.click('settings-tab-model');
-  await h.settle();
-  await h.settle();
-  await h.click('provider-probe');
-  await h.settle();
-  await h.settle();
+  const server = providerServer();
+  server.probeResult = { models: [], problem: 'https://api.deepseek/v1/models answered 401 Unauthorized: invalid key' };
+  const h = navigationHarness({ respond: server.respond });
+  await openProviderPane(h);
 
+  await h.click('provider-probe');
   assert.match(h.$('provider-status').textContent, /401 Unauthorized/);
   assert.equal(h.$('provider-status').classList.contains('failure'), true);
+  assert.equal(h.$('provider-probe').disabled, false, '探测结束后按钮可以再点');
+});
+
+test('模型服务这一页的样式、结构与不写的写法', () => {
+  const html = source('index.html');
+  const css = source('style.css');
+  const js = source('app.js');
+  // 三个输入框换成"列表 + 编辑表单"：列表、添加动作、名字、其他模型、候选都在。
+  assert.match(html, /<ul id="provider-list" class="luna-list provider-list"><\/ul>/);
+  assert.match(html, /id="provider-add" class="luna-button" type="button">添加 provider</);
+  assert.match(html, /<label for="provider-name">名字<\/label>/);
+  assert.match(html, /id="provider-models" class="luna-list provider-models"/);
+  assert.match(html, /id="provider-candidates" class="luna-list provider-candidates" hidden/);
+  assert.equal(html.includes('provider-model-options'), false, '候选不再是一张 datalist');
+  assert.equal(html.includes('style='), false, 'HTML 里不写内联样式');
+  // 这一页不再说"重启"或"启动参数"：存下来就是接下来在用的。
+  const pane = html.slice(html.indexOf('id="settings-pane-model"'), html.indexOf('</section>', html.indexOf('id="settings-pane-model"')));
+  for (const text of ['重启', '启动参数']) {
+    assert.equal(pane.includes(text), false, `模型服务这一页不提${text}`);
+  }
+  const jsSection = js.slice(js.indexOf('// --- 设置：模型服务'), js.indexOf('// --- 设置：技能清单'));
+  assert.ok(jsSection.length > 0, '模型服务的脚本块必须在');
+  assert.doesNotMatch(jsSection, /restart_needed|重启|启动参数/);
+  assert.equal(js.includes('window.confirm'), false, '删除用两次点击确认，不用 window.confirm');
+  assert.equal(js.includes('innerHTML'), false);
+
+  // 脚本建出来的每个 class 都在样式表里有规则，且只用语义 token。
+  const selectors = ['.provider-head', '.provider-empty', '.provider-list', '.provider-row', '.provider-row.is-active',
+    '.provider-row.is-editing', '.provider-title', '.provider-name', '.provider-badge', '.provider-badge.is-active',
+    '.provider-meta', '.provider-actions', '.provider-use', '.provider-edit', '.provider-remove', '.provider-remove.is-armed',
+    '.provider-form', '.provider-models', '.provider-model-row', '.provider-model-name', '.provider-model-remove',
+    '.provider-candidates', '.provider-candidate', '.provider-candidate-use', '.provider-candidate-add',
+    '.provider-status', '.provider-status.failure'];
+  for (const selector of selectors) {
+    assert.ok(
+      [`${selector} {`, `${selector}:`, `${selector},`, `${selector}.`].some((form) => css.includes(form)),
+      `missing style ${selector}`
+    );
+  }
+  const block = css.slice(css.indexOf('/* --- 设置：模型服务（可命名的多 provider）'), css.indexOf('/* --- 设置：能力清单'));
+  assert.ok(block.length > 0, '模型服务的样式块必须在');
+  assert.equal(/gradient\s*\(/i.test(block), false);
+  assert.doesNotMatch(block, /#[0-9a-f]{3,8}\b/i, '颜色只来自 --luna-* token');
 });
