@@ -19,64 +19,169 @@ func env(values map[string]string) func(string) string {
 	return func(k string) string { return values[k] }
 }
 
-func TestLoadAcceptsAgreeingModelAliases(t *testing.T) {
-	cfg, err := Load(env(map[string]string{
-		"OPENAI_BASE_URL":   "https://example.test/v1",
-		"OPENAI_API_KEY":    "secret-value",
-		"OPENAI_MODEL_NAME": "demo",
-		"OPENAI_MODEL":      "demo",
-		"OPENAI_MODEL_ID":   "demo",
-	}), nil)
+// providerValues is what the settings page would have written: an endpoint, a
+// key and a model, and nothing else.
+func providerValues() ProviderValues {
+	return ProviderValues{BaseURL: "https://example.test/v1", APIKey: "test-key", Model: "test-model"}
+}
+
+func TestTheProviderFileIsTheSource(t *testing.T) {
+	cfg, err := Load(env(map[string]string{}), nil, providerValues())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Model != "demo" || cfg.ProviderHost != "example.test" {
+	if cfg.BaseURL != "https://example.test/v1" || cfg.APIKey != "test-key" || cfg.Model != "test-model" {
+		t.Fatalf("unexpected config: %#v", cfg)
+	}
+	if cfg.ProviderHost != "example.test" {
+		t.Fatalf("provider host = %q, want the endpoint's host", cfg.ProviderHost)
+	}
+	if len(cfg.Missing) != 0 {
+		t.Fatalf("a complete provider still reports missing fields: %v", cfg.Missing)
+	}
+}
+
+// A Luna that has never been configured must still start: the settings page that
+// fills this in is served by this same process, so refusing to start would make
+// the one thing that fixes it unreachable.
+func TestAnUnconfiguredProviderIsNotAnError(t *testing.T) {
+	cfg, err := Load(env(map[string]string{}), nil, ProviderValues{})
+	if err != nil {
+		t.Fatalf("an unconfigured Luna must start: %v", err)
+	}
+	want := []string{"base_url", "api_key", "model"}
+	if strings.Join(cfg.Missing, ",") != strings.Join(want, ",") {
+		t.Fatalf("missing = %v, want %v", cfg.Missing, want)
+	}
+	if len(cfg.Models) != 0 {
+		t.Fatalf("models = %+v, want none while the provider is unset", cfg.Models)
+	}
+}
+
+func TestAPartlyConfiguredProviderNamesWhatIsStillMissing(t *testing.T) {
+	cfg, err := Load(env(map[string]string{}), nil, ProviderValues{BaseURL: "https://example.test/v1", APIKey: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Missing) != 1 || cfg.Missing[0] != "model" {
+		t.Fatalf("missing = %v, want just the model", cfg.Missing)
+	}
+}
+
+// The settings page is where a provider is set most recently, so it wins where
+// the hand-written file also states something.
+func TestTheProviderFileWinsOverTheHandWrittenFile(t *testing.T) {
+	cfg, err := Load(env(map[string]string{}), &File{
+		Model:           "file-model",
+		BaseURL:         "https://file.example.test/v1",
+		ReasoningEffort: "high",
+	}, providerValues())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Model != "test-model" || cfg.ProviderHost != "example.test" {
+		t.Fatalf("the hand-written file won where the provider file stated a value: %#v", cfg)
+	}
+	// A run budget is not a provider setting: it is still the file's to state.
+	if cfg.ReasoningEffort != "high" {
+		t.Fatalf("reasoning effort = %q, want the file's level", cfg.ReasoningEffort)
+	}
+}
+
+// An installation configured entirely by hand keeps working: the hand-written
+// file fills in what the provider file leaves out.
+func TestTheHandWrittenFileFillsInWhatTheProviderFileLeavesOut(t *testing.T) {
+	cfg, err := Load(env(map[string]string{}), &File{
+		Model:   "file-model",
+		BaseURL: "https://file.example.test/v1",
+	}, ProviderValues{APIKey: "only-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Model != "file-model" || cfg.ProviderHost != "file.example.test" || cfg.APIKey != "only-key" {
 		t.Fatalf("unexpected config: %#v", cfg)
 	}
 }
 
-func TestLoadRejectsConflictingAliasesWithoutValues(t *testing.T) {
-	_, err := Load(env(map[string]string{
-		"OPENAI_BASE_URL": "https://example.test/v1", "OPENAI_API_KEY": "top-secret",
-		"OPENAI_MODEL_NAME": "model-a", "OPENAI_MODEL": "model-b",
-	}), nil)
-	if err == nil {
-		t.Fatal("expected conflict")
+// Naming a variable keeps a key out of a hand-written file, and it is only
+// consulted when the settings page has no key to offer.
+func TestTheHandWrittenFileMayNameAVariableForTheKey(t *testing.T) {
+	cfg, err := Load(env(map[string]string{"MY_PROVIDER_KEY": "chosen-name-key"}), &File{
+		Model:     "m",
+		BaseURL:   "https://example.test/v1",
+		APIKeyEnv: "MY_PROVIDER_KEY",
+	}, ProviderValues{})
+	if err != nil {
+		t.Fatal(err)
 	}
-	msg := err.Error()
-	for _, value := range []string{"model-a", "model-b", "top-secret"} {
-		if strings.Contains(msg, value) {
-			t.Fatalf("error leaked value %q: %s", value, msg)
-		}
-	}
-	if !strings.Contains(msg, "OPENAI_MODEL_NAME") || !strings.Contains(msg, "OPENAI_MODEL") {
-		t.Fatalf("missing variable names: %s", msg)
+	if cfg.APIKey != "chosen-name-key" {
+		t.Fatalf("the named variable was not read: %#v", cfg)
 	}
 }
 
-func TestLoadReportsMissingNamesOnly(t *testing.T) {
-	_, err := Load(env(map[string]string{}), nil)
-	if err == nil {
-		t.Fatal("expected missing error")
+// A file that names a variable nobody set is not an error the server refuses to
+// start on: it is a provider that is not configured yet, and the settings page
+// is what fills it in.
+func TestANamedVariableThatIsUnsetLeavesTheProviderUnconfigured(t *testing.T) {
+	cfg, err := Load(env(map[string]string{}), &File{
+		Model:     "m",
+		BaseURL:   "https://example.test/v1",
+		APIKeyEnv: "MY_PROVIDER_KEY",
+	}, ProviderValues{})
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, name := range []string{"OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL_NAME/OPENAI_MODEL/OPENAI_MODEL_ID"} {
-		if !strings.Contains(err.Error(), name) {
-			t.Fatalf("missing %s in %s", name, err)
+	if len(cfg.Missing) != 1 || cfg.Missing[0] != "api_key" {
+		t.Fatalf("missing = %v, want just the key", cfg.Missing)
+	}
+}
+
+// A key set through the settings page is the one that is used, even when the
+// hand-written file names a variable as well: two answers to "which key" is one
+// too many, and the settings page is the more specific of the two.
+func TestTheProviderKeyWinsOverANamedVariable(t *testing.T) {
+	cfg, err := Load(env(map[string]string{"MY_PROVIDER_KEY": "var-key"}), &File{
+		Model:     "m",
+		BaseURL:   "https://example.test/v1",
+		APIKeyEnv: "MY_PROVIDER_KEY",
+	}, ProviderValues{APIKey: "settings-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.APIKey != "settings-key" {
+		t.Fatalf("api key = %q, want the one the settings page holds", cfg.APIKey)
+	}
+}
+
+// A key that is set but unusable is the one thing an error must never quote.
+func TestTheKeyNeverAppearsInAnError(t *testing.T) {
+	_, err := Load(env(map[string]string{}), nil, ProviderValues{
+		BaseURL: "not-a-url", APIKey: "top-secret-value", Model: "m",
+	})
+	if err == nil {
+		t.Fatal("a relative base URL was accepted")
+	}
+	if strings.Contains(err.Error(), "top-secret-value") {
+		t.Fatalf("the error leaked the key: %v", err)
+	}
+}
+
+func TestLoadRejectsABaseURLThatCannotBeCalled(t *testing.T) {
+	for _, base := range []string{"example.test/v1", "ftp://example.test/v1", "https:///v1"} {
+		if _, err := Load(env(map[string]string{}), nil, ProviderValues{
+			BaseURL: base, APIKey: "k", Model: "m",
+		}); err == nil {
+			t.Fatalf("%q was accepted", base)
 		}
 	}
 }
 
 func effortEnv(level string) func(string) string {
-	return env(map[string]string{
-		"OPENAI_BASE_URL":   "https://example.test/v1",
-		"OPENAI_API_KEY":    "test-key",
-		"OPENAI_MODEL_NAME": "test-model",
-		ReasoningEffortEnv:  level,
-	})
+	return env(map[string]string{ReasoningEffortEnv: level})
 }
 
 func TestLoadCarriesTheChosenReasoningEffort(t *testing.T) {
-	cfg, err := Load(effortEnv("  High "), nil)
+	cfg, err := Load(effortEnv("  High "), nil, providerValues())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +191,7 @@ func TestLoadCarriesTheChosenReasoningEffort(t *testing.T) {
 }
 
 func TestLoadSendsNoReasoningEffortByDefault(t *testing.T) {
-	cfg, err := Load(effortEnv(""), nil)
+	cfg, err := Load(effortEnv(""), nil, providerValues())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +202,7 @@ func TestLoadSendsNoReasoningEffortByDefault(t *testing.T) {
 
 func TestLoadRejectsALevelTheAPIDoesNotDefine(t *testing.T) {
 	for _, level := range []string{"ultra", "xhigh", "max"} {
-		_, err := Load(effortEnv(level), nil)
+		_, err := Load(effortEnv(level), nil, providerValues())
 		if err == nil {
 			t.Fatalf("%q was accepted", level)
 		}
@@ -107,96 +212,6 @@ func TestLoadRejectsALevelTheAPIDoesNotDefine(t *testing.T) {
 		if strings.Contains(err.Error(), level) {
 			t.Fatalf("%q: the error quotes the rejected value: %v", level, err)
 		}
-	}
-}
-
-// fileEnv is an environment that is complete on its own, so a test can show what
-// the file changes rather than what it fills in.
-func fileEnv() func(string) string {
-	return env(map[string]string{
-		"OPENAI_BASE_URL":   "https://env.example.test/v1",
-		"OPENAI_API_KEY":    "env-key",
-		"OPENAI_MODEL_NAME": "env-model",
-	})
-}
-
-func TestTheFileOverridesTheEnvironment(t *testing.T) {
-	cfg, err := Load(fileEnv(), &File{
-		Model:           "file-model",
-		BaseURL:         "https://file.example.test/v1",
-		ReasoningEffort: "high",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Model != "file-model" || cfg.ProviderHost != "file.example.test" || cfg.ReasoningEffort != "high" {
-		t.Fatalf("the environment won where the file stated a value: %#v", cfg)
-	}
-	if cfg.APIKey != "env-key" {
-		t.Fatal("the key must still come from the environment variable the file names")
-	}
-}
-
-// The point of the file is that a user can configure Luna without a launcher
-// that exports variables.
-func TestTheFileSuppliesWhatTheEnvironmentLacks(t *testing.T) {
-	cfg, err := Load(env(map[string]string{"OPENAI_API_KEY": "only-key"}), &File{
-		Model:   "file-model",
-		BaseURL: "https://file.example.test/v1",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Model != "file-model" || cfg.ProviderHost != "file.example.test" || cfg.APIKey != "only-key" {
-		t.Fatalf("unexpected config: %#v", cfg)
-	}
-}
-
-// Naming the variable keeps the key out of the file, and the error for a key
-// that is not set must name the variable the user chose.
-func TestTheFileNameWhichVariableHoldsTheKey(t *testing.T) {
-	cfg, err := Load(env(map[string]string{
-		"OPENAI_BASE_URL": "https://example.test/v1",
-		"MY_PROVIDER_KEY": "chosen-name-key",
-	}), &File{Model: "m", APIKeyEnv: "MY_PROVIDER_KEY"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.APIKey != "chosen-name-key" {
-		t.Fatal("the named variable was not read")
-	}
-
-	_, err = Load(env(map[string]string{
-		"OPENAI_BASE_URL": "https://example.test/v1",
-		"OPENAI_API_KEY":  "unused-default",
-	}), &File{Model: "m", APIKeyEnv: "MY_PROVIDER_KEY"})
-	if err == nil {
-		t.Fatal("a named variable that is not set must be reported")
-	}
-	if !strings.Contains(err.Error(), "MY_PROVIDER_KEY") {
-		t.Fatalf("the error must name the variable the file chose: %v", err)
-	}
-}
-
-// A launcher that exports two different model aliases is a conflict worth
-// reporting — unless the file settles the question, in which case the
-// environment is no longer being asked.
-func TestAFileModelSettlesAConflictingEnvironment(t *testing.T) {
-	conflicting := env(map[string]string{
-		"OPENAI_BASE_URL":   "https://example.test/v1",
-		"OPENAI_API_KEY":    "key",
-		"OPENAI_MODEL_NAME": "model-a",
-		"OPENAI_MODEL":      "model-b",
-	})
-	if _, err := Load(conflicting, nil); err == nil {
-		t.Fatal("the conflict must be reported when nothing else decides it")
-	}
-	cfg, err := Load(conflicting, &File{Model: "file-model"})
-	if err != nil {
-		t.Fatalf("a model stated in the file must settle it: %v", err)
-	}
-	if cfg.Model != "file-model" {
-		t.Fatalf("model = %q", cfg.Model)
 	}
 }
 
@@ -243,7 +258,7 @@ func TestAFileIsReadWithItsValuesTrimmed(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("found=%v err=%v", found, err)
 	}
-	cfg, err := Load(env(map[string]string{"OPENAI_API_KEY": "k"}), &file)
+	cfg, err := Load(env(map[string]string{}), &file, ProviderValues{APIKey: "k"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,11 +287,11 @@ func TestAFileErrorNamesTheFileNameOnly(t *testing.T) {
 	}
 }
 
-// A user who configured nothing has one model: the one their settings already
-// resolve to. The list is never empty, because /model has to have something to
-// switch back to.
+// A user who configured one model has one model: the one the provider file
+// names. The list is never empty while a provider is configured, because /model
+// has to have something to switch back to.
 func TestTheDefaultModelIsTheWholeListWithoutAFile(t *testing.T) {
-	cfg, err := Load(fileEnv(), nil)
+	cfg, err := Load(env(map[string]string{}), nil, providerValues())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,37 +299,35 @@ func TestTheDefaultModelIsTheWholeListWithoutAFile(t *testing.T) {
 		t.Fatalf("models = %+v", cfg.Models)
 	}
 	only := cfg.Models[0]
-	if only.Name != "env-model" || only.BaseURL != "https://env.example.test/v1" ||
-		only.Provider != "env.example.test" || only.APIKeyEnv != "OPENAI_API_KEY" {
+	if only.Name != "test-model" || only.BaseURL != "https://example.test/v1" || only.Provider != "example.test" {
 		t.Fatalf("the default entry is not the effective configuration: %+v", only)
 	}
 }
 
 // Entries the file adds come after the default, and inherit what they leave out.
 // A user with one provider and several models writes only names.
-func TestFileModelsInheritTheEndpointAndKeyVariable(t *testing.T) {
-	cfg, err := Load(fileEnv(), &File{
+func TestFileModelsInheritTheEndpoint(t *testing.T) {
+	cfg, err := Load(env(map[string]string{}), &File{
 		Models: []Model{
 			{Name: "second"},
-			{Name: "third", BaseURL: "https://other.example.test/v1", APIKeyEnv: "OTHER_KEY", Provider: "Other"},
+			{Name: "third", BaseURL: "https://other.example.test/v1", Provider: "Other"},
 		},
-	})
+	}, providerValues())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(cfg.Models) != 3 {
 		t.Fatalf("models = %+v", cfg.Models)
 	}
-	if cfg.Models[0].Name != "env-model" {
+	if cfg.Models[0].Name != "test-model" {
 		t.Fatalf("the default must come first: %+v", cfg.Models)
 	}
 	inherited := cfg.Models[1]
-	if inherited.Name != "second" || inherited.BaseURL != "https://env.example.test/v1" ||
-		inherited.APIKeyEnv != "OPENAI_API_KEY" || inherited.Provider != "env.example.test" {
+	if inherited.Name != "second" || inherited.BaseURL != "https://example.test/v1" || inherited.Provider != "example.test" {
 		t.Fatalf("the second entry did not inherit: %+v", inherited)
 	}
 	own := cfg.Models[2]
-	if own.BaseURL != "https://other.example.test/v1" || own.APIKeyEnv != "OTHER_KEY" || own.Provider != "Other" {
+	if own.BaseURL != "https://other.example.test/v1" || own.Provider != "Other" {
 		t.Fatalf("the third entry did not keep its own values: %+v", own)
 	}
 }
@@ -324,16 +337,15 @@ func TestFileModelsInheritTheEndpointAndKeyVariable(t *testing.T) {
 // one.
 func TestADuplicateModelNameIsRefused(t *testing.T) {
 	cases := []struct {
-		name  string
-		file  *File
-		model string
+		name string
+		file *File
 	}{
-		{"twice in the file", &File{Models: []Model{{Name: "a"}, {Name: "a"}}}, ""},
-		{"once as the default", &File{Model: "env-model", Models: []Model{{Name: "env-model"}}}, ""},
+		{"twice in the file", &File{Models: []Model{{Name: "a"}, {Name: "a"}}}},
+		{"once as the default", &File{Models: []Model{{Name: "test-model"}}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := Load(fileEnv(), tc.file); err == nil {
+			if _, err := Load(env(map[string]string{}), tc.file, providerValues()); err == nil {
 				t.Fatal("the duplicate name was accepted")
 			}
 		})
@@ -351,20 +363,16 @@ func TestModelEntriesThatCannotBeUsedAreRefused(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := Load(fileEnv(), &File{Models: []Model{tc.entry}}); err == nil {
+			if _, err := Load(env(map[string]string{}), &File{Models: []Model{tc.entry}}, providerValues()); err == nil {
 				t.Fatalf("%+v was accepted", tc.entry)
 			}
 		})
 	}
 }
 
-// budgetEnv is a complete configuration whose two run budgets are the arguments.
+// budgetEnv is an environment whose two run budgets are the arguments.
 func budgetEnv(maxIterations, runTimeout string) func(string) string {
-	values := map[string]string{
-		"OPENAI_BASE_URL":   "https://example.test/v1",
-		"OPENAI_API_KEY":    "test-key",
-		"OPENAI_MODEL_NAME": "test-model",
-	}
+	values := map[string]string{}
 	if maxIterations != "" {
 		values[MaxIterationsEnv] = maxIterations
 	}
@@ -378,7 +386,7 @@ func budgetEnv(maxIterations, runTimeout string) func(string) string {
 // reads as "use your own default": the number is declared once, where it is
 // enforced, rather than repeated in the configuration.
 func TestUnstatedRunBudgetsResolveToZero(t *testing.T) {
-	cfg, err := Load(budgetEnv("", ""), nil)
+	cfg, err := Load(budgetEnv("", ""), nil, providerValues())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +396,7 @@ func TestUnstatedRunBudgetsResolveToZero(t *testing.T) {
 }
 
 func TestTheEnvironmentCarriesBothRunBudgets(t *testing.T) {
-	cfg, err := Load(budgetEnv("120", "25m"), nil)
+	cfg, err := Load(budgetEnv("120", "25m"), nil, providerValues())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,7 +409,7 @@ func TestTheEnvironmentCarriesBothRunBudgets(t *testing.T) {
 }
 
 func TestTheFileOverridesBothRunBudgets(t *testing.T) {
-	cfg, err := Load(budgetEnv("120", "25m"), &File{MaxIterations: 8, RunTimeout: " 90s "})
+	cfg, err := Load(budgetEnv("120", "25m"), &File{MaxIterations: 8, RunTimeout: " 90s "}, providerValues())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +439,7 @@ func TestRunBudgetsThatCannotBeUsedAreRefused(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Load(budgetEnv(tc.maxIterations, tc.runTimeout), tc.file)
+			_, err := Load(budgetEnv(tc.maxIterations, tc.runTimeout), tc.file, providerValues())
 			if err == nil {
 				t.Fatal("a budget that cannot be used was accepted")
 			}

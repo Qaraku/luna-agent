@@ -40,6 +40,16 @@ func (s *Server) requiresOrigin(method, path string) bool {
 	switch path {
 	case "/api/reload", "/api/runs":
 		return true
+	case providerPath:
+		// Saving a provider writes the file a run calls through, so it is a
+		// mutation in the same way starting a run is. A read method to this
+		// path is a wrong-method request and is answered 405.
+		return !isReadMethod(method)
+	case providerModelsPath:
+		// Asking the endpoint which models it serves spends this
+		// installation's key on an outbound call, so a foreign page must not be
+		// able to make Luna do it.
+		return true
 	}
 	if _, ok := cancelRunPath(path); ok {
 		// Stopping the active run is a kernel mutation in the same way starting

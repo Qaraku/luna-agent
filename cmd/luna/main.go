@@ -27,6 +27,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	skillsplugin "github.com/Qaraku/luna-agent/internal/plugins/skills"
 	"github.com/Qaraku/luna-agent/internal/plugins/workspace"
+	"github.com/Qaraku/luna-agent/internal/provider"
 	"github.com/Qaraku/luna-agent/internal/settings"
 	"github.com/Qaraku/luna-agent/internal/skills"
 	"github.com/Qaraku/luna-agent/internal/store"
@@ -289,6 +290,35 @@ func fileReason(err error) string {
 	return err.Error()
 }
 
+// providerConfig is the provider file as the HTTP layer uses it: the path is
+// known here, and the file's own format and permissions belong to
+// internal/provider. It is the same shape as the skill catalog: the composition
+// root supplies what the interface needs and owns where it is kept.
+type providerConfig struct{ path string }
+
+func (c providerConfig) Read() (provider.File, error) {
+	file, _, err := provider.LoadFile(c.path)
+	return file, err
+}
+
+func (c providerConfig) Write(file provider.File) error {
+	if err := provider.Save(c.path, file); err != nil {
+		return err
+	}
+	log.Printf("luna: provider: saved to %s", c.path)
+	return nil
+}
+
+// unconfiguredRunner is what runs before provider.yaml says where to call. It
+// fails every run with the one sentence a person can act on, and everything else
+// keeps working: the settings page that fixes this is served by the same process,
+// so a Luna that has never been configured is a Luna you can configure.
+type unconfiguredRunner struct{ missing []string }
+
+func (r unconfiguredRunner) Run(context.Context, agent.RunRequest) (string, error) {
+	return "", fmt.Errorf("this Luna has no provider configured yet: %s is unset. Fill it in on the settings page, which writes provider.yaml", strings.Join(r.missing, ", "))
+}
+
 // configFileFor decides which configuration file to read: an explicit
 // -config-file always wins, otherwise the file lives in the user's own
 // configuration directory, which is the one place a user can edit without
@@ -298,6 +328,14 @@ func configFileFor(explicit, configDir string) string {
 		return explicit
 	}
 	return filepath.Join(configDir, config.FileName)
+}
+
+// providerFileFor is where the provider file lives: beside the user's other
+// configuration, in the directory they own. There is no flag for it, because it
+// is not a launch-time choice — it is the installation's provider, and the
+// settings page writes it where the next start will read it.
+func providerFileFor(configDir string) string {
+	return filepath.Join(configDir, provider.FileName)
 }
 
 // userConfig reads the user's configuration file and returns it, or nil when
@@ -453,9 +491,24 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	cfg, err := config.Load(os.Getenv, configFile)
+	// The provider file is Luna's own: the settings page writes it, and this is
+	// where it reads it back. A file that is not there yet means this Luna has
+	// never been configured, which is a starting state rather than a failure.
+	prov, provFound, err := provider.LoadFile(providerFileFor(paths.Config))
 	if err != nil {
 		return err
+	}
+	if provFound {
+		log.Printf("luna: provider: reading %s", providerFileFor(paths.Config))
+	}
+	cfg, err := config.Load(os.Getenv, configFile, config.ProviderValues{BaseURL: prov.BaseURL, APIKey: prov.APIKey, Model: prov.Model})
+	if err != nil {
+		return err
+	}
+	if len(cfg.Missing) > 0 {
+		// Not fatal on purpose: the settings page that fills this in is served
+		// by this process, so refusing to start would make it unreachable.
+		log.Printf("luna: provider: not configured yet — %s is unset; fill it in on the settings page", strings.Join(cfg.Missing, ", "))
 	}
 	executable, err := os.Executable()
 	if err != nil {
@@ -572,9 +625,16 @@ func run() error {
 	// The store is both sides of the conversation: history is read from it and
 	// the transcript of every run is appended to it. Capabilities are assembled
 	// from the registry, which is what makes them capabilities rather than core.
-	runner, err := agent.NewOpenAIRunner(ctx, cfg, plugins, plugins, agent.WithHistory(sessions), agent.WithTranscript(sessions), agent.WithCapabilities(registry))
-	if err != nil {
-		return fmt.Errorf("construct Eino agent: %w", err)
+	//
+	// A Luna with no provider yet gets a runner that says so rather than one that
+	// cannot be built: the settings page that fixes it is served right here.
+	var runner httpapi.Runner = unconfiguredRunner{missing: cfg.Missing}
+	if len(cfg.Missing) == 0 {
+		built, err := agent.NewOpenAIRunner(ctx, cfg, plugins, plugins, agent.WithHistory(sessions), agent.WithTranscript(sessions), agent.WithCapabilities(registry))
+		if err != nil {
+			return fmt.Errorf("construct Eino agent: %w", err)
+		}
+		runner = built
 	}
 	// The command table is built once, here, from the kernel's own commands plus
 	// what this configuration offers. It is handed to the server instead of to
@@ -596,7 +656,7 @@ func run() error {
 	// 运行预算与 HTTP 写入截止时间必须互相说得通：一次运行有权用到它自己的预算为止，
 	// 所以写入截止时间要**高于**预算，而不是替预算结束运行（见 writeDeadlineFor）。
 	runTimeout := httpapi.RunTimeoutFor(cfg.RunTimeout)
-	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(newSkillCatalog(skillSet, settingsPath, userSettings)), httpapi.WithWorkspaces(workspaceStore), httpapi.WithRunTimeout(runTimeout))
+	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, BaseURL: cfg.BaseURL, Missing: cfg.Missing, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(newSkillCatalog(skillSet, settingsPath, userSettings)), httpapi.WithWorkspaces(workspaceStore), httpapi.WithProvider(providerConfig{path: providerFileFor(paths.Config)}), httpapi.WithRunTimeout(runTimeout))
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: writeDeadlineFor(runTimeout), IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() {

@@ -3,7 +3,6 @@ package config
 import (
 	"fmt"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +29,12 @@ type Config struct {
 	// rather than repeated here.
 	MaxIterations int
 	RunTimeout    time.Duration
+	// Missing names the provider settings that are still unset, if any. A Luna
+	// that has never been configured is a first run rather than a failure: the
+	// settings page that fills this in is served by the same process, so
+	// refusing to start would make the one thing that fixes it unreachable.
+	// When it is not empty, the rest of the provider fields are zero.
+	Missing []string
 }
 
 // ReasoningEffortEnv is where the level is read from. It is a separate variable
@@ -60,8 +65,11 @@ func ParseReasoningEffort(value string) (string, error) {
 }
 
 // APIKeyEnv is the environment variable the key is read from when the
-// configuration file does not name another one.
-const APIKeyEnv = "OPENAI_API_KEY"
+// configuration file names one and the provider file has no key of its own.
+// It is empty by default: a Luna configured through the settings page has no
+// use for a variable, and a default here would keep a second, invisible source
+// of the same value alive.
+const APIKeyEnv = ""
 
 // MaxIterationsEnv and RunTimeoutEnv are where the two run budgets are read
 // from when the configuration file states neither. They are separate variables
@@ -72,11 +80,19 @@ const (
 	RunTimeoutEnv    = "LUNA_RUN_TIMEOUT"
 )
 
-// ModelEnvNames are the environment variables a model may be named by, tried in
-// this order. They are aliases of one another, not a precedence chain: two that
-// disagree are refused, because which one a launcher meant is not something this
-// package can know.
-var ModelEnvNames = []string{"OPENAI_MODEL_NAME", "OPENAI_MODEL", "OPENAI_MODEL_ID"}
+// ProviderValues are the provider settings the settings page owns: the endpoint,
+// the key and the model. They are passed in as plain values rather than as the
+// file type they come from, so this package does not depend on the package that
+// owns that file.
+//
+// They are a source, not an override: whatever they state wins over the
+// hand-written file, because they are what this installation was told most
+// recently, and the settings page is where that happens.
+type ProviderValues struct {
+	BaseURL string
+	APIKey  string
+	Model   string
+}
 
 // ParseMaxIterations and ParseRunTimeout read one run budget each. The empty
 // string means "not stated" and resolves to zero, which the layer that enforces
@@ -109,21 +125,22 @@ func ParseRunTimeout(value string) (time.Duration, error) {
 	return d, nil
 }
 
-// Load resolves the configuration from its two sources: the environment, and
-// the user's configuration file. file may be nil, and then this is the
-// environment alone, which is how Luna has always been configured.
+// Load resolves the configuration from the files that state it: the provider
+// file the settings page writes, and the user's hand-written configuration file.
+// The environment still decides the two run budgets and the reasoning level,
+// which are choices about how a run is made rather than about who it calls.
 //
-// Where the file states a value it wins, and the environment fills whatever it
-// leaves out. The order is that way round because the file is the more specific
-// statement: it is written for this user, while the environment may come from a
-// shell profile or a launcher shared with other tools.
-func Load(getenv func(string) string, file *File) (Config, error) {
-	base := strings.TrimSpace(getenv("OPENAI_BASE_URL"))
-	keyEnv := APIKeyEnv
-	key := strings.TrimSpace(getenv(keyEnv))
+// Where both files state a provider setting, the provider file wins: it is what
+// this installation was told most recently, and the settings page is where that
+// happens. The hand-written file fills in what the provider file leaves out, so
+// an installation configured by hand keeps working.
+//
+// A provider that states nothing is not an error — see Config.Missing.
+func Load(getenv func(string) string, file *File, prov ProviderValues) (Config, error) {
+	base := strings.TrimSpace(prov.BaseURL)
+	key := strings.TrimSpace(prov.APIKey)
+	model := strings.TrimSpace(prov.Model)
 	effort := strings.TrimSpace(getenv(ReasoningEffortEnv))
-	model, _, modelErr := modelFromEnv(getenv)
-	modelSource := strings.Join(ModelEnvNames, "/")
 	maxIterations, err := ParseMaxIterations(getenv(MaxIterationsEnv))
 	if err != nil {
 		return Config{}, err
@@ -132,6 +149,7 @@ func Load(getenv func(string) string, file *File) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	keyEnv := ""
 
 	if file != nil {
 		stated := file.trimmed()
@@ -152,56 +170,57 @@ func Load(getenv func(string) string, file *File) (Config, error) {
 			}
 			runTimeout = parsed
 		}
-		if stated.BaseURL != "" {
-			base = stated.BaseURL
-		}
 		if stated.ReasoningEffort != "" {
 			effort = stated.ReasoningEffort
 		}
+		if base == "" {
+			base = stated.BaseURL
+		}
+		if model == "" {
+			model = stated.Model
+		}
 		if stated.APIKeyEnv != "" {
-			// The file names the variable, never the key itself; reading it is
-			// the same lookup the default goes through.
+			// The file names the variable, never the key itself. This is the
+			// remaining path for an installation configured entirely by hand;
+			// it is consulted only when the settings page has no key to offer.
 			keyEnv = stated.APIKeyEnv
-			key = strings.TrimSpace(getenv(keyEnv))
+			if key == "" {
+				key = strings.TrimSpace(getenv(keyEnv))
+			}
 		}
-		if stated.Model != "" {
-			// A model stated by name settles it: the environment's aliases are
-			// no longer being asked.
-			model, modelErr = stated.Model, nil
-			modelSource = "model in the configuration file"
-		}
-	}
-	if modelErr != nil {
-		return Config{}, modelErr
-	}
-
-	var missing []string
-	if base == "" {
-		missing = append(missing, "OPENAI_BASE_URL")
-	}
-	if key == "" {
-		missing = append(missing, keyEnv)
-	}
-	if model == "" {
-		missing = append(missing, modelSource)
-	}
-	if len(missing) > 0 {
-		return Config{}, fmt.Errorf("missing required configuration: %s (set it in the environment, or in the user configuration file)", strings.Join(missing, ", "))
-	}
-
-	u, err := url.Parse(base)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
-		return Config{}, fmt.Errorf("the provider base URL must be an absolute http(s) URL (set OPENAI_BASE_URL, or base_url in the user configuration file)")
 	}
 	level, err := ParseReasoningEffort(effort)
 	if err != nil {
 		return Config{}, err
 	}
+
+	cfg := Config{BaseURL: base, APIKey: key, Model: model, ReasoningEffort: level, MaxIterations: maxIterations, RunTimeout: runTimeout}
+	var missing []string
+	if base == "" {
+		missing = append(missing, "base_url")
+	}
+	if key == "" {
+		missing = append(missing, "api_key")
+	}
+	if model == "" {
+		missing = append(missing, "model")
+	}
+	if len(missing) > 0 {
+		cfg.Missing = missing
+		return cfg, nil
+	}
+
+	u, err := url.Parse(base)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return Config{}, fmt.Errorf("the provider base URL must be an absolute http(s) URL (the settings page writes provider.yaml; base_url there is the endpoint)")
+	}
 	models, err := modelList(model, base, keyEnv, u.Hostname(), file)
 	if err != nil {
 		return Config{}, err
 	}
-	return Config{BaseURL: base, APIKey: key, Model: model, ProviderHost: u.Hostname(), ReasoningEffort: level, Models: models, MaxIterations: maxIterations, RunTimeout: runTimeout}, nil
+	cfg.ProviderHost = u.Hostname()
+	cfg.Models = models
+	return cfg, nil
 }
 
 // modelList is the effective set of models a run may be sent to: the
@@ -243,30 +262,7 @@ func modelList(defaultModel, base, keyEnv, defaultHost string, file *File) ([]Mo
 	return models, nil
 }
 
-// modelFromEnv reads the model from whichever alias is set. The second return
-// value names the aliases that were set, for a caller that has to say what it
-// looked for.
-func modelFromEnv(getenv func(string) string) (string, []string, error) {
-	values := map[string]string{}
-	for _, name := range ModelEnvNames {
-		if value := strings.TrimSpace(getenv(name)); value != "" {
-			values[name] = value
-		}
-	}
-	var model string
-	var used []string
-	for _, name := range ModelEnvNames {
-		value, ok := values[name]
-		if !ok {
-			continue
-		}
-		used = append(used, name)
-		if model == "" {
-			model = value
-		} else if model != value {
-			sort.Strings(used)
-			return "", nil, fmt.Errorf("conflicting model environment variables: %s", strings.Join(used, ", "))
-		}
-	}
-	return model, used, nil
-}
+// modelFromEnv read the model from whichever alias was set. It is gone with the
+// environment variables it read: a model comes from the provider file, or from
+// the hand-written configuration file, and never from a variable that may or may
+// not have been exported by whatever launched the process.

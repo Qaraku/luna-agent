@@ -52,6 +52,14 @@ type Info struct {
 	BoundHost    string
 	Model        string
 	ProviderHost string
+	// BaseURL is the endpoint this process was started with. It is reported so
+	// the settings page can tell "what is stored" from "what this process is
+	// using" — the model is built once, so those two can differ until a restart.
+	BaseURL string
+	// Missing names the provider settings that were unset when this process
+	// started. A Luna in that state is running and cannot answer a run: the
+	// settings page that fills the gap is served by this process.
+	Missing []string
 	// Models are the models a run may be sent to, the default first. A runtime
 	// configured by environment variables alone has exactly one entry.
 	Models []ModelRef
@@ -88,10 +96,14 @@ type State struct {
 	// enforces: how many model turns a run may take, and how long it may take
 	// before it is stopped and reported as cancelled. They are reported because
 	// a bound that ends a run has to be visible in the product.
-	MaxIterations   int                 `json:"max_iterations,omitempty"`
-	RunTimeoutMS    int64               `json:"run_timeout_ms,omitempty"`
-	ModelConfigured bool                `json:"model_configured"`
-	ModelConnected  bool                `json:"model_connected"`
+	MaxIterations   int   `json:"max_iterations,omitempty"`
+	RunTimeoutMS    int64 `json:"run_timeout_ms,omitempty"`
+	ModelConfigured bool  `json:"model_configured"`
+	ModelConnected  bool  `json:"model_connected"`
+	// ProviderMissing names the provider settings this process started without.
+	// It is empty for a configured Luna, and a run started while it is not empty
+	// fails with a sentence naming them rather than with a provider error.
+	ProviderMissing []string            `json:"provider_missing,omitempty"`
 	Plugins         []pluginhost.Record `json:"plugins"`
 	Busy            bool                `json:"busy"`
 	CurrentRunID    string              `json:"current_run_id,omitempty"`
@@ -200,6 +212,10 @@ type Server struct {
 	// are installed and which of them the user turned off. It is supplied by
 	// the composition root, which also owns where that preference is stored.
 	skills SkillCatalog
+	// provider is the file the settings page edits: the endpoint, the key and
+	// the model. It is an interface because where that file lives, and how it
+	// is written, belong to the composition root.
+	provider ProviderConfig
 	// workspaces are the sets of directories work can happen in, as the
 	// composition root stores them. They are the same store the Workspace
 	// capability reads, so what this interface defines is what the next run
@@ -308,7 +324,7 @@ func (s *Server) state() State {
 	s.eventMu.Lock()
 	events := append([]LifecycleEvent{}, s.events...)
 	s.eventMu.Unlock()
-	return State{HostPID: os.Getpid(), StartedAt: s.started, Model: s.info.Model, ProviderHost: s.info.ProviderHost, ReasoningEffort: s.info.ReasoningEffort, MaxIterations: s.info.MaxIterations, RunTimeoutMS: s.runTimeout.Milliseconds(), ModelConfigured: s.info.Model != "" && s.info.ProviderHost != "", ModelConnected: s.connected.Load(), Plugins: ps.Plugins, Busy: busy, CurrentRunID: id, CurrentSessionID: sessionID, Events: events, Capabilities: capabilityViews(s.capabilities), Demo: true}
+	return State{HostPID: os.Getpid(), StartedAt: s.started, Model: s.info.Model, ProviderHost: s.info.ProviderHost, ReasoningEffort: s.info.ReasoningEffort, MaxIterations: s.info.MaxIterations, RunTimeoutMS: s.runTimeout.Milliseconds(), ModelConfigured: s.info.Model != "" && s.info.ProviderHost != "", ModelConnected: s.connected.Load(), Plugins: ps.Plugins, Busy: busy, CurrentRunID: id, CurrentSessionID: sessionID, Events: events, Capabilities: capabilityViews(s.capabilities), ProviderMissing: s.info.Missing, Demo: true}
 }
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -380,6 +396,21 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.sendSkills(w)
+	case providerPath:
+		switch r.Method {
+		case http.MethodGet:
+			s.getProvider(w)
+		case http.MethodPut:
+			s.setProvider(w, r)
+		default:
+			method(w, "GET, PUT")
+		}
+	case providerModelsPath:
+		if r.Method != http.MethodPost {
+			method(w, http.MethodPost)
+			return
+		}
+		s.probeProvider(w, r)
 	case workspacesPath:
 		switch r.Method {
 		case http.MethodGet:
