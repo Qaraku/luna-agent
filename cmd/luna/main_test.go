@@ -204,50 +204,188 @@ func TestResolveRootDeduplicatesCandidates(t *testing.T) {
 	}
 }
 
-func TestSessionsDirDefaultsUnderRoot(t *testing.T) {
-	got := sessionsDir("/repo", "")
-	want := filepath.Join("/repo", ".runtime", "sessions")
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
+// localData decides where the user's own local data lives. The new location is
+// under the XDG data root; the location used before this version is the
+// checkout's .runtime/ next to the sessions. Both decisions are made by what is
+// actually there, and each one is reported so the startup log can say which
+// location is in use and why.
+func TestLocalDataUsesTheDataRootWhenTheCheckoutHasNothing(t *testing.T) {
+	repo, data := t.TempDir(), t.TempDir()
+	sessions, state, notes := localData(data, repo)
+	if want := filepath.Join(data, "sessions"); sessions != want {
+		t.Fatalf("sessions = %q, want %q", sessions, want)
+	}
+	if want := data; state != want {
+		t.Fatalf("state root = %q, want %q", state, want)
+	}
+	assertNotes(t, notes, sessions, data)
+}
+
+func TestLocalDataKeepsTheCheckoutLocationWhileItHoldsSessions(t *testing.T) {
+	repo, data := t.TempDir(), t.TempDir()
+	old := filepath.Join(repo, ".runtime", "sessions")
+	if err := os.MkdirAll(old, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sessions, state, notes := localData(data, repo)
+	if sessions != old {
+		t.Fatalf("sessions = %q, want the location that already holds them (%q)", sessions, old)
+	}
+	// The two decisions are taken independently, and that is the point of asking
+	// what is there: this installation has no memory file in the checkout, so its
+	// state root goes to the new location while the conversations stay put.
+	if state != data {
+		t.Fatalf("state root = %q, want %q: nothing of the state is in the checkout", state, data)
+	}
+	assertNotes(t, notes, old)
+}
+
+// The realistic upgrade: an installation that ran before has both the sessions and
+// the memory file in the checkout, and keeps both there until the user moves them.
+func TestLocalDataKeepsBothInTheCheckoutWhenBothAreThere(t *testing.T) {
+	repo, data := t.TempDir(), t.TempDir()
+	oldSessions := filepath.Join(repo, ".runtime", "sessions")
+	if err := os.MkdirAll(oldSessions, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldMemory := filepath.Join(repo, ".runtime", memory.StateFileName)
+	if err := os.WriteFile(oldMemory, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sessions, state, notes := localData(data, repo)
+	if sessions != oldSessions {
+		t.Fatalf("sessions = %q, want %q", sessions, oldSessions)
+	}
+	if state != repo {
+		t.Fatalf("state root = %q, want %q so memory keeps its old file", state, repo)
+	}
+	assertNotes(t, notes, oldSessions, repo)
+}
+
+// The two decisions are independent: a machine can have sessions in the new
+// place and facts still in the old one, and each has to say what it did.
+func TestLocalDataDecidesSessionsAndStateSeparately(t *testing.T) {
+	repo, data := t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, ".runtime"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".runtime", "memory.jsonl"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sessions, state, _ := localData(data, repo)
+	if want := filepath.Join(data, "sessions"); sessions != want {
+		t.Fatalf("sessions = %q, want %q: nothing is in the checkout's session directory", sessions, want)
+	}
+	if state != repo {
+		t.Fatalf("state root = %q, want %q: the memory file still lives in the checkout", state, repo)
 	}
 }
 
-func TestSessionsDirPrefersExplicitValue(t *testing.T) {
-	got := sessionsDir("/repo", "/elsewhere/sessions")
-	if got != "/elsewhere/sessions" {
-		t.Fatalf("got %q, want the explicit value", got)
+func TestLocalDataPrefersTheDataRootWhenBothLocationsExist(t *testing.T) {
+	repo, data := t.TempDir(), t.TempDir()
+	for _, dir := range []string{
+		filepath.Join(repo, ".runtime", "sessions"),
+		filepath.Join(data, "sessions"),
+		filepath.Join(data, ".runtime"),
+	} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, file := range []string{
+		filepath.Join(repo, ".runtime", "memory.jsonl"),
+		filepath.Join(data, ".runtime", "memory.jsonl"),
+	} {
+		if err := os.WriteFile(file, []byte("{}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sessions, state, _ := localData(data, repo)
+	if want := filepath.Join(data, "sessions"); sessions != want {
+		t.Fatalf("sessions = %q, want %q", sessions, want)
+	}
+	if want := data; state != want {
+		t.Fatalf("state root = %q, want %q", state, want)
 	}
 }
 
-func TestStateRootDefaultsToTheResolvedRoot(t *testing.T) {
-	got := stateRoot("/repo", "")
-	want := "/repo"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
+// A built binary in .runtime/ is not data: a checkout that was only compiled
+// must still start in the new location.
+func TestLocalDataIgnoresBuildOutputInTheCheckout(t *testing.T) {
+	repo, data := t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repo, ".runtime"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".runtime", "luna"), []byte("binary"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sessions, state, _ := localData(data, repo)
+	if want := filepath.Join(data, "sessions"); sessions != want {
+		t.Fatalf("sessions = %q, want %q", sessions, want)
+	}
+	if want := data; state != want {
+		t.Fatalf("state root = %q, want %q", state, want)
 	}
 }
 
-func TestStateRootPrefersExplicitValue(t *testing.T) {
-	got := stateRoot("/repo", "/elsewhere/state")
-	if got != "/elsewhere/state" {
-		t.Fatalf("got %q, want the explicit value", got)
+func TestExplicitFlagsWinOverTheResolvedLocation(t *testing.T) {
+	dir, note := explicitOr("/elsewhere/sessions", "/resolved/sessions", "sessions")
+	if dir != "/elsewhere/sessions" {
+		t.Fatalf("dir = %q, want the explicit value", dir)
+	}
+	if note == "" {
+		t.Fatal("an explicit value should be reported, so the log does not read as if the default applied")
+	}
+	dir, note = explicitOr("", "/resolved/sessions", "sessions")
+	if dir != "/resolved/sessions" || note != "" {
+		t.Fatalf("dir = %q note = %q, want the resolved location and no note", dir, note)
 	}
 }
 
-// The capability's state namespace resolves next to the session directory, both
-// under the git-ignored .runtime/, so neither is a repository artifact — and the
-// default memory file keeps the path it always had.
-func TestCapabilityStateResolvesNextToTheSessions(t *testing.T) {
-	root := "/repo"
-	dir, err := plugin.StateDirFor(memory.Descriptor(), stateRoot(root, ""))
+// assertNotes requires the log lines to name the directory in use, so a user
+// reading startup output never has to guess which location was chosen.
+func assertNotes(t *testing.T, notes []string, wanted ...string) {
+	t.Helper()
+	joined := strings.Join(notes, "\n")
+	for _, want := range wanted {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("notes %q should name %q", joined, want)
+		}
+	}
+}
+
+// The capability's own file is what tells the two locations apart, so where that
+// file lands is the whole point of the rule: in the new location it sits under
+// the data root, and in the old one it keeps the path it has always had.
+func TestMemoryFileFollowsTheStateRoot(t *testing.T) {
+	repo, data := t.TempDir(), t.TempDir()
+	_, state, _ := localData(data, repo)
+	dir, err := plugin.StateDirFor(memory.Descriptor(), state)
 	if err != nil {
 		t.Fatalf("StateDirFor: %v", err)
 	}
-	if want := filepath.Join(root, ".runtime"); dir != want {
-		t.Fatalf("capability state dir = %q, want %q", dir, want)
+	if want := filepath.Join(data, ".runtime"); dir != want {
+		t.Fatalf("state dir = %q, want %q", dir, want)
 	}
-	if filepath.Dir(sessionsDir(root, "")) != dir {
-		t.Fatalf("capability state %q and sessions %q do not share a directory", dir, sessionsDir(root, ""))
+	if got, want := filepath.Join(dir, memory.StateFileName), filepath.Join(data, ".runtime", "memory.jsonl"); got != want {
+		t.Fatalf("memory file = %q, want %q", got, want)
+	}
+
+	// An installation that still keeps facts in the checkout keeps the path it
+	// had before this version — byte for byte, so its file is found untouched.
+	if err := os.MkdirAll(filepath.Join(repo, ".runtime"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".runtime", memory.StateFileName), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, oldState, _ := localData(data, repo)
+	oldDir, err := plugin.StateDirFor(memory.Descriptor(), oldState)
+	if err != nil {
+		t.Fatalf("StateDirFor: %v", err)
+	}
+	if want := filepath.Join(repo, ".runtime"); oldDir != want {
+		t.Fatalf("old state dir = %q, want the path memory had before this version (%q)", oldDir, want)
 	}
 }
 

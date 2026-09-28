@@ -50,10 +50,13 @@ const (
 	// the default data path does not change and no migration is needed.
 	stateNamespace = ".runtime"
 
-	// stateFileName is the file this package keeps inside its state directory.
+	// StateFileName is the file this package keeps inside its state directory.
 	// Only this package names it; the Kernel hands over a directory and never
-	// learns what is in it.
-	stateFileName = "memory.jsonl"
+	// learns what is in it. It is exported because the composition root asks
+	// whether this file already exists in a location before deciding to keep
+	// using that location — a compatibility question about this capability's own
+	// data, not a layout rule the Kernel should know.
+	StateFileName = "memory.jsonl"
 )
 
 // Plugin is the official Memory contribution: one write-only tool, one injected
@@ -78,7 +81,7 @@ type Plugin struct {
 // Only Open's failure (an empty path, an unusable directory) can fail here: the
 // file itself is created by the first write.
 func New(stateDir string) (*Plugin, error) {
-	store, err := Open(filepath.Join(stateDir, stateFileName))
+	store, err := Open(filepath.Join(stateDir, StateFileName))
 	if err != nil {
 		return nil, err
 	}

@@ -111,14 +111,58 @@ func projectRoot(root, explicitReadRoot string) string {
 	return root
 }
 
-// sessionsDir resolves the session directory. An explicit value wins; otherwise
-// sessions live under the resolved root, where .runtime/ is already ignored by
-// git.
-func sessionsDir(root, explicit string) string {
-	if explicit != "" {
-		return explicit
+// localData decides where the user's own local data lives: the sessions and the
+// capability state root. It reports one sentence per decision, so startup can say
+// which location is in use instead of leaving it to be guessed.
+//
+// The new location is the user's data root — sessions in <data>/sessions, and the
+// state root at <data> itself, so the memory capability's file lands at
+// <data>/.runtime/memory.jsonl (the namespace is that capability's own claim; the
+// kernel only decides the root). Before this version both lived in the checkout:
+// <root>/.runtime/sessions, and the checkout root as the state root.
+//
+// Nothing is moved and nothing is deleted here: a location that already holds data
+// wins over an empty one, and when neither holds anything — a fresh checkout, or
+// one that was only built — the new location is used.
+func localData(dataRoot, repoRoot string) (sessions string, state string, notes []string) {
+	newSessions := filepath.Join(dataRoot, "sessions")
+	oldSessions := filepath.Join(repoRoot, ".runtime", "sessions")
+	sessionsChoice := layout.ChooseDir("sessions", newSessions, oldSessions,
+		dirExists(newSessions), dirExists(oldSessions))
+	// The state root used to be the checkout root, so a directory alone proves
+	// nothing: every checkout that ran once has .runtime/, and one that was only
+	// built has .runtime/luna. What tells the two apart is the capability's own
+	// file, which is what memoryFileUnder asks for.
+	stateChoice := layout.ChooseDir("capability state", dataRoot, repoRoot,
+		fileExists(memoryFileUnder(dataRoot)), fileExists(memoryFileUnder(repoRoot)))
+	return sessionsChoice.Dir, stateChoice.Dir, []string{sessionsChoice.Reason, stateChoice.Reason}
+}
+
+// memoryFileUnder is where the memory capability's file lives when the state root
+// is root. The namespace and the file name both belong to that capability, so this
+// asks it rather than hardcoding a path that would then be a second source of
+// truth for where its data is.
+func memoryFileUnder(root string) string {
+	dir, err := plugin.StateDirFor(memory.Descriptor(), root)
+	if err != nil {
+		return ""
 	}
-	return filepath.Join(root, ".runtime", "sessions")
+	return filepath.Join(dir, memory.StateFileName)
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+// explicitOr applies a value given on the command line on top of the resolved
+// location, and reports when it did: a log that showed only the resolved path
+// would read as if the flag had not been given.
+func explicitOr(explicit, resolved, name string) (string, string) {
+	if explicit != "" {
+		return explicit, name + ": using the directory given on the command line (" + explicit + ")"
+	}
+	return resolved, ""
 }
 
 // workspaceFile resolves where the user's workspaces are stored. They are data
@@ -157,7 +201,10 @@ func workspaceLookup(sessions *store.Store, items *workspacedata.Store) workspac
 // that a project agent reads its project's rules without being told to.
 const defaultRulesName = "AGENTS.md"
 
-// fileExists reports whether a path is a regular file we could read rules from.
+// fileExists reports whether a path is a regular file: the project rules file we
+// could read, or a capability's own state file when compatibility asks whether
+// there is data in a location. A directory is not a file here, and neither is a
+// path that cannot be looked up.
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular()
@@ -293,16 +340,10 @@ func loadUserSettings(path string) (settings.Settings, error) {
 }
 
 // stateRoot resolves where capabilities keep their state: an explicit directory
-// wins, otherwise state lives under the resolved root next to the sessions. A
-// capability then claims a namespace inside it, and the kernel resolves that
+// wins, otherwise the resolved location — see localData for how that is decided.
+// A capability then claims a namespace inside it, and the kernel resolves that
 // claim to a directory — never to a file, because which file a capability keeps
 // is its own business.
-func stateRoot(root, explicit string) string {
-	if explicit != "" {
-		return explicit
-	}
-	return root
-}
 
 // writeDeadlineFor places the HTTP write deadline above the run budget.
 //
@@ -401,15 +442,26 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	sessions, err := store.Open(sessionsDir(root, *sessionsFlag))
+	sessionsDefault, stateDefault, dataNotes := localData(paths.Data, root)
+	sessionsPath, sessionsNote := explicitOr(*sessionsFlag, sessionsDefault, "sessions")
+	statePath, stateNote := explicitOr(*stateFlag, stateDefault, "capability state")
+	// Which location is in use is a property of the installation, not something
+	// the user should have to infer from where files appear.
+	for _, line := range append(dataNotes, sessionsNote, stateNote) {
+		if line != "" {
+			log.Printf("luna: %s", line)
+		}
+	}
+	sessions, err := store.Open(sessionsPath)
 	if err != nil {
 		return fmt.Errorf("open session store: %w", err)
 	}
 	// Capabilities are the product surface; the kernel owns what runs them. The
-	// Memory capability is the first one: a built-in plugin whose state file
-	// lives where it always has, so no stored data moves.
+	// Memory capability is the first one: a built-in plugin that claims a state
+	// namespace, which the kernel resolves into a directory under whichever state
+	// root is in use — the kernel never learns which file it keeps inside.
 	registry := plugin.NewRegistry(plugin.PermissionStateWrite)
-	memoryDir, err := plugin.StateDirFor(memory.Descriptor(), stateRoot(root, *stateFlag))
+	memoryDir, err := plugin.StateDirFor(memory.Descriptor(), statePath)
 	if err != nil {
 		return fmt.Errorf("resolve memory state directory: %w", err)
 	}
