@@ -3,6 +3,7 @@ package pluginhost
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -564,6 +565,136 @@ func TestFileCallsUseTheRootsTheyName(t *testing.T) {
 	}
 	if _, err := h.ListDir(ctx, ListRequest{Path: "default.txt"}); !errors.Is(err, fileread.ErrNotDir) {
 		t.Fatalf("listing the configured root's file with no roots err = %v, want ErrNotDir", err)
+	}
+}
+
+// listTree builds the tree the listing-depth tests walk: a file at the top, one
+// level down and two levels down.
+//
+//	<root>/top.txt
+//	<root>/sub/inner.txt
+//	<root>/sub/deeper/bottom.txt
+func listTree(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	for _, f := range []struct{ path, content string }{
+		{"top.txt", "top\n"},
+		{"sub/inner.txt", "inner\n"},
+		{"sub/deeper/bottom.txt", "bottom\n"},
+	} {
+		full := filepath.Join(root, filepath.FromSlash(f.path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(f.content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+// The depth of a listing is the host's to validate and the plugin's to render.
+// The host passes on a depth inside the range, reads a request that named none as
+// the one level the tool has always been, and refuses a depth outside the range
+// before the path is even resolved — the refusal is about the call, not about
+// whether the directory happens to exist.
+func TestListDirDepthReachesThePluginAndRefusesOutsideTheRange(t *testing.T) {
+	root := listTree(t)
+	h := testHost(t, Options{ReadRoot: root})
+	ctx := context.Background()
+
+	one, err := h.ListDir(ctx, ListRequest{Path: "."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(one.Result, "top.txt") || !strings.Contains(one.Result, "sub") {
+		t.Fatalf("the one-level listing lost its entries:\n%s", one.Result)
+	}
+	if strings.Contains(one.Result, "sub/inner.txt") {
+		t.Fatalf("a request that named no depth entered a subdirectory:\n%s", one.Result)
+	}
+	// Zero is how the protocol says "no depth was named", so it is the default
+	// of one level and not a request for nothing.
+	zero, err := h.ListDir(ctx, ListRequest{Path: ".", Depth: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if zero.Result != one.Result {
+		t.Fatalf("depth 0 changed the listing:\n%q\n%q", zero.Result, one.Result)
+	}
+
+	two, err := h.ListDir(ctx, ListRequest{Path: ".", Depth: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(two.Result, "sub/inner.txt") {
+		t.Fatalf("depth 2 did not reach the second level:\n%s", two.Result)
+	}
+	if strings.Contains(two.Result, "sub/deeper/bottom.txt") {
+		t.Fatalf("depth 2 went to the third level:\n%s", two.Result)
+	}
+	// The deepest depth the listing has is enough for this tree, and the paths
+	// stay relative to the directory the call named.
+	deep, err := h.ListDir(ctx, ListRequest{Path: ".", Depth: fileread.MaxListDepth})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(deep.Result, "sub/deeper/bottom.txt") {
+		t.Fatalf("the deepest listing did not reach the third level:\n%s", deep.Result)
+	}
+	inside, err := h.ListDir(ctx, ListRequest{Path: "sub", Depth: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(inside.Result, "deeper/bottom.txt") {
+		t.Fatalf("the paths must be relative to the directory listed:\n%s", inside.Result)
+	}
+
+	// A depth outside the range is refused here, with the range it may ask for,
+	// and no plugin call is made for it.
+	for _, depth := range []int{-1, -100, fileread.MaxListDepth + 1, 100} {
+		out, err := h.ListDir(ctx, ListRequest{Path: ".", Depth: depth})
+		if !errors.Is(err, fileread.ErrDepthInvalid) {
+			t.Fatalf("depth %d: result %q, error %v, want ErrDepthInvalid", depth, out.Result, err)
+		}
+		if !strings.Contains(err.Error(), fmt.Sprintf("%d..%d", fileread.DefaultListDepth, fileread.MaxListDepth)) {
+			t.Fatalf("the refusal must name the range: %v", err)
+		}
+	}
+	// The depth is refused whether or not the path exists: the host checks the
+	// depth before resolving anything.
+	if _, err := h.ListDir(ctx, ListRequest{Path: "absent", Depth: fileread.MaxListDepth + 1}); !errors.Is(err, fileread.ErrDepthInvalid) {
+		t.Fatalf("a bad depth next to a missing path = %v, want ErrDepthInvalid", err)
+	}
+	if _, err := h.ListDir(ctx, ListRequest{Path: "/etc", Depth: 9}); !errors.Is(err, fileread.ErrDepthInvalid) {
+		t.Fatalf("a bad depth next to an absolute path = %v, want ErrDepthInvalid", err)
+	}
+}
+
+// The scan cap is the host's, and the plugin only carries it: a listing that goes
+// deeper than its depth stops at the cap the host sent and states which cap it
+// was, so a prefix of the tree is never read as the whole tree.
+func TestListDirStatesTheScanCapTheHostConfigured(t *testing.T) {
+	root := listTree(t)
+	h := testHost(t, Options{ReadRoot: root, ListMaxScanned: 2})
+	out, err := h.ListDir(context.Background(), ListRequest{Path: ".", Depth: fileread.MaxListDepth})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.Result, "the listing stopped after 2 entries were examined; the remaining entries were not examined") {
+		t.Fatalf("the configured scan cap must be stated:\n%s", out.Result)
+	}
+	if strings.Contains(out.Result, "sub/deeper/bottom.txt") {
+		t.Fatalf("entries past the scan cap were rendered anyway:\n%s", out.Result)
+	}
+	// One level never reaches the scan cap, however small it is: a single
+	// directory read is bounded by how many entries it renders.
+	one, err := h.ListDir(context.Background(), ListRequest{Path: "."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(one.Result, "top.txt") || strings.Contains(one.Result, "stopped") {
+		t.Fatalf("the scan cap must not cut a one-level listing short:\n%s", one.Result)
 	}
 }
 

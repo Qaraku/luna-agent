@@ -654,11 +654,13 @@ func TestListDirToolEmitsStartedThenFinishedAndHidesIdentityFromTheModel(t *test
 	}
 }
 
-// A listing takes one path and nothing else. The recursion a model will reach
-// for first — a depth — is refused before the host sees it, because one listing
-// is one level by design.
+// A listing takes one path and a bounded depth. The two knobs that would turn
+// one listing into a different question — a recursion flag and a glob — are still
+// refused before the host sees them, and so is a depth outside the range, an
+// explicit zero included: asking for zero levels is a call the listing refuses
+// with the range it may ask for rather than answering with a listing of one.
 func TestListDirToolRejectsMalformedOrWideningArgumentsBeforeTheHost(t *testing.T) {
-	for _, arguments := range []string{`{}`, `{"path":""}`, `{"path":"."}{"path":"."}`, `{"path":".","depth":2}`, `{"path":".","recursive":true}`, `{"path":".","glob":"**/*.go"}`, `not json`, ``} {
+	for _, arguments := range []string{`{}`, `{"path":""}`, `{"path":"."}{"path":"."}`, `{"path":".","depth":0}`, `{"path":".","depth":6}`, `{"path":".","depth":-1}`, `{"path":".","depth":1.5}`, `{"path":".","depth":"two"}`, `{"path":".","recursive":true}`, `{"path":".","glob":"**/*.go"}`, `not json`, ``} {
 		sink := &collectingSink{}
 		ctx := WithRun(context.Background(), "run-1", sink)
 		lister := &recordingReader{listOut: pluginhost.Output{Result: "should not be reached"}}
@@ -680,9 +682,35 @@ func TestListDirToolRejectsMalformedOrWideningArgumentsBeforeTheHost(t *testing.
 			t.Fatalf("arguments %q failed payload=%+v", arguments, failed)
 		}
 	}
+	// A depth the listing does not have is refused with the range it may ask
+	// for, and the refusal names the value it got.
+	for _, c := range []struct {
+		arguments string
+		value     string
+	}{
+		{`{"path":".","depth":0}`, "0"},
+		{`{"path":".","depth":6}`, "6"},
+		{`{"path":".","depth":-1}`, "-1"},
+	} {
+		sink := &collectingSink{}
+		ctx := WithRun(context.Background(), "run-1", sink)
+		got, err := NewListDirTool(&recordingReader{}).InvokableRun(ctx, c.arguments)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(got, fileread.ErrDepthInvalid.Error()) || !strings.Contains(got, "1..5") || !strings.Contains(got, "got "+c.value) {
+			t.Fatalf("the depth refusal must name the range and the value it got: %q", got)
+		}
+	}
 }
 
-func TestListDirSchemaIsStrictAndOffersNoRecursion(t *testing.T) {
+// The schema offers the path and an optional depth, and it says what the depth
+// means: how many levels, which value is the default, and that the range is
+// enforced. This is a rewrite of the assertion that the listing took a path and
+// nothing else — the depth is now part of the call, and what the schema must not
+// offer is anything that widens the question (a glob, a filter, an unbounded
+// depth).
+func TestListDirSchemaIsStrictAndOffersOnlyAPathAndABoundedDepth(t *testing.T) {
 	info, err := NewListDirTool(&recordingReader{}).Info(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -690,8 +718,12 @@ func TestListDirSchemaIsStrictAndOffersNoRecursion(t *testing.T) {
 	if info.Name != ListDirToolName {
 		t.Fatalf("tool name = %q", info.Name)
 	}
-	if !strings.Contains(info.Desc, "one level") || !strings.Contains(info.Desc, "recursion") {
-		t.Fatalf("the description must say that one call is one level and that there is no recursion option: %q", info.Desc)
+	// The description states the default and the range, so a model reading it
+	// does not have to guess either one.
+	for _, want := range []string{"One level is listed by default", "depth is optional", "1 to 5", "refused before anything is looked at", "not examined"} {
+		if !strings.Contains(info.Desc, want) {
+			t.Fatalf("the description must state %q: %q", want, info.Desc)
+		}
 	}
 	s, err := info.ParamsOneOf.ToJSONSchema()
 	if err != nil {
@@ -708,8 +740,125 @@ func TestListDirSchemaIsStrictAndOffersNoRecursion(t *testing.T) {
 		t.Fatalf("the schema required list must be exactly the path: %s", b)
 	}
 	properties, _ := raw["properties"].(map[string]any)
-	if len(properties) != 1 {
-		t.Fatalf("the listing offers more than a path: %s", b)
+	if len(properties) != 2 {
+		t.Fatalf("the listing offers something besides a path and a depth: %s", b)
+	}
+	depth, ok := properties["depth"].(map[string]any)
+	if !ok {
+		t.Fatalf("the schema has no depth: %s", b)
+	}
+	if depth["type"] != "integer" {
+		t.Fatalf("depth must be an integer: %s", b)
+	}
+	description, _ := depth["description"].(string)
+	if !strings.Contains(description, "1 to 5") {
+		t.Fatalf("the depth description must state its range: %q", description)
+	}
+	if _, ok := properties["path"]; !ok {
+		t.Fatalf("the schema lost its path: %s", b)
+	}
+	// The other two options a listing deliberately does not have.
+	for _, forbidden := range []string{"glob", "pattern", "recursive", "filter"} {
+		if _, ok := properties[forbidden]; ok {
+			t.Fatalf("the listing offers %q: %s", forbidden, b)
+		}
+	}
+}
+
+// The wrapper names the depth it forwards: two when the call asked for two, and
+// the default of one when the call named none, so the request the host sees
+// always states how deep the listing is to go.
+func TestListDirToolForwardsTheDepthItWasGiven(t *testing.T) {
+	for _, c := range []struct {
+		arguments string
+		want      int
+	}{
+		{`{"path":"docs"}`, fileread.DefaultListDepth},
+		{`{"path":"docs","depth":2}`, 2},
+		{`{"path":"docs","depth":5}`, 5},
+	} {
+		sink := &collectingSink{}
+		ctx := WithRun(context.Background(), "run-1", sink)
+		lister := &recordingReader{listOut: pluginhost.Output{Result: "listed\n"}}
+		if _, err := NewListDirTool(lister).InvokableRun(ctx, c.arguments); err != nil {
+			t.Fatal(err)
+		}
+		if len(lister.listRequests) != 1 {
+			t.Fatalf("arguments %q reached the host %d times", c.arguments, len(lister.listRequests))
+		}
+		if got := lister.listRequests[0].Depth; got != c.want {
+			t.Fatalf("arguments %q forwarded depth %d, want %d", c.arguments, got, c.want)
+		}
+		if got := lister.listRequests[0].Path; got != "docs" {
+			t.Fatalf("arguments %q forwarded path %q", c.arguments, got)
+		}
+	}
+}
+
+// A depth really reaches the second level: the listing runs through the real
+// subprocess plugin against a tree built for this test, and the second level is
+// visible only when the call asks for it. The tree is a temporary directory, not
+// the repository: what is being pinned is the depth, not today's checkout.
+func TestAListingWithDepthSeesTheSecondLevel(t *testing.T) {
+	tree := t.TempDir()
+	for _, f := range []struct{ path, content string }{
+		{"top.txt", "top\n"},
+		{"sub/inner.txt", "inner\n"},
+		{"sub/deeper/bottom.txt", "bottom\n"},
+	} {
+		full := filepath.Join(tree, filepath.FromSlash(f.path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(f.content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := pluginhost.New(context.Background(), root, pluginhost.Options{ReadRoot: tree})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	run := func(arguments string) string {
+		t.Helper()
+		sink := &collectingSink{}
+		ctx := WithRun(context.Background(), "run-1", sink)
+		got, err := NewListDirTool(h).InvokableRun(ctx, arguments)
+		if err != nil {
+			t.Fatalf("%s: %v", arguments, err)
+		}
+		if strings.HasPrefix(got, refusalPrefix) {
+			t.Fatalf("%s was refused: %q", arguments, got)
+		}
+		return got
+	}
+	one := run(`{"path":"."}`)
+	if !strings.Contains(one, "top.txt") || !strings.Contains(one, "sub") {
+		t.Fatalf("the one-level listing lost its entries:\n%s", one)
+	}
+	if strings.Contains(one, "sub/inner.txt") {
+		t.Fatalf("one level entered a subdirectory:\n%s", one)
+	}
+	two := run(`{"path":".","depth":2}`)
+	if !strings.Contains(two, "sub/inner.txt") {
+		t.Fatalf("depth 2 did not reach the second level:\n%s", two)
+	}
+	if strings.Contains(two, "sub/deeper/bottom.txt") {
+		t.Fatalf("depth 2 went to the third level:\n%s", two)
+	}
+	three := run(`{"path":".","depth":3}`)
+	if !strings.Contains(three, "sub/deeper/bottom.txt") {
+		t.Fatalf("depth 3 did not reach the third level:\n%s", three)
+	}
+	// A depth below a subdirectory is relative to the directory the call named,
+	// not to the session's root.
+	inside := run(`{"path":"sub","depth":2}`)
+	if !strings.Contains(inside, "deeper/bottom.txt") {
+		t.Fatalf("the paths must be relative to the directory listed:\n%s", inside)
 	}
 }
 

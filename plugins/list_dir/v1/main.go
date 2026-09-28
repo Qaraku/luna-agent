@@ -1,12 +1,13 @@
 // Command v1 is the directory-listing plugin candidate: it renders one level of
-// the directory the host validated.
+// the directory the host validated, or as many levels as the host's depth says.
 //
 // It never interprets a path. Path arrives absolute and already checked against
-// the read root by the host, and MaxEntries/MaxLineBytes carry the host's caps.
-// The plugin lists exactly one level — it never enters a subdirectory and never
-// follows a symbolic link, so a listing cannot grow into a recursive walk of the
-// read root — and it states every cap it reached instead of cutting the list
-// silently (see internal/fileread).
+// the read root by the host, and MaxEntries/MaxLineBytes/MaxScanned carry the
+// host's caps. The plugin lists one level unless the host sends a depth it
+// accepts — it never chooses a depth itself, never enters a subdirectory at one
+// level and never follows a symbolic link, so a listing cannot grow into an
+// unbounded walk of the read root — and it states every cap it reached instead
+// of cutting the list silently (see internal/fileread).
 package main
 
 import (
@@ -29,7 +30,7 @@ func (tool) Invoke(in pluginprotocol.Input) (string, error) {
 		return "", fmt.Errorf("delay_ms must be 0..%d", pluginprotocol.MaxDelayMS)
 	}
 	time.Sleep(time.Duration(in.DelayMS) * time.Millisecond)
-	return fileread.List(in.Path, fileread.ListOptions{MaxEntries: in.MaxEntries, MaxLineBytes: in.MaxLineBytes})
+	return fileread.List(in.Path, fileread.ListOptions{Depth: in.Depth, MaxEntries: in.MaxEntries, MaxLineBytes: in.MaxLineBytes, MaxScanned: in.MaxScanned})
 }
 func main() {
 	plugin.Serve(&plugin.ServeConfig{HandshakeConfig: pluginprotocol.Handshake, Plugins: map[string]plugin.Plugin{"tool": &pluginprotocol.ToolPlugin{Impl: tool{}}}})

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Qaraku/luna-agent/internal/config"
+	"github.com/Qaraku/luna-agent/internal/fileread"
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/Qaraku/luna-agent/internal/store"
@@ -42,7 +43,7 @@ const (
 // because a capability describes its own tool and contributes its own reference
 // block. Text that would have to change when a capability changes does not
 // belong here.
-const instruction = "You are Luna, a truthful local demo. Use luna_text_transform whenever the user explicitly requests text transformation or explicitly asks to call it; it returns exactly what the active candidate produced, so when the result equals the input, say so plainly instead of guessing that the plugin is broken. Use luna_list_dir to see what a directory contains — when the user asks what is in a directory or in the project, or when you need to discover a path before reading it; the path must be relative to one of the directories this session works in (a single configured root when it works in none), and one call lists one level only: subdirectories are named but not entered, and there is no option to list a whole tree in one call, so walk a repository one directory per call. Use luna_search_files to find where something is written — when you need to locate text or a definition rather than read a file you already know; by default the query is a literal string and never a pattern, so a regular expression is searched as its own characters, and you get a pattern only by setting mode to \"regex\", which compiles the same query as an RE2 regular expression matched against each line separately, so it never matches across a line break and a query that is not a valid pattern is refused rather than reported as no matches; the path says where the search starts, a directory or one file, relative to one of the directories this session works in, which nothing outside may be searched. A search looks below the path you give and is bounded, so it can stop at one of its caps; when it does it states the cap it reached and that the remaining paths were not searched, and you must report that limit rather than describe the whole project as covered. Use luna_find_files to find files by name — when the user asks which files or directories are called something, or where a kind of file lives, rather than what is written inside one; the pattern is a glob matched against the whole entry name, so a pattern naming one file matches exactly that file while *_test.go matches every Go test file at any depth, and a plain name is never tested as a substring. A find looks below the path you give and is bounded the same way a search is: it renders a limited list of paths and states the cap it reached, so report that limit rather than describing the whole tree as covered. Use luna_read_file when the user asks you to read a file; the path must be relative to one of the directories this session works in, which hold the local text files you may read. A file larger than the read limit cannot be read whole and is refused: read it in parts by giving start_line (counting from 1) and max_lines, and the result states which lines it returned and how many were left, so continue from there rather than claiming you read the file. A tool that refuses a call returns a result that begins \"the tool refused this call:\" followed by the reason: report that reason in the user's own language, and do not retry the same call or describe the tool as unavailable. Do not claim tools or actions that were not observed."
+const instruction = "You are Luna, a truthful local demo. Use luna_text_transform whenever the user explicitly requests text transformation or explicitly asks to call it; it returns exactly what the active candidate produced, so when the result equals the input, say so plainly instead of guessing that the plugin is broken. Use luna_list_dir to see what a directory contains — when the user asks what is in a directory or in the project, or when you need to discover a path before reading it; the path must be relative to one of the directories this session works in (a single configured root when it works in none), and one call lists one level by default: subdirectories are named but not entered, so walk a repository one directory per call. Its optional depth lists more levels in one call — 1 to 5, and a value outside that range is refused — and below the first level each line is the entry's path relative to the directory you named, with a subdirectory's own entries on the lines right after it. A listing is bounded however deep it goes, so when it stops at one of its caps it says which cap it reached and that the remaining entries were not examined; report that limit rather than describing the whole tree as covered. Use luna_search_files to find where something is written — when you need to locate text or a definition rather than read a file you already know; by default the query is a literal string and never a pattern, so a regular expression is searched as its own characters, and you get a pattern only by setting mode to \"regex\", which compiles the same query as an RE2 regular expression matched against each line separately, so it never matches across a line break and a query that is not a valid pattern is refused rather than reported as no matches; the path says where the search starts, a directory or one file, relative to one of the directories this session works in, which nothing outside may be searched. A search looks below the path you give and is bounded, so it can stop at one of its caps; when it does it states the cap it reached and that the remaining paths were not searched, and you must report that limit rather than describe the whole project as covered. Use luna_find_files to find files by name — when the user asks which files or directories are called something, or where a kind of file lives, rather than what is written inside one; the pattern is a glob matched against the whole entry name, so a pattern naming one file matches exactly that file while *_test.go matches every Go test file at any depth, and a plain name is never tested as a substring. A find looks below the path you give and is bounded the same way a search is: it renders a limited list of paths and states the cap it reached, so report that limit rather than describing the whole tree as covered. Use luna_read_file when the user asks you to read a file; the path must be relative to one of the directories this session works in, which hold the local text files you may read. A file larger than the read limit cannot be read whole and is refused: read it in parts by giving start_line (counting from 1) and max_lines, and the result states which lines it returned and how many were left, so continue from there rather than claiming you read the file. A tool that refuses a call returns a result that begins \"the tool refused this call:\" followed by the reason: report that reason in the user's own language, and do not retry the same call or describe the tool as unavailable. Do not claim tools or actions that were not observed."
 
 type Event struct {
 	Type string `json:"type"`
@@ -341,8 +342,10 @@ func emitMessageUsage(ctx context.Context, runID string, message *schema.Message
 // FileTools is the host-side file capability the core's plugin-backed file tools
 // depend on: reading one file, and listing one directory. Both wrappers hand it
 // the raw path from the model; validating that path against the read root is the
-// host's job, not the tool wrapper's and never the plugin's. Listing carries no
-// recursion knob, so the interface cannot ask for more than one level.
+// host's job, not the tool wrapper's and never the plugin's. A listing carries a
+// depth the wrapper has already bounded, and the host refuses one outside the
+// range on its own terms as well, so the interface cannot ask for more levels
+// than the listing has.
 type FileTools interface {
 	ReadFile(context.Context, pluginhost.ReadRequest) (pluginhost.Output, error)
 	ListDir(context.Context, pluginhost.ListRequest) (pluginhost.Output, error)
@@ -515,12 +518,19 @@ func (t *ListDirTool) Info(context.Context) (*schema.ToolInfo, error) {
 	return listDirInfo(), nil
 }
 
-// listDirSchema is deliberately one parameter. A recursion depth, a glob or a
-// filter would turn one listing into an unbounded walk of the read root, so the
-// schema offers no way to ask for one.
+// listDirSchema fixes the two arguments of a listing: the path to list, and an
+// optional depth. The depth is bounded at both ends by the listing itself rather
+// than by the schema alone — the wrapper refuses a value outside the range before
+// the host sees it — and there is deliberately no glob, filter or sort knob: what
+// a listing answers is what a directory holds, in the one order it has always
+// rendered, and a depth only says how far down it looks.
 func listDirSchema() *jsonschema.Schema {
 	type args struct {
 		Path string `json:"path" jsonschema_description:"Directory path, relative to one of the directories this session works in; use \".\" for the first of them"`
+		// The depth is optional, and saying nothing about it means one level:
+		// an integer with a range is what the model reads as "you may ask for
+		// more, up to this much".
+		Depth int `json:"depth,omitempty" jsonschema_description:"How many levels below the path to list, 1 to 5. Omit for 1, the listing of that one directory; a value outside 1 to 5 is refused before anything is looked at"`
 	}
 	r := jsonschema.Reflector{DoNotReference: true, AllowAdditionalProperties: false}
 	s := r.Reflect(args{})
@@ -537,17 +547,34 @@ func (t *ListDirTool) InvokableRun(ctx context.Context, arguments string, _ ...t
 	emit(ctx, Event{Type: "tool.started", Data: ToolStarted{RunID: runID(ctx), Name: ListDirToolName, Arguments: raw}})
 	var in struct {
 		Path string `json:"path"`
+		// Depth is a pointer so an explicit zero is distinguishable from an
+		// omitted depth: omitting it means the default of one level, and asking
+		// for zero levels is a call the listing refuses and explains.
+		Depth *int `json:"depth"`
 	}
 	err := decodeOne(arguments, &in)
-	if err != nil || in.Path == "" {
-		if err == nil {
-			err = fmt.Errorf("path is required")
-		}
+	if err == nil && in.Path == "" {
+		err = fmt.Errorf("path is required")
+	}
+	// The depth is refused here, before the host is asked to resolve anything:
+	// the range is the listing's own, stated once in internal/fileread, and a
+	// call that named a depth the listing does not have must not reach a
+	// directory at all.
+	if err == nil && in.Depth != nil {
+		err = fileread.ValidateNamedDepth(*in.Depth)
+	}
+	if err != nil {
 		return refuse(ctx, ListDirToolName, pluginhost.Output{}, err, startedAt)
+	}
+	// An omitted depth is the default, and it is sent explicitly: every request
+	// the host sees names the depth it is to cover.
+	depth := fileread.DefaultListDepth
+	if in.Depth != nil {
+		depth = *in.Depth
 	}
 	// As with a read, the requested path is passed through unchanged: the host
 	// resolves and validates it against the read root before any plugin sees it.
-	out, err := t.lister.ListDir(ctx, pluginhost.ListRequest{Path: in.Path, Roots: roots(ctx)})
+	out, err := t.lister.ListDir(ctx, pluginhost.ListRequest{Path: in.Path, Depth: depth, Roots: roots(ctx)})
 	if err != nil {
 		if stopped := ctx.Err(); stopped != nil {
 			return stopCall(ctx, ListDirToolName, stopped, out, startedAt)
@@ -561,12 +588,16 @@ func (t *ListDirTool) InvokableRun(ctx context.Context, arguments string, _ ...t
 }
 
 // listDirInfo is the exact public schema of the listing tool. The description
-// states the two things a model gets wrong about a directory tool: the path is
-// relative to the read root, and one call is one level — it names subdirectories
-// without entering them and offers no recursion, so a whole tree is walked one
-// directory at a time. It never carries the absolute host path.
+// states the four things a model gets wrong about a directory tool: the path is
+// relative to the read root, an optional depth covers more than one level and is
+// bounded at both ends, the walk is depth-first with paths relative to the
+// directory that was named, and the result is bounded and names its own caps. It
+// never carries the absolute host path. The caps are interpolated from
+// internal/fileread rather than written out here, so the description cannot
+// describe a cap the listing no longer has.
 func listDirInfo() *schema.ToolInfo {
-	return &schema.ToolInfo{Name: ListDirToolName, Desc: "List the entries of one directory in one of the directories this session works in using the active local Luna subprocess plugin. The path must be relative to one of the directories this session works in (a single configured root when it works in none), and \".\" means the first of them; an absolute path or one outside them is refused. Exactly one level is listed: a subdirectory appears as an entry and is not entered, and there is no recursion option. Each line gives the kind (dir, file, link, other), a size for regular files and the name; directories come first, then files and links, each sorted by name. A directory with more entries than one listing renders says how many were left out instead of dropping them silently.", ParamsOneOf: schema.NewParamsOneOfByJSONSchema(listDirSchema())}
+	desc := fmt.Sprintf(`List the entries of one directory in one of the directories this session works in using the active local Luna subprocess plugin. The path must be relative to one of the directories this session works in (a single configured root when it works in none), and "." means the first of them; an absolute path or one outside them is refused. depth is optional: %d to %d levels, and %d — the entries of that one directory — when it is omitted; any other value, including 0, is refused before anything is looked at. One level is listed by default: a subdirectory appears as an entry and is not entered. A greater depth lists that many levels in one call, depth-first, and below the first level the name on each line is that entry's path relative to the directory you named, with a subdirectory's own entries on the lines right after it. Each line gives the kind (dir, file, link, other), a size for regular files and the name; at every level directories come first, then files and links, each sorted by name, and a symbolic link is named but never entered, so a listing cannot leave the directories this session works in. Every listing is bounded — it renders at most %d entries, one line is at most %d bytes and a listing that goes deeper examines at most %d entries — and when it stops at one of those caps it says which cap it reached and that the remaining entries were not examined, so a listing that reports a cap has not seen the whole tree.`, fileread.DefaultListDepth, fileread.MaxListDepth, fileread.DefaultListDepth, fileread.DefaultListEntries, fileread.DefaultListLineBytes, fileread.DefaultListScanned)
+	return &schema.ToolInfo{Name: ListDirToolName, Desc: desc, ParamsOneOf: schema.NewParamsOneOfByJSONSchema(listDirSchema())}
 }
 
 // readFileInfo is the exact public schema of the file tool. The description

@@ -11,9 +11,10 @@ var Handshake = plugin.HandshakeConfig{ProtocolVersion: 1, MagicCookieKey: "LUNA
 // plugin; Path/MaxBytes serve the file-read plugin, where Path is an absolute
 // path the host has already validated against the read root, MaxBytes bounds
 // the bytes returned and StartLine/MaxLines bound which lines of the file are
-// returned. Path/MaxEntries/
+// returned. Path/Depth/MaxEntries/
 // MaxLineBytes serve the directory-listing plugin, where Path is the same kind
-// of validated absolute path — a directory — and the two caps bound how much of
+// of validated absolute path — a directory — Depth says how many levels below
+// it are covered, and the caps bound how much of
 // Path/Query/MaxMatches/MaxFiles/MaxFileBytes serve the search plugin, where
 // Path is a validated absolute file or directory, Query is the text to look
 // for, MaxLineBytes bounds one rendered line and the other three bound how many
@@ -24,7 +25,8 @@ var Handshake = plugin.HandshakeConfig{ProtocolVersion: 1, MagicCookieKey: "LUNA
 // plugin, where Path is a validated absolute file or directory, Pattern is the
 // glob matched against one entry name, MaxLineBytes bounds one rendered line,
 // MaxPaths bounds how many matching paths are rendered and MaxScanned how many
-// entries are examined. A plugin never receives a model- or browser-supplied
+// entries are examined — the same field, for the same reason, as the listing
+// walks below its directory. A plugin never receives a model- or browser-supplied
 // path in Path.
 type Input struct {
 	Text     string `json:"text"`
@@ -54,6 +56,14 @@ type Input struct {
 	// default, so a request that asked for a mode the search does not have can
 	// never be answered as though it had asked for literal text.
 	Mode string `json:"mode"`
+	// Depth carries how many levels below Path a listing covers.
+	// fileread.DefaultListDepth (one level) is the listing this tool has always
+	// been, and fileread.MaxListDepth is as deep as it goes: the host refuses a
+	// depth outside that range before it resolves the path, so a plugin is only
+	// ever sent one the listing has. Zero means the request named none, which
+	// is what a plugin that is sent no depth falls back to; the host resolves
+	// it before sending so the value on the wire is always a real depth.
+	Depth int `json:"depth"`
 	// MaxEntries and MaxLineBytes carry the listing caps: at most that many
 	// entries are rendered, and one rendered line is at most that many bytes.
 	// A plugin that is sent no cap falls back to its own default rather than
@@ -79,7 +89,8 @@ type Input struct {
 	// matching paths are rendered, and at most that many directory entries are
 	// examined. A plugin sent no cap falls back to its own default, and it
 	// states the cap that stopped it rather than returning a prefix of the
-	// answer silently.
+	// answer silently. MaxScanned is the same field a listing uses for the
+	// same count: the entries a walk examines below the directory it was given.
 	MaxPaths   int `json:"max_paths"`
 	MaxScanned int `json:"max_scanned"`
 	// DelayMS makes a candidate take a known amount of time before it answers.

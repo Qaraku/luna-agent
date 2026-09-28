@@ -507,6 +507,322 @@ func TestListFallsBackToTheDefaultCaps(t *testing.T) {
 	}
 }
 
+// depthFixture builds the tree the depth tests render, with every shape a depth
+// has to get right: two levels below the top, a directory and a file at each
+// level, and two symbolic links — one to a file, one to a directory — that must
+// be named as entries and never entered.
+//
+//	<root>/a.txt                  1 B
+//	<root>/notes                  1 B
+//	<root>/docs/keep.md           6 B
+//	<root>/docs/deep/z.txt        2 B
+//	<root>/docs/img/p.png         2 B
+//	<root>/link      -> a.txt
+//	<root>/linkdir   -> docs
+func depthFixture(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "a.txt"), "x")
+	mustWrite(t, filepath.Join(root, "notes"), "x")
+	mustWrite(t, filepath.Join(root, "docs", "keep.md"), "hello\n")
+	mustWrite(t, filepath.Join(root, "docs", "deep", "z.txt"), "z\n")
+	mustWrite(t, filepath.Join(root, "docs", "img", "p.png"), "p\n")
+	if err := os.Symlink("a.txt", filepath.Join(root, "link")); err != nil {
+		t.Fatalf("symlink to a file: %v", err)
+	}
+	if err := os.Symlink("docs", filepath.Join(root, "linkdir")); err != nil {
+		t.Fatalf("symlink to a directory: %v", err)
+	}
+	return root
+}
+
+// One level is what a listing has always been, and it is rendered byte for byte
+// as it was: the same header, the same line format, the same order, and the same
+// closing line. A depth is an option, not a change to the default.
+func TestListOneLevelIsUnchangedByTheDepthOption(t *testing.T) {
+	root := depthFixture(t)
+	const oneLevel = "5 entries: 1 dir, 2 files, 2 links (directories first, then files and links, each by name)\n" +
+		"dir          -  docs\n" +
+		"file       1 B  a.txt\n" +
+		"file       1 B  notes\n" +
+		"link         -  link\n" +
+		"link         -  linkdir\n"
+	for _, opts := range []ListOptions{
+		{},
+		{Depth: 1},
+		// The scan cap is a cap on a walk below the directory; one level never
+		// reaches it, so naming it cannot cut a one-level listing short.
+		{Depth: 1, MaxScanned: 1},
+		// Neither can the line cap, which one level applies exactly as before.
+		{Depth: 1, MaxLineBytes: DefaultListLineBytes},
+	} {
+		got, err := List(root, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != oneLevel {
+			t.Fatalf("one level with %+v =\n%q\nwant the listing it has always been:\n%q", opts, got, oneLevel)
+		}
+	}
+	// The same holds for the real fixture the older tests use: a listing with no
+	// depth and one named as 1 must agree byte for byte.
+	other := listRoot(t)
+	a, err := List(other, ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := List(other, ListOptions{Depth: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a != b {
+		t.Fatalf("depth 1 differs from the default:\n%q\n%q", a, b)
+	}
+	if !strings.Contains(a, "5 entries: 1 dir, 3 files, 1 link (directories first, then files and links, each by name)\n") {
+		t.Fatalf("the one-level header changed:\n%s", a)
+	}
+}
+
+// Deeper than one level, the rendering generalizes instead of changing: the same
+// line, with the path of the entry relative to the directory the listing started
+// at in place of the name, and each directory's entries following it. The order
+// at every level is the one-level order, and the walk is depth-first.
+func TestListRendersRelativePathsDepthFirst(t *testing.T) {
+	root := depthFixture(t)
+	header := func(entries int, depth int, kinds string) string {
+		return fmt.Sprintf("%d entries up to %d levels deep: %s (directories first, then files and links, each by name, with every path relative to the directory listed)\n", entries, depth, kinds)
+	}
+	cases := []struct {
+		depth int
+		want  string
+	}{
+		// Depth 2 stops at the second level, so nothing below docs is entered.
+		{2, header(8, 2, "3 dirs, 3 files, 2 links") +
+			"dir          -  docs\n" +
+			"dir          -  docs/deep\n" +
+			"dir          -  docs/img\n" +
+			"file       6 B  docs/keep.md\n" +
+			"file       1 B  a.txt\n" +
+			"file       1 B  notes\n" +
+			"link         -  link\n" +
+			"link         -  linkdir\n" +
+			"2 symbolic links not entered\n"},
+		// Depth 3 reaches the third level, and docs/deep's own entries follow
+		// docs/deep rather than appearing after its siblings.
+		{3, header(10, 3, "3 dirs, 5 files, 2 links") +
+			"dir          -  docs\n" +
+			"dir          -  docs/deep\n" +
+			"file       2 B  docs/deep/z.txt\n" +
+			"dir          -  docs/img\n" +
+			"file       2 B  docs/img/p.png\n" +
+			"file       6 B  docs/keep.md\n" +
+			"file       1 B  a.txt\n" +
+			"file       1 B  notes\n" +
+			"link         -  link\n" +
+			"link         -  linkdir\n" +
+			"2 symbolic links not entered\n"},
+	}
+	for _, c := range cases {
+		got, err := List(root, ListOptions{Depth: c.depth})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != c.want {
+			t.Fatalf("depth %d listing =\n%s\nwant:\n%s", c.depth, got, c.want)
+		}
+	}
+	// A depth deeper than the tree is not an error and does not invent entries:
+	// it renders the same lines as the depth that reaches the bottom, and its
+	// header states the depth it was allowed rather than one it did not use.
+	deep, err := List(root, ListOptions{Depth: MaxListDepth})
+	if err != nil {
+		t.Fatal(err)
+	}
+	same, err := List(root, ListOptions{Depth: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := listingLines(deep)[1:]; len(lines) == 0 || strings.Join(lines, "\n") != strings.Join(listingLines(same)[1:], "\n") {
+		t.Fatalf("a depth past the bottom changed the entries:\n%s\n%s", deep, same)
+	}
+	if !strings.HasPrefix(deep, fmt.Sprintf("10 entries up to %d levels deep: ", MaxListDepth)) {
+		t.Fatalf("the header must say how deep the listing was allowed to go:\n%s", deep)
+	}
+}
+
+// listingLines splits a rendered listing into its lines without the trailing
+// newline.
+func listingLines(listing string) []string {
+	return strings.Split(strings.TrimRight(listing, "\n"), "\n")
+}
+
+// A depth the listing does not have is refused with the range it may ask for,
+// and it is refused before a directory is read: the path in the call is not
+// looked at at all, which is why a path that does not exist still reports the
+// depth.
+func TestListRefusesADepthItDoesNotHave(t *testing.T) {
+	for _, depth := range []int{-1, -10, MaxListDepth + 1, 100} {
+		err := ValidateDepth(depth)
+		if !errors.Is(err, ErrDepthInvalid) {
+			t.Fatalf("ValidateDepth(%d) = %v, want ErrDepthInvalid", depth, err)
+		}
+		if !strings.Contains(err.Error(), fmt.Sprintf("%d..%d", DefaultListDepth, MaxListDepth)) || !strings.Contains(err.Error(), fmt.Sprintf("got %d", depth)) {
+			t.Fatalf("the refusal must name the range and the value it got: %v", err)
+		}
+	}
+	// Zero is how the protocol says "no depth was named", so it is the default
+	// at the boundary; a tool that takes a depth from a model refuses an
+	// explicit zero separately, because a call that named 0 asked for nothing.
+	if err := ValidateDepth(0); err != nil {
+		t.Fatalf("an unnamed depth must be accepted here: %v", err)
+	}
+	if err := ValidateNamedDepth(0); !errors.Is(err, ErrDepthInvalid) {
+		t.Fatalf("an explicit zero must be refused: %v", err)
+	}
+	for depth := DefaultListDepth; depth <= MaxListDepth; depth++ {
+		if err := ValidateNamedDepth(depth); err != nil {
+			t.Fatalf("ValidateNamedDepth(%d) = %v", depth, err)
+		}
+	}
+	if got := DepthOrDefault(0); got != DefaultListDepth {
+		t.Fatalf("DepthOrDefault(0) = %d, want %d", got, DefaultListDepth)
+	}
+	if got := DepthOrDefault(3); got != 3 {
+		t.Fatalf("DepthOrDefault(3) = %d", got)
+	}
+	// The refusal comes first: the directory below does not exist, and the
+	// error is still about the depth.
+	if _, err := List(filepath.Join(t.TempDir(), "absent"), ListOptions{Depth: 9}); !errors.Is(err, ErrDepthInvalid) {
+		t.Fatalf("a bad depth next to a bad path = %v, want ErrDepthInvalid", err)
+	}
+}
+
+// A listing that goes below the directory it was given has two caps it can
+// reach, and it states which one it reached and that the rest of the tree was
+// not examined: the entries it renders, and the entries it examines.
+func TestListStatesTheScanCapItReached(t *testing.T) {
+	root := depthFixture(t)
+	got, err := List(root, ListOptions{Depth: 3, MaxScanned: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "the listing stopped after 4 entries were examined; the remaining entries were not examined") {
+		t.Fatalf("the scan cap must be stated as the one that stopped the listing:\n%s", got)
+	}
+	if strings.Contains(got, "one listing returns at most") {
+		t.Fatalf("the render cap was reported although the scan cap stopped the walk:\n%s", got)
+	}
+	if strings.Contains(got, "docs/img/p.png") || strings.Contains(got, "docs/keep.md") {
+		t.Fatalf("entries past the scan cap were rendered anyway:\n%s", got)
+	}
+	// The render cap stops a deeper listing too, and it says so in its own
+	// words: it did not examine the rest, so it cannot count what it left out.
+	got, err = List(root, ListOptions{Depth: 3, MaxEntries: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "the listing stopped at 3 entries; the remaining entries were not examined") {
+		t.Fatalf("the render cap must be named as the one that stopped the listing:\n%s", got)
+	}
+	if strings.Contains(got, "entries were examined;") {
+		t.Fatalf("the scan cap was reported although the render cap stopped the walk:\n%s", got)
+	}
+	// A listing inside both caps says nothing about either.
+	full, err := List(root, ListOptions{Depth: 3, MaxScanned: 100, MaxEntries: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(full, "stopped") {
+		t.Fatalf("a complete listing must not claim it stopped:\n%s", full)
+	}
+}
+
+// The line cap is the one-level cap it always was, applied to the deeper paths
+// as well: a line that does not fit is cut and says so, and says how long the
+// path really is.
+func TestListKeepsTheLineCapOnDeeperPaths(t *testing.T) {
+	root := t.TempDir()
+	deep := strings.Repeat("d", 60)
+	long := strings.Repeat("n", 240)
+	mustWrite(t, filepath.Join(root, deep, long), "x")
+	got, err := List(root, ListOptions{Depth: 2, MaxLineBytes: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(got, "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("listing has %d lines, want a header and two entries:\n%s", len(lines), got)
+	}
+	entry := lines[2]
+	if len(entry) > 80 {
+		t.Fatalf("a line exceeded the cap: %d bytes %q", len(entry), entry)
+	}
+	if !strings.Contains(entry, fmt.Sprintf("path truncated; it is %d bytes", len(deep)+1+len(long))) {
+		t.Fatalf("a cut path must say it was cut and how long it is: %q", entry)
+	}
+	for _, line := range lines[1:] {
+		if len(line) > 80 {
+			t.Fatalf("a line exceeded the cap: %d bytes %q", len(line), line)
+		}
+	}
+}
+
+// A symbolic link is an entry like any other and is never entered, at any depth:
+// a link that points outside the directory cannot pull the walk out of it, and a
+// link that points at the directory itself cannot make the walk run forever.
+func TestListNeverEntersASymbolicLinkAtAnyDepth(t *testing.T) {
+	root, outside := t.TempDir(), t.TempDir()
+	mustWrite(t, filepath.Join(outside, "secret.txt"), "not yours\n")
+	if err := os.Symlink(outside, filepath.Join(root, "outlink")); err != nil {
+		t.Fatalf("symlink out: %v", err)
+	}
+	if err := os.Symlink(".", filepath.Join(root, "loop")); err != nil {
+		t.Fatalf("symlink loop: %v", err)
+	}
+	mustWrite(t, filepath.Join(root, "here.txt"), "x")
+	got, err := List(root, ListOptions{Depth: MaxListDepth})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, "secret.txt") {
+		t.Fatalf("the walk followed a link out of the directory:\n%s", got)
+	}
+	if !strings.Contains(got, "outlink") || !strings.Contains(got, "2 symbolic links not entered") {
+		t.Fatalf("a link must be named as an entry and reported as not entered:\n%s", got)
+	}
+	// The loop link is an entry, and the walk it would have started never
+	// happened: exactly one line names the top level's entries.
+	if strings.Count(got, "loop") != 1 {
+		t.Fatalf("the walk entered a link to its own directory:\n%s", got)
+	}
+}
+
+// A directory below the one that was asked for may be unreadable. That is
+// counted and stated rather than failing the listing: the model has to know that
+// this directory was not looked at, not that the call was refused.
+func TestListCountsASubdirectoryItCouldNotRead(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read a directory whatever its mode says")
+	}
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "closed", "hidden.txt"), "x\n")
+	mustWrite(t, filepath.Join(root, "open.txt"), "x\n")
+	if err := os.Chmod(filepath.Join(root, "closed"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(filepath.Join(root, "closed"), 0o755) })
+	got, err := List(root, ListOptions{Depth: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "closed") || !strings.Contains(got, "1 directory could not be read") {
+		t.Fatalf("an unreadable subdirectory must be named and counted:\n%s", got)
+	}
+	if strings.Contains(got, "hidden.txt") {
+		t.Fatalf("a directory that could not be read must not be described:\n%s", got)
+	}
+}
+
 // searchRoot builds a small tree for searching, including every kind of content
 // a search has to state something about:
 //

@@ -24,9 +24,11 @@
 //     path. They receive the validated path plus the caps, and all four refuse to
 //     overstate what they found: Read reads at most one byte past the cap so an
 //     oversize file is refused instead of truncated and refuses binary content,
-//     List renders exactly one level — it never enters a subdirectory and never
-//     follows a symbolic link — and states every cap it hit instead of cutting
-//     the list silently, Search matches one query per line — as literal text by
+//     List renders one level by default and up to MaxListDepth levels when the
+//     call names a depth — it never follows a symbolic link, and every rendered
+//     path is relative to the directory it was given, which at one level is the
+//     entry's own name — and states every cap it hit instead of cutting the list
+//     silently, Search matches one query per line — as literal text by
 //     default, and as an RE2 pattern when the call asks for that mode — never
 //     follows a symbolic link, and states every cap it hit — including that its
 //     walk stopped, because a search that stopped cannot say how many matches it
@@ -58,12 +60,32 @@ import (
 const DefaultLimit = 256 << 10
 
 // The listing caps. At most DefaultListEntries entries are rendered in one
-// listing, and one rendered line is at most DefaultListLineBytes bytes. They
-// bound a listing the model has to read for the same reason DefaultLimit bounds
-// a read: a result too large to digest is not a truthful result either.
+// listing, one rendered line is at most DefaultListLineBytes bytes, and at most
+// DefaultListScanned directory entries are examined. They bound a listing the
+// model has to read for the same reason DefaultLimit bounds a read: a result too
+// large to digest is not a truthful result either.
+//
+// The scan cap is the one a single directory read cannot already bound. One
+// level reads exactly one directory and renders at most DefaultListEntries of
+// it, so the render cap is always reached first; a listing that goes below the
+// directory it was given walks a tree instead, and a walk of a tree with a
+// dependency directory in it has to end and say where it ended. It is stated in
+// the same shape as the name search's entry cap (DefaultFindEntries), because it
+// is the same problem: the walk reads no file content, so the cost of one entry
+// is the directory read that produced it.
 const (
 	DefaultListEntries   = 200
 	DefaultListLineBytes = 160
+	DefaultListScanned   = 20000
+)
+
+// The listing depth. One listing covers DefaultListDepth level by default and
+// never more than MaxListDepth: a depth past the range is refused with the range
+// rather than clamped, because a clamped depth would answer a call about levels
+// it did not get to say it looked at.
+const (
+	DefaultListDepth = 1
+	MaxListDepth     = 5
 )
 
 // The search caps. One search renders at most DefaultSearchMatches matching
@@ -148,6 +170,11 @@ var (
 	ErrLineTooLarge = errors.New("the first line of the range is longer than the single-read limit")
 	ErrNotReadable  = errors.New("file cannot be read")
 	ErrNotListable  = errors.New("directory cannot be listed")
+	// ErrDepthInvalid reports a listing depth outside
+	// DefaultListDepth..MaxListDepth. It is a refusal rather than a clamp: a
+	// call that asked for a depth this listing does not have must not come
+	// back as a listing of some other depth that it never asked for.
+	ErrDepthInvalid = errors.New("the listing depth is not valid")
 	// ErrNotSearchable reports a search whose starting path is neither a
 	// regular file nor a directory — or is a symbolic link, which a search
 	// never follows.
@@ -873,14 +900,60 @@ func ReadRangeParts(path string, opts RangeOptions) (header, text string, err er
 	return fmt.Sprintf("lines %d-%d of %d\n", first, last, lines), text, nil
 }
 
-// ListOptions carries the host's caps for one listing. A non-positive cap falls
-// back to the package default, so a plugin can never render an unbounded
-// listing just because a host sent no cap.
+// ValidateDepth checks an optional listing depth the way the plugin protocol
+// carries one: zero means the call named none, which is DefaultListDepth, and
+// anything else has to be inside DefaultListDepth..MaxListDepth.
+//
+// It lives here, next to the listing that consumes it, so the host can refuse a
+// depth on the same terms the plugin would — and so a malformed depth is refused
+// before a directory is read rather than answered at a depth the call never
+// asked for. A clamp would be the other option and it is the wrong one: the
+// model would be told "5 levels" while looking at a result about three.
+func ValidateDepth(depth int) error {
+	if depth == 0 {
+		return nil
+	}
+	return ValidateNamedDepth(depth)
+}
+
+// ValidateNamedDepth checks a depth a call named explicitly, zero included. Zero
+// is how the protocol says "no depth was named", and a tool that asks a model
+// for a depth refuses an explicit zero rather than reading it as that protocol
+// value: a call that named depth 0 asked for a listing of nothing, and the
+// answer it needs is the range it may ask for.
+func ValidateNamedDepth(depth int) error {
+	if depth < DefaultListDepth || depth > MaxListDepth {
+		return fmt.Errorf("%w: depth must be %d..%d (got %d)", ErrDepthInvalid, DefaultListDepth, MaxListDepth, depth)
+	}
+	return nil
+}
+
+// DepthOrDefault maps a depth a call may or may not have named onto the depth
+// the listing runs: nothing named is one level.
+func DepthOrDefault(depth int) int {
+	if depth == 0 {
+		return DefaultListDepth
+	}
+	return depth
+}
+
+// ListOptions carries the host's caps and the depth of one listing. A
+// non-positive cap falls back to the package default, so a plugin can never
+// render an unbounded listing just because a host sent no cap.
 type ListOptions struct {
 	// MaxEntries is the largest number of entries one listing renders.
 	MaxEntries int
 	// MaxLineBytes is the largest length of one rendered line.
 	MaxLineBytes int
+	// MaxScanned is the largest number of directory entries one listing
+	// examines. See DefaultListScanned: it is the cap a walk below the
+	// directory can reach, and reaching it ends the walk and is stated.
+	MaxScanned int
+	// Depth is how many levels below the directory the listing covers. Zero
+	// means the call named none, which is DefaultListDepth; a value outside
+	// DefaultListDepth..MaxListDepth is refused by ValidateDepth before a
+	// directory is read.
+	Depth int
 	// ExactBytes renders every file size as an exact byte count instead of a
 	// human-readable unit. Both renderings round the same measured number, so
 	// neither invents a size; the choice is what makes a candidate replacement
@@ -895,74 +968,263 @@ type listEntry struct {
 	name string
 }
 
-// List renders one level of dir. dir is an absolute path the host already
-// validated against the read root: no path is interpreted here, and no entry is
-// ever entered. The result is bounded three ways, and each bound is stated in
-// the text rather than hidden:
-//
-//   - one level only, so a listing can never become a recursive dump;
-//   - at most opts.MaxEntries entries rendered, with the remainder counted in a
-//     closing line;
-//   - at most opts.MaxLineBytes bytes per line, with a cut name marked and its
-//     real length reported.
-//
-// Order is fixed and part of the result's meaning: directories first, then files
-// and links, each group keeping the name order the directory read returned.
-func List(dir string, opts ListOptions) (string, error) {
-	if opts.MaxEntries <= 0 {
-		opts.MaxEntries = DefaultListEntries
-	}
-	if opts.MaxLineBytes <= 0 {
-		opts.MaxLineBytes = DefaultListLineBytes
-	}
+// listGroups is the order a listing renders the kinds of one level in:
+// directories first, then files, then anything else, then links. It is the
+// order at every level, so a listing that goes below the directory it was given
+// orders each of those levels the way one level orders its own entries.
+var listGroups = []string{"dir", "file", "other", "link"}
+
+// level is one directory read: its entries in the order above, together with how
+// many of each kind there are.
+type level struct {
+	items  []listEntry
+	counts map[string]int
+}
+
+// readLevel reads one directory and orders its entries the way a listing renders
+// them. It is the only place a directory is read, so one level and a walk below
+// it cannot disagree about what the entries of a directory are or the order they
+// come in, and a directory that cannot be read fails the same way wherever it is
+// read from.
+func readLevel(dir string, exact bool) (level, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		// The path is absolute here, so only the cause is reported.
-		return "", fmt.Errorf("%w: %s", ErrNotListable, pathError(err))
+		return level{}, fmt.Errorf("%w: %s", ErrNotListable, pathError(err))
 	}
 	items := make([]listEntry, 0, len(entries))
 	counts := map[string]int{}
 	for _, e := range entries {
-		item := classify(e, opts.ExactBytes)
+		item := classify(e, exact)
 		counts[item.kind]++
 		items = append(items, item)
 	}
-	groups := []string{"dir", "file", "other", "link"}
 	ordered := make([]listEntry, 0, len(items))
-	for _, kind := range groups {
+	for _, kind := range listGroups {
 		for _, item := range items {
 			if item.kind == kind {
 				ordered = append(ordered, item)
 			}
 		}
 	}
+	return level{items: ordered, counts: counts}, nil
+}
 
-	var b strings.Builder
-	parts := make([]string, 0, len(groups))
-	for _, kind := range groups {
+// listPrefix is the fixed part of every entry line: what the entry is, and a size
+// when it has one. Only the name after it differs between the depths.
+func listPrefix(item listEntry) string {
+	return fmt.Sprintf("%-4s %9s  ", item.kind, item.size)
+}
+
+// kindParts states how many entries of each kind were rendered, in listGroups
+// order, so both renderings describe the same counts the same way.
+func kindParts(counts map[string]int) []string {
+	parts := make([]string, 0, len(listGroups))
+	for _, kind := range listGroups {
 		if counts[kind] > 0 {
 			parts = append(parts, plural(counts[kind], kind))
 		}
 	}
+	return parts
+}
+
+// List renders dir: one level by default, and up to opts.Depth levels when the
+// call named a depth. dir is an absolute path the host already validated against
+// the read root: no path is interpreted here, and no symbolic link is ever
+// entered, whether it is an entry or a subdirectory. The result is bounded four
+// ways, and each bound is stated in the text rather than hidden:
+//
+//   - one level at least and MaxListDepth at most, so a listing can never become
+//     an unbounded walk of the read root;
+//   - at most opts.MaxEntries entries rendered. One level can state how many
+//     entries were left out, because it has read the whole directory; a listing
+//     that goes below it stops there instead and says the remaining entries were
+//     not examined, because a walk that stopped cannot count what it did not
+//     look at;
+//   - at most opts.MaxScanned entries examined, which is the cap a walk can reach
+//     while the rendered entries are still inside their own cap;
+//   - at most opts.MaxLineBytes bytes per line, with a cut path marked and its
+//     real length reported.
+//
+// Order is fixed and part of the result's meaning: at every level directories
+// come first, then files and links, each group in the name order the directory
+// read returned. A listing that goes deeper walks depth-first — it renders an
+// entry and, when that entry is a directory, the entries of that directory
+// follow it immediately — so the tree reads as a tree rather than as a flat set
+// of paths sorted by something else.
+//
+// One level is rendered exactly as it always was. That is deliberate and is why
+// the deeper rendering is a generalization rather than a second format: an
+// entry's name and its path relative to dir are the same string when there is
+// only one level, so the deeper rendering is the same line with that relative
+// path in place of the name, and one header that states the depth it covered and
+// every cap it reached.
+func List(dir string, opts ListOptions) (string, error) {
+	if err := ValidateDepth(opts.Depth); err != nil {
+		return "", err
+	}
+	if opts.MaxEntries <= 0 {
+		opts.MaxEntries = DefaultListEntries
+	}
+	if opts.MaxLineBytes <= 0 {
+		opts.MaxLineBytes = DefaultListLineBytes
+	}
+	if opts.MaxScanned <= 0 {
+		opts.MaxScanned = DefaultListScanned
+	}
+	depth := DepthOrDefault(opts.Depth)
+	// The first level is read here, so a directory that cannot be read at all
+	// is the same refusal whatever depth was asked for.
+	first, err := readLevel(dir, opts.ExactBytes)
+	if err != nil {
+		return "", err
+	}
+	if depth == DefaultListDepth {
+		return renderLevel(first, opts), nil
+	}
+	l := &lister{opts: opts, depth: depth, counts: map[string]int{}}
+	l.walk(first, dir, "", depth)
+	return l.render(), nil
+}
+
+// renderLevel renders one level, the way a listing has always rendered it: a
+// header stating what was found, the entries in listGroups order, and a closing
+// line stating how many entries the render cap left out.
+func renderLevel(one level, opts ListOptions) string {
+	var b strings.Builder
+	parts := kindParts(one.counts)
 	if len(parts) == 0 {
 		b.WriteString("0 entries: the directory is empty\n")
-		return b.String(), nil
+		return b.String()
 	}
-	fmt.Fprintf(&b, "%s: %s (directories first, then files and links, each by name)\n", plural(len(entries), "entry"), strings.Join(parts, ", "))
+	fmt.Fprintf(&b, "%s: %s (directories first, then files and links, each by name)\n", plural(len(one.items), "entry"), strings.Join(parts, ", "))
 	shown := 0
-	for _, item := range ordered {
+	for _, item := range one.items {
 		if shown == opts.MaxEntries {
 			break
 		}
 		shown++
-		prefix := fmt.Sprintf("%-4s %9s  ", item.kind, item.size)
-		b.WriteString(fitLine(prefix, item.name, opts.MaxLineBytes, "name"))
+		b.WriteString(fitLine(listPrefix(item), item.name, opts.MaxLineBytes, "name"))
 		b.WriteString("\n")
 	}
-	if remaining := len(ordered) - shown; remaining > 0 {
+	if remaining := len(one.items) - shown; remaining > 0 {
 		fmt.Fprintf(&b, "%s are not listed: one listing returns at most %s\n", plural(remaining, "entry"), plural(opts.MaxEntries, "entry"))
 	}
-	return b.String(), nil
+	return b.String()
+}
+
+// lister is the state of one listing that goes below the directory it was given:
+// the lines it rendered, and everything the result has to state about what it
+// examined, what it passed over and which cap ended it.
+type lister struct {
+	opts   ListOptions
+	depth  int
+	lines  []string
+	counts map[string]int
+
+	// The counters below are why a result can state its own scope: how many
+	// entries were rendered and examined, and what was passed over.
+	rendered   int
+	scanned    int
+	links      int
+	unreadable int
+
+	stoppedAtEntries bool
+	stoppedAtScanned bool
+}
+
+// walk renders the entries of one level and then the directories among them,
+// depth-first. The level is already read by the caller, so a walk never reads the
+// same directory twice and a directory that cannot be read is counted where it
+// was reached.
+func (l *lister) walk(one level, dir, rel string, levelsLeft int) {
+	for _, item := range one.items {
+		if l.scanned == l.opts.MaxScanned {
+			l.stoppedAtScanned = true
+			return
+		}
+		l.scanned++
+		if item.kind == "link" {
+			l.links++
+		}
+		if l.rendered == l.opts.MaxEntries {
+			l.stoppedAtEntries = true
+			return
+		}
+		// The path is relative to the directory the listing started at: at one
+		// level rel is empty and this is the entry's own name.
+		name := filepath.Join(rel, item.name)
+		l.lines = append(l.lines, fitLine(listPrefix(item), name, l.opts.MaxLineBytes, "path"))
+		l.counts[item.kind]++
+		l.rendered++
+		if item.kind != "dir" || levelsLeft <= DefaultListDepth {
+			continue
+		}
+		child := filepath.Join(dir, item.name)
+		deeper, err := readLevel(child, l.opts.ExactBytes)
+		if err != nil {
+			// A directory that cannot be read is counted rather than ending
+			// the listing: what the model needs to know is that this one was
+			// not looked at, not that the call failed.
+			l.unreadable++
+			continue
+		}
+		l.walk(deeper, child, name, levelsLeft-1)
+		if l.stopped() {
+			return
+		}
+	}
+}
+
+// stopped reports whether a cap ended the walk, so the levels above it stop too
+// rather than continuing past what the listing is allowed to examine.
+func (l *lister) stopped() bool { return l.stoppedAtEntries || l.stoppedAtScanned }
+
+// render states what the listing found and what it cost: how many entries it
+// rendered, how deep it went, and every cap it reached and every directory it
+// passed over. A result that hid either half would describe a smaller listing
+// than the one that was asked for.
+func (l *lister) render() string {
+	var b strings.Builder
+	if l.rendered == 0 {
+		// Nothing below the directory at any level the call asked for, which
+		// is the answer one level gives for the same directory.
+		b.WriteString("0 entries: the directory is empty\n")
+		return b.String()
+	}
+	fmt.Fprintf(&b, "%s up to %s deep: %s (directories first, then files and links, each by name, with every path relative to the directory listed)\n", plural(l.rendered, "entry"), plural(l.depth, "level"), strings.Join(kindParts(l.counts), ", "))
+	for _, line := range l.lines {
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	for _, note := range l.notes() {
+		b.WriteString(note)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// notes lists what the result has to say besides the entries, in a fixed order:
+// first what was passed over, then the one cap that ended the walk. Which cap it
+// was is stated, because the two mean different things — one says the listing
+// rendered as much as it may, the other that the walk stopped before it could
+// look at everything — and a listing that stopped must not read as a listing
+// that described the whole tree.
+func (l *lister) notes() []string {
+	notes := make([]string, 0, 4)
+	if l.links > 0 {
+		notes = append(notes, fmt.Sprintf("%s not entered", plural(l.links, "symbolic link")))
+	}
+	if l.unreadable > 0 {
+		notes = append(notes, fmt.Sprintf("%s could not be read", plural(l.unreadable, "directory")))
+	}
+	if l.stoppedAtEntries {
+		notes = append(notes, fmt.Sprintf("the listing stopped at %s; the remaining entries were not examined", plural(l.opts.MaxEntries, "entry")))
+	}
+	if l.stoppedAtScanned {
+		notes = append(notes, fmt.Sprintf("the listing stopped after %s were examined; the remaining entries were not examined", plural(l.opts.MaxScanned, "entry")))
+	}
+	return notes
 }
 
 // classify states what one entry is, from its own metadata. A symbolic link is

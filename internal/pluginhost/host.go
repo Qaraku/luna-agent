@@ -157,13 +157,16 @@ type Options struct {
 	// ReadLimit is the single-read size cap in bytes. It defaults to
 	// fileread.DefaultLimit (256 KiB).
 	ReadLimit int
-	// ListMaxEntries and ListMaxLineBytes are the two listing caps: at most this
-	// many entries are rendered, and one rendered line is at most this many
-	// bytes. They default to fileread.DefaultListEntries and
-	// fileread.DefaultListLineBytes, and each is stated in the result when it is
-	// reached.
+	// ListMaxEntries, ListMaxLineBytes and ListMaxScanned are the three
+	// listing caps: at most this many entries are rendered, one rendered line
+	// is at most this many bytes, and at most this many directory entries are
+	// examined by a listing that goes below the directory it was given. They
+	// default to fileread.DefaultListEntries, fileread.DefaultListLineBytes
+	// and fileread.DefaultListScanned, and each is stated in the result when
+	// it is reached.
 	ListMaxEntries   int
 	ListMaxLineBytes int
+	ListMaxScanned   int
 	// SearchMaxMatches, SearchMaxLineBytes, SearchMaxFiles and
 	// SearchMaxFileBytes are the four search caps: at most this many matching
 	// lines are rendered, one rendered line is at most this many bytes, at most
@@ -216,10 +219,19 @@ type ReadRequest struct {
 // ListRequest is a directory-listing request from the core. Path is the raw,
 // model-supplied path, on the same terms as ReadRequest: the host validates it
 // against the roots the call names and the plugin only ever sees the resolved
-// absolute path. There is deliberately no recursion knob: one listing is one
-// level, and no request can widen that.
+// absolute path.
+//
+// Depth is how many levels below that path the listing covers. Zero means the
+// call named none, which is fileread.DefaultListDepth — one level, the listing
+// this tool has always been — and anything else has to be inside
+// fileread.DefaultListDepth..fileread.MaxListDepth or the call is refused here.
+// It is a bound and not a widening: the depth says how far down a listing looks,
+// the listing is still capped on how much it renders and on how much it examines
+// (see Options.ListMaxScanned), and a listing that stopped at a cap says so.
 type ListRequest struct {
 	Path string
+	// Depth is the number of levels to cover, or zero for the default of one.
+	Depth int
 	// Roots are the directories this call may list from, on the same terms as
 	// ReadRequest.Roots.
 	Roots []string
@@ -320,6 +332,9 @@ func (h *Host) withDefaults() {
 	}
 	if o.ListMaxLineBytes <= 0 {
 		o.ListMaxLineBytes = fileread.DefaultListLineBytes
+	}
+	if o.ListMaxScanned <= 0 {
+		o.ListMaxScanned = fileread.DefaultListScanned
 	}
 	if o.SearchMaxMatches <= 0 {
 		o.SearchMaxMatches = fileread.DefaultSearchMatches
@@ -557,10 +572,16 @@ func (h *Host) ReadFile(ctx context.Context, req ReadRequest) (Output, error) {
 // ListDir calls the directory-listing tool. The requested path is validated here,
 // on the host side, exactly as a read path is — same normalization, same
 // containment, same symbolic-link resolution, against the same roots — and the
-// plugin is handed only the resolved absolute directory path plus the two caps.
+// plugin is handed only the resolved absolute directory path plus the depth and
+// the three caps.
+//
 // A refusal (an absolute path, a `..` escape, something that is not a
-// directory, a nonexistent path) is therefore made before any RPC, so no plugin
-// process ever sees a path none of the roots holds.
+// directory, a nonexistent path, a depth outside the range the listing has) is
+// therefore made before any RPC, so no plugin process ever sees a path none of
+// the roots holds or a depth the listing does not have. The depth is checked
+// before the path is even resolved, because it is a refusal about the call
+// rather than about the filesystem: a call that asked for depth 9 is refused
+// whether or not the directory it named exists.
 func (h *Host) ListDir(ctx context.Context, req ListRequest) (Output, error) {
 	if len(req.Path) > 4096 {
 		return Output{}, fmt.Errorf("path must not exceed 4096 bytes")
@@ -568,11 +589,14 @@ func (h *Host) ListDir(ctx context.Context, req ListRequest) (Output, error) {
 	if req.DelayMS < 0 || req.DelayMS > pluginprotocol.MaxDelayMS {
 		return Output{}, fmt.Errorf("delay_ms must be 0..%d", pluginprotocol.MaxDelayMS)
 	}
+	if err := fileread.ValidateDepth(req.Depth); err != nil {
+		return Output{}, err
+	}
 	resolved, err := fileread.ResolveDirInRoots(h.readRoots(req.Roots), req.Path)
 	if err != nil {
 		return Output{}, err
 	}
-	return h.invoke(ctx, ToolListDir, Input{Path: resolved.Path, MaxEntries: h.opts.ListMaxEntries, MaxLineBytes: h.opts.ListMaxLineBytes, DelayMS: req.DelayMS})
+	return h.invoke(ctx, ToolListDir, Input{Path: resolved.Path, Depth: fileread.DepthOrDefault(req.Depth), MaxEntries: h.opts.ListMaxEntries, MaxLineBytes: h.opts.ListMaxLineBytes, MaxScanned: h.opts.ListMaxScanned, DelayMS: req.DelayMS})
 }
 
 // SearchFiles calls the search tool. The requested path is validated here, on
