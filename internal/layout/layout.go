@@ -106,3 +106,42 @@ func (p Paths) RuntimeOrState() (string, bool) {
 	}
 	return p.State, true
 }
+
+// Choice is the result of deciding between where a kind of data belongs now and
+// where it used to live. Exactly one location is ever in use: reading one and
+// writing the other would give "where is this user's data" two answers.
+type Choice struct {
+	// Dir is the directory to read from and write to.
+	Dir string
+	// New reports whether Dir is the location introduced by this version.
+	New bool
+	// Reason is one sentence naming the directory, and — when the previous
+	// location is still in use — where the data would live after a move. The
+	// composition root logs it verbatim, so it has to be enough to act on.
+	Reason string
+}
+
+// ChooseDir decides which of two directories a kind of data lives in, given
+// whether each one is already there.
+//
+// The rule is compatibility before cleanliness: the new location wins when it
+// already exists and also when neither does, so a fresh installation starts in
+// the new place; an installation whose data is still in the previous location
+// keeps working there and says so. Nothing is moved and nothing is deleted —
+// moving the old files is a separate, explicit operation, because deleting is
+// the user's decision.
+func ChooseDir(name, newDir, oldDir string, newExists, oldExists bool) Choice {
+	switch {
+	case newExists:
+		return Choice{Dir: newDir, New: true, Reason: name + ": using " + newDir}
+	case oldExists:
+		return Choice{
+			Dir: oldDir,
+			New: false,
+			Reason: name + ": still in " + oldDir + ", the location used before this version; " +
+				"they would live in " + newDir + " after a move, which this version never does by itself",
+		}
+	default:
+		return Choice{Dir: newDir, New: true, Reason: name + ": creating " + newDir}
+	}
+}
