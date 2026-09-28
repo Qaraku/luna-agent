@@ -427,6 +427,57 @@ func TestReadRootDefaultsToTheRepositoryRoot(t *testing.T) {
 	}
 }
 
+// The search mode crosses two hops the fileread tests cannot see: the host validates it
+// and hands it to the plugin, and the plugin hands it to the same search the literal
+// default uses. The query below is chosen so that the two readings disagree — "a.c" is a
+// literal miss against a file holding "abc" and a pattern hit — so a plugin that ignored
+// the mode could not produce the match, and a host that never validated it could not
+// produce the refusal.
+func TestSearchFilesCarriesTheModeAcrossThePluginBoundary(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "notes.md"), []byte("abc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := testHost(t, Options{ReadRoot: root, ReadLimit: 4096})
+	ctx := context.Background()
+
+	// A call that names no mode reads the query literally, exactly as before.
+	out, err := h.SearchFiles(ctx, SearchRequest{Path: ".", Query: "a.c"})
+	if err != nil {
+		t.Fatalf("literal search: %v", err)
+	}
+	if !strings.Contains(out.Result, "no matches") {
+		t.Fatalf("a call with no mode was not read literally: %q", out.Result)
+	}
+
+	// The same query with the mode named does match, and the result says how it was read.
+	out, err = h.SearchFiles(ctx, SearchRequest{Path: ".", Query: "a.c", Mode: "regex"})
+	if err != nil {
+		t.Fatalf("regex search: %v", err)
+	}
+	if !strings.Contains(out.Result, "notes.md") {
+		t.Fatalf("the mode did not reach the search: %q", out.Result)
+	}
+	if !strings.Contains(out.Result, "as a regular expression") {
+		t.Fatalf("the result does not say the query was read as a pattern: %q", out.Result)
+	}
+
+	// A mode this search does not have is refused here, before any plugin is asked.
+	if _, err := h.SearchFiles(ctx, SearchRequest{Path: ".", Query: "a", Mode: "glob"}); !errors.Is(err, fileread.ErrModeInvalid) {
+		t.Fatalf("search with an unknown mode err = %v, want ErrModeInvalid", err)
+	}
+
+	// A pattern that cannot compile is the call's own refusal, carrying Go's explanation,
+	// and never a result that reads as "there is nothing there".
+	out, err = h.SearchFiles(ctx, SearchRequest{Path: ".", Query: "[", Mode: "regex"})
+	if err == nil {
+		t.Fatalf("an uncompilable pattern was answered with %q", out.Result)
+	}
+	if !strings.Contains(err.Error(), "error parsing regexp") {
+		t.Fatalf("the refusal does not carry Go's own explanation: %v", err)
+	}
+}
+
 // A file call is checked against the roots that call names, not against whatever
 // the host was built with: the working directories of the run decide what the
 // model may reach. A call that names none keeps the configured root, which is

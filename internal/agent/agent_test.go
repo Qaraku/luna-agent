@@ -809,6 +809,51 @@ func TestFindFilesToolRejectsMalformedArgumentsBeforeTheHost(t *testing.T) {
 	}
 }
 
+// The search tool offers exactly three arguments — where to look, what to look for and
+// how to read it — and it spells the mode out in the schema instead of leaving a model to
+// discover it from a refusal. The mode is also optional, because every call that names
+// none has to keep the literal reading it has always had.
+func TestSearchFilesSchemaOffersTheModeItHas(t *testing.T) {
+	info, err := NewSearchFilesTool(&recordingReader{}).Info(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Name != SearchFilesToolName {
+		t.Fatalf("tool name = %q", info.Name)
+	}
+	s, err := info.ParamsOneOf.ToJSONSchema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(s)
+	var raw map[string]any
+	_ = json.Unmarshal(b, &raw)
+	if raw["type"] != "object" || raw["additionalProperties"] != false {
+		t.Fatalf("schema is not strict: %s", b)
+	}
+	req := raw["required"].([]any)
+	if len(req) != 2 || req[0] != "path" || req[1] != "query" {
+		t.Fatalf("required mismatch: %s", b)
+	}
+	props, ok := raw["properties"].(map[string]any)
+	if !ok || len(props) != 3 {
+		t.Fatalf("the schema does not offer exactly a path, a query and a mode: %s", b)
+	}
+	mode, ok := props["mode"].(map[string]any)
+	if !ok {
+		t.Fatalf("the schema does not offer a mode: %s", b)
+	}
+	if enum, ok := mode["enum"].([]any); !ok || len(enum) != 2 || enum[0] != "literal" || enum[1] != "regex" {
+		t.Fatalf("the mode's values are not pinned: %v", mode["enum"])
+	}
+	if desc, _ := mode["description"].(string); !strings.Contains(strings.ToLower(desc), "literal") {
+		t.Fatalf("the mode does not say what the default is: %q", desc)
+	}
+	if !strings.Contains(info.Desc, "literal") {
+		t.Fatalf("the tool description does not say what the default is: %q", info.Desc)
+	}
+}
+
 func TestFindFilesSchemaIsStrictAndOffersNoDepthOrTypeFilter(t *testing.T) {
 	info, err := NewFindFilesTool(&recordingReader{}).Info(context.Background())
 	if err != nil {
