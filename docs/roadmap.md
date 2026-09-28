@@ -301,7 +301,7 @@ provider 与模型不需要。探测失败不算服务错误，它是一次回�
 **未验证**：真实 provider 上每条 provider 各自的长跑（本轮用的是两个假端点，没有真实凭据）、
 非 OpenAI 兼容的协议、以及切换 provider 之后的答案质量差异。
 
-## 未发布：Luna 有了手和脚，以及一份能读回来的记忆
+## 未发布：Luna 有了手、脚和耳朵，以及一份能读回来的记忆
 
 用户给出的缺口清单里排在最前面的三件事——写文件、跑命令、把记忆读回来——在这一批里落地；每一件都做成了**默认关闭、由用户在设置里显式打开**的能力，因为这三样都能改动用户的机器或它的记忆。
 
@@ -331,6 +331,28 @@ provider 与模型不需要。探测失败不算服务错误，它是一次回�
 - diff 不是最小编辑脚本（只掐掉公共前缀与后缀行），分散改动时中间的未变行会各出现一次；超过 8 KiB 截断并说明上限。
 - 写入授权指向**路径**而不是"目录身份"：允许的目录被改名或移动之后那条授权不再匹配，需要重新允许（工具会拒绝并说清原因）。
 - 真实模型会不会正确使用这两件新工具（选对命令、写对文件、不滥用）**没有真实 provider 跑过**——目前只有假 provider 驱动的事件流证据。
+
+## 未发布（续）：联网抓取、正则搜索，以及几处被新能力说成假的文档
+
+用户缺口清单里第一优先级的第三件是**联网**，第二优先级里有**正儿八经的搜索**（支持正则）；这一批把这两件落地，并把手脚那一批留下的错漏收干净。**尚未排期发布**。
+
+| 改动 | 引入提交 |
+|---|---|
+| 新的内置能力 **联网**：`luna_web_fetch` 取回一个公开 http(s) 地址的正文文本——只允许公开地址（请求前解析主机名 + 连接时各判一次）、非文本响应按类型拒绝、20 秒/5 跳重定向/1 MiB 响应体/16 KiB 返回文本四个上限都在结果里点名、响应体超限时读前 1 MiB 并说明还有多少没读（且说明 `start_offset` 到不了那部分）、提取是启发式阅读器而不是渲染；显式申请 `net.fetch`，自己不会跑 | `0e5c230` |
+| 装配根把联网接上：始终注册、只在 `settings.yaml` 点名时启用；`go.mod` 里 `golang.org/x/net` 由 indirect 转为直接依赖（`go mod tidy` 只挪了那一处标记） | `b10cfef` |
+| `luna_search_files` 新增 `mode`：`literal` 是默认、`regex` 时同一个 query 按 RE2 **逐行**匹配；非法模式是拒绝并带 Go 自己的原文、未知 `mode` 值被点名拒绝而不是当默认；**默认模式的头与文案逐字未变** | `0f33339` |
+| 未绑定工作区的会话现在能干活：run 分支在会话没点名工作区时把**配置的读取根**当作本次运行的工作目录（与文件工具在宿主内的回退取同一个值），否则 `luna_run` / `luna_write_file` 会在一个「能读却不能工作」的运行里被拒 | `20ae592` |
+| 两处「没有工作目录」的拒绝改成**可行动**：点明该会话没有绑定工作区，以及用户在设置页哪一处绑定 | `ae5e68a` |
+| 多根下的写入改到**读会看的地方**：已经有这个文件的根优先，多个根都持有它时按根顺序取第一个；否则「读出来、改回去」会写到另一个根里的同名新文件上，而结果还写着 created | `69f15ab` |
+| 文档纠正：网络工具不存在、内核只能强制一种授权、搜索不接受模式的那条错论据（Go 的 `regexp` 是 RE2，线性、不回溯）、`tool.started` 的能力工具清单、以及浏览器判据的保真度说明 | `0a040c1`、`6ba3b45`、`417a7a5`、`886b7ef`、`d9b3f7b`、`25ef776` |
+
+**验证**：
+
+- **主树门禁**（合并后重跑）：`go test -race -count=1 ./...` 无失败、`go vet ./...` 无输出、`go build -o .runtime/luna ./cmd/luna`、`gofmt -l internal cmd plugins` 无输出、`node --test web/app.test.cjs` **125/125**、`git diff --check` 通过。
+- **未绑定工作区的回退**有端到端证据：`.evidence/tools/smoke-tools.py` **37 项判据、0 失败、10/10 工具**（比上一批多 6 项）。新增的第四个隔离实例把 `-root` 与 `-read-root` 都指向临时夹具、`settings.yaml` 里打开 terminal 与 filewrite、**不给任何会话绑定 workspace**：`luna_run` 的 `pwd` 返回夹具根、`luna_write_file` 在夹具根里真的写出文件并被读回，随后同一会话绑定 workspace 之后 `pwd` 改回 workspace 的目录。修复前的**负对照**留在 `.evidence/tools/smoke-tools.before-fix.txt`：用不含该修复的 `HEAD~1` 二进制跑同一脚本，这两条判据失败，失败原文正是「没有工作目录」的拒绝。
+- 正则模式的**缺陷侧验证**：把新加的正则分支短路后，4 条新用例立刻失败（`TestSearchReadsTheQueryAsAPatternWhenTheCallAsksForIt`、`TestTheSameQueryReadsDifferentlyInEachMode`、`TestSearchRegexStatesTheSameCapsAndComposesWithTrimIndent`、`TestSearchRegexRefusesAPatternItCannotCompile`），改回后全绿。
+
+**未验证 / 已知边界**：联网与正则的端到端判据（联网：默认关闭→开启、不依赖外网的地址拒绝、一次真实公网抓取；正则：模式命中、非法模式被拒）尚未跑完，完成后补进本节的判据计数。在补完之前，这两项的证据是单元与宿主层测试（`internal/plugins/web`、`internal/fileread`、`internal/pluginhost`）加上主树门禁，不是进程级证据。联网还缺两样：真实路由下的 https 与 6to4/NAT64 行为只被单元测试覆盖，代理路径也只由注入的代理函数验证过（`http.ProxyFromEnvironment` 每进程只读一次环境，进程内不可注入）。
 
 ## 构建方式
 
