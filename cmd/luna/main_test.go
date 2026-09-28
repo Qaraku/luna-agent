@@ -13,8 +13,67 @@ import (
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	"github.com/Qaraku/luna-agent/internal/plugins/workspace"
+	"github.com/Qaraku/luna-agent/internal/provider"
 	"github.com/Qaraku/luna-agent/internal/skills"
 )
+
+// No way of getting the provider file wrong may end the process: the settings page
+// that repairs it is served by the same process, so exiting would put the only fix
+// out of reach. What could not be read is carried into the sentence that is logged,
+// and the runtime answers it per request and per run.
+func TestStartupProviderReadingNeverFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), provider.FileName)
+	runtime := providerRuntime{path: path, getenv: func(string) string { return "" }}
+
+	// Nothing yet: the normal first run.
+	cfg, note := initialProvider(runtime, path)
+	if strings.Join(cfg.Missing, ",") != "provider" {
+		t.Fatalf("missing = %v, want the provider itself", cfg.Missing)
+	}
+	if !strings.Contains(note, "not configured yet") {
+		t.Fatalf("note = %q", note)
+	}
+
+	// A file an earlier version wrote: still usable, and the note names the
+	// provider it was read as.
+	previous := "base_url: https://old.example.test/v1\napi_key: sk-old\nmodel: old-model\n"
+	if err := os.WriteFile(path, []byte(previous), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, note = initialProvider(runtime, path)
+	if len(cfg.Missing) != 0 || cfg.Model != "old-model" || cfg.BaseURL != "https://old.example.test/v1" {
+		t.Fatalf("cfg = %+v, note = %q", cfg, note)
+	}
+	if !strings.Contains(note, provider.LegacyName) || !strings.Contains(note, "old.example.test") {
+		t.Fatalf("note = %q, want it to name what it read", note)
+	}
+
+	// A file that cannot be read: one logged sentence, an empty configuration and
+	// no exit.
+	broken := "active: nobody\nproviders:\n  a:\n    base_url: https://a.example.test/v1\n    model: m\n"
+	if err := os.WriteFile(path, []byte(broken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, note = initialProvider(runtime, path)
+	if !strings.Contains(note, "could not be read") || !strings.Contains(note, "nobody") {
+		t.Fatalf("note = %q, want the reason in it", note)
+	}
+	if cfg.Model != "" || len(cfg.Missing) != 0 {
+		t.Fatalf("cfg = %+v, want an empty configuration", cfg)
+	}
+	// The same reason is what a run and the interface get, and the file is left as
+	// it was: repairing it is the user's decision, not a silent rewrite.
+	if _, err := runtime.Current(); err == nil || !strings.Contains(err.Error(), "nobody") {
+		t.Fatalf("Current() = %v, want the reason the file could not be used", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != broken {
+		t.Fatalf("the file was rewritten: %s", after)
+	}
+}
 
 func TestRootFromExecutableRuntimeBinary(t *testing.T) {
 	got := rootFromExecutable("/tmp/luna-agent/.runtime/luna")

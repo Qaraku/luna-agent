@@ -286,3 +286,92 @@ func TestTheHintShowsOnlyTheEnd(t *testing.T) {
 		t.Fatalf("hint %q discloses a short key", hint)
 	}
 }
+
+// A file an earlier version wrote — one endpoint, one key and one model at the top
+// level — is read as one provider, so an installation that was already configured
+// keeps working instead of being told its own file is broken on startup. It gets a
+// name, because everything above this point refers to a provider by name, and the
+// next save writes the current shape.
+func TestThePreviousShapeIsReadAsOneProvider(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	previous := "base_url: https://old.example.test/v1\napi_key: sk-old-value\nmodel: old-model\n"
+	if err := os.WriteFile(path, []byte(previous), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, found, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("a file an earlier version wrote must be read: %v", err)
+	}
+	if !found {
+		t.Fatal("the file was there but not found")
+	}
+	if file.Active != LegacyName {
+		t.Fatalf("active = %q, want %q", file.Active, LegacyName)
+	}
+	entry, ok := file.Providers[LegacyName]
+	if !ok {
+		t.Fatalf("providers = %+v", file.Providers)
+	}
+	if entry.BaseURL != "https://old.example.test/v1" || entry.APIKey != "sk-old-value" || entry.Model != "old-model" {
+		t.Fatalf("entry = %+v", entry)
+	}
+	if err := Save(path, file); err != nil {
+		t.Fatal(err)
+	}
+	written, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(written), "providers:") {
+		t.Fatalf("the save did not write the current shape: %s", written)
+	}
+	again, _, err := LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(again, file) {
+		t.Fatalf("round trip = %+v, want %+v", again, file)
+	}
+}
+
+// The error has to point at the file the person actually has: one misspelled key in
+// an older file must name that key, not complain that the current shape has no
+// field called base_url.
+func TestAMisspelledKeyInThePreviousShapeIsNamed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	if err := os.WriteFile(path, []byte("base_url: https://old.example.test/v1\nmodle: typo\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := LoadFile(path)
+	if err == nil || !strings.Contains(err.Error(), "modle") {
+		t.Fatalf("err = %v, want it to name the misspelled key", err)
+	}
+}
+
+// A file that is neither shape is refused by the current decoder, which names the
+// keys it does not expect.
+func TestAFileOfNeitherShapeNamesTheUnknownKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	if err := os.WriteFile(path, []byte("base_urls: https://old.example.test/v1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := LoadFile(path)
+	if err == nil || !strings.Contains(err.Error(), "base_urls") {
+		t.Fatalf("err = %v, want it to name the unknown key", err)
+	}
+}
+
+// A file that carries both shapes is the current one with an unexpected key:
+// telling the shapes apart by their keys must not make base_url acceptable next to
+// providers.
+func TestAFileThatCarriesBothShapesIsRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	mixed := "active: a\nproviders:\n  a:\n    base_url: https://a.example.test/v1\n    model: m\nbase_url: https://old.example.test/v1\n"
+	if err := os.WriteFile(path, []byte(mixed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := LoadFile(path)
+	if err == nil || !strings.Contains(err.Error(), "base_url") {
+		t.Fatalf("err = %v, want it to refuse the stray key", err)
+	}
+}

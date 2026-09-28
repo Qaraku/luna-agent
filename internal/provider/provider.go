@@ -18,6 +18,11 @@
 // and OAuth-style logins are deliberately out of scope: they need a per-provider
 // flow, and a field meaning "whatever that provider's own login is" would make
 // this file mean something different depending on which provider read it.
+//
+// A file an earlier version wrote — one endpoint, one key and one model at the top
+// level — is still read, as a single provider named "default". An installation
+// that was already configured keeps working, and the next save writes the current
+// shape.
 package provider
 
 import (
@@ -250,14 +255,8 @@ func LoadFile(path string) (File, bool, error) {
 		// happens to have.
 		return File{}, false, fmt.Errorf("read %s: %w", filepath.Base(path), reason(err))
 	}
-	var file File
-	decoder := yaml.NewDecoder(bytes.NewReader(data))
-	decoder.KnownFields(true)
-	if err := decoder.Decode(&file); err != nil {
-		if errors.Is(err, io.EOF) {
-			// An empty file is an unconfigured provider, not a broken one.
-			return File{}, true, nil
-		}
+	file, err := decode(data)
+	if err != nil {
 		return File{}, false, fmt.Errorf("%s: %w", filepath.Base(path), err)
 	}
 	file = file.Trimmed()
@@ -265,6 +264,80 @@ func LoadFile(path string) (File, bool, error) {
 		return File{}, false, fmt.Errorf("%s: %w", filepath.Base(path), err)
 	}
 	return file, true, nil
+}
+
+// LegacyName is what the single provider an older file describes is called now
+// that providers have names.
+const LegacyName = "default"
+
+// legacyFile is the shape this file had before providers had names: one endpoint,
+// one key and one model, at the top level.
+type legacyFile struct {
+	BaseURL string `yaml:"base_url"`
+	APIKey  string `yaml:"api_key"`
+	Model   string `yaml:"model"`
+}
+
+// decode reads whichever of the two shapes the file is written in, and refuses
+// anything else.
+//
+// The shape is told from the file's own top-level keys rather than by trying both
+// and seeing which sticks, because the error a person gets has to point at the
+// file they actually have: an older file with one misspelled key must hear about
+// that key, not "base_url is not a field of provider.File". An installation
+// configured by an earlier version therefore keeps working, and the next save
+// writes the current shape.
+func decode(data []byte) (File, error) {
+	var top map[string]any
+	if err := yaml.Unmarshal(data, &top); err != nil {
+		return File{}, err
+	}
+	switch {
+	case len(top) == 0:
+		// An empty file is an unconfigured provider, not a broken one.
+		return File{}, nil
+	case hasKey(top, "active"), hasKey(top, "providers"):
+		return decodeCurrent(data)
+	case hasKey(top, "base_url"), hasKey(top, "api_key"), hasKey(top, "model"):
+		var legacy legacyFile
+		if err := decodeStrict(data, &legacy); err != nil {
+			return File{}, err
+		}
+		return File{Active: LegacyName, Providers: map[string]Endpoint{LegacyName: {
+			BaseURL: legacy.BaseURL,
+			APIKey:  legacy.APIKey,
+			Model:   legacy.Model,
+		}}}, nil
+	default:
+		// Nothing this file knows: the current shape's decoder names the keys it
+		// does not expect, which is the most useful answer for a file that is
+		// neither shape.
+		return decodeCurrent(data)
+	}
+}
+
+func hasKey(top map[string]any, key string) bool {
+	_, ok := top[key]
+	return ok
+}
+
+func decodeCurrent(data []byte) (File, error) {
+	var file File
+	if err := decodeStrict(data, &file); err != nil {
+		return File{}, err
+	}
+	return file, nil
+}
+
+// decodeStrict decodes one object and refuses unknown keys. An empty document is
+// nothing stated rather than a broken file.
+func decodeStrict(data []byte, v any) error {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(v); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
 }
 
 // Save writes the file, replacing it whole.

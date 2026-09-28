@@ -344,6 +344,33 @@ func providerValues(file provider.File) config.ProviderValues {
 	return config.ProviderValues{Name: name, BaseURL: entry.BaseURL, APIKey: entry.APIKey, Model: entry.Model, Models: entry.Models}
 }
 
+// initialProvider reads the provider file once, at startup, and says what it
+// found. It returns a configuration and a sentence, never an error: the caller
+// logs the sentence and starts anyway.
+//
+// Nothing is papered over by that. A file that could not be read leaves the
+// configuration empty — the same state as a Luna that has never been configured —
+// and the runtime then answers the reason on every request and every run, which is
+// what the settings page shows and what a run fails with. What it avoids is the
+// alternative: exiting, which would make the one surface that can repair the file
+// unreachable, on an installation whose only problem is a file it owns.
+func initialProvider(runtime providerRuntime, path string) (config.Config, string) {
+	cfg, err := runtime.Current()
+	if err != nil {
+		return config.Config{}, fmt.Sprintf("provider: %s could not be read: %v — fix it on the settings page or in that file; a run reports this until then", path, err)
+	}
+	if len(cfg.Missing) > 0 {
+		return cfg, fmt.Sprintf("provider: not configured yet — %s is unset; fill it in on the settings page", strings.Join(cfg.Missing, ", "))
+	}
+	file, found, readErr := provider.LoadFile(path)
+	if readErr == nil && found {
+		if name, entry, ok := file.Selection(); ok {
+			return cfg, fmt.Sprintf("provider: %s calls %s for model %s; another provider can be chosen on the settings page and the next run uses it", name, entry.BaseURL, entry.Model)
+		}
+	}
+	return cfg, "provider: using " + path
+}
+
 // configFileFor decides which configuration file to read: an explicit
 // -config-file always wins, otherwise the file lives in the user's own
 // configuration directory, which is the one place a user can edit without
@@ -517,32 +544,18 @@ func run() error {
 		return err
 	}
 	// The provider file is Luna's own: the settings page writes it, and this is
-	// where the runner and the interface read it back. A file that is not there
-	// yet means this Luna has never been configured, which is a starting state
-	// rather than a failure.
+	// where the runner and the interface read it back. Every way this can go
+	// wrong — no file yet, a file an earlier version wrote, a file that cannot be
+	// parsed — is a starting state rather than a reason to exit: the settings page
+	// that repairs the last of them is served by this process, and a Luna that
+	// will not start is a Luna nobody can fix from the interface.
 	providerPath := providerFileFor(paths.Config)
-	providers, provFound, err := provider.LoadFile(providerPath)
-	if err != nil {
-		return err
-	}
-	if provFound {
-		log.Printf("luna: provider: reading %s", providerPath)
-	}
 	// runtime is the same object the runner and the settings page are handed:
 	// one place reads the provider file, so the answer a run uses and the answer
 	// the interface shows cannot drift apart.
 	runtime := providerRuntime{path: providerPath, getenv: os.Getenv, userConfig: configFile}
-	cfg, err := runtime.Current()
-	if err != nil {
-		return err
-	}
-	if len(cfg.Missing) > 0 {
-		// Not fatal on purpose: the settings page that fills this in is served
-		// by this process, so refusing to start would make it unreachable.
-		log.Printf("luna: provider: not configured yet — %s is unset; fill it in on the settings page", strings.Join(cfg.Missing, ", "))
-	} else if name, entry, ok := providers.Selection(); ok {
-		log.Printf("luna: provider: %s calls %s for model %s; another provider can be chosen on the settings page and the next run uses it", name, entry.BaseURL, entry.Model)
-	}
+	cfg, providerNote := initialProvider(runtime, providerPath)
+	log.Printf("luna: %s", providerNote)
 	executable, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate executable: %w", err)
