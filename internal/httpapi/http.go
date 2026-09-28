@@ -262,12 +262,25 @@ type Server struct {
 	eventMu    sync.Mutex
 	events     []LifecycleEvent
 	connected  atomic.Bool
+	// fallbackRoot is the directory a run works in when its session names no
+	// workspace. The file tools already fall back to it inside the host, so a run
+	// that reported no directories at all would leave the capabilities that need
+	// one refusing while the model could still read everything under it.
+	//
+	// A session bound to a workspace that is gone is not this case: that run is
+	// refused, because the fallback is a different and possibly wider place to
+	// read than the directory the session asked for.
+	fallbackRoot string
 }
 
 // WithRunTimeout sets how long one run may take before it is stopped and
 // reported as cancelled with the timeout reason. A non-positive value keeps the
 // default.
 func WithRunTimeout(d time.Duration) Option { return func(s *Server) { s.runTimeout = d } }
+
+// WithFallbackRoot sets the directory a run works in when its session names no
+// workspace, which has to be the same directory the host falls back to for reads.
+func WithFallbackRoot(dir string) Option { return func(s *Server) { s.fallbackRoot = dir } }
 
 func Listen(addr string) (net.Listener, error) {
 	host, _, err := net.SplitHostPort(addr)
@@ -815,6 +828,14 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 			}
 			runRoots = found
 		}
+	}
+	// A session that names no workspace works in the configured root: that is what
+	// the file tools fall back to, so the directories the run reports have to be
+	// the same ones. Reporting none left luna_run and luna_write_file refusing in
+	// a session where the model could still read every file in that root — a run
+	// that can read a directory but cannot work in it.
+	if len(runRoots) == 0 && s.fallbackRoot != "" {
+		runRoots = []string{s.fallbackRoot}
 	}
 	// The run context carries both ends of the run: a deadline, and a cancel
 	// handle the Stop endpoint uses. They are two contexts because they mean two

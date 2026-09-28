@@ -15,6 +15,71 @@ import (
 	"github.com/Qaraku/luna-agent/internal/workspace"
 )
 
+// rootsRunner records the working directories each run was given, so a test can ask
+// what a run would work in rather than only whether it started.
+type rootsRunner struct{ roots [][]string }
+
+func (r *rootsRunner) Run(_ context.Context, req agent.RunRequest) (string, error) {
+	r.roots = append(r.roots, req.Roots)
+	req.Sink.Emit(agent.Event{Type: "run.started", Data: agent.RunStarted{RunID: req.RunID, SessionID: req.SessionID}})
+	req.Sink.Emit(agent.Event{Type: "run.finished", Data: agent.RunFinished{RunID: req.RunID, Answer: "hello"}})
+	return "hello", nil
+}
+
+// A run has to report the directories it really works in. The file tools fall back to
+// the configured root when a session names no workspace, so a run that reported none
+// left luna_run and luna_write_file refusing with "no working directory" in a session
+// where the model could still read every file under that root — a run that can read a
+// directory but cannot work in it.
+func TestARunThatNamesNoWorkspaceWorksInTheConfiguredRoot(t *testing.T) {
+	const root = "/srv/configured-root"
+	runs := &rootsRunner{}
+	sessions := newTestStore(t)
+	items, err := workspace.Open(filepath.Join(t.TempDir(), workspace.FileName))
+	if err != nil {
+		t.Fatalf("open workspace store: %v", err)
+	}
+	h := New(&fakePlugins{state: everyAllowlistedTool()}, runs, sessions, Info{BoundHost: "127.0.0.1:43210", Model: "fake-model", ProviderHost: "provider.test", WebDir: "../../web"}, WithWorkspaces(items), WithFallbackRoot(root))
+
+	// No session at all, and a session that names no workspace: both work in the
+	// configured root, which is where their reads come from.
+	id := seedSession(t, sessions, "unbound")
+	for _, body := range []string{`{"message":"do it"}`, `{"message":"do it","session_id":"` + id + `"}`} {
+		w := request(t, h, http.MethodPost, "/api/runs", body, true)
+		if w.Code != 200 {
+			t.Fatalf("%s: status = %d, want the run to start (body %s)", body, w.Code, w.Body)
+		}
+	}
+	if len(runs.roots) != 2 {
+		t.Fatalf("roots = %v, want two runs", runs.roots)
+	}
+	for i, got := range runs.roots {
+		if len(got) != 1 || got[0] != root {
+			t.Fatalf("run %d works in %v, want exactly [%s]", i, got, root)
+		}
+	}
+
+	// A session that does name a workspace keeps it, and does not also get the root:
+	// the fallback is for a session that named nothing, not for one that named
+	// something narrower.
+	dir := t.TempDir()
+	created, err := items.Create("luna", []string{dir})
+	if err != nil {
+		t.Fatalf("create workspace: %v", err)
+	}
+	bound := seedSession(t, sessions, "bound")
+	if w := request(t, h, http.MethodPost, "/api/sessions/"+bound+"/workspace", `{"workspace":"`+created.ID+`"}`, true); w.Code != 200 {
+		t.Fatalf("bind: status = %d, body %s", w.Code, w.Body)
+	}
+	if w := request(t, h, http.MethodPost, "/api/runs", `{"message":"do it","session_id":"`+bound+`"}`, true); w.Code != 200 {
+		t.Fatalf("status = %d, want the run to start (body %s)", w.Code, w.Body)
+	}
+	got := runs.roots[len(runs.roots)-1]
+	if len(got) != 1 || got[0] != dir {
+		t.Fatalf("the bound run works in %v, want %s only", got, dir)
+	}
+}
+
 // countingRunner records how many runs reached it, so a test can tell "refused
 // before anything started" apart from "answered with an error after starting".
 type countingRunner struct{ runs int }

@@ -767,7 +767,7 @@ func run() error {
 	// capabilities are both written there, and the same value serves both seams
 	// the HTTP layer uses.
 	prefs := newUserPreferences(skillSet, settingsPath, userSettings)
-	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Missing: cfg.Missing, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(prefs), httpapi.WithCapabilityPreference(prefs), httpapi.WithWriteDirs(prefs), httpapi.WithWorkspaces(workspaceStore), httpapi.WithProvider(runtime), httpapi.WithConfigSource(runtime), httpapi.WithRunTimeout(runTimeout))
+	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Missing: cfg.Missing, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(prefs), httpapi.WithCapabilityPreference(prefs), httpapi.WithWriteDirs(prefs), httpapi.WithWorkspaces(workspaceStore), httpapi.WithProvider(runtime), httpapi.WithConfigSource(runtime), httpapi.WithRunTimeout(runTimeout), httpapi.WithFallbackRoot(projectRoot(root, *readRoot)))
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: writeDeadlineFor(runTimeout), IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() {
