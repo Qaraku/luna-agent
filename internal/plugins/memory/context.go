@@ -14,7 +14,21 @@ const (
 	// chronologically ordered suffix.
 	MaxInjectFacts = 50
 	MaxInjectBytes = 8 * 1024
+
+	// MaxRecallFacts bounds how many facts luna_recall returns in one call. It
+	// is declared here, next to the injection cap, and is the same number on
+	// purpose: a listing the model asked for is the same model-visible window
+	// one run may carry, not a second scale of its own. A listing that stops at
+	// it says so, so the model knows it is reading a window rather than the
+	// whole store.
+	MaxRecallFacts = MaxInjectFacts
 )
+
+// singleLine collapses the line breaks in a stored fact so it renders as one
+// line, wherever the capability renders fact text.
+func singleLine(text string) string {
+	return strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(text)
+}
 
 // factsBlockHeader is the label the injected block carries: what this text is
 // and where it came from.
@@ -31,8 +45,7 @@ func factLine(text string) string {
 	// a fact containing a line break cannot open a line of its own inside a
 	// system prompt, which is exactly what a directive smuggled into memory
 	// would need.
-	single := strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(text)
-	return "- " + single + "\n"
+	return "- " + singleLine(text) + "\n"
 }
 
 // selectFacts returns the facts that fit the injection caps, oldest dropped

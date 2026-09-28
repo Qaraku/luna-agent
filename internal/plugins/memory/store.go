@@ -9,10 +9,10 @@
 // Memory belongs to the Memory capability, not to the kernel: the store, the
 // caps, the rendering and the routes are this package's business, and the
 // kernel sees only the contributions it declares. The model can add a fact
-// through `luna_remember`, and it still has no read, list or retract path.
-// Reading happens only when the capability contributes its context block, and
-// the user can retract a stored fact from the panel — both go through this
-// store, so the model-visible surface never widens.
+// through `luna_remember` and list the facts in effect through `luna_recall`,
+// and those two are its whole surface: it still has no path that edits or
+// removes one. The user can retract a stored fact from the panel; every reader
+// goes through this store, so the model-visible surface never widens.
 //
 // Three properties carry the design:
 //

@@ -59,19 +59,20 @@ const (
 	StateFileName = "memory.jsonl"
 )
 
-// Plugin is the official Memory contribution: one write-only tool, one injected
-// context block, the user's routes over the same store, and the browser panel
-// with its module and stylesheet.
+// Plugin is the official Memory contribution: one write-only tool and one
+// read-only tool, one injected context block, the user's routes over the same
+// store, and the browser panel with its module and stylesheet.
 //
 // The store is the plugin's own state, not something the Kernel manages: the
 // Kernel hands over a state directory and knows nothing about the file inside
-// it, and it sees only a tool, a context block and two routes — never a fact, a
-// retraction or a rendering rule. Being built in is a deployment choice, not a
-// privilege: this plugin declares the same claims and asks for the same
+// it, and it sees only two tools, a context block and four routes — never a
+// fact, a retraction or a rendering rule. Being built in is a deployment choice,
+// not a privilege: this plugin declares the same claims and asks for the same
 // permissions any other built-in plugin would.
 type Plugin struct {
-	store *Store
-	tool  *RememberTool
+	store  *Store
+	tool   *RememberTool
+	recall *RecallTool
 }
 
 // New opens the capability's fact file inside stateDir and wires the plugin to
@@ -85,7 +86,7 @@ func New(stateDir string) (*Plugin, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Plugin{store: store, tool: NewRememberTool(store)}, nil
+	return &Plugin{store: store, tool: NewRememberTool(store), recall: NewRecallTool(store)}, nil
 }
 
 // Descriptor declares exactly what the Memory capability exposes. The registry
@@ -102,6 +103,7 @@ func Descriptor() plugin.Descriptor {
 		Deployment: plugin.DeploymentBuiltin,
 		Contributions: []plugin.Contribution{
 			{Kind: plugin.ContributionTool, ID: RememberToolName},
+			{Kind: plugin.ContributionTool, ID: RecallToolName},
 			{Kind: plugin.ContributionContext, ID: FactsContextID, BudgetBytes: FactsBudgetBytes},
 			{Kind: plugin.ContributionRoute, ID: MemoryRoutePath},
 			{Kind: plugin.ContributionRoute, ID: RetractRoutePath},
@@ -124,9 +126,10 @@ func Descriptor() plugin.Descriptor {
 // Descriptor implements plugin.Plugin.
 func (p *Plugin) Descriptor() plugin.Descriptor { return Descriptor() }
 
-// Tools returns the model-visible surface: exactly luna_remember, append only.
+// Tools returns the model-visible surface: luna_remember, append only, and
+// luna_recall, read only. Neither of them can edit or remove a stored fact.
 func (p *Plugin) Tools() []plugin.Tool {
-	return []plugin.Tool{p.tool}
+	return []plugin.Tool{p.tool, p.recall}
 }
 
 // Routes returns the capability's HTTP entries: the user's two data routes plus

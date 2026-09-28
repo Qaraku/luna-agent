@@ -14,8 +14,13 @@ import (
 )
 
 const (
-	// RememberToolName is the model-visible name of the memory tool.
+	// RememberToolName is the model-visible name of the memory write tool.
 	RememberToolName = "luna_remember"
+
+	// RecallToolName is the model-visible name of the memory read tool. The
+	// pair is deliberate: the capability has one append and one list, and
+	// neither of them edits or removes anything.
+	RecallToolName = "luna_recall"
 
 	// rememberConfirmation is the whole model-visible result of a memory write.
 	// It carries no plugin identity: the tool's owner is named in the
@@ -25,13 +30,25 @@ const (
 
 	// rememberDescription is the tool's model-visible description. It has to
 	// keep the two facts the model can act on: the write is append-only, and
-	// the user — not the model — is who removes a stored fact.
-	rememberDescription = "Store one durable fact about the user so a later session can use it. You can only append: a stored fact cannot be read back or removed by you. The user can see the stored facts and retract one in the dedicated Memory (记忆) panel, opened from the page header, so tell them where to remove it rather than refusing to store it."
+	// the user — not the model — is who removes a stored fact. It points at
+	// luna_recall for reading rather than telling the model the write is blind.
+	rememberDescription = "Store one durable fact about the user so a later session can use it. You can only append: this tool never edits or removes a stored fact, and luna_recall is how you see what is already stored. The user can see the stored facts and retract one in the dedicated Memory (记忆) panel, opened from the page header, so tell them where to remove it rather than refusing to store it."
+
+	// recallDescription is the tool's model-visible description. It states when
+	// to reach for it and what it will not do, because a listing tool the model
+	// could mistake for a write is worse than no listing tool at all.
+	recallDescription = "List the facts about the user that are in effect right now, each with the time it was recorded. Use it when you want to confirm what you already know about the user, or when you are unsure whether something was stored before; it only reads and never changes anything. A fact the user retracted is not in the list. The list is capped, and a list that stopped at the cap says how many of how many it returned and where it stopped. No stored fact at all is an ordinary answer, not an error."
+
+	// recallEmpty is the whole model-visible result of a recall over an empty
+	// store. An empty store is not a failure: it is a store that holds nothing
+	// yet, and the honest answer says exactly that.
+	recallEmpty = "no stored facts: nothing has been stored yet"
 )
 
-// RememberTool is the plugin's luna_remember: the model's only reach into the
-// store, and a write-only one. There is deliberately no parameter that could
-// read, list, edit or retract a fact.
+// RememberTool is the plugin's luna_remember: the write half of the model's
+// reach into the store, and a write-only one. There is deliberately no parameter
+// that could read, list, edit or retract a fact — reading is RecallTool's job
+// and nothing the model can call changes or removes a stored fact.
 //
 // It emits nothing. tool.started, tool.failed and tool.finished are the Kernel's
 // to emit for this round — the plugin's job is the arguments and the store.
@@ -124,4 +141,95 @@ func (t *RememberTool) Invoke(ctx context.Context, arguments string) (string, er
 		return "", plugin.Unavailable(fmt.Errorf("store the fact: %w", err))
 	}
 	return rememberConfirmation, nil
+}
+
+// RecallTool is the plugin's luna_recall: the read half of the model's reach
+// into the store, and a read-only one. It takes no parameter at all, so there
+// is no input that could name a fact to change or remove, and it never writes.
+//
+// It emits nothing, for the same reason RememberTool does not: the event stream
+// belongs to the Kernel.
+type RecallTool struct{ store *Store }
+
+// NewRecallTool wires the tool to the store it reads.
+func NewRecallTool(store *Store) *RecallTool { return &RecallTool{store: store} }
+
+func (t *RecallTool) Name() string { return RecallToolName }
+
+func (t *RecallTool) Description() string { return recallDescription }
+
+func (t *RecallTool) Schema() *jsonschema.Schema { return recallSchema() }
+
+// recallSchema is the exact public schema of the read tool: an object with no
+// parameters and no additional properties, so a call carrying anything is
+// refused before the store is reached.
+func recallSchema() *jsonschema.Schema {
+	r := jsonschema.Reflector{DoNotReference: true, AllowAdditionalProperties: false}
+	return r.Reflect(struct{}{})
+}
+
+// plural renders "1 fact" / "2 facts". It exists so the model-visible lines
+// never read "1 facts".
+func plural(n int, noun string) string {
+	if n == 1 {
+		return fmt.Sprintf("1 %s", noun)
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
+// recallListing renders the model-visible answer for a read of the store: the
+// facts in effect, oldest first, one line each, carrying the fact's own text and
+// the time it was recorded.
+//
+// A listing longer than MaxRecallFacts keeps the newest facts — the oldest go
+// first, the same direction the injection drops them — and says exactly what
+// happened: how many were returned, how many are in effect, and which end was
+// cut. A silent cut would let the model read a window as if it were the whole
+// store.
+func recallListing(facts []Fact) string {
+	if len(facts) == 0 {
+		return recallEmpty
+	}
+	kept := facts
+	if len(facts) > MaxRecallFacts {
+		kept = facts[len(facts)-MaxRecallFacts:]
+	}
+	var b strings.Builder
+	if len(kept) < len(facts) {
+		fmt.Fprintf(&b, "%d of %d stored facts in effect (the list stopped at %s; the %s older are not listed):\n",
+			len(kept), len(facts), plural(MaxRecallFacts, "fact"), plural(len(facts)-len(kept), "fact"))
+	} else {
+		fmt.Fprintf(&b, "%s in effect:\n", plural(len(kept), "fact"))
+	}
+	for _, fact := range kept {
+		// One line per fact, and the recorded time exactly as stored (UTC), so
+		// the model can tell two similar facts apart by when they were written.
+		fmt.Fprintf(&b, "- %s (recorded %s)\n", singleLine(fact.Text), fact.At.UTC().Format(time.RFC3339Nano))
+	}
+	return b.String()
+}
+
+// Invoke lists the facts in effect. It never writes: a read leaves the store
+// byte for byte as it found it.
+//
+// A store that cannot be read is an infrastructure failure, marked the same way
+// a failed write is: a listing that quietly reported an empty memory would tell
+// the model it remembers nothing, which is not what happened.
+func (t *RecallTool) Invoke(_ context.Context, arguments string) (string, error) {
+	// The tool takes no parameters, so the model calling it with no arguments
+	// at all — an empty string — means the same as an empty object.
+	if strings.TrimSpace(arguments) == "" {
+		arguments = "{}"
+	}
+	if err := decodeOne(arguments, &struct{}{}); err != nil {
+		return "", err
+	}
+	if t.store == nil {
+		return "", errors.New("memory is not configured on this host")
+	}
+	facts, err := t.store.Facts()
+	if err != nil {
+		return "", plugin.Unavailable(fmt.Errorf("read the stored facts: %w", err))
+	}
+	return recallListing(facts), nil
 }
