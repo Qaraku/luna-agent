@@ -206,6 +206,19 @@ func (f Settings) WithWriteDir(dir string, allowed bool) Settings {
 	return current
 }
 
+// WithWriteDirs returns these settings with the whole list of allowed directories
+// replaced.
+//
+// The settings page owns the list and therefore submits the list: a directory that is
+// no longer in it is not allowed any more, which is what makes revoking one work
+// without anyone having to track which change added it. Entries are normalized on the
+// way out like every other list in this file.
+func (f Settings) WithWriteDirs(dirs []string) Settings {
+	current := f.normalized()
+	current.Write = Write{Dirs: append([]string(nil), dirs...)}
+	return current
+}
+
 // withName returns names with one name added or removed: trimming it, dropping
 // it wherever it already was, and appending it at the end when add is true. The
 // rest keep their order, so one change never moves another entry.

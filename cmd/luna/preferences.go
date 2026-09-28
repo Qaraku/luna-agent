@@ -53,6 +53,33 @@ func (c *userPreferences) SetEnabled(id string, enabled bool) error {
 	return nil
 }
 
+// Dirs returns the directories the user allows writing in, as they are stored.
+//
+// It answers from the copy this process holds rather than re-reading the file: this
+// type is the file's only writer, so what it holds is what the file says. A directory
+// allowed through the settings page is therefore in the list the page is shown next.
+func (c *userPreferences) Dirs() ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.settings.WriteDirs(), nil
+}
+
+// SetDirs replaces the whole list of directories Luna may write in.
+//
+// The file is written first and the held copy second, the same order and the same
+// reason as SetEnabled: a failed write must leave nothing changed, so a request that
+// reports failure is one that can be retried without wondering what it already did.
+func (c *userPreferences) SetDirs(dirs []string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	next := c.settings.WithWriteDirs(dirs)
+	if err := settings.Save(c.path, next); err != nil {
+		return err
+	}
+	c.settings = next
+	return nil
+}
+
 // Skills lists every discovered skill with its state, which is what the
 // settings page renders.
 func (c *userPreferences) Skills() []httpapi.SkillRef {

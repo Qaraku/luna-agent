@@ -24,6 +24,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/layout"
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
+	"github.com/Qaraku/luna-agent/internal/plugins/filewrite"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	skillsplugin "github.com/Qaraku/luna-agent/internal/plugins/skills"
 	"github.com/Qaraku/luna-agent/internal/plugins/terminal"
@@ -517,6 +518,27 @@ func registerTerminal(registry *plugin.Registry, enabled bool) error {
 	return nil
 }
 
+// registerFileWrite registers the capability that writes files and, when the user has
+// asked for it, turns it on.
+//
+// It is the other capability that does not run on its own, and the only one whose reach
+// is decided per directory rather than all at once: even switched on, it refuses every
+// call until a directory is allowed in the settings page, and it reads that list on
+// every call rather than at start-up. Which directories those are is the user's answer
+// to give, and giving it does not need a restart.
+func registerFileWrite(registry *plugin.Registry, settingsPath string, enabled bool) error {
+	if err := registry.Register(filewrite.New(settingsPath)); err != nil {
+		return fmt.Errorf("register file write capability: %w", err)
+	}
+	if !enabled {
+		return nil
+	}
+	if err := registry.Enable(filewrite.PluginID); err != nil {
+		return fmt.Errorf("enable file write capability: %w", err)
+	}
+	return nil
+}
+
 func run() error {
 	addr := flag.String("addr", "127.0.0.1:0", "literal loopback listen address")
 	rootFlag := flag.String("root", "", "repository root holding web/ and plugins/ (default: auto-detect)")
@@ -611,12 +633,13 @@ func run() error {
 	// Memory capability is the first one: a built-in plugin that claims a state
 	// namespace, which the kernel resolves into a directory under whichever state
 	// root is in use — the kernel never learns which file it keeps inside.
-	// Two abilities are grantable here: a capability may keep its own state in a
-	// directory the kernel resolves for it, and it may run commands in the
-	// directories this run works in. Granting one is what lets a capability ask
-	// for it at all; whether this machine's user has turned the capability on is
-	// a separate question, and the settings file answers it below.
-	registry := plugin.NewRegistry(plugin.PermissionStateWrite, plugin.PermissionProcessExec)
+	// Three abilities are grantable here: a capability may keep its own state in a
+	// directory the kernel resolves for it, it may run commands in the directories
+	// this run works in, and it may create or replace files in the directories the
+	// user allows. Granting one is what lets a capability ask for it at all; whether
+	// this machine's user has turned the capability on, and which directories it may
+	// write in, are separate questions the settings file answers below.
+	registry := plugin.NewRegistry(plugin.PermissionStateWrite, plugin.PermissionProcessExec, plugin.PermissionFilesystemWrite)
 	memoryDir, err := plugin.StateDirFor(memory.Descriptor(), statePath)
 	if err != nil {
 		return fmt.Errorf("resolve memory state directory: %w", err)
@@ -689,6 +712,13 @@ func run() error {
 	if err := registerTerminal(registry, userSettings.CapabilityEnabled(terminal.PluginID)); err != nil {
 		return err
 	}
+	// The capability that writes files is the other one the user decides about. It
+	// asks for fs.write, and it reads the directories it may write in from the
+	// settings file on every call, so a directory allowed in the settings page takes
+	// effect on the model's next call rather than at the next start-up.
+	if err := registerFileWrite(registry, settingsPath, userSettings.CapabilityEnabled(filewrite.PluginID)); err != nil {
+		return err
+	}
 	listener, err := httpapi.Listen(*addr)
 	if err != nil {
 		return err
@@ -737,7 +767,7 @@ func run() error {
 	// capabilities are both written there, and the same value serves both seams
 	// the HTTP layer uses.
 	prefs := newUserPreferences(skillSet, settingsPath, userSettings)
-	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Missing: cfg.Missing, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(prefs), httpapi.WithCapabilityPreference(prefs), httpapi.WithWorkspaces(workspaceStore), httpapi.WithProvider(runtime), httpapi.WithConfigSource(runtime), httpapi.WithRunTimeout(runTimeout))
+	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Missing: cfg.Missing, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(prefs), httpapi.WithCapabilityPreference(prefs), httpapi.WithWriteDirs(prefs), httpapi.WithWorkspaces(workspaceStore), httpapi.WithProvider(runtime), httpapi.WithConfigSource(runtime), httpapi.WithRunTimeout(runTimeout))
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: writeDeadlineFor(runTimeout), IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() {

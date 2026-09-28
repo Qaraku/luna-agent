@@ -12,6 +12,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/httpapi"
 	"github.com/Qaraku/luna-agent/internal/layout"
 	"github.com/Qaraku/luna-agent/internal/plugin"
+	"github.com/Qaraku/luna-agent/internal/plugins/filewrite"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	"github.com/Qaraku/luna-agent/internal/plugins/terminal"
 	"github.com/Qaraku/luna-agent/internal/plugins/workspace"
@@ -754,6 +755,84 @@ func TestACapabilityChoiceIsRecordedWithoutLosingTheOthers(t *testing.T) {
 	blockedPrefs := newUserPreferences(nil, blocked, settings.Settings{})
 	if err := blockedPrefs.SetEnabled(terminal.PluginID, true); err == nil {
 		t.Fatal("a choice that could not be written was reported as recorded")
+	}
+}
+
+// 写文件的能力同样是「不自己跑」的那一类：注册了但没启用，直到用户在设置里打开它；
+// 而且即使打开了，它每次调用都会去读用户允许写入的目录，零个目录时任何写入都被拒。
+func TestTheFileWriteCapabilityIsOffUntilTheSettingsSaySo(t *testing.T) {
+	settingsPath := filepath.Join(t.TempDir(), settings.FileName)
+
+	t.Run("a capability nobody asked for is not running", func(t *testing.T) {
+		registry := plugin.NewRegistry(plugin.PermissionStateWrite, plugin.PermissionFilesystemWrite)
+		if err := registerFileWrite(registry, settingsPath, false); err != nil {
+			t.Fatal(err)
+		}
+		entry, found := registry.Entry(filewrite.PluginID)
+		if !found {
+			t.Fatal("the file write capability was not registered, so the settings page has nothing to turn on")
+		}
+		if entry.State != plugin.StateRegistered {
+			t.Fatalf("state = %q, want %q", entry.State, plugin.StateRegistered)
+		}
+		if tools := toolsOf(registry); slices.Contains(tools, filewrite.WriteToolName) {
+			t.Fatalf("tools = %v, want no %s", tools, filewrite.WriteToolName)
+		}
+	})
+	t.Run("the user's choice turns it on", func(t *testing.T) {
+		registry := plugin.NewRegistry(plugin.PermissionStateWrite, plugin.PermissionFilesystemWrite)
+		if err := registerFileWrite(registry, settingsPath, true); err != nil {
+			t.Fatal(err)
+		}
+		if tools := toolsOf(registry); !slices.Contains(tools, filewrite.WriteToolName) {
+			t.Fatalf("tools = %v, want %s", tools, filewrite.WriteToolName)
+		}
+	})
+	t.Run("a registry that did not grant it refuses it", func(t *testing.T) {
+		registry := plugin.NewRegistry(plugin.PermissionStateWrite)
+		if err := registerFileWrite(registry, settingsPath, true); err == nil {
+			t.Fatal("a registry that did not grant filesystem writes accepted the file write capability")
+		}
+	})
+}
+
+// 设置页提交的是整份列表：不在里面的目录就是不再被允许，所以撤销一个目录不需要记得是
+// 哪一次请求加进来的。写盘失败时一个字节不该改。
+func TestTheWholeWriteDirectoryListIsReplacedAndRecorded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "luna", settings.FileName)
+	prefs := newUserPreferences(nil, path, settings.Settings{})
+	if err := prefs.SetDirs([]string{"/one", "/two"}); err != nil {
+		t.Fatal(err)
+	}
+	file, _, err := settings.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dirs := file.WriteDirs(); len(dirs) != 2 || dirs[0] != "/one" || dirs[1] != "/two" {
+		t.Fatalf("dirs = %v, want [/one /two]", dirs)
+	}
+	// 整份替换：第二个被去掉，不是被追加。
+	if err := prefs.SetDirs([]string{"/one"}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := prefs.Dirs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 || stored[0] != "/one" {
+		t.Fatalf("dirs = %v, want [/one]", stored)
+	}
+	// 写不进去时报告失败，且内存里那份也不改。
+	blocked := filepath.Join(t.TempDir(), "luna", settings.FileName)
+	if err := os.MkdirAll(blocked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	brokenPrefs := newUserPreferences(nil, blocked, settings.Settings{})
+	if err := brokenPrefs.SetDirs([]string{"/one"}); err == nil {
+		t.Fatal("a list that could not be written was reported as recorded")
+	}
+	if dirs, err := brokenPrefs.Dirs(); err != nil || len(dirs) != 0 {
+		t.Fatalf("dirs = %v (err %v), want nothing recorded", dirs, err)
 	}
 }
 
