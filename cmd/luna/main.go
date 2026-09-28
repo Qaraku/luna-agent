@@ -155,6 +155,17 @@ func dirExists(path string) bool {
 	return err == nil && info.IsDir()
 }
 
+// pinnedLocations is where the sessions and the capability state go when
+// LUNA_HOME names one directory for everything.
+//
+// It does not consult the previous location, and that is the point: LUNA_HOME is
+// a direct request about where Luna's files live, and a checkout that has ever
+// run would otherwise outvote it — leaving the one variable that promises "all of
+// it, here" unable to deliver in exactly the case someone reaches for it.
+func pinnedLocations(paths layout.Paths) (sessions string, state string) {
+	return filepath.Join(paths.Data, "sessions"), paths.State
+}
+
 // explicitOr applies a value given on the command line on top of the resolved
 // location, and reports when it did: a log that showed only the resolved path
 // would read as if the flag had not been given.
@@ -409,13 +420,25 @@ func run() error {
 	// copy of Luna is installed. The first follows the XDG directories, the
 	// second is found next to the executable; resolving them together is what
 	// made "the project" and "the installation" the same thing.
+	// pinnedHome carries a LUNA_HOME value down to the location decision: with it
+	// set, the previous location has no vote (see pinnedLocations).
+	var pinnedHome string
 	home, err := os.UserHomeDir()
-	if err != nil {
+	if err != nil && strings.TrimSpace(os.Getenv(layout.HomeEnv)) == "" {
+		// With LUNA_HOME there is nothing for the home directory to decide, so
+		// an environment that cannot report one is not a reason to stop.
 		return fmt.Errorf("locate the home directory: %w", err)
 	}
 	paths, err := layout.Resolve(os.Getenv, home)
 	if err != nil {
 		return err
+	}
+	if value := strings.TrimSpace(os.Getenv(layout.HomeEnv)); value != "" {
+		// One directory holding everything is a deliberate choice, and the
+		// files it holds are otherwise unfindable: configuration, sessions,
+		// capability state and cache all live under it and nowhere else.
+		pinnedHome = value
+		log.Printf("luna: home: %s=%s holds the configuration, the sessions, the capability state and the cache", layout.HomeEnv, value)
 	}
 	configFile, err := userConfig(configFileFor(*configFlag, paths.Config))
 	if err != nil {
@@ -442,7 +465,13 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	sessionsDefault, stateDefault, dataNotes := localData(paths.Data, root)
+	var sessionsDefault, stateDefault string
+	var dataNotes []string
+	if pinnedHome != "" {
+		sessionsDefault, stateDefault = pinnedLocations(paths)
+	} else {
+		sessionsDefault, stateDefault, dataNotes = localData(paths.Data, root)
+	}
 	sessionsPath, sessionsNote := explicitOr(*sessionsFlag, sessionsDefault, "sessions")
 	statePath, stateNote := explicitOr(*stateFlag, stateDefault, "capability state")
 	// Which location is in use is a property of the installation, not something

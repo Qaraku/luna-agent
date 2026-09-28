@@ -27,6 +27,17 @@ import (
 // DirName is the directory Luna owns inside each XDG root.
 const DirName = "luna"
 
+// HomeEnv names one directory to put everything under: configuration, data,
+// state, cache and process files. It exists for the two cases where the XDG
+// split is the wrong shape — a development checkout that should keep its own
+// files next to itself, and anyone who wants to carry one directory around —
+// and it is deliberately one variable rather than five, because the point is
+// that nothing is decided anywhere else.
+//
+// Setting it is a direct request: a relative value is refused instead of
+// ignored, since silently falling back would recreate the confusion it removes.
+const HomeEnv = "LUNA_HOME"
+
 // Paths is the set of directories Luna uses. Every field is absolute.
 type Paths struct {
 	// Install holds web/ and plugins/: the assets of the running Luna itself.
@@ -63,6 +74,21 @@ type Env func(name string) string
 // treating "./data" as a location would scatter data relative to whatever
 // directory the process happened to start in.
 func Resolve(env Env, home string) (Paths, error) {
+	// LUNA_HOME is answered first, and on its own: with it set there is nothing
+	// left for the home directory or the XDG variables to decide, so an
+	// environment without a home directory still resolves.
+	if value := strings.TrimSpace(env(HomeEnv)); value != "" {
+		if !filepath.IsAbs(value) {
+			return Paths{}, fmt.Errorf("%s must be an absolute path (got %q): a relative one would put Luna's files under whatever directory the process happened to start in", HomeEnv, value)
+		}
+		return Paths{
+			Config:  value,
+			Data:    value,
+			State:   filepath.Join(value, "state"),
+			Cache:   filepath.Join(value, "cache"),
+			Runtime: filepath.Join(value, "run"),
+		}, nil
+	}
 	if strings.TrimSpace(home) == "" {
 		return Paths{}, fmt.Errorf("cannot resolve %s: the user's home directory is unknown", DirName)
 	}

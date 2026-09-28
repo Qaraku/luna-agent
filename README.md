@@ -183,6 +183,7 @@ nothing is worse than one that fails to load. Startup says which file it read.
 
 | Variable | Required | Notes |
 |---|---|---|
+| `LUNA_HOME` | no | One directory holding everything: configuration, sessions, capability state and cache. Setting it overrides every XDG root and every previous location, so a development checkout can keep its files next to itself (`LUNA_HOME=$PWD/.runtime`). A relative value is refused rather than ignored. Startup prints it |
 | `OPENAI_BASE_URL` | yes | OpenAI-compatible endpoint. `base_url` in the file overrides it |
 | `OPENAI_API_KEY` | yes | Environment only; there is no browser or file path to it. The file names the variable to read (`api_key_env`), never the value |
 | `OPENAI_MODEL_NAME` | yes | Canonical name. `model` in the file overrides it |
