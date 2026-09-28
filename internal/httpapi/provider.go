@@ -206,22 +206,33 @@ func (s *Server) setProvider(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &in) {
 		return
 	}
-	stored, err := s.provider.Read()
+	next, status, err := s.saveProvider(in)
 	if err != nil {
-		fail(w, 500, err)
-		return
-	}
-	next, err := mergeProvider(stored, in)
-	if err != nil {
-		fail(w, 400, err)
-		return
-	}
-	if err := s.provider.Write(next); err != nil {
-		fail(w, 400, err)
+		fail(w, status, err)
 		return
 	}
 	s.addEvent("provider_saved", describeProviderSave(next))
 	s.sendProvider(w, next)
+}
+
+// saveProvider 串行化整个保存事务，而不只是最终文件替换：空密钥必须从此前
+// 已提交的配置继承，不能从另一个请求尚未提交时读到的旧快照继承。
+// HTTP 写回在锁外，慢客户端不会挡住后续保存或模型读取配置。
+func (s *Server) saveProvider(in providerInput) (provider.File, int, error) {
+	s.providerWriteMu.Lock()
+	defer s.providerWriteMu.Unlock()
+	stored, err := s.provider.Read()
+	if err != nil {
+		return provider.File{}, http.StatusInternalServerError, err
+	}
+	next, err := mergeProvider(stored, in)
+	if err != nil {
+		return provider.File{}, http.StatusBadRequest, err
+	}
+	if err := s.provider.Write(next); err != nil {
+		return provider.File{}, http.StatusBadRequest, err
+	}
+	return next, http.StatusOK, nil
 }
 
 // mergeProvider turns the form's submission into the file to write.

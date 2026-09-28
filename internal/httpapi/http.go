@@ -231,6 +231,8 @@ type Server struct {
 	// interface because where that file lives, and how it is written, belong to
 	// the composition root.
 	provider ProviderConfig
+	// providerWriteMu 保护保留密钥所需的读—合并—写事务，不锁住只读请求或 HTTP 写回。
+	providerWriteMu sync.Mutex
 	// configSource is what a run started right now would use, when the
 	// composition root supplied one: the interface asks it instead of reporting
 	// what this process started with.
