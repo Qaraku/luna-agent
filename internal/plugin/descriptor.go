@@ -78,6 +78,10 @@ const (
 	// 在设置里逐个标为可写的目录。它与前两项一样是显式授权项：注册表没有这条授权时，
 	// 申请它的能力注册失败。
 	PermissionFilesystemWrite PermissionKind = "fs.write"
+	// PermissionNetworkFetch 允许能力主动向外发起请求，取回一个 http(s) 地址的内容。
+	// 它管的只是“能不能出网”，能访问哪里由能力自己的边界决定（只允许公开地址、只允许
+	// 文本响应），因此它同样是显式授权项：注册表没有这条授权时，申请它的能力注册失败。
+	PermissionNetworkFetch PermissionKind = "net.fetch"
 )
 
 // Permission 是插件对某个受控能力的申请。是否可授予由注册表持有的授权表决定；
