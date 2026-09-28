@@ -861,14 +861,18 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	s.runID = id
 	s.cancelRun = cancelRun
 	s.runMu.Unlock()
-	defer func() {
+	// 终止事件发出前释放准入；defer 仍覆盖前置错误，但不能清除后来已开始的运行。
+	releaseRun := func() {
 		s.runMu.Lock()
-		s.busy = false
-		s.runID = ""
-		s.sessionID = ""
-		s.cancelRun = nil
+		if s.runID == id {
+			s.busy = false
+			s.sessionID = ""
+			s.runID = ""
+			s.cancelRun = nil
+		}
 		s.runMu.Unlock()
-	}()
+	}
+	defer releaseRun()
 	// A run without a session id starts a session; its id reaches the client on
 	// the existing run.started event, and no terminal event is added or changed.
 	sessionID := in.SessionID
@@ -900,7 +904,7 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 		close(sink.events)
 		result <- runResult{answer, err}
 	}()
-	terminal := 0
+	var terminal agent.Event
 	canWrite := true
 	events := (<-chan agent.Event)(sink.events)
 	resultCh := (<-chan runResult)(result)
@@ -920,12 +924,13 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 				events = nil
 				continue
 			}
-			isTerminal := agent.IsTerminalEvent(ev.Type)
-			if isTerminal {
-				if terminal > 0 {
-					continue
+			if agent.IsTerminalEvent(ev.Type) {
+				// emit 不等于 Runner 已退出。保留首个终止事件，等事件收齐且
+				// Runner 返回后再发送，不能让客户端在收尾期间开始下一轮。
+				if terminal.Type == "" {
+					terminal = ev
 				}
-				terminal++
+				continue
 			}
 			if canWrite {
 				if r.Context().Err() != nil {
@@ -946,15 +951,8 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	// synthesis below exists only for a runner that wrote none, and it uses the
 	// same classification, so a stopped run is never reported as a broken one.
 	outcome := agent.TerminalEvent(runCtx, id, out.answer, out.err)
-	if terminal == 0 {
-		if canWrite && r.Context().Err() != nil {
-			canWrite = false
-			cancelRun(errStreamAbandoned)
-		}
-		if canWrite {
-			_ = writeSSE(w, flusher, outcome)
-		}
-		terminal = 1
+	if terminal.Type == "" {
+		terminal = outcome
 	}
 	switch outcome.Type {
 	case "run.finished":
@@ -964,6 +962,16 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 		s.addEvent("run_cancelled", "run "+id+" cancelled")
 	default:
 		s.addEvent("run_failed", "run "+id+" failed")
+	}
+	// 此时没有运行中的工具或未完成的 Runner 收尾。客户端看见终止事件时，
+	// 状态和准入已经就绪；即使下一轮马上开始，旧 handler 的清理也不会误伤它。
+	releaseRun()
+	if canWrite && r.Context().Err() != nil {
+		canWrite = false
+		cancelRun(errStreamAbandoned)
+	}
+	if canWrite {
+		_ = writeSSE(w, flusher, terminal)
 	}
 }
 

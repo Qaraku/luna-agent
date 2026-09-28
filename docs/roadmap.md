@@ -360,7 +360,7 @@ provider 与模型不需要。探测失败不算服务错误，它是一次回�
 - 目录深度的端到端判据也在这份记录里：默认那次**不出现**第二层路径 `internal/agent`、`depth=2` 那次**出现**它（两边都断言才有分辨力）、`depth=9` 以 `depth must be 1..5 (got 9)` 的拒绝返回且这一轮继续。同一刀的**缺陷侧验证**：把递归分支短路成只列一层后，3 条新用例立刻失败（`TestListRendersRelativePathsDepthFirst`、`TestListKeepsTheLineCapOnDeeperPaths`、`TestListCountsASubdirectoryItCouldNotRead`），改回后全绿。
 - **一处夹具保真度**：超长响应体与分页那两条用的是脚本自己的 loopback 代理加一个公开段地址字面量（`203.0.113.5`），因此它们证明的是上限行为与「说清还有多少没读」，**不证明目标真的是那个地址**。
 - 仍未验证：`https` 与 6to4/NAT64 在真实路由下的行为只有单元测试覆盖；真实模型会不会正确使用 `mode`、会不会滥用抓取，**没有真实 provider 跑过**。
-- **准入竞争（新发现，尚未决定怎么修）**：一次运行的终止事件写进流之后、run handler 清掉「忙」标志之前有一个小窗口，客户端在这个窗口里紧接着发下一次运行会拿到 `409 another run is active`。一次 30+ 轮的自动化验证里撞到过一次（脚本为此加了带上限的重试，那只是等待、不是判据）。两条修法：服务端在写出终止事件之前释放准入位，或客户端在 409 后重试一次。
+- **准入竞争（已修复，未发布）**：过去终止事件已经写进流、run handler 却尚未清掉「忙」标志，紧接着的请求可能得到 `409 another run is active`。现在服务端暂存首个终止事件，待 Runner 退出并收齐事件后先释放准入，再发出终止事件；旧 handler 的延迟清理按 run ID 守卫，不能清掉新一轮。不以客户端重试掩盖竞态。`internal/httpapi/run_completion_test.go` 用确定性的 flush 回调覆盖同一会话收到 finished / failed / cancelled / 补发终止后立即继续、提前 emit 终止但 Runner 尚未退出、旧 handler 清理与新运行交错。旧实现回归测试失败，修复后相关生命周期测试以 `-race -count=20` 通过，`internal/httpapi`、`internal/agent`、`internal/store` 三包 race 回归通过；移除 run ID 守卫的临时缺陷版本会被“旧 handler 不得释放新运行”测试抓住。本次没有真实模型或浏览器端到端验证，不替代发布检查。
 
 ## 构建方式
 

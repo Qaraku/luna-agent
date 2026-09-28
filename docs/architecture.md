@@ -476,7 +476,7 @@ data: <JSON payload>
 - `run.failed` —— `{"run_id":"...","error":"..."}`；真正的失败，例如 provider 或存储故障。
 - `run.cancelled` —— `{"run_id":"...","reason":"user"|"timeout"}`；`user` 是 `POST /api/runs/{id}/cancel`（或拥有该流的请求上下文结束），`timeout` 是整轮截止时间。原因取自运行自己的 context（`context.Cause`），不取自错误文字，因为取消可能以任意包装错误从迭代器里冒出来。
 
-流建立之后，`run.finished`、`run.failed` 或 `run.cancelled` 是终止事件集合，且每条流恰好有一个。一次没有成功、其 context 已经结束的运行是**被停止**而不是**被破坏**的，因此它报告 `run.cancelled`；写入 transcript 的状态词汇不变（两者都记为 `cancelled`）。HTTP 层转发第一个终止事件，丢弃之后的终止事件，并在 runner 遗漏时从 runner 结果合成一个。因此每条可写的已完成流都恰好有一个终止事件。流建立前的校验和准入失败则是普通的 JSON HTTP 错误。处理器会 flush 每个事件；客户端断连或写入失败会停止后续写入、取消运行，并在 runner 退出之后才释放一次性运行准入。
+流建立之后，`run.finished`、`run.failed` 或 `run.cancelled` 是终止事件集合，且每条流恰好有一个。一次没有成功、其 context 已经结束的运行是**被停止**而不是**被破坏**的，因此它报告 `run.cancelled`；写入 transcript 的状态词汇不变（两者都记为 `cancelled`）。HTTP 层暂存第一个终止事件，丢弃之后的终止事件，并在 runner 遗漏时从 runner 结果合成一个。它继续发送非终止事件，等事件通道排空且 runner 返回后，先更新状态和释放准入，再发送唯一终止事件。因此客户端收到终止事件后可以立即开始下一轮，而不会撞上上一轮尚未释放的准入位；runner 尚未退出时仍不允许另一个运行。旧处理器的延迟清理按 run ID 校验归属，不能清除已经开始的下一轮。因此每条可写的已完成流都恰好有一个终止事件。流建立前的校验和准入失败则是普通的 JSON HTTP 错误。处理器会 flush 每个事件；客户端断连或写入失败会停止后续写入、取消运行，并在 runner 退出之后才释放一次性运行准入。
 
 `tool.started.arguments` 和 `tool.finished.result` 可能包含用户文本，因为它们是实时运行记录的一部分。核心的有界生命周期日志只保存简洁的状态消息，不得持久化提示词、参数、结果、模型响应正文、授权头、秘密或隐藏推理链。
 
