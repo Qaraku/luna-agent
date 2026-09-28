@@ -297,18 +297,53 @@ func ResolveWrite(root, requested string) (Resolved, error) {
 	return Resolved{Path: resolved, Root: root}, nil
 }
 
-// ResolveWriteInRoots is ResolveWrite against several roots: the first root
-// that admits the path wins. See resolveInRoots for what "first" and "admits"
-// mean, and for why the `..` climb is decided once before any root is asked: a
-// path that rises above the root it is resolved against escapes, and it stays
-// an escape when the directory it lands in is another root of the same call —
-// a sibling root does not rescue it, so the answer does not depend on the order
-// the roots were given in. Every other refusal is per root and is moved past, so
-// a name that only one of the working directories holds is found.
+// ResolveWriteInRoots is ResolveWrite against several roots.
+//
+// A target that is already there wins over a root where the name is free, and among the
+// roots that hold it the first one wins. That is the read rule applied to writes:
+// reading that path would have come from the root that holds the file, so writing to the
+// same path has to land on the file the read returned. Without this, a run working in two
+// directories would read a file from the second and create a second file of the same name
+// in the first, and the answer would say it created the file — leaving the model to
+// insist it edited what it had just read.
+//
+// When no root holds the target, the first root that admits the path wins, which is where
+// a new file is created. Everything else is resolveWrite's: the same normalization, the
+// same refusal of an absolute path and of a `..` climb decided once before any root is
+// asked (a sibling root does not rescue an escape), and the same symbolic-link
+// resolution. See resolveInRoots for what "first" and "admits" mean.
 func ResolveWriteInRoots(roots []string, requested string) (Resolved, error) {
+	// A path that climbs above a root never reaches the first pass: resolveInRoots
+	// decides the climb once, before any root is asked, and it has to stay that way —
+	// `../b/x` re-enters a sibling root lexically, so a pass that looked for a holder
+	// first would accept a path the read side refuses.
+	if !climbsAboveRoot(requested) {
+		if held, ok := rootHoldingTarget(roots, requested); ok {
+			return held, nil
+		}
+	}
 	return resolveInRoots(roots, requested, func(root string) (string, error) {
 		return resolveWrite(root, requested)
 	})
+}
+
+// rootHoldingTarget returns the first root whose resolution of the path is a file that is
+// already there. A root that refuses the path is passed over, exactly as resolveInRoots
+// passes over one: the question here is which root already holds the target, not whether
+// some root would accept the call.
+func rootHoldingTarget(roots []string, requested string) (Resolved, bool) {
+	for _, root := range roots {
+		resolved, err := resolveWrite(root, requested)
+		if err != nil {
+			continue
+		}
+		info, err := os.Lstat(resolved)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		return Resolved{Path: resolved, Root: root}, true
+	}
+	return Resolved{}, false
 }
 
 // ValidateQuery checks one literal query before any work is done with it. It

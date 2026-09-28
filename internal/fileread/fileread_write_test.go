@@ -361,8 +361,8 @@ func TestResolveWriteInRootsPicksTheFirstRootThatAdmitsThePath(t *testing.T) {
 		{"an existing file in the first root", []string{a, b}, "a.txt", a, filepath.Join(ra, "a.txt")},
 		{"an existing file in the second root, asked second", []string{b, a}, "b.txt", b, filepath.Join(rb, "b.txt")},
 		{"a name the root does not hold yet is a new file there", []string{a}, "b.txt", a, filepath.Join(ra, "b.txt")},
-		{"the first root takes a name only the second holds", []string{a, b}, "b.txt", a, filepath.Join(ra, "b.txt")},
-		{"the order decides a name both roots would take", []string{b, a}, "a.txt", b, filepath.Join(rb, "a.txt")},
+		{"a name only the second root holds is written where it is", []string{a, b}, "b.txt", b, filepath.Join(rb, "b.txt")},
+		{"a name the second root already holds beats a new file in the first", []string{b, a}, "a.txt", a, filepath.Join(ra, "a.txt")},
 		{"a new file in a directory only one root holds", []string{b, a}, "sub/b.txt", a, filepath.Join(ra, "sub", "b.txt")},
 		{"a new file in the first root", []string{a, b}, "new.txt", a, filepath.Join(ra, "new.txt")},
 	}
@@ -468,6 +468,42 @@ func TestResolveWriteInRootsRefusesAnEmptyRootListLikeTheReadSide(t *testing.T) 
 		if writeErr.Error() != readErr.Error() {
 			t.Fatalf("the two sides refuse %q differently: write %v, read %v", requested, writeErr, readErr)
 		}
+	}
+}
+
+// A read and a write of the same path have to land on the same file. A read follows the
+// root that holds the file; if a write instead took the first root where the name was
+// free, it would create a second file of that name and answer "created" — leaving the
+// model to insist it had edited the file it had just read.
+func TestResolveWriteInRootsLandsWhereAReadWouldLook(t *testing.T) {
+	_, a, b := siblingRoots(t)
+	read, err := ResolveInRoots([]string{a, b}, "b.txt", DefaultLimit)
+	if err != nil {
+		t.Fatalf("read b.txt: %v", err)
+	}
+	write, err := ResolveWriteInRoots([]string{a, b}, "b.txt")
+	if err != nil {
+		t.Fatalf("write b.txt: %v", err)
+	}
+	if write.Root != read.Root || write.Path != read.Path {
+		t.Fatalf("write goes to %q under %q and read comes from %q under %q, want the same file",
+			write.Path, write.Root, read.Path, read.Root)
+	}
+	// When more than one root holds the name, both take the first of them in the order
+	// the roots were given, so the answer does not depend on which call asked.
+	mustWrite(t, filepath.Join(a, "shared.txt"), "in a\n")
+	mustWrite(t, filepath.Join(b, "shared.txt"), "in b\n")
+	read, err = ResolveInRoots([]string{b, a}, "shared.txt", DefaultLimit)
+	if err != nil {
+		t.Fatalf("read shared.txt: %v", err)
+	}
+	write, err = ResolveWriteInRoots([]string{b, a}, "shared.txt")
+	if err != nil {
+		t.Fatalf("write shared.txt: %v", err)
+	}
+	if write.Root != read.Root || write.Path != read.Path || write.Root != b {
+		t.Fatalf("write goes to %q under %q and read comes from %q under %q, want both in the first root that holds it",
+			write.Path, write.Root, read.Path, read.Root)
 	}
 }
 
