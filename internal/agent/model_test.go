@@ -47,23 +47,24 @@ func withFakeClients(clients ...*namedModel) Option {
 		for _, client := range clients {
 			byName[client.name] = client
 		}
-		r.clientFor = func(_ context.Context, _ config.Config, entry config.Model) (model.ToolCallingChatModel, error) {
-			client, ok := byName[entry.Name]
+		r.clientFor = func(_ context.Context, _ config.Config, modelName string) (model.ToolCallingChatModel, error) {
+			client, ok := byName[modelName]
 			if !ok {
-				return nil, fmt.Errorf("the test has no client for %q", entry.Name)
+				return nil, fmt.Errorf("the test has no client for %q", modelName)
 			}
 			return client, nil
 		}
 	}
 }
 
-// modelTestConfig is a configured model list: the first name is the default.
+// modelTestConfig is a configured model list of one provider: the first name is
+// the default.
 func modelTestConfig(names ...string) config.Config {
 	models := make([]config.Model, 0, len(names))
 	for _, name := range names {
-		models = append(models, config.Model{Name: name, BaseURL: "http://127.0.0.1:1/v1", APIKeyEnv: config.APIKeyEnv})
+		models = append(models, config.Model{Name: name, Provider: "test-provider"})
 	}
-	return config.Config{BaseURL: models[0].BaseURL, APIKey: "test-key", Model: names[0], ProviderHost: "127.0.0.1", Models: models}
+	return config.Config{BaseURL: "http://127.0.0.1:1/v1", APIKey: "test-key", Model: names[0], ProviderHost: "127.0.0.1", Models: models}
 }
 
 // runOnce performs one run and reports what came back.
@@ -81,9 +82,9 @@ func TestEachRunIsSentToTheModelItNames(t *testing.T) {
 	built := map[string]int{}
 	runner, err := NewRunner(context.Background(), alpha, fakeInvoker{}, &recordingReader{}, WithConfig(modelTestConfig("alpha", "beta")), withFakeClients(alpha, beta), func(r *Runner) {
 		inner := r.clientFor
-		r.clientFor = func(ctx context.Context, cfg config.Config, entry config.Model) (model.ToolCallingChatModel, error) {
-			built[entry.Name]++
-			return inner(ctx, cfg, entry)
+		r.clientFor = func(ctx context.Context, cfg config.Config, modelName string) (model.ToolCallingChatModel, error) {
+			built[modelName]++
+			return inner(ctx, cfg, modelName)
 		}
 	})
 	if err != nil {

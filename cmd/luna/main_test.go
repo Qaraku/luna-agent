@@ -543,14 +543,14 @@ func TestAMissingUserConfigIsNotAProblem(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), config.FileName)
-	if err := os.WriteFile(path, []byte("model: demo-model\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("max_iterations: 12\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	file, err = userConfig(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if file == nil || file.Model != "demo-model" {
+	if file == nil || file.MaxIterations != 12 {
 		t.Fatalf("file = %#v, want the file that was there", file)
 	}
 }

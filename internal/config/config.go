@@ -9,18 +9,22 @@ import (
 )
 
 type Config struct {
-	BaseURL      string
-	APIKey       string
-	Model        string
+	BaseURL string
+	APIKey  string
+	Model   string
+	// ProviderHost is the endpoint's host, which is what a run is actually sent
+	// to. It is reported so the interface can say where a run goes without
+	// revealing a key.
 	ProviderHost string
 	// ReasoningEffort is how hard the model should think before it answers, sent
 	// as the API's own reasoning_effort field. Empty means the field is not sent
 	// at all, which is the default: a provider that has never heard of the field
 	// must not be affected by a knob it did not ask for.
 	ReasoningEffort string
-	// Models is the set a run may be sent to, the default first. A user who has
-	// configured none has exactly one entry: what the settings above resolve to.
-	// Switching a run to another entry is what /model does.
+	// Models is the set a run may be sent to, the active provider's default
+	// first. A provider that names no extra model has exactly one entry, and a
+	// Luna with no active provider has none. Switching a run to another entry is
+	// what /model does.
 	Models []Model
 	// MaxIterations and RunTimeout are the two run budgets: how many model turns
 	// one run may take, and how long it may take, before the layer that owns
@@ -34,6 +38,10 @@ type Config struct {
 	// settings page that fills this in is served by the same process, so
 	// refusing to start would make the one thing that fixes it unreachable.
 	// When it is not empty, the rest of the provider fields are zero.
+	//
+	// The names are provider.yaml's own keys, because they are what the
+	// interface points at: "provider" when no provider is active, and otherwise
+	// whichever of base_url, api_key and model the active one leaves out.
 	Missing []string
 }
 
@@ -64,13 +72,6 @@ func ParseReasoningEffort(value string) (string, error) {
 		strings.Join(ReasoningEffortLevels, ", "), ReasoningEffortEnv)
 }
 
-// APIKeyEnv is the environment variable the key is read from when the
-// configuration file names one and the provider file has no key of its own.
-// It is empty by default: a Luna configured through the settings page has no
-// use for a variable, and a default here would keep a second, invisible source
-// of the same value alive.
-const APIKeyEnv = ""
-
 // MaxIterationsEnv and RunTimeoutEnv are where the two run budgets are read
 // from when the configuration file states neither. They are separate variables
 // from the ones that decide which provider is called, because how long a run
@@ -80,18 +81,26 @@ const (
 	RunTimeoutEnv    = "LUNA_RUN_TIMEOUT"
 )
 
-// ProviderValues are the provider settings the settings page owns: the endpoint,
-// the key and the model. They are passed in as plain values rather than as the
-// file type they come from, so this package does not depend on the package that
-// owns that file.
+// ProviderValues are the settings the provider file holds for the active
+// provider: its name, its endpoint, its key and its model list. They are passed
+// in as plain values rather than as the file type they come from, so this
+// package does not depend on the package that owns that file.
 //
-// They are a source, not an override: whatever they state wins over the
-// hand-written file, because they are what this installation was told most
-// recently, and the settings page is where that happens.
+// They are the whole source of a provider: the hand-written configuration file
+// states none of them, because which endpoint a run calls is what the settings
+// page is for.
 type ProviderValues struct {
+	// Name is what provider.yaml calls this provider. It is the name the
+	// interface shows and the one a missing field is reported against.
+	Name string
+	// BaseURL and APIKey are the endpoint and the secret every run of this
+	// installation is sent with.
 	BaseURL string
 	APIKey  string
-	Model   string
+	// Model is the model a run that names none is sent to; Models are the other
+	// ones the interface may offer.
+	Model  string
+	Models []string
 }
 
 // ParseMaxIterations and ParseRunTimeout read one run budget each. The empty
@@ -125,18 +134,22 @@ func ParseRunTimeout(value string) (time.Duration, error) {
 	return d, nil
 }
 
-// Load resolves the configuration from the files that state it: the provider
-// file the settings page writes, and the user's hand-written configuration file.
-// The environment still decides the two run budgets and the reasoning level,
-// which are choices about how a run is made rather than about who it calls.
+// Load resolves the configuration from the two files that state it: the active
+// provider the provider file holds, and the user's hand-written configuration
+// file. The environment still decides the two run budgets and the reasoning
+// level, which are choices about how a run is made rather than about who it
+// calls.
 //
-// Where both files state a provider setting, the provider file wins: it is what
-// this installation was told most recently, and the settings page is where that
-// happens. The hand-written file fills in what the provider file leaves out, so
-// an installation configured by hand keeps working.
+// The provider is passed in already resolved, because which entry in that file
+// is active is that file's business: this package does not know that file's
+// shape, and the composition root that does resolves the active entry before
+// calling here. Everything else about a run — the endpoint, the key, the model
+// list — comes from those values alone; the configuration file cannot state a
+// second endpoint, because two answers to "which provider" is one too many.
 //
 // A provider that states nothing is not an error — see Config.Missing.
 func Load(getenv func(string) string, file *File, prov ProviderValues) (Config, error) {
+	name := strings.TrimSpace(prov.Name)
 	base := strings.TrimSpace(prov.BaseURL)
 	key := strings.TrimSpace(prov.APIKey)
 	model := strings.TrimSpace(prov.Model)
@@ -149,8 +162,6 @@ func Load(getenv func(string) string, file *File, prov ProviderValues) (Config, 
 	if err != nil {
 		return Config{}, err
 	}
-	keyEnv := ""
-
 	if file != nil {
 		stated := file.trimmed()
 		if stated.MaxIterations != 0 {
@@ -173,28 +184,24 @@ func Load(getenv func(string) string, file *File, prov ProviderValues) (Config, 
 		if stated.ReasoningEffort != "" {
 			effort = stated.ReasoningEffort
 		}
-		if base == "" {
-			base = stated.BaseURL
-		}
-		if model == "" {
-			model = stated.Model
-		}
-		if stated.APIKeyEnv != "" {
-			// The file names the variable, never the key itself. This is the
-			// remaining path for an installation configured entirely by hand;
-			// it is consulted only when the settings page has no key to offer.
-			keyEnv = stated.APIKeyEnv
-			if key == "" {
-				key = strings.TrimSpace(getenv(keyEnv))
-			}
-		}
 	}
 	level, err := ParseReasoningEffort(effort)
 	if err != nil {
 		return Config{}, err
 	}
 
-	cfg := Config{BaseURL: base, APIKey: key, Model: model, ReasoningEffort: level, MaxIterations: maxIterations, RunTimeout: runTimeout}
+	// The budgets are resolved before the provider is looked at: they are
+	// choices about how a run is made, and a Luna with no provider yet still
+	// reports the budgets it would run under.
+	cfg := Config{ReasoningEffort: level, MaxIterations: maxIterations, RunTimeout: runTimeout}
+	if name == "" {
+		// No provider is active, so nothing about a provider can be reported —
+		// not even which of its fields is unset, because there is no provider
+		// those fields would belong to. The one thing to fill in is a provider.
+		cfg.Missing = []string{"provider"}
+		return cfg, nil
+	}
+	cfg.BaseURL, cfg.APIKey, cfg.Model = base, key, model
 	var missing []string
 	if base == "" {
 		missing = append(missing, "base_url")
@@ -214,55 +221,31 @@ func Load(getenv func(string) string, file *File, prov ProviderValues) (Config, 
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
 		return Config{}, fmt.Errorf("the provider base URL must be an absolute http(s) URL (the settings page writes provider.yaml; base_url there is the endpoint)")
 	}
-	models, err := modelList(model, base, keyEnv, u.Hostname(), file)
-	if err != nil {
-		return Config{}, err
-	}
 	cfg.ProviderHost = u.Hostname()
-	cfg.Models = models
+	cfg.Models = modelList(name, model, prov.Models)
 	return cfg, nil
 }
 
-// modelList is the effective set of models a run may be sent to: the
-// configuration's own default first, then every entry the file adds, each with
-// the endpoint and key variable it inherits when it states none of its own.
+// modelList is the effective set of models a run may be sent to: the active
+// provider's own model first, then every extra name it lists, in the order the
+// interface shows them. Every entry names the provider it belongs to, because
+// that is the label the interface displays.
 //
 // Two entries cannot share a name. A name is how a run says which model it
 // wants, so a name that matches twice is a name that cannot be chosen — and the
-// user would only find that out by picking the wrong one.
-func modelList(defaultModel, base, keyEnv, defaultHost string, file *File) ([]Model, error) {
-	models := []Model{{Name: defaultModel, Provider: defaultHost, BaseURL: base, APIKeyEnv: keyEnv}}
-	if file == nil {
-		return models, nil
-	}
+// user would only find that out by picking the wrong one. A duplicate is skipped
+// here rather than refused: the file itself already refuses a repeated name, and
+// what this function assembles is a list for an interface to render.
+func modelList(providerName, defaultModel string, extra []string) []Model {
+	models := []Model{{Name: defaultModel, Provider: providerName}}
 	seen := map[string]bool{defaultModel: true}
-	for _, entry := range file.trimmed().Models {
-		if entry.Name == "" {
-			return nil, fmt.Errorf("a model entry in the user configuration file has no name")
+	for _, name := range extra {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			continue
 		}
-		if seen[entry.Name] {
-			return nil, fmt.Errorf("the model %q is listed twice; /model chooses a model by name", entry.Name)
-		}
-		seen[entry.Name] = true
-		if entry.BaseURL == "" {
-			entry.BaseURL = base
-		}
-		if entry.APIKeyEnv == "" {
-			entry.APIKeyEnv = keyEnv
-		}
-		u, err := url.Parse(entry.BaseURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
-			return nil, fmt.Errorf("the model %q must have an absolute http(s) base URL", entry.Name)
-		}
-		if entry.Provider == "" {
-			entry.Provider = u.Hostname()
-		}
-		models = append(models, entry)
+		seen[name] = true
+		models = append(models, Model{Name: name, Provider: providerName})
 	}
-	return models, nil
+	return models
 }
-
-// modelFromEnv read the model from whichever alias was set. It is gone with the
-// environment variables it read: a model comes from the provider file, or from
-// the hand-written configuration file, and never from a variable that may or may
-// not have been exported by whatever launched the process.

@@ -290,33 +290,58 @@ func fileReason(err error) string {
 	return err.Error()
 }
 
-// providerConfig is the provider file as the HTTP layer uses it: the path is
-// known here, and the file's own format and permissions belong to
-// internal/provider. It is the same shape as the skill catalog: the composition
-// root supplies what the interface needs and owns where it is kept.
-type providerConfig struct{ path string }
+// providerRuntime is the provider file as the rest of the program uses it: one
+// object, because the runner and the interface have to agree about which provider
+// a run is sent to.
+//
+// Read and Write are the settings page's view of the file. Current is what a run
+// started right now would use, re-read from disk every time it is asked — that is
+// what makes saving a provider take effect on the next run rather than at the next
+// start, and it is the same answer the runner builds its client from, so the
+// interface can never report a provider the run would not use.
+//
+// The user's own configuration file is read once, at startup: the settings page
+// does not write it, and its budgets belong to this run of the process.
+type providerRuntime struct {
+	path       string
+	getenv     func(string) string
+	userConfig *config.File
+}
 
-func (c providerConfig) Read() (provider.File, error) {
-	file, _, err := provider.LoadFile(c.path)
+func (p providerRuntime) Read() (provider.File, error) {
+	file, _, err := provider.LoadFile(p.path)
 	return file, err
 }
 
-func (c providerConfig) Write(file provider.File) error {
-	if err := provider.Save(c.path, file); err != nil {
+func (p providerRuntime) Write(file provider.File) error {
+	if err := provider.Save(p.path, file); err != nil {
 		return err
 	}
-	log.Printf("luna: provider: saved to %s", c.path)
+	log.Printf("luna: provider: saved to %s", p.path)
 	return nil
 }
 
-// unconfiguredRunner is what runs before provider.yaml says where to call. It
-// fails every run with the one sentence a person can act on, and everything else
-// keeps working: the settings page that fixes this is served by the same process,
-// so a Luna that has never been configured is a Luna you can configure.
-type unconfiguredRunner struct{ missing []string }
+// Current resolves the configuration a run started now would use: the active
+// provider in the file, plus the run budgets and the reasoning level from the
+// user's configuration file and the environment.
+func (p providerRuntime) Current() (config.Config, error) {
+	file, _, err := provider.LoadFile(p.path)
+	if err != nil {
+		return config.Config{}, err
+	}
+	return config.Load(p.getenv, p.userConfig, providerValues(file))
+}
 
-func (r unconfiguredRunner) Run(context.Context, agent.RunRequest) (string, error) {
-	return "", fmt.Errorf("this Luna has no provider configured yet: %s is unset. Fill it in on the settings page, which writes provider.yaml", strings.Join(r.missing, ", "))
+// providerValues is the active provider as the configuration layer reads it. A
+// file with no provider in use yields no values, and the loader then reports what
+// is still unset instead of failing: a Luna that has never been configured is a
+// starting state, not a broken installation.
+func providerValues(file provider.File) config.ProviderValues {
+	name, entry, ok := file.Selection()
+	if !ok {
+		return config.ProviderValues{}
+	}
+	return config.ProviderValues{Name: name, BaseURL: entry.BaseURL, APIKey: entry.APIKey, Model: entry.Model, Models: entry.Models}
 }
 
 // configFileFor decides which configuration file to read: an explicit
@@ -492,16 +517,22 @@ func run() error {
 		return err
 	}
 	// The provider file is Luna's own: the settings page writes it, and this is
-	// where it reads it back. A file that is not there yet means this Luna has
-	// never been configured, which is a starting state rather than a failure.
-	prov, provFound, err := provider.LoadFile(providerFileFor(paths.Config))
+	// where the runner and the interface read it back. A file that is not there
+	// yet means this Luna has never been configured, which is a starting state
+	// rather than a failure.
+	providerPath := providerFileFor(paths.Config)
+	providers, provFound, err := provider.LoadFile(providerPath)
 	if err != nil {
 		return err
 	}
 	if provFound {
-		log.Printf("luna: provider: reading %s", providerFileFor(paths.Config))
+		log.Printf("luna: provider: reading %s", providerPath)
 	}
-	cfg, err := config.Load(os.Getenv, configFile, config.ProviderValues{BaseURL: prov.BaseURL, APIKey: prov.APIKey, Model: prov.Model})
+	// runtime is the same object the runner and the settings page are handed:
+	// one place reads the provider file, so the answer a run uses and the answer
+	// the interface shows cannot drift apart.
+	runtime := providerRuntime{path: providerPath, getenv: os.Getenv, userConfig: configFile}
+	cfg, err := runtime.Current()
 	if err != nil {
 		return err
 	}
@@ -509,6 +540,8 @@ func run() error {
 		// Not fatal on purpose: the settings page that fills this in is served
 		// by this process, so refusing to start would make it unreachable.
 		log.Printf("luna: provider: not configured yet — %s is unset; fill it in on the settings page", strings.Join(cfg.Missing, ", "))
+	} else if name, entry, ok := providers.Selection(); ok {
+		log.Printf("luna: provider: %s calls %s for model %s; another provider can be chosen on the settings page and the next run uses it", name, entry.BaseURL, entry.Model)
 	}
 	executable, err := os.Executable()
 	if err != nil {
@@ -626,36 +659,26 @@ func run() error {
 	// the transcript of every run is appended to it. Capabilities are assembled
 	// from the registry, which is what makes them capabilities rather than core.
 	//
-	// A Luna with no provider yet gets a runner that says so rather than one that
-	// cannot be built: the settings page that fixes it is served right here.
-	var runner httpapi.Runner = unconfiguredRunner{missing: cfg.Missing}
-	if len(cfg.Missing) == 0 {
-		built, err := agent.NewOpenAIRunner(ctx, cfg, plugins, plugins, agent.WithHistory(sessions), agent.WithTranscript(sessions), agent.WithCapabilities(registry))
-		if err != nil {
-			return fmt.Errorf("construct Eino agent: %w", err)
-		}
-		runner = built
+	// The runner is built around the same runtime the interface reads: it asks for
+	// the provider at the start of every run, so a provider saved while this
+	// process runs is used by the next run without a restart. A Luna that has
+	// never been configured is a normal Luna here — its run reports what is
+	// missing, and the settings page that fills it in is served by this process.
+	runner, err := agent.NewProviderRunner(ctx, runtime, plugins, plugins, agent.WithHistory(sessions), agent.WithTranscript(sessions), agent.WithCapabilities(registry))
+	if err != nil {
+		return fmt.Errorf("construct Eino agent: %w", err)
 	}
-	// The command table is built once, here, from the kernel's own commands plus
-	// what this configuration offers. It is handed to the server instead of to
-	// the browser, so the composer's candidates and its help list come from one
-	// description of what exists.
-	modelNames := make([]string, 0, len(cfg.Models))
-	for _, model := range cfg.Models {
-		modelNames = append(modelNames, model.Name)
-	}
-	// A Luna with no provider has no models to switch between, and a command that
-	// offers no choice is not a command: /model appears once there is something
-	// to switch to, which is what the settings page is for.
-	builtins := command.Builtins()
-	if len(modelNames) > 0 {
-		builtins = append(builtins, command.ModelCommand(modelNames))
-	}
-	commands, err := command.New(builtins...)
+	// The command table is the kernel's own list. /model is not declared here:
+	// which models exist is a property of the provider file, so the server
+	// derives that command from the same runtime on every request.
+	commands, err := command.New(command.Builtins()...)
 	if err != nil {
 		return fmt.Errorf("build the command table: %w", err)
 	}
 	bound := listener.Addr().String()
+	// The values gathered here are what this process started with. They are the
+	// whole answer only when the runtime cannot be read; otherwise the interface
+	// asks the runtime, because what is stored is what the next run uses.
 	models := make([]httpapi.ModelRef, 0, len(cfg.Models))
 	for _, model := range cfg.Models {
 		models = append(models, httpapi.ModelRef{Name: model.Name, Provider: model.Provider})
@@ -663,7 +686,7 @@ func run() error {
 	// 运行预算与 HTTP 写入截止时间必须互相说得通：一次运行有权用到它自己的预算为止，
 	// 所以写入截止时间要**高于**预算，而不是替预算结束运行（见 writeDeadlineFor）。
 	runTimeout := httpapi.RunTimeoutFor(cfg.RunTimeout)
-	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, BaseURL: cfg.BaseURL, Missing: cfg.Missing, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(newSkillCatalog(skillSet, settingsPath, userSettings)), httpapi.WithWorkspaces(workspaceStore), httpapi.WithProvider(providerConfig{path: providerFileFor(paths.Config)}), httpapi.WithRunTimeout(runTimeout))
+	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Missing: cfg.Missing, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(newSkillCatalog(skillSet, settingsPath, userSettings)), httpapi.WithWorkspaces(workspaceStore), httpapi.WithProvider(runtime), httpapi.WithConfigSource(runtime), httpapi.WithRunTimeout(runTimeout))
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: writeDeadlineFor(runTimeout), IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() {

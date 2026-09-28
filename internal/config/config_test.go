@@ -9,23 +9,22 @@ import (
 )
 
 // isEmptyFile reports whether a file carries nothing, which is what a missing or
-// an empty file must produce. File is not comparable itself once it holds a
-// slice, so the fields are checked rather than the struct.
+// an empty file must produce.
 func isEmptyFile(f File) bool {
-	return f.Model == "" && f.BaseURL == "" && f.APIKeyEnv == "" && f.ReasoningEffort == "" && len(f.Models) == 0
+	return f.ReasoningEffort == "" && f.MaxIterations == 0 && f.RunTimeout == ""
 }
 
 func env(values map[string]string) func(string) string {
 	return func(k string) string { return values[k] }
 }
 
-// providerValues is what the settings page would have written: an endpoint, a
-// key and a model, and nothing else.
+// providerValues is what the settings page would have written: one named
+// provider with an endpoint, a key and a model.
 func providerValues() ProviderValues {
-	return ProviderValues{BaseURL: "https://example.test/v1", APIKey: "test-key", Model: "test-model"}
+	return ProviderValues{Name: "deepseek", BaseURL: "https://example.test/v1", APIKey: "test-key", Model: "test-model"}
 }
 
-func TestTheProviderFileIsTheSource(t *testing.T) {
+func TestTheActiveProviderIsTheSource(t *testing.T) {
 	cfg, err := Load(env(map[string]string{}), nil, providerValues())
 	if err != nil {
 		t.Fatal(err)
@@ -44,22 +43,28 @@ func TestTheProviderFileIsTheSource(t *testing.T) {
 // A Luna that has never been configured must still start: the settings page that
 // fills this in is served by this same process, so refusing to start would make
 // the one thing that fixes it unreachable.
-func TestAnUnconfiguredProviderIsNotAnError(t *testing.T) {
+//
+// With no provider at all the one thing to fill in is a provider: naming a
+// base_url would point the interface at a field of an entry that does not exist.
+func TestNoProviderAtAllNamesTheProvider(t *testing.T) {
 	cfg, err := Load(env(map[string]string{}), nil, ProviderValues{})
 	if err != nil {
 		t.Fatalf("an unconfigured Luna must start: %v", err)
 	}
-	want := []string{"base_url", "api_key", "model"}
+	want := []string{"provider"}
 	if strings.Join(cfg.Missing, ",") != strings.Join(want, ",") {
 		t.Fatalf("missing = %v, want %v", cfg.Missing, want)
 	}
 	if len(cfg.Models) != 0 {
-		t.Fatalf("models = %+v, want none while the provider is unset", cfg.Models)
+		t.Fatalf("models = %+v, want none while no provider is active", cfg.Models)
+	}
+	if cfg.Model != "" || cfg.BaseURL != "" || cfg.APIKey != "" {
+		t.Fatalf("a Luna with no provider reports provider fields: %#v", cfg)
 	}
 }
 
 func TestAPartlyConfiguredProviderNamesWhatIsStillMissing(t *testing.T) {
-	cfg, err := Load(env(map[string]string{}), nil, ProviderValues{BaseURL: "https://example.test/v1", APIKey: "k"})
+	cfg, err := Load(env(map[string]string{}), nil, ProviderValues{Name: "deepseek", BaseURL: "https://example.test/v1", APIKey: "k"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,95 +73,10 @@ func TestAPartlyConfiguredProviderNamesWhatIsStillMissing(t *testing.T) {
 	}
 }
 
-// The settings page is where a provider is set most recently, so it wins where
-// the hand-written file also states something.
-func TestTheProviderFileWinsOverTheHandWrittenFile(t *testing.T) {
-	cfg, err := Load(env(map[string]string{}), &File{
-		Model:           "file-model",
-		BaseURL:         "https://file.example.test/v1",
-		ReasoningEffort: "high",
-	}, providerValues())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Model != "test-model" || cfg.ProviderHost != "example.test" {
-		t.Fatalf("the hand-written file won where the provider file stated a value: %#v", cfg)
-	}
-	// A run budget is not a provider setting: it is still the file's to state.
-	if cfg.ReasoningEffort != "high" {
-		t.Fatalf("reasoning effort = %q, want the file's level", cfg.ReasoningEffort)
-	}
-}
-
-// An installation configured entirely by hand keeps working: the hand-written
-// file fills in what the provider file leaves out.
-func TestTheHandWrittenFileFillsInWhatTheProviderFileLeavesOut(t *testing.T) {
-	cfg, err := Load(env(map[string]string{}), &File{
-		Model:   "file-model",
-		BaseURL: "https://file.example.test/v1",
-	}, ProviderValues{APIKey: "only-key"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Model != "file-model" || cfg.ProviderHost != "file.example.test" || cfg.APIKey != "only-key" {
-		t.Fatalf("unexpected config: %#v", cfg)
-	}
-}
-
-// Naming a variable keeps a key out of a hand-written file, and it is only
-// consulted when the settings page has no key to offer.
-func TestTheHandWrittenFileMayNameAVariableForTheKey(t *testing.T) {
-	cfg, err := Load(env(map[string]string{"MY_PROVIDER_KEY": "chosen-name-key"}), &File{
-		Model:     "m",
-		BaseURL:   "https://example.test/v1",
-		APIKeyEnv: "MY_PROVIDER_KEY",
-	}, ProviderValues{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.APIKey != "chosen-name-key" {
-		t.Fatalf("the named variable was not read: %#v", cfg)
-	}
-}
-
-// A file that names a variable nobody set is not an error the server refuses to
-// start on: it is a provider that is not configured yet, and the settings page
-// is what fills it in.
-func TestANamedVariableThatIsUnsetLeavesTheProviderUnconfigured(t *testing.T) {
-	cfg, err := Load(env(map[string]string{}), &File{
-		Model:     "m",
-		BaseURL:   "https://example.test/v1",
-		APIKeyEnv: "MY_PROVIDER_KEY",
-	}, ProviderValues{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cfg.Missing) != 1 || cfg.Missing[0] != "api_key" {
-		t.Fatalf("missing = %v, want just the key", cfg.Missing)
-	}
-}
-
-// A key set through the settings page is the one that is used, even when the
-// hand-written file names a variable as well: two answers to "which key" is one
-// too many, and the settings page is the more specific of the two.
-func TestTheProviderKeyWinsOverANamedVariable(t *testing.T) {
-	cfg, err := Load(env(map[string]string{"MY_PROVIDER_KEY": "var-key"}), &File{
-		Model:     "m",
-		BaseURL:   "https://example.test/v1",
-		APIKeyEnv: "MY_PROVIDER_KEY",
-	}, ProviderValues{APIKey: "settings-key"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.APIKey != "settings-key" {
-		t.Fatalf("api key = %q, want the one the settings page holds", cfg.APIKey)
-	}
-}
-
 // A key that is set but unusable is the one thing an error must never quote.
 func TestTheKeyNeverAppearsInAnError(t *testing.T) {
 	_, err := Load(env(map[string]string{}), nil, ProviderValues{
-		BaseURL: "not-a-url", APIKey: "top-secret-value", Model: "m",
+		Name: "deepseek", BaseURL: "not-a-url", APIKey: "top-secret-value", Model: "m",
 	})
 	if err == nil {
 		t.Fatal("a relative base URL was accepted")
@@ -169,10 +89,25 @@ func TestTheKeyNeverAppearsInAnError(t *testing.T) {
 func TestLoadRejectsABaseURLThatCannotBeCalled(t *testing.T) {
 	for _, base := range []string{"example.test/v1", "ftp://example.test/v1", "https:///v1"} {
 		if _, err := Load(env(map[string]string{}), nil, ProviderValues{
-			BaseURL: base, APIKey: "k", Model: "m",
+			Name: "deepseek", BaseURL: base, APIKey: "k", Model: "m",
 		}); err == nil {
 			t.Fatalf("%q was accepted", base)
 		}
+	}
+}
+
+// The hand-written file answers the questions about how a run is made. It has no
+// vote on which provider that run is sent to.
+func TestTheFileStatesHowARunIsMadeAndNotWhereItGoes(t *testing.T) {
+	cfg, err := Load(env(map[string]string{}), &File{ReasoningEffort: "high", MaxIterations: 7, RunTimeout: "90s"}, providerValues())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ReasoningEffort != "high" || cfg.MaxIterations != 7 || cfg.RunTimeout != 90*time.Second {
+		t.Fatalf("the file's choices were not applied: %#v", cfg)
+	}
+	if cfg.Model != "test-model" || cfg.ProviderHost != "example.test" {
+		t.Fatalf("the provider did not come from the active entry: %#v", cfg)
 	}
 }
 
@@ -237,20 +172,23 @@ func TestAnEmptyFileIsAnEmptyConfiguration(t *testing.T) {
 }
 
 // A misspelled key that is ignored would leave the user with no effect and no
-// reason, which is the one outcome a configuration file must not produce.
+// reason, which is the one outcome a configuration file must not produce. The
+// provider keys are refused here too: this file does not state an endpoint.
 func TestAnUnknownKeyIsRefused(t *testing.T) {
-	path := filepath.Join(t.TempDir(), FileName)
-	if err := os.WriteFile(path, []byte("modell: demo\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := LoadFile(path); err == nil {
-		t.Fatal("an unknown key was accepted")
+	for _, body := range []string{"modell: demo\n", "model: demo\n", "base_url: https://example.test/v1\n", "api_key_env: SOMETHING\n"} {
+		path := filepath.Join(t.TempDir(), FileName)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := LoadFile(path); err == nil {
+			t.Fatalf("%q was accepted", body)
+		}
 	}
 }
 
 func TestAFileIsReadWithItsValuesTrimmed(t *testing.T) {
 	path := filepath.Join(t.TempDir(), FileName)
-	body := "model: \"  spaced-model  \"\nbase_url: \" https://example.test/v1 \"\nreasoning_effort: \" High \"\n"
+	body := "reasoning_effort: \" High \"\nrun_timeout: \" 90s \"\n"
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -258,11 +196,11 @@ func TestAFileIsReadWithItsValuesTrimmed(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("found=%v err=%v", found, err)
 	}
-	cfg, err := Load(env(map[string]string{}), &file, ProviderValues{APIKey: "k"})
+	cfg, err := Load(env(map[string]string{}), &file, providerValues())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Model != "spaced-model" || cfg.ReasoningEffort != "high" || cfg.ProviderHost != "example.test" {
+	if cfg.ReasoningEffort != "high" || cfg.RunTimeout != 90*time.Second || cfg.ProviderHost != "example.test" {
 		t.Fatalf("unexpected config: %#v", cfg)
 	}
 }
@@ -272,7 +210,7 @@ func TestAFileIsReadWithItsValuesTrimmed(t *testing.T) {
 func TestAFileErrorNamesTheFileNameOnly(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, FileName)
-	if err := os.WriteFile(path, []byte("model: [unclosed\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("reasoning_effort: [unclosed\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	_, _, err := LoadFile(path)
@@ -287,10 +225,10 @@ func TestAFileErrorNamesTheFileNameOnly(t *testing.T) {
 	}
 }
 
-// A user who configured one model has one model: the one the provider file
-// names. The list is never empty while a provider is configured, because /model
-// has to have something to switch back to.
-func TestTheDefaultModelIsTheWholeListWithoutAFile(t *testing.T) {
+// A user who configured one model has one model: the provider's own. The list is
+// never empty while a provider is active, because /model has to have something to
+// switch back to.
+func TestTheProvidersOwnModelIsTheWholeListWithNoExtras(t *testing.T) {
 	cfg, err := Load(env(map[string]string{}), nil, providerValues())
 	if err != nil {
 		t.Fatal(err)
@@ -299,74 +237,46 @@ func TestTheDefaultModelIsTheWholeListWithoutAFile(t *testing.T) {
 		t.Fatalf("models = %+v", cfg.Models)
 	}
 	only := cfg.Models[0]
-	if only.Name != "test-model" || only.BaseURL != "https://example.test/v1" || only.Provider != "example.test" {
-		t.Fatalf("the default entry is not the effective configuration: %+v", only)
+	if only.Name != "test-model" || only.Provider != "deepseek" {
+		t.Fatalf("the default entry is not the active provider's own model: %+v", only)
 	}
 }
 
-// Entries the file adds come after the default, and inherit what they leave out.
-// A user with one provider and several models writes only names.
-func TestFileModelsInheritTheEndpoint(t *testing.T) {
-	cfg, err := Load(env(map[string]string{}), &File{
-		Models: []Model{
-			{Name: "second"},
-			{Name: "third", BaseURL: "https://other.example.test/v1", Provider: "Other"},
-		},
-	}, providerValues())
+// The extras a provider lists come after its own model, in the order it lists
+// them, and every entry says which provider it belongs to — that name is the
+// label the interface shows.
+func TestExtraModelsFollowTheProvidersOwnAndCarryTheProviderName(t *testing.T) {
+	cfg, err := Load(env(map[string]string{}), nil, ProviderValues{
+		Name: "deepseek", BaseURL: "https://example.test/v1", APIKey: "k", Model: "first",
+		Models: []string{"second", " third "},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.Models) != 3 {
+	want := []string{"first", "second", "third"}
+	if len(cfg.Models) != len(want) {
 		t.Fatalf("models = %+v", cfg.Models)
 	}
-	if cfg.Models[0].Name != "test-model" {
-		t.Fatalf("the default must come first: %+v", cfg.Models)
-	}
-	inherited := cfg.Models[1]
-	if inherited.Name != "second" || inherited.BaseURL != "https://example.test/v1" || inherited.Provider != "example.test" {
-		t.Fatalf("the second entry did not inherit: %+v", inherited)
-	}
-	own := cfg.Models[2]
-	if own.BaseURL != "https://other.example.test/v1" || own.Provider != "Other" {
-		t.Fatalf("the third entry did not keep its own values: %+v", own)
+	for i, name := range want {
+		if cfg.Models[i].Name != name || cfg.Models[i].Provider != "deepseek" {
+			t.Fatalf("models[%d] = %+v, want %q from the active provider", i, cfg.Models[i], name)
+		}
 	}
 }
 
-// A name is how a run says which model it wants, so a name that matches twice
-// cannot be chosen — and the user would only discover that by picking the wrong
-// one.
-func TestADuplicateModelNameIsRefused(t *testing.T) {
-	cases := []struct {
-		name string
-		file *File
-	}{
-		{"twice in the file", &File{Models: []Model{{Name: "a"}, {Name: "a"}}}},
-		{"once as the default", &File{Models: []Model{{Name: "test-model"}}}},
+// A name is how /model says which model it means, so a name that appears twice
+// cannot be chosen. The file itself refuses a repeated name; this is the assembly
+// step, which drops a repeat rather than offering the same choice twice.
+func TestARepeatedModelNameIsListedOnce(t *testing.T) {
+	cfg, err := Load(env(map[string]string{}), nil, ProviderValues{
+		Name: "deepseek", BaseURL: "https://example.test/v1", APIKey: "k", Model: "first",
+		Models: []string{"first", "second", "second", "  "},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, err := Load(env(map[string]string{}), tc.file, providerValues()); err == nil {
-				t.Fatal("the duplicate name was accepted")
-			}
-		})
-	}
-}
-
-func TestModelEntriesThatCannotBeUsedAreRefused(t *testing.T) {
-	cases := []struct {
-		name  string
-		entry Model
-	}{
-		{"no name", Model{Provider: "P"}},
-		{"relative base url", Model{Name: "a", BaseURL: "not-a-url"}},
-		{"unsupported scheme", Model{Name: "a", BaseURL: "ftp://example.test/v1"}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, err := Load(env(map[string]string{}), &File{Models: []Model{tc.entry}}, providerValues()); err == nil {
-				t.Fatalf("%+v was accepted", tc.entry)
-			}
-		})
+	if len(cfg.Models) != 2 || cfg.Models[0].Name != "first" || cfg.Models[1].Name != "second" {
+		t.Fatalf("models = %+v, want the two distinct names in order", cfg.Models)
 	}
 }
 

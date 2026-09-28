@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Qaraku/luna-agent/internal/config"
 	"github.com/Qaraku/luna-agent/internal/store"
 )
 
@@ -38,24 +39,78 @@ const (
 	originGlobal  = "global"
 )
 
-// defaultModel is the model a run uses when nothing else is chosen: the first
-// configured entry, or the single model an environment-only configuration has.
-func (s *Server) defaultModel() string {
-	if len(s.info.Models) > 0 {
-		return s.info.Models[0].Name
+// providerConfigNow returns the configuration a run started right now would use.
+//
+// The second value reports whether this server has a source at all: a server
+// built without one — a test, or an embedder that owns the provider itself —
+// reports the configuration it was built with, and callers fall back to Info in
+// that case. An error is only ever returned together with live=true.
+func (s *Server) providerConfigNow() (config.Config, bool, error) {
+	if s.configSource == nil {
+		return config.Config{}, false, nil
 	}
-	return s.info.Model
+	cfg, err := s.configSource.Current()
+	if err != nil {
+		return config.Config{}, true, err
+	}
+	return cfg, true, nil
+}
+
+// modelsNow is the list a run started now could be sent to, the default first.
+//
+// It is read on every request rather than cached at startup, because the provider
+// file can change while this process runs: a list cached once would offer a model
+// the next run cannot be sent to, or miss one it could.
+func (s *Server) modelsNow() ([]ModelRef, bool, error) {
+	cfg, live, err := s.providerConfigNow()
+	if err != nil {
+		return nil, true, err
+	}
+	if !live {
+		refs := make([]ModelRef, 0, len(s.info.Models))
+		for i, model := range s.info.Models {
+			refs = append(refs, ModelRef{Name: model.Name, Provider: model.Provider, Default: i == 0})
+		}
+		return refs, false, nil
+	}
+	refs := make([]ModelRef, 0, len(cfg.Models))
+	for i, model := range cfg.Models {
+		refs = append(refs, ModelRef{Name: model.Name, Provider: model.Provider, Default: i == 0})
+	}
+	return refs, true, nil
+}
+
+// defaultModelNow is the model a run uses when nothing else is chosen: the first
+// entry of the live list, or the model this server was built with when there is no
+// source. It is empty for a Luna with no provider in use, which a run reports as
+// an unconfigured provider rather than as a model choice.
+func (s *Server) defaultModelNow() (string, error) {
+	refs, live, err := s.modelsNow()
+	if err != nil {
+		return "", err
+	}
+	if len(refs) > 0 {
+		return refs[0].Name, nil
+	}
+	if live {
+		return "", nil
+	}
+	return s.info.Model, nil
 }
 
 // configuredModel reports whether name is one of the models this runtime may be
-// asked for.
+// asked for right now.
 func (s *Server) configuredModel(name string) bool {
-	for _, model := range s.info.Models {
+	refs, live, err := s.modelsNow()
+	if err != nil {
+		return false
+	}
+	for _, model := range refs {
 		if model.Name == name {
 			return true
 		}
 	}
-	return len(s.info.Models) == 0 && name == s.info.Model
+	return !live && len(refs) == 0 && name == s.info.Model
 }
 
 // sendModels reports the configured models and which one a session would use.
@@ -63,11 +118,17 @@ func (s *Server) configuredModel(name string) bool {
 // The session is optional: without it the answer describes the configuration
 // alone, which is what a browser that has not opened a session yet can ask.
 func (s *Server) sendModels(w http.ResponseWriter, r *http.Request) {
-	views := make([]ModelRef, 0, len(s.info.Models))
-	for i, model := range s.info.Models {
-		views = append(views, ModelRef{Name: model.Name, Provider: model.Provider, Default: i == 0})
+	views, _, err := s.modelsNow()
+	if err != nil {
+		fail(w, 500, err)
+		return
 	}
-	current := currentModel{Name: s.defaultModel(), Origin: originGlobal}
+	name, err := s.defaultModelNow()
+	if err != nil {
+		fail(w, 500, err)
+		return
+	}
+	current := currentModel{Name: name, Origin: originGlobal}
 	if id := strings.TrimSpace(r.URL.Query().Get("session")); id != "" {
 		session, err := s.sessions.Read(id)
 		if err != nil {
@@ -98,6 +159,12 @@ func (s *Server) setSessionModel(w http.ResponseWriter, r *http.Request, id stri
 	name := strings.TrimSpace(in.Model)
 	if name == "" {
 		fail(w, 400, fmt.Errorf("model is required"))
+		return
+	}
+	if _, _, err := s.modelsNow(); err != nil {
+		// The list could not be read at all, so "unknown model" would be a
+		// guess about what this runtime offers.
+		fail(w, 500, err)
 		return
 	}
 	if !s.configuredModel(name) {
@@ -133,11 +200,21 @@ func (s *Server) setSessionModel(w http.ResponseWriter, r *http.Request, id stri
 // configuredModelNames names what could have been chosen instead, so a refused
 // switch tells the user what would work.
 func (s *Server) configuredModelNames() string {
-	if len(s.info.Models) == 0 {
+	refs, live, err := s.modelsNow()
+	if err != nil {
+		// Unreachable from the refusal path, which reads the list first: a
+		// message that cannot name the alternatives still must not claim there
+		// are none.
+		return "no model this runtime could read"
+	}
+	if len(refs) == 0 {
+		if live {
+			return "no model: no provider is configured yet"
+		}
 		return fmt.Sprintf("%q", s.info.Model)
 	}
-	names := make([]string, 0, len(s.info.Models))
-	for _, model := range s.info.Models {
+	names := make([]string, 0, len(refs))
+	for _, model := range refs {
 		names = append(names, model.Name)
 	}
 	return strings.Join(names, ", ")

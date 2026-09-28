@@ -38,15 +38,55 @@ type commandsResponse struct {
 }
 
 func (s *Server) sendCommands(w http.ResponseWriter) {
-	send(w, 200, commandsResponse{Commands: commandViews(s.commands)})
+	send(w, 200, commandsResponse{Commands: s.commandViews()})
 }
 
-// commandViews renders the table. An empty table is an empty list rather than a
-// missing field, so a browser never has to tell "no commands" apart from
-// "nothing was sent".
-func commandViews(table *command.Table) []commandView {
-	views := make([]commandView, 0, len(table.All()))
-	for _, cmd := range table.All() {
+// commandViews renders the table the composer works from.
+//
+// /model is derived here rather than handed in with the table, because which
+// models exist is read from the provider file and that file can change while this
+// process runs: a table built once at startup would offer the models that existed
+// then. A table that already declares /model keeps it — the kernel's own list is
+// never second-guessed — which also keeps a test's fixture table intact.
+func (s *Server) commandViews() []commandView {
+	commands := s.commands.All()
+	if names := s.liveModelNames(); len(names) > 0 && !declaresModel(commands) {
+		commands = append(commands, command.ModelCommand(names))
+	}
+	return viewsFor(commands)
+}
+
+// liveModelNames are the models /model may switch to right now. An empty list
+// means the command does not exist at all: a command that offers no choice is not
+// a command.
+func (s *Server) liveModelNames() []string {
+	refs, _, err := s.modelsNow()
+	if err != nil {
+		return nil
+	}
+	names := make([]string, 0, len(refs))
+	for _, model := range refs {
+		names = append(names, model.Name)
+	}
+	return names
+}
+
+// declaresModel reports whether the table already carries /model.
+func declaresModel(commands []command.Command) bool {
+	for _, cmd := range commands {
+		if cmd.Name == "model" {
+			return true
+		}
+	}
+	return false
+}
+
+// viewsFor renders commands as the browser sees them. An empty list is an empty
+// list rather than a missing field, so a browser never has to tell "no commands"
+// apart from "nothing was sent".
+func viewsFor(commands []command.Command) []commandView {
+	views := make([]commandView, 0, len(commands))
+	for _, cmd := range commands {
 		view := commandView{
 			Name:     cmd.Name,
 			Summary:  cmd.Summary,

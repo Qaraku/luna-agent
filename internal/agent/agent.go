@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -753,14 +753,28 @@ type Runner struct {
 	files    FileTools
 	// cfg is the model list a run may be sent to, its default first.
 	cfg config.Config
+	// source is where the current provider is read from, when one was supplied.
+	// With it, a provider saved while this process runs is used by the next run
+	// without a restart; without it, cfg is what the runner was built with and
+	// stays that way.
+	source ProviderSource
+	// sig is the configuration the current agent and its clients were built
+	// from. A run re-reads the source and rebuilds when this no longer matches
+	// what the source states. Guarded by mu.
+	sig configSignature
+	// built reports whether an agent and a default client exist at all. A runner
+	// built around a source has neither until its first run.
+	built bool
 	// model is the client the runner was started with: the default entry of
 	// cfg. Every run that asks for no particular model, and every run that asks
 	// for the default entry by name, is sent here.
 	model model.ToolCallingChatModel
-	// clients caches the clients built for the other entries by name, so a
-	// session that switches back and forth builds each one once. Guarded by mu.
+	// clients caches the clients built for the other models by name, so a
+	// session that switches back and forth builds each one once. Guarded by mu,
+	// and emptied whenever the provider changes: a client built for the old
+	// endpoint must not answer for the new one.
 	clients map[string]model.ToolCallingChatModel
-	// clientFor builds the client for one entry. It is a field so the
+	// clientFor builds the client for one model. It is a field so the
 	// construction has one home and so a test can stand a fake in for a
 	// provider instead of calling one.
 	clientFor clientFactory
@@ -771,15 +785,73 @@ type Runner struct {
 	// when the runner was built without a list.
 	builtRevision uint64
 	// maxIterations is how many model turns one run may take before the agent
-	// stops it as a runaway loop. It is resolved once, at construction, so a run
-	// and the error that explains it agree on the number.
+	// stops it as a runaway loop. It is resolved when the agent is built, so a
+	// run and the error that explains it agree on the number.
 	maxIterations int
 }
 
-// clientFactory builds the model client for one entry of the configured model
-// list. Building one resolves an endpoint and a key; it is not a request, and
-// the provider is first spoken to by the run.
-type clientFactory func(ctx context.Context, cfg config.Config, entry config.Model) (model.ToolCallingChatModel, error)
+// ProviderSource is where the provider a run should be sent to comes from: the
+// configuration as it is now, not as it was when the process started.
+//
+// It is an interface rather than a value because "which endpoint, key and model
+// this installation uses" is a question whose answer can change while the
+// process runs — the settings page saves a provider, and the next run has to use
+// it. An error means the question could not be answered (a file that cannot be
+// read, a key that cannot be resolved), which fails the run that asked.
+type ProviderSource interface {
+	Current() (config.Config, error)
+}
+
+// WithProviderSource supplies the source the runner asks for the current
+// configuration at the start of every run.
+//
+// A runner built without one keeps the configuration it was constructed with:
+// that is the shape the tests and any embedding that owns the provider itself
+// use, and it is not a second, weaker provider path — it is the absence of one.
+func WithProviderSource(src ProviderSource) Option { return func(r *Runner) { r.source = src } }
+
+// configSignature is everything about a configuration that the built agent and
+// its clients depend on. It exists so "the provider changed" is one comparison
+// instead of a list of fields at every call site, and so a change that does not
+// matter (a reasoning level, say — which is read per request, not baked into the
+// client) does not throw away a working agent.
+type configSignature struct {
+	provider      string
+	baseURL       string
+	apiKey        string
+	model         string
+	models        []string
+	maxIterations int
+	runTimeout    time.Duration
+}
+
+// signatureOf reduces a configuration to the parts a built agent and its clients
+// depend on.
+func signatureOf(cfg config.Config) configSignature {
+	models := make([]string, 0, len(cfg.Models))
+	provider := ""
+	for i, entry := range cfg.Models {
+		models = append(models, entry.Name)
+		if i == 0 {
+			provider = entry.Provider
+		}
+	}
+	return configSignature{provider: provider, baseURL: cfg.BaseURL, apiKey: cfg.APIKey, model: cfg.Model, models: models, maxIterations: cfg.MaxIterations, runTimeout: cfg.RunTimeout}
+}
+
+func (s configSignature) same(other configSignature) bool {
+	return s.provider == other.provider && s.baseURL == other.baseURL && s.apiKey == other.apiKey && s.model == other.model &&
+		s.maxIterations == other.maxIterations && s.runTimeout == other.runTimeout && slices.Equal(s.models, other.models)
+}
+
+// clientFactory builds the model client for one model of the active provider.
+// Building one resolves the endpoint and the key that provider is called with; it
+// is not a request, and the provider is first spoken to by the run.
+//
+// The endpoint and the key come from the configuration rather than from the entry
+// that names the model, because they are properties of the provider: every model
+// the active provider serves is served at the same endpoint, with the same key.
+type clientFactory func(ctx context.Context, cfg config.Config, modelName string) (model.ToolCallingChatModel, error)
 
 // DefaultMaxIterations is how many model turns one run may take before the agent
 // stops it as a runaway loop.
@@ -825,10 +897,10 @@ func WithMaxIterations(n int) Option { return func(r *Runner) { r.maxIterations 
 // both use the client the runner was started with.
 func WithConfig(cfg config.Config) Option { return func(r *Runner) { r.cfg = cfg } }
 
-// NewRunner builds the agent and its tool set. Every model-visible tool is
-// registered here, by the core: the plugin-backed wrappers whose host-side half
-// the runner was handed, and one wrapper per tool contributed by an enabled
-// capability.
+// NewRunner builds the agent and its tool set around a model the caller already
+// has. Every model-visible tool is registered here, by the core: the plugin-backed
+// wrappers whose host-side half the runner was handed, and one wrapper per tool
+// contributed by an enabled capability.
 func NewRunner(ctx context.Context, m model.ToolCallingChatModel, invoker Invoker, files FileTools, opts ...Option) (*Runner, error) {
 	// buildCtx is the construction context, kept for rebuilds: a rebuild is not
 	// part of any single run, so it must not inherit that run's cancellation.
@@ -842,7 +914,63 @@ func NewRunner(ctx context.Context, m model.ToolCallingChatModel, invoker Invoke
 	if err := r.build(m, r.defaultModelName()); err != nil {
 		return nil, err
 	}
+	r.built, r.sig = true, signatureOf(r.cfg)
 	return r, nil
+}
+
+// NewProviderRunner builds a runner that asks src for the provider to call at the
+// start of every run, instead of being handed a model at construction.
+//
+// Nothing is built here on purpose. A Luna that has never been configured is a
+// normal Luna — the settings page that configures it is served by the same
+// process — so a runner that could only be constructed from a working provider
+// would make the one thing that fixes the installation unreachable. The first run
+// asks the source, reports what is missing if anything is, and builds the agent
+// and its clients from what it gets.
+func NewProviderRunner(ctx context.Context, src ProviderSource, invoker Invoker, files FileTools, opts ...Option) (*Runner, error) {
+	if src == nil {
+		return nil, errors.New("a provider source is required")
+	}
+	r := &Runner{buildCtx: ctx, source: src, invoker: invoker, files: files, clients: map[string]model.ToolCallingChatModel{}, clientFor: openAICompatibleClient}
+	for _, opt := range opts {
+		opt(r)
+	}
+	if r.maxIterations <= 0 {
+		r.maxIterations = DefaultMaxIterations
+	}
+	return r, nil
+}
+
+// missingProviderError is the sentence a run gets when the installation has no
+// usable provider. It names the fields to fill in and where they are written,
+// because the person reading it is looking at a settings page.
+func missingProviderError(missing []string) error {
+	return fmt.Errorf("this Luna has no provider configured yet: %s is unset. Fill it in on the settings page, which writes provider.yaml", strings.Join(missing, ", "))
+}
+
+// adopt takes the configuration a run should use from now on: it replaces the
+// model list, empties the client cache — those clients were built for the endpoint
+// and key that have just been replaced — and rebuilds the default client and the
+// agent.
+//
+// The signature is recorded only once the rebuild succeeded, so a build failure
+// fails the run instead of leaving the runner believing it has adopted a
+// configuration it could not build.
+func (r *Runner) adopt(cfg config.Config) error {
+	r.cfg = cfg
+	r.maxIterations = MaxIterationsFor(cfg)
+	r.clients = map[string]model.ToolCallingChatModel{}
+	defaultModel := r.defaultModelName()
+	m, err := r.clientFor(r.buildCtx, cfg, defaultModel)
+	if err != nil {
+		return fmt.Errorf("build the client for the model %q of the provider %q: %w", defaultModel, cfg.ProviderHost, err)
+	}
+	r.model = m
+	if err := r.build(m, defaultModel); err != nil {
+		return fmt.Errorf("build the agent for the current provider: %w", err)
+	}
+	r.built, r.sig = true, signatureOf(cfg)
+	return nil
 }
 
 // build assembles the model-visible tools and the agent that runs them, from the
@@ -902,11 +1030,10 @@ func (r *Runner) modelForRun(name string) (model.ToolCallingChatModel, string, e
 	if client, ok := r.clients[requested]; ok {
 		return client, requested, nil
 	}
-	entry, ok := r.modelEntry(requested)
-	if !ok {
+	if _, ok := r.modelEntry(requested); !ok {
 		return nil, "", fmt.Errorf("unknown model %q: this Luna can run %s", requested, r.knownModels())
 	}
-	client, err := r.clientFor(r.buildCtx, r.cfg, entry)
+	client, err := r.clientFor(r.buildCtx, r.cfg, requested)
 	if err != nil {
 		return nil, "", fmt.Errorf("build the client for model %q: %w", requested, err)
 	}
@@ -946,13 +1073,14 @@ func (r *Runner) currentRevision() uint64 {
 }
 
 // agentForRun returns the agent a run should use, rebuilding it first when the
-// capability list changed, or when the run is sent to a different model, since
-// the agent was built.
+// capability list changed, when the run is sent to a different model, or when the
+// provider the source reports is no longer the one the agent was built for.
 //
 // A run takes the agent it gets here and keeps it to the end: a toggle during a
 // run rebuilds the agent for the NEXT run, so an in-flight run is never switched
-// out from under itself. The same holds for a model: switching the session's
-// model mid-run does not move the run that is already talking to a provider.
+// out from under itself. The same holds for a model and for the provider:
+// switching the session's model mid-run, or saving another provider, does not move
+// the run that is already talking to one.
 // Rebuilding before the run rather than on the toggle keeps the toggle path free
 // of this package's build errors.
 //
@@ -962,6 +1090,23 @@ func (r *Runner) currentRevision() uint64 {
 func (r *Runner) agentForRun(name string) (*adk.Runner, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.source != nil {
+		cfg, err := r.source.Current()
+		if err != nil {
+			return nil, fmt.Errorf("read the configured provider: %w", err)
+		}
+		if len(cfg.Missing) > 0 {
+			return nil, missingProviderError(cfg.Missing)
+		}
+		// Adopting only on a real change keeps a working agent: rebuilding on
+		// every run would throw away the client cache and the built tool set for
+		// nothing, and the configuration is re-read on every run regardless.
+		if !r.built || !signatureOf(cfg).same(r.sig) {
+			if err := r.adopt(cfg); err != nil {
+				return nil, err
+			}
+		}
+	}
 	m, resolved, err := r.modelForRun(name)
 	if err != nil {
 		return nil, err
@@ -975,53 +1120,41 @@ func (r *Runner) agentForRun(name string) (*adk.Runner, error) {
 	return r.runner, nil
 }
 
-// openAIChatConfig is the client configuration for one entry of the model list,
-// called with key. The reasoning level is set only when one was chosen: the
-// field is then left out of the request entirely, which is what keeps this knob
-// from reaching providers that do not define it. How hard the model thinks is a
-// parameter of the run; showing the reasoning it produced is a separate concern
+// openAIChatConfig is the client configuration for one model of the active
+// provider, called with key. The reasoning level is set only when one was chosen:
+// the field is then left out of the request entirely, which is what keeps this
+// knob from reaching providers that do not define it. How hard the model thinks is
+// a parameter of the run; showing the reasoning it produced is a separate concern
 // and does not depend on this being set.
-func openAIChatConfig(entry config.Model, key, effort string) *openai.ChatModelConfig {
-	modelConfig := &openai.ChatModelConfig{APIKey: key, BaseURL: entry.BaseURL, Model: entry.Name}
-	if effort != "" {
-		modelConfig.ReasoningEffort = openai.ReasoningEffortLevel(effort)
+func openAIChatConfig(cfg config.Config, modelName, key string) *openai.ChatModelConfig {
+	modelConfig := &openai.ChatModelConfig{APIKey: key, BaseURL: cfg.BaseURL, Model: modelName}
+	if cfg.ReasoningEffort != "" {
+		modelConfig.ReasoningEffort = openai.ReasoningEffortLevel(cfg.ReasoningEffort)
 	}
 	return modelConfig
 }
 
-// openAICompatibleClient builds the client for one entry of the model list
-// whose key comes from the environment.
-func openAICompatibleClient(ctx context.Context, cfg config.Config, entry config.Model) (model.ToolCallingChatModel, error) {
-	key, env := keyForEntry(cfg, entry)
+// openAICompatibleClient builds the client for one model of the provider the
+// configuration names. The endpoint and the key are the provider's, so every model
+// it serves is reached the same way; the key is never logged or returned.
+func openAICompatibleClient(ctx context.Context, cfg config.Config, modelName string) (model.ToolCallingChatModel, error) {
+	key := strings.TrimSpace(cfg.APIKey)
 	if key == "" {
-		return nil, fmt.Errorf("%s is not set", env)
+		return nil, fmt.Errorf("the provider api_key is not set")
 	}
-	return openai.NewChatModel(ctx, openAIChatConfig(entry, key, cfg.ReasoningEffort))
+	return openai.NewChatModel(ctx, openAIChatConfig(cfg, modelName, key))
 }
 
-// keyForEntry returns the key one entry is called with, and the variable it came
-// from — named in errors, never valued. The default entry's variable is the one
-// the configuration already read, so its value is taken from the configuration
-// rather than read a second time; every other entry names its own variable,
-// which is read here. The key is never logged or returned for display.
-func keyForEntry(cfg config.Config, entry config.Model) (key, env string) {
-	if len(cfg.Models) > 0 && entry.APIKeyEnv == cfg.Models[0].APIKeyEnv {
-		return cfg.APIKey, entry.APIKeyEnv
-	}
-	env = entry.APIKeyEnv
-	if env == "" {
-		env = config.APIKeyEnv
-	}
-	return strings.TrimSpace(os.Getenv(env)), env
-}
-
-// NewOpenAIRunner builds the agent every run is sent to, from the configuration
-// the process was started with. The run budgets come from the same place: the
-// turn ceiling is the configured one, and zero there means the default this
-// package declares.
+// NewOpenAIRunner builds the agent every run is sent to, from a configuration the
+// caller already resolved. The run budgets come from the same place: the turn
+// ceiling is the configured one, and zero there means the default this package
+// declares.
+//
+// It is the shape a caller with a fixed configuration uses — the tests, and any
+// embedding that owns the provider itself. A running Luna uses NewProviderRunner:
+// its provider can change while the process runs.
 func NewOpenAIRunner(ctx context.Context, cfg config.Config, invoker Invoker, files FileTools, opts ...Option) (*Runner, error) {
-	entry := config.Model{Name: cfg.Model, Provider: cfg.ProviderHost, BaseURL: cfg.BaseURL}
-	m, err := openai.NewChatModel(ctx, openAIChatConfig(entry, cfg.APIKey, cfg.ReasoningEffort))
+	m, err := openAICompatibleClient(ctx, cfg, cfg.Model)
 	if err != nil {
 		return nil, err
 	}

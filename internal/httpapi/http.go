@@ -52,13 +52,15 @@ type Info struct {
 	BoundHost    string
 	Model        string
 	ProviderHost string
-	// BaseURL is the endpoint this process was started with. It is reported so
-	// the settings page can tell "what is stored" from "what this process is
-	// using" — the model is built once, so those two can differ until a restart.
-	BaseURL string
 	// Missing names the provider settings that were unset when this process
 	// started. A Luna in that state is running and cannot answer a run: the
 	// settings page that fills the gap is served by this process.
+	//
+	// Everything from Model down is what this server was built with. It is the
+	// whole answer when no ConfigSource was supplied, and the fallback only
+	// when reading one fails: with a source, what a run would use right now is
+	// asked of the source, because saving a provider takes effect on the next
+	// run rather than at the next start.
 	Missing []string
 	// Models are the models a run may be sent to, the default first. A runtime
 	// configured by environment variables alone has exactly one entry.
@@ -100,10 +102,15 @@ type State struct {
 	RunTimeoutMS    int64 `json:"run_timeout_ms,omitempty"`
 	ModelConfigured bool  `json:"model_configured"`
 	ModelConnected  bool  `json:"model_connected"`
-	// ProviderMissing names the provider settings this process started without.
-	// It is empty for a configured Luna, and a run started while it is not empty
-	// fails with a sentence naming them rather than with a provider error.
-	ProviderMissing []string            `json:"provider_missing,omitempty"`
+	// ProviderMissing names the provider settings a run started now would still
+	// lack. It is empty for a configured Luna, and a run started while it is not
+	// empty fails with a sentence naming them rather than with a provider error.
+	ProviderMissing []string `json:"provider_missing,omitempty"`
+	// ProviderProblem is the reason the provider file could not be read, when it
+	// could not be. The values above are then what this process started with,
+	// which is not what the next run would use — and a person who hand-edited the
+	// file is owed the reason instead of a stale answer.
+	ProviderProblem string              `json:"provider_problem,omitempty"`
 	Plugins         []pluginhost.Record `json:"plugins"`
 	Busy            bool                `json:"busy"`
 	CurrentRunID    string              `json:"current_run_id,omitempty"`
@@ -212,10 +219,15 @@ type Server struct {
 	// are installed and which of them the user turned off. It is supplied by
 	// the composition root, which also owns where that preference is stored.
 	skills SkillCatalog
-	// provider is the file the settings page edits: the endpoint, the key and
-	// the model. It is an interface because where that file lives, and how it
-	// is written, belong to the composition root.
+	// provider is the file the settings page edits: the named endpoints, their
+	// keys and their models, and which of them a run is sent to. It is an
+	// interface because where that file lives, and how it is written, belong to
+	// the composition root.
 	provider ProviderConfig
+	// configSource is what a run started right now would use, when the
+	// composition root supplied one: the interface asks it instead of reporting
+	// what this process started with.
+	configSource ConfigSource
 	// workspaces are the sets of directories work can happen in, as the
 	// composition root stores them. They are the same store the Workspace
 	// capability reads, so what this interface defines is what the next run
@@ -324,7 +336,22 @@ func (s *Server) state() State {
 	s.eventMu.Lock()
 	events := append([]LifecycleEvent{}, s.events...)
 	s.eventMu.Unlock()
-	return State{HostPID: os.Getpid(), StartedAt: s.started, Model: s.info.Model, ProviderHost: s.info.ProviderHost, ReasoningEffort: s.info.ReasoningEffort, MaxIterations: s.info.MaxIterations, RunTimeoutMS: s.runTimeout.Milliseconds(), ModelConfigured: s.info.Model != "" && s.info.ProviderHost != "", ModelConnected: s.connected.Load(), Plugins: ps.Plugins, Busy: busy, CurrentRunID: id, CurrentSessionID: sessionID, Events: events, Capabilities: capabilityViews(s.capabilities), ProviderMissing: s.info.Missing, Demo: true}
+	// What a run started now would use, when there is a source to ask. A source
+	// that cannot be read is reported as a problem rather than hidden: the values
+	// this process started with are not what the next run would use, and saying
+	// nothing would leave a person believing a broken file was in effect.
+	model, providerHost, missing, problem := s.info.Model, s.info.ProviderHost, s.info.Missing, ""
+	effort, maxIterations := s.info.ReasoningEffort, s.info.MaxIterations
+	if cfg, live, err := s.providerConfigNow(); live {
+		if err != nil {
+			problem = err.Error()
+		} else {
+			model, providerHost, missing = cfg.Model, cfg.ProviderHost, cfg.Missing
+			effort = cfg.ReasoningEffort
+			maxIterations = agent.MaxIterationsFor(cfg)
+		}
+	}
+	return State{HostPID: os.Getpid(), StartedAt: s.started, Model: model, ProviderHost: providerHost, ReasoningEffort: effort, MaxIterations: maxIterations, RunTimeoutMS: s.runTimeout.Milliseconds(), ModelConfigured: model != "" && providerHost != "" && len(missing) == 0, ModelConnected: s.connected.Load(), Plugins: ps.Plugins, Busy: busy, CurrentRunID: id, CurrentSessionID: sessionID, Events: events, Capabilities: capabilityViews(s.capabilities), ProviderMissing: missing, ProviderProblem: problem, Demo: true}
 }
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")

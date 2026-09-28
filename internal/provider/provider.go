@@ -1,11 +1,18 @@
-// Package provider owns provider.yaml: which OpenAI-compatible endpoint Luna
-// calls, with which key, and for which model.
+// Package provider owns provider.yaml: which OpenAI-compatible endpoints Luna
+// knows, with which keys and which models, and which of them is the one a run is
+// sent to.
 //
 // This is the file Luna writes. config.yaml is the file the user writes and Luna
 // only reads; they stay separate because a program that rewrites a hand-edited
 // file destroys the comments around every value it did not change. The browser
 // settings page is the ordinary way to fill this file in, and editing it by hand
 // works too — one of them is a convenience, not the definition.
+//
+// Endpoints are named because a run has to be able to say which one it means:
+// "the endpoint" is not something a person can keep two of, and a name is what
+// the interface shows, what /model reports, and what the log blames when
+// something is wrong. One of the entries is active — the one a run that names
+// nothing is sent to.
 //
 // Only an endpoint and an API key are described here. Official subscriptions
 // and OAuth-style logins are deliberately out of scope: they need a per-provider
@@ -22,7 +29,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 
@@ -37,31 +46,68 @@ const FileName = "provider.yaml"
 // private and explicitly, rather than inheriting whatever the umask would give.
 const fileMode fs.FileMode = 0o600
 
-// File is the provider Luna is configured to call.
+// Endpoint is one named provider: where it is called, with which key, and which
+// models it may be asked for.
 //
 // Every field is optional on disk, because a half-filled form has to be
 // representable: the settings page saves the endpoint before it knows the model,
 // and the loader — not this file — is where "which fields are still missing"
 // belongs.
-type File struct {
+type Endpoint struct {
 	// BaseURL is an absolute http(s) endpoint of an OpenAI-compatible API.
 	BaseURL string `yaml:"base_url"`
-	// APIKey is the secret the endpoint is called with.
+	// APIKey is the secret the endpoint is called with. It is never sent back
+	// to any interface: what an interface may read is whether one is set and
+	// its last four characters.
 	APIKey string `yaml:"api_key"`
-	// Model is the model name the endpoint is asked for.
+	// Model is the model this provider is asked for when a run names none.
 	Model string `yaml:"model"`
+	// Models are the other models this provider may be asked for, in the order
+	// the interface lists them. The default one is not repeated here.
+	Models []string `yaml:"models"`
+}
+
+// File is the provider file: the endpoints Luna knows, and which of them is
+// active.
+//
+// The whole file may be empty, and that is the normal state of a Luna that has
+// never been configured — a first run, not a failure. What may not be
+// inconsistent is the pair: Active either names a provider that is listed, or
+// nothing is listed at all and Active is empty.
+type File struct {
+	// Active is the provider a run that names none is sent to. It must name one
+	// of Providers whenever there is one.
+	Active string `yaml:"active"`
+	// Providers are the named endpoints, by the name the interface shows.
+	Providers map[string]Endpoint `yaml:"providers"`
 }
 
 // Trimmed returns the values without surrounding space, treating a value that is
 // only whitespace as unset. A key pasted into a form arrives with a trailing
 // newline often enough that keeping it would produce an authentication failure
-// with no visible cause.
+// with no visible cause; a name is typed, so a stray space in it would make it
+// unfindable by the name the interface shows.
 func (f File) Trimmed() File {
-	return File{
-		BaseURL: strings.TrimSpace(f.BaseURL),
-		APIKey:  strings.TrimSpace(f.APIKey),
-		Model:   strings.TrimSpace(f.Model),
+	providers := make(map[string]Endpoint, len(f.Providers))
+	for name, entry := range f.Providers {
+		models := make([]string, 0, len(entry.Models))
+		for _, model := range entry.Models {
+			models = append(models, strings.TrimSpace(model))
+		}
+		if len(models) == 0 {
+			models = nil
+		}
+		providers[strings.TrimSpace(name)] = Endpoint{
+			BaseURL: strings.TrimSpace(entry.BaseURL),
+			APIKey:  strings.TrimSpace(entry.APIKey),
+			Model:   strings.TrimSpace(entry.Model),
+			Models:  models,
+		}
 	}
+	if len(providers) == 0 {
+		providers = nil
+	}
+	return File{Active: strings.TrimSpace(f.Active), Providers: providers}
 }
 
 // Empty reports whether the file states nothing at all. A provider that states
@@ -69,26 +115,103 @@ func (f File) Trimmed() File {
 // starting state rather than an error.
 func (f File) Empty() bool {
 	t := f.Trimmed()
-	return t.BaseURL == "" && t.APIKey == "" && t.Model == ""
+	return t.Active == "" && len(t.Providers) == 0
 }
 
 // Validate refuses a file that could not be read back as itself.
 //
-// It checks form, not completeness: an endpoint that is not an absolute http(s)
-// URL, or a key that carries a line break, is refused with the reason. A missing
-// field is not a failure here — the caller that needs it says what it needs.
+// It checks form and consistency, not completeness: a provider whose endpoint is
+// not an absolute http(s) URL, a key that carries a line break, or an active
+// name that points at nothing is refused with the reason. A missing field is not
+// a failure here — the caller that needs it says what it needs.
 func (f File) Validate() error {
 	t := f.Trimmed()
-	if t.BaseURL != "" {
-		u, err := url.Parse(t.BaseURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
-			return fmt.Errorf("the provider base URL must be an absolute http(s) URL")
+	for name, entry := range t.Providers {
+		if err := validName(name); err != nil {
+			return err
+		}
+		if err := entry.validate(); err != nil {
+			return fmt.Errorf("the provider %q: %w", name, err)
 		}
 	}
-	if strings.ContainsAny(t.APIKey, "\r\n") {
-		return fmt.Errorf("the API key must be a single line")
+	_, _, found := t.Selection()
+	switch {
+	case len(t.Providers) == 0 && t.Active != "":
+		return fmt.Errorf("active names the provider %q, but no provider is listed", t.Active)
+	case len(t.Providers) > 0 && t.Active == "":
+		return fmt.Errorf("active is empty, so a run would not know which of the %d listed providers to call", len(t.Providers))
+	case t.Active != "" && !found:
+		return fmt.Errorf("active names the provider %q, which is not listed", t.Active)
 	}
 	return nil
+}
+
+// validName checks one provider name: a name is how an interface, a log line and
+// a run all refer to the same endpoint, so it has to be there and it has to be a
+// single token.
+func validName(name string) error {
+	if name == "" {
+		return fmt.Errorf("a provider name must not be empty")
+	}
+	if strings.ContainsFunc(name, unicode.IsSpace) {
+		return fmt.Errorf("the provider name %q must not contain whitespace", name)
+	}
+	return nil
+}
+
+// validate checks one endpoint's form. It says what is wrong with which field,
+// because the reader is looking at a form.
+func (e Endpoint) validate() error {
+	if e.BaseURL != "" {
+		u, err := url.Parse(e.BaseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+			return fmt.Errorf("base_url must be an absolute http(s) URL")
+		}
+	}
+	if strings.ContainsAny(e.APIKey, "\r\n") {
+		return fmt.Errorf("api_key must be a single line")
+	}
+	if strings.ContainsAny(e.Model, "\r\n") {
+		return fmt.Errorf("model must be a single line")
+	}
+	seen := make(map[string]bool, len(e.Models))
+	for i, model := range e.Models {
+		if model == "" {
+			return fmt.Errorf("models has an empty entry (number %d)", i+1)
+		}
+		if model == e.Model {
+			return fmt.Errorf("models lists %q, which is already the model", model)
+		}
+		if seen[model] {
+			return fmt.Errorf("models lists %q twice", model)
+		}
+		seen[model] = true
+	}
+	return nil
+}
+
+// Selection returns the active provider and its name. The third value reports
+// whether there is one at all: a file with no active provider is an installation
+// that has not been configured yet.
+func (f File) Selection() (name string, entry Endpoint, ok bool) {
+	name = strings.TrimSpace(f.Active)
+	if name == "" {
+		return "", Endpoint{}, false
+	}
+	entry, ok = f.Providers[name]
+	return name, entry, ok
+}
+
+// Names lists the provider names in sorted order, which is the order an
+// interface renders them in. Sorted rather than map order: a form that reshuffles
+// itself between two reads is a form nobody can use.
+func (f File) Names() []string {
+	names := make([]string, 0, len(f.Providers))
+	for name := range f.Providers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // Hint describes a key without disclosing it: enough for the person who set it

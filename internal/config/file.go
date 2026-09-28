@@ -24,20 +24,12 @@ const FileName = "config.yaml"
 // owns — comments included — for a change that is not theirs, so anything Luna
 // has to change itself will live somewhere else, in a file it owns.
 //
-// The key is never a value in this file: APIKeyEnv names the environment
-// variable that holds it. A file that says which variable to read keeps working
-// when the key rotates, and one that contained the key itself would put a
-// secret in the user's dotfiles where backups and screenshots can reach it.
+// It holds the choices about how a run is made, and nothing about which provider
+// it is sent to: the endpoint, the key and the models belong to provider.yaml,
+// which the settings page owns. Keeping them out of here is what makes "the
+// settings page is where a provider is set" true rather than a matter of which
+// file was read last.
 type File struct {
-	// Model is the model to ask the provider for. It overrides the model
-	// environment variables. Together with the rest of the effective
-	// configuration it forms the default entry of the model list.
-	Model string `yaml:"model"`
-	// BaseURL is the provider endpoint. It overrides OPENAI_BASE_URL.
-	BaseURL string `yaml:"base_url"`
-	// APIKeyEnv names the environment variable holding the key. Empty means
-	// OPENAI_API_KEY.
-	APIKeyEnv string `yaml:"api_key_env"`
 	// ReasoningEffort overrides LUNA_REASONING_EFFORT.
 	ReasoningEffort string `yaml:"reasoning_effort"`
 	// MaxIterations is how many model turns one run may take before the agent
@@ -49,37 +41,30 @@ type File struct {
 	// reported as cancelled, overriding LUNA_RUN_TIMEOUT. It is a Go duration
 	// such as "20m" or "90s"; empty means not stated.
 	RunTimeout string `yaml:"run_timeout"`
-	// Models are the other models this user may switch to. The default one is
-	// not repeated here: it is whatever the settings above resolve to, and it is
-	// always available.
-	Models []Model `yaml:"models"`
 }
 
-// Model is one provider endpoint a run may be sent to.
+// Model is one model a run may be sent to, and the provider it belongs to.
 //
-// It is deliberately not a set of credentials: BaseURL and APIKeyEnv may each be
-// left out, and then the entry inherits the value the effective configuration
-// already has. A user with one provider and several models writes only names.
+// It is not an endpoint: which endpoint and key a run uses is decided by the
+// active provider in provider.yaml, and the settings page owns that. What a
+// model entry carries is the name a run asks for and the name of the provider
+// that serves it, which is the label the interface shows.
 type Model struct {
 	// Name is what the provider is asked for, and the value /model accepts.
-	Name string `yaml:"name"`
-	// Provider is a label for the interface. Empty means the base URL's host,
-	// which is what a run is actually sent to.
-	Provider string `yaml:"provider"`
-	// BaseURL is this entry's endpoint. Empty inherits the configured one.
-	BaseURL string `yaml:"base_url"`
-	// APIKeyEnv names this entry's key variable. Empty inherits the configured
-	// one.
-	APIKeyEnv string `yaml:"api_key_env"`
+	Name string
+	// Provider is the name of the provider this model belongs to, as
+	// provider.yaml lists it. A run is sent to the active provider, whose name
+	// this is.
+	Provider string
 }
 
 // LoadFile reads the configuration file at path.
 //
-// A file that is not there is not an error: most people start with the
-// environment alone, and a runtime that refuses to start because a file it may
-// never need is missing would be inventing a problem. The second return value
-// reports whether a file was found, so a caller can say which source it used
-// instead of guessing.
+// A file that is not there is not an error: every setting it can state is also
+// readable from the environment, and a runtime that refuses to start because a
+// file it may never need is missing would be inventing a problem. The second
+// return value reports whether a file was found, so a caller can say which source
+// it used instead of guessing.
 //
 // Unknown keys are refused. A configuration file that silently ignores a
 // misspelled key is worse than one that fails to load: the user sees no effect
@@ -123,22 +108,9 @@ func reason(err error) error {
 // opinion" rather than "the empty string", which is what lets the environment
 // fill it in.
 func (f File) trimmed() File {
-	models := make([]Model, 0, len(f.Models))
-	for _, m := range f.Models {
-		models = append(models, Model{
-			Name:      strings.TrimSpace(m.Name),
-			Provider:  strings.TrimSpace(m.Provider),
-			BaseURL:   strings.TrimSpace(m.BaseURL),
-			APIKeyEnv: strings.TrimSpace(m.APIKeyEnv),
-		})
-	}
 	return File{
-		Model:           strings.TrimSpace(f.Model),
-		BaseURL:         strings.TrimSpace(f.BaseURL),
-		APIKeyEnv:       strings.TrimSpace(f.APIKeyEnv),
 		ReasoningEffort: strings.TrimSpace(f.ReasoningEffort),
 		MaxIterations:   f.MaxIterations,
 		RunTimeout:      strings.TrimSpace(f.RunTimeout),
-		Models:          models,
 	}
 }
