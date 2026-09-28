@@ -564,7 +564,7 @@ func registerWeb(registry *plugin.Registry, enabled bool) error {
 func run() error {
 	addr := flag.String("addr", "127.0.0.1:0", "literal loopback listen address")
 	rootFlag := flag.String("root", "", "repository root holding web/ and plugins/ (default: auto-detect)")
-	readRoot := flag.String("read-root", "", "directory the file tools (luna_read_file, luna_list_dir, luna_search_files, luna_find_files) are bounded to (default: the resolved root)")
+	readRoot := flag.String("read-root", "", "directory the file tools (luna_read_file, luna_list_dir, luna_search_files, luna_find_files) are bounded to, and the directory a run works in when its session names no workspace (default: the resolved root)")
 	readLimit := flag.Int("read-limit", 0, "single-read cap in bytes for luna_read_file (default: 262144)")
 	sessionsFlag := flag.String("sessions-dir", "", "directory holding the append-only session files (default: chosen at startup — <data-dir>/sessions, or the previous <root>/.runtime/sessions/ while the sessions are still there; startup logs which one is in use)")
 	stateFlag := flag.String("state-dir", "", "root directory holding capability state (default: chosen at startup — <data-dir>, or the previous <root> while that is where the capability state already is; startup logs which one is in use)")
