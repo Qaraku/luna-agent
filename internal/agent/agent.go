@@ -51,7 +51,6 @@ type Event struct {
 type Sink interface{ Emit(Event) }
 type sinkKey struct{}
 type runIDKey struct{}
-type rootsKey struct{}
 
 // RunRequest is one admitted run. RunID is core-owned; SessionID names the
 // durable session the run belongs to and is carried to the client on the
@@ -113,8 +112,13 @@ func WithRun(ctx context.Context, runID string, sink Sink) context.Context {
 // directories without being handed the session. An empty list is carried as an
 // empty list rather than replaced here: the host applies its default root, and
 // doing it twice would hide which layer decided the range.
+//
+// The context slot belongs to the plugin substrate (plugin.WithRoots): the
+// directories a run works in are a single piece of context, and the file tools,
+// the shell tool and anything else that needs them read it through the same
+// accessor.
 func WithRoots(ctx context.Context, roots []string) context.Context {
-	return context.WithValue(ctx, rootsKey{}, roots)
+	return plugin.WithRoots(ctx, roots)
 }
 func emit(ctx context.Context, e Event) {
 	if s, ok := ctx.Value(sinkKey{}).(Sink); ok && s != nil {
@@ -124,8 +128,9 @@ func emit(ctx context.Context, e Event) {
 func runID(ctx context.Context) string { v, _ := ctx.Value(runIDKey{}).(string); return v }
 
 // roots is the set of directories the current run works in, and nil when the
-// run named none.
-func roots(ctx context.Context) []string { v, _ := ctx.Value(rootsKey{}).([]string); return v }
+// run named none. It reads the plugin substrate's own slot, so a capability
+// tool and the core see the same working directories.
+func roots(ctx context.Context) []string { return plugin.Roots(ctx) }
 
 type RunStarted struct {
 	RunID     string `json:"run_id"`

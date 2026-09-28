@@ -63,10 +63,17 @@ type Claim struct {
 	ID   string
 }
 
-// PermissionKind 是受权限权威管理的权限种类，目前只有一种可授权项。
+// PermissionKind 是受权限权威管理的权限种类。这里只定义“有哪些可授权项”；
+// 某一项是否可授予由注册表持有的授权表决定，插件声明了未授权的种类会在注册时被拒。
 type PermissionKind string
 
-const PermissionStateWrite PermissionKind = "state.write"
+const (
+	// PermissionStateWrite 允许能力在宿主解析出的状态目录里写入自己的数据。
+	PermissionStateWrite PermissionKind = "state.write"
+	// PermissionProcessExec 允许能力在本次运行的工作目录里执行命令。它与 state.write
+	// 一样是显式授权项：注册表没有这条授权时，申请它的能力注册失败。
+	PermissionProcessExec PermissionKind = "process.exec"
+)
 
 // Permission 是插件对某个受控能力的申请。是否可授予由注册表持有的授权表决定；
 // Detail 预留给以后的细粒度授权，目前只接受空串。
