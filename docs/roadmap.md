@@ -275,14 +275,22 @@ C 两边都有——各自一套临时 XDG 根与临时 checkout，判据全部�
 | `config.yaml` 退回成只有两个运行预算与思考档位，`api_key_env` 与 `models[]` 一并移除："往哪里打电话"只剩一个说法 | `60b878c` |
 | `/api/provider` 的 GET/PUT 换成列表形状，`restart_needed` 整个删掉；`/api/models`、`/model` 的候选与 `/api/state` 都跟着当前 provider 走 | `60b878c` |
 | 设置页的「模型服务」变成 provider 列表加一份表单：新增、编辑、删除（同一行二次确认）、切换使用中；密钥仍然只写不读 | `d2bcd4c` |
+| 上一版写下的 `provider.yaml`（顶层 `base_url`/`api_key`/`model`）仍然读得懂，被读成一条名为 `default` 的 provider；**provider 文件的任何问题都不再结束进程**（原因进日志、`/api/provider`、`/api/state` 与运行的失败里，文件不被改写） | `89ae09c` |
+| 读不出 provider 文件时，设置页显示服务端那句原因，而不是一个 `HTTP 500` | `bb88696` |
+
+`89ae09c` 修的是一个真缺陷，来源是用户自己的升级：把跑着旧版的安装切到这一版时，`provider.yaml` 还是旧形状，
+新的解码把它当成非法键，进程直接退出——而能修好这个文件的设置页正是由那个进程提供的。一个版本自己的文件不该
+把进程挡住，这条现在是明确的、有测试与有隔离验证的不变量。
 
 **验证**（两层，都在隔离环境上）：
 
-- **服务层** `.evidence/provider-list/verify-provider-list.txt`，25 项判据全过：真二进制 + **两个**假
+- **服务层** `.evidence/provider-list/verify-provider-list.txt`，38 项判据全过：真二进制 + **两个**假
   OpenAI 兼容端点 + 隔离 `LUNA_HOME`。全新装没有 `provider.yaml` 时起得来；**进程还跑着的时候**
   保存一个 provider，紧随其后的那次运行真的带着正确的 Bearer 打到那个端点上；把 `active` 换成另一个
   provider，下一次运行打到另一个端点；`active` 指向不存在的名字是 `400` 且文件一个字节都不变；
-  密钥不出现在任何应答与启动日志里；整个环境里没有任何 `OPENAI_*`。
+  密钥不出现在任何应答与启动日志里；整个环境里没有任何 `OPENAI_*`。另外两种升级/异常场景：
+  旧形状的文件照常启动、照常能聊、逐字节不动；读不出来的文件照常启动，原因在启动日志、
+  `/api/provider`、`/api/state` 与运行里都能拿到，文件同样不动。
 - **真实浏览器** `.evidence/provider-list/verify-browser.txt`，21 项判据全过（Chromium + 确定性夹具）：
   列表按服务端报的渲染并标出使用中的那条、密钥不被渲染、新增 provider 后提交的是整份文件
   （新那份带新密钥，已存在那份留空即沿用）、切换使用中、探测候选并点选成默认模型、刷新后仍来自服务端。

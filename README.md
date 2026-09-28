@@ -188,6 +188,17 @@ An empty provider list is a Luna that has not been configured yet; one provider
 listed without `active` naming it (or an `active` that names nothing) is refused,
 because a run would not know where to go.
 
+A file an earlier version wrote — `base_url`, `api_key` and `model` at the top
+level, before providers had names — is still read, as one provider named
+`default`. An installation that was already configured keeps working, and the next
+save writes the shape above.
+
+Nothing about this file can stop Luna. A file that cannot be read is logged once
+at startup, the process serves anyway, and the reason is what the settings page
+shows, what `/api/state` reports and what a run fails with — exiting would put the
+one surface that can repair the file out of reach. Either way the file is left as
+it is; repairing it is the reader's decision, not a silent rewrite.
+
 `config.yaml`, the file a person edits by hand, stays theirs: Luna reads it and
 never rewrites it, comments included. It holds the two run budgets and the
 reasoning level, and it cannot state an endpoint, a key or a model: two answers to
@@ -302,7 +313,7 @@ The tool-refusal change is covered by the same gates on this tree, and no provid
 
 The memory view and retraction change is covered by the same deterministic gates on this tree. Its tests pin the fold — a retraction takes exactly one fact out of the effective set, matched by text and timestamp together — the refusal to retract a fact that is not in effect, the survival of a retraction across a reopen, the byte cap counting retraction records so that retracting in a loop cannot grow the file, and a rewrite compacting a retraction away together with the fact it removed. The endpoint tests pin the view shape, the `400`, `404` and Origin cases, and that a corrupt memory file is reported rather than shown as empty. No provider was called for it.
 
-The named-provider change is covered by the same deterministic gates on this tree, plus two isolated passes (`.evidence/provider-list/`). The service-level pass runs a real binary against two fake OpenAI-compatible endpoints under an isolated `LUNA_HOME` (25 checks): a fresh installation with no `provider.yaml`, saving a provider **while the process runs** and the next run reaching that endpoint with no restart in between, switching `active` and the next run reaching the other endpoint, a save refused for naming a provider that is not there writing nothing, the key never appearing in an answer or in the startup log, and no `OPENAI_*` variable anywhere in the environment. The browser pass runs real headless Chromium against the deterministic fixture (21 checks): the list rendered from the server with the entry in use marked, the key never rendered, adding a provider and submitting the whole file, switching which one is in use, probing for models, and a reload showing what the server holds. The previous pass had shipped "save, then restart Luna" as a documented limitation; both passes exist to show it is gone rather than to restate it.
+The named-provider change is covered by the same deterministic gates on this tree, plus two isolated passes (`.evidence/provider-list/`). The service-level pass runs a real binary against two fake OpenAI-compatible endpoints under an isolated `LUNA_HOME` (38 checks): a fresh installation with no `provider.yaml`, saving a provider **while the process runs** and the next run reaching that endpoint with no restart in between, switching `active` and the next run reaching the other endpoint, a save refused for naming a provider that is not there writing nothing, the key never appearing in an answer or in the startup log, and no `OPENAI_*` variable anywhere in the environment. It also starts on a `provider.yaml` an earlier version wrote (read as one provider named `default`, and left byte-for-byte alone), and on one it cannot read at all (logged once, reported per request and per run as `provider_problem`, and again left alone) — the first of those two was a real defect: restarting onto this change exited, which is how the file a version owns and stops on was found. The browser pass runs real headless Chromium against the deterministic fixture (21 checks): the list rendered from the server with the entry in use marked, the key never rendered, adding a provider and submitting the whole file, switching which one is in use, probing for models, and a reload showing what the server holds. The previous pass had shipped "save, then restart Luna" as a documented limitation; both passes exist to show it is gone rather than to restate it.
 
 No API key appeared in the retained verification evidence. These results are point-in-time evidence for the tested provider and headless Chromium path, not a production-readiness claim, a compatibility guarantee for every OpenAI-compatible provider, or a complete accessibility/cross-browser audit.
 
