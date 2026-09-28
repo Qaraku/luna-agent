@@ -70,7 +70,7 @@ See [docs/architecture.md](docs/architecture.md) for ownership and reload semant
 ## 日常界面
 
 - **会话**：桌面左侧会话列表和“新建会话”，可以一键折叠、也可以拖动右边缘调整宽度；折叠后页头左边出现展开入口。折叠状态和宽度只存在浏览器本地。窄屏仍然按抽屉处理，通过页头“会话”按钮打开列表，选中后回到对话。
-- **设置**：侧栏底部的“设置”打开一个独立模态，左侧是分类导航（外观 / 模型服务 / 能力 / 技能 / 工作区 / 界面扩展 / 诊断），右侧是内容面，内部自己滚动；关闭后回到原来的会话上下文。凡是“Luna 有什么、在用什么”的入口都在这里。“能力”列出内核当前注册的能力——各自的部署形态、是否在服务、贡献了哪些工具与上下文块、哪些路由与面板，并可在这里启用或停用，以及直接打开某个能力贡献的面板；声明与权限属于开发者信息，收在每行下面默认折叠的次级块里。停用只是把这些从服务里取下并如实重绘，能力自己的数据不动。“模型服务”显示模型、provider、思考档位与两个运行预算，并列出可用的模型、把当前会话切到其中一个；档位未设置时如实写作“未发送”，而不是补一个默认值。“工作区”列出本机定义过的工作区（一组目录），标出当前会话在用的那个并可以换；没有绑定时说清楚文件工具回到启动时的读取根。
+- **设置**：侧栏底部的“设置”打开一个独立模态，左侧是分类导航（外观 / 模型服务 / 能力 / 技能 / 工作区 / 界面扩展 / 诊断），右侧是内容面，内部自己滚动；关闭后回到原来的会话上下文。凡是“Luna 有什么、在用什么”的入口都在这里。“能力”列出内核当前注册的能力——各自的部署形态、是否在服务、贡献了哪些工具与上下文块、哪些路由与面板，并可在这里启用或停用，以及直接打开某个能力贡献的面板；声明与权限属于开发者信息，收在每行下面默认折叠的次级块里。停用只是把这些从服务里取下并如实重绘，能力自己的数据不动。“模型服务”编辑这台机器的 provider 列表——每个 provider 的名字、接口地址、密钥、默认模型与其他模型，标出使用中的那一个，新增、编辑与删除都在这里，删除要二次确认；密钥只写不读，界面上只有“是否已设置 + 末四位”。同一页只读显示当前在用的模型、provider 与两个运行预算，并列出当前 provider 可用的模型、把当前会话切到其中一个；档位未设置时如实写作“未发送”，而不是补一个默认值。“工作区”列出本机定义过的工作区（一组目录），标出当前会话在用的那个并可以换；没有绑定时说清楚文件工具回到启动时的读取根。
 - **工作目录与项目规则**：内置的 Workspace 能力向模型贡献两条上下文——这个会话在哪些目录里工作（只用目录名，不写宿主绝对路径），以及这些目录自己的规则。**一个 Workspace 是一个或多个目录的集合**（例如同时包含 `luna-agent` 和 `luna-agent-dev`），会话与它关联；每个目录的 `AGENTS.md` 作为“规则”进入上下文（默认文件名，`-rules-file` 仍可覆盖单根回退时的取值）。文件不存在只意味着那个目录没有规则；超限或不可读会被报告而不是截断。**没有关联 Workspace 的会话走回退**，与旧行为一致（安装根/`-read-root` 的单根身份与规则），所以已有会话不会因为这次改动而变。`AGENTS.md` 的读取复用文件工具那套边界（`internal/fileread`，根就是那个目录），能力不新增权限声明。**Workspace 不是权限范围**：它是“在哪些目录里工作”，不是“允许读写什么”——权限是以后独立设计的另一件事。
 - **记忆**：页头的“记忆”入口来自 Memory 能力贡献的面板——宿主按 `/api/state` 的 `capabilities[]` 渲染入口与容器，打开时加载能力自己的模块。面板的主体是生效中的事实（每条带来源与时间，可以就地撤回），已撤回的那些只占一行摘要，点开才列出：撤回记录是存储的事实，不是用户在主要界面上要看的一屏内容。不提供新增或编辑。
 - **界面扩展**：本地界面插件的管理与内容展示在设置的“界面扩展”分类里，不再占用页头入口；启用状态仍然在刷新后重置。
@@ -137,16 +137,17 @@ LISTEN_URL=http://127.0.0.1:<port>
 ROOT=/path/to/repo
 ```
 
-Open that URL, then open **Settings → 模型服务** and fill in the endpoint, the API
-key and the model. Luna writes them to its own `provider.yaml` in the
-configuration directory, so a first run works with nothing configured: the page
-that configures it is served by the same process.
+Open that URL, then open **Settings → 模型服务**. One row per provider there: a
+name, an endpoint, an API key and the models that endpoint serves, with the one in
+use marked. Luna writes the list to its own `provider.yaml` in the configuration
+directory, so a first run works with nothing configured: the page that configures
+it is served by the same process.
 
-The dialog can ask the endpoint which models it serves (`获取模型列表`), and the
-model field suggests what came back while still accepting a name typed by hand.
-Saving is followed by a restart, because the model is built when the process
-starts; the page says so, and says when the running process is already using what
-is stored.
+A second provider is another row, and choosing which one to use is one click on
+the row; the next message uses it. Nothing is restarted for that: the provider is
+read when a run starts, not when the process does. The page can also ask the
+endpoint which models it serves (`获取模型列表`), and it offers them as the model to
+use while still accepting a name typed by hand.
 
 Roots are resolved in this order: an explicit `-root` (which must hold `web/index.html` and `plugins/`), then the executable's grandparent — the `<repo>/.runtime/luna` layout — then the working directory, which is the candidate that makes `go run ./cmd/luna` work from a fresh checkout.
 
@@ -165,27 +166,39 @@ Runtime candidate builds need the Go toolchain on `PATH`, because each reload co
 
 Where Luna calls and with which key is a setting of the installation, not
 something a launcher exports. It is stored in Luna's own file, written by the
-settings page:
+settings page: a list of named providers, and which of them a run is sent to.
 
 ```yaml
 # ~/.config/luna/provider.yaml   (0600; Luna writes this one)
-base_url: https://your-provider.example/v1
-api_key: sk-...                 # written by the settings page, never returned to the browser
-model: your-model
+active: deepseek                   # the provider a run is sent to
+providers:
+  deepseek:
+    base_url: https://api.deepseek.com/v1
+    api_key: sk-...                # written by the settings page, never returned to the browser
+    model: deepseek-chat           # what a run asks for by default
+    models:                        # the others /model can switch to
+      - deepseek-reasoner
+  local:
+    base_url: http://127.0.0.1:11434/v1
+    api_key: none
+    model: qwen3
 ```
 
+An empty provider list is a Luna that has not been configured yet; one provider
+listed without `active` naming it (or an `active` that names nothing) is refused,
+because a run would not know where to go.
+
 `config.yaml`, the file a person edits by hand, stays theirs: Luna reads it and
-never rewrites it, comments included. It supplies the run budgets, and it fills
-in any provider setting `provider.yaml` leaves out, so an installation configured
-by hand keeps working.
+never rewrites it, comments included. It holds the two run budgets and the
+reasoning level, and it cannot state an endpoint, a key or a model: two answers to
+"which provider does this call" is one too many, and the settings page is where
+that answer is written.
 
 ```yaml
 # ~/.config/luna/config.yaml
 reasoning_effort: high
 max_iterations: 64            # how many model turns one run may take
 run_timeout: 20m              # how long one run may take
-models:                       # other models /model can switch to; each inherits the endpoint above
-  - name: another-model
 ```
 
 A missing file is not an error, an empty file is an empty configuration, and an
@@ -194,7 +207,9 @@ nothing is worse than one that fails to load. Startup says which file it read.
 
 A Luna with no provider at all is not an error either: it starts, says what is
 unset, and serves the page that sets it. A run started meanwhile fails with a
-sentence naming the missing settings rather than with a provider error.
+sentence naming the missing settings rather than with a provider error — and once
+the page saves a provider, that run works without a restart, because the file is
+read when a run starts.
 
 | Variable | Required | Notes |
 |---|---|---|
@@ -214,12 +229,12 @@ Startup errors name the missing variable but never print its value.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/healthz` | Configuration readiness plus an active generation for every allowlisted plugin tool; implies no provider call |
-| `GET` | `/api/state` | Bounded runtime state: model name, provider host, host PID, one plugin record per allowlisted plugin tool (tool name, candidate, version, generation, plugin PID, status, in-flight calls), busy flag, the two run budgets it enforces (`max_iterations`, `run_timeout_ms`), the reasoning tier it was started with (omitted when none was chosen), the current run and session ids (empty when idle), lifecycle events, and `capabilities[]` — one entry per registered capability carrying its `id`, `title`, `deployment`, `state`, `contributions`, `claims`, `permissions` and `panels`. No API key, and none of any capability's stored data |
-| `GET` | `/api/commands` | The composer's command table: one entry per command with `name`, `summary`, `usage`, `category`, `aliases`, `args` (`none` / `text` / `options`), `options` when the command takes a fixed set, and `busy` (`allow` / `reject`, i.e. whether it works while a run is active). The browser draws its candidates and its help list from this, so the table is described once. No commands is an empty list |
-| `GET` | `/api/provider` | What this installation calls: `base_url`, `model`, `key_set`, `key_hint`, the file's name, `missing` (what is still unset, empty when nothing is), `configured` (what the running process is using) and `restart_needed` (what is stored is not what is running). The key itself is never in the answer — only whether one is set and its last four characters |
-| `PUT` | `/api/provider` | `{"base_url":"...","api_key":"...","model":"..."}` stores it. An empty `api_key` keeps the stored one, because the browser is never given it; `"clear_api_key":true` is how a key is removed. An endpoint that cannot be called is `400` and nothing is written. A mutation, so it requires the exact origin |
-| `POST` | `/api/provider/models` | Asks the endpoint which models it serves and answers `{"models":[...],"problem":""}`; a failure comes back as the provider's own words in `problem`, not as an HTTP error, because the page shows them next to the field that caused them. Sends the stored key unless the request carries one, so a half-typed form can be tested. Requires the exact origin: it spends this installation's key on an outbound call |
-| `GET` | `/api/models` | The models a run may be sent to — `name`, `provider`, and `default` on the first entry — plus which one a session would use and where that choice came from: `{"name":"...","origin":"session"\|"global"}`. `?session=<id>` names the session; without it the answer describes the configuration alone. An unknown session is `404`, a malformed one `400` |
+| `GET` | `/api/state` | Bounded runtime state: model name, provider host, host PID, one plugin record per allowlisted plugin tool (tool name, candidate, version, generation, plugin PID, status, in-flight calls), busy flag, the two run budgets it enforces (`max_iterations`, `run_timeout_ms`), the reasoning tier it was started with (omitted when none was chosen), the current run and session ids (empty when idle), `provider_missing` (what a run started now would still lack) and `provider_problem` (why the provider file could not be read, when it could not be — the model and provider host are then what this process started with), lifecycle events, and `capabilities[]` — one entry per registered capability carrying its `id`, `title`, `deployment`, `state`, `contributions`, `claims`, `permissions` and `panels`. No API key, and none of any capability's stored data |
+| `GET` | `/api/commands` | The composer's command table: one entry per command with `name`, `summary`, `usage`, `category`, `aliases`, `args` (`none` / `text` / `options`), `options` when the command takes a fixed set, and `busy` (`allow` / `reject`, i.e. whether it works while a run is active). The browser draws its candidates and its help list from this, so the table is described once. `/model` is derived from the provider in use and appears only when it serves at least one model, so its options follow a provider saved a moment ago. No commands is an empty list |
+| `GET` | `/api/provider` | The provider file as the interface sees it: `active` (the name a run is sent to, empty when none is), `providers[]` (each `name`, `base_url`, `model`, `models`, `key_set`, `key_hint`, sorted by name), `configured` (whether a run started now would work), `missing` (what saving would still leave unset, in the file's own field names: `provider`, or the active entry's fields) and the file's name. The key itself is never in the answer — only whether one is set and its last four characters. There is no field saying a restart is needed: the file this describes is the file the next run reads |
+| `PUT` | `/api/provider` | `{"active":"...","providers":[{"name":"...","base_url":"...","model":"...","models":[...],"api_key":"...","clear_api_key":false}]}` replaces the whole file, so a provider the body no longer lists is removed. An empty `api_key` keeps the stored key of the provider with the same name, because the browser is never given one; `"clear_api_key":true` is how a key is removed. A name that appears twice, or an `active` that names nothing, is `400` with the reason and nothing is written. A mutation, so it requires the exact origin |
+| `POST` | `/api/provider/models` | Asks one endpoint which models it serves and answers `{"models":[...],"problem":""}`; a failure comes back as the provider's own words in `problem`, not as an HTTP error, because the page shows them next to the field that caused them. `name` says which provider is being edited, and `base_url`/`api_key` may carry values the form is halfway through typing — whatever is left out comes from the stored provider of that name, so a form can be tested without retyping the key. Requires the exact origin: it spends this installation's key on an outbound call |
+| `GET` | `/api/models` | The models a run started now may be sent to — `name`, `provider` (the provider's name), and `default` on the first entry — plus which one a session would use and where that choice came from: `{"name":"...","origin":"session"\|"global"}`. It follows the provider file, so a provider saved a moment ago is what this reports. `?session=<id>` names the session; without it the answer describes the running configuration alone. An unknown session is `404`, a malformed one `400` |
 | `GET` | `/api/skills` | Every skill discovery found, in discovery order: `name`, `description`, `scope`, `enabled`, and `disabled_reason` when it is turned off. A long description is truncated with the fact stated rather than cut silently. No skills is an empty list |
 | `POST` | `/api/skills/{name}/enable` · `/disable` | Turns one skill off or on and returns its new state. The preference is written to `$XDG_CONFIG_HOME/luna/settings.yaml` — Luna's own file, since it is the side that writes it — and the running list follows immediately, without a rebuild: the manifest is read once per run. An unknown name is `404` (nothing is stored for a skill that is not there), and both are mutations, so they require the exact origin |
 | `POST` | `/api/sessions/{id}/model` | `{"model":"..."}` — records which model this session's next runs use, as an appended `config` record in the session's own file, so the choice survives a restart and travels with the session. A model the configuration does not have is `400`, an unknown session `404`, and it is a mutation, so it requires the exact origin. The record is merged with the session's current one, so choosing a model never detaches the workspace |
@@ -286,6 +301,8 @@ The runtime UI plugin change re-ran those same gates and nothing more. No server
 The tool-refusal change is covered by the same gates on this tree, and no provider was called for it. It came out of a user-run acceptance pass, where asking for a file that is not there ended the whole run with the host's raw error and no answer at all, and the message a missing file produced read as an internal phrase rather than a reason. A refusal is now the call's result, so the run continues and the model explains it; an infrastructure failure still ends the run. Each half was also checked from the defect side, by restoring the previous behaviour in a copy of the tree and confirming the new tests fail there.
 
 The memory view and retraction change is covered by the same deterministic gates on this tree. Its tests pin the fold — a retraction takes exactly one fact out of the effective set, matched by text and timestamp together — the refusal to retract a fact that is not in effect, the survival of a retraction across a reopen, the byte cap counting retraction records so that retracting in a loop cannot grow the file, and a rewrite compacting a retraction away together with the fact it removed. The endpoint tests pin the view shape, the `400`, `404` and Origin cases, and that a corrupt memory file is reported rather than shown as empty. No provider was called for it.
+
+The named-provider change is covered by the same deterministic gates on this tree, plus two isolated passes (`.evidence/provider-list/`). The service-level pass runs a real binary against two fake OpenAI-compatible endpoints under an isolated `LUNA_HOME` (25 checks): a fresh installation with no `provider.yaml`, saving a provider **while the process runs** and the next run reaching that endpoint with no restart in between, switching `active` and the next run reaching the other endpoint, a save refused for naming a provider that is not there writing nothing, the key never appearing in an answer or in the startup log, and no `OPENAI_*` variable anywhere in the environment. The browser pass runs real headless Chromium against the deterministic fixture (21 checks): the list rendered from the server with the entry in use marked, the key never rendered, adding a provider and submitting the whole file, switching which one is in use, probing for models, and a reload showing what the server holds. The previous pass had shipped "save, then restart Luna" as a documented limitation; both passes exist to show it is gone rather than to restate it.
 
 No API key appeared in the retained verification evidence. These results are point-in-time evidence for the tested provider and headless Chromium path, not a production-readiness claim, a compatibility guarantee for every OpenAI-compatible provider, or a complete accessibility/cross-browser audit.
 
