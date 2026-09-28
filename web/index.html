@@ -217,6 +217,32 @@
           <section id="settings-pane-model" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-model" tabindex="0" hidden>
             <h3>模型服务</h3>
             <p class="luna-muted">发送的内容会交给这台机器上配置的模型服务处理。</p>
+            <h4>这台机器调用哪个模型服务</h4>
+            <p class="luna-muted">接口地址、密钥与模型保存在 Luna 自己的 <code>provider.yaml</code> 里，写的是这台机器的设置而不是启动参数。密钥只写不读：界面只告诉你它是否已设置。</p>
+            <form id="provider-form" class="provider-form" autocomplete="off">
+              <div class="settings-field">
+                <label for="provider-base-url">接口地址</label>
+                <input id="provider-base-url" class="luna-input" type="text" inputmode="url" spellcheck="false" placeholder="https://api.example.com/v1">
+              </div>
+              <div class="settings-field">
+                <label for="provider-api-key">API key</label>
+                <input id="provider-api-key" class="luna-input" type="password" autocomplete="new-password" spellcheck="false" placeholder="留空即沿用已保存的密钥">
+              </div>
+              <div class="settings-field">
+                <label for="provider-model">模型</label>
+                <input id="provider-model" class="luna-input" type="text" spellcheck="false" list="provider-model-options" placeholder="模型名">
+                <datalist id="provider-model-options"></datalist>
+              </div>
+              <div class="settings-field">
+                <span></span>
+                <span id="provider-key-state" class="luna-muted"></span>
+              </div>
+              <div class="settings-actions">
+                <button id="provider-probe" class="luna-button" type="button">获取模型列表</button>
+                <button id="provider-save" class="luna-button" type="submit">保存</button>
+              </div>
+              <p id="provider-status" class="luna-status provider-status" role="status"></p>
+            </form>
             <dl class="settings-facts">
               <div><dt>模型</dt><dd id="settings-model">—</dd></div>
               <div><dt>提供方</dt><dd id="settings-provider">—</dd></div>

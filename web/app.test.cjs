@@ -3474,3 +3474,113 @@ test('a capability panel that fails keeps its own message, unmount failure inclu
   // 关这一句同时是宿主的行为承诺（app.js 的 teardownCapabilityPanel 先 try/catch 再 remove）。
   assert.equal(capabilityPanelUnmountError('记忆', 'boom'), '能力面板 记忆 关闭时清理失败，容器已移除：boom');
 });
+
+test('设置里的模型服务可以读回地址与模型，密钥只说是"已设置"', async () => {
+  // 密钥只写不读：接口只回答"是否已设置"和末四位，所以输入框永远是空的，留空的意思
+  // 是沿用。这条用例钉住的是这三件事一起成立，而不是分开成立。
+  const h = navigationHarness({ respond: async (url) => {
+    if (url === '/api/provider') {
+      return { ok: true, json: async () => ({
+        base_url: 'https://api.test/v1', model: 'alpha', key_set: true, key_hint: '••••abcd',
+        configured: true, missing: [], file: 'provider.yaml', restart_needed: false,
+      }) };
+    }
+  } });
+  await h.settle();
+  await h.click('settings-toggle');
+  await h.click('settings-tab-model');
+  await h.settle();
+  await h.settle();
+
+  assert.equal(h.$('provider-base-url').value, 'https://api.test/v1');
+  assert.equal(h.$('provider-model').value, 'alpha');
+  assert.equal(h.$('provider-api-key').value, '', '界面不回填密钥');
+  assert.match(h.$('provider-key-state').textContent, /••••abcd/);
+  assert.match(h.$('provider-api-key').placeholder, /留空即沿用/);
+});
+
+test('保存模型服务时，空着的密钥不会被当成清空', async () => {
+  const h = navigationHarness({ respond: async (url, options) => {
+    if (url === '/api/provider' && options && options.method === 'PUT') {
+      return { ok: true, json: async () => ({
+        base_url: 'https://api.test/v1', model: 'alpha', key_set: true, key_hint: '••••abcd',
+        configured: false, missing: [], file: 'provider.yaml', restart_needed: true,
+      }) };
+    }
+    if (url === '/api/provider') {
+      return { ok: true, json: async () => ({
+        base_url: '', model: '', key_set: true, key_hint: '••••abcd',
+        configured: false, missing: ['base_url', 'model'], file: 'provider.yaml', restart_needed: true,
+      }) };
+    }
+  } });
+  await h.settle();
+  await h.click('settings-toggle');
+  await h.click('settings-tab-model');
+  await h.settle();
+  await h.settle();
+  assert.match(h.$('provider-status').textContent, /还缺 base_url、model/);
+
+  h.$('provider-base-url').value = 'https://api.test/v1';
+  h.$('provider-model').value = 'alpha';
+  h.$('provider-form').emit('submit');
+  await h.settle();
+  await h.settle();
+
+  const put = h.calls.filter(({ url, options }) => url === '/api/provider' && options && options.method === 'PUT');
+  assert.equal(put.length, 1, '保存只发一次');
+  assert.deepEqual(JSON.parse(put[0].options.body), { base_url: 'https://api.test/v1', model: 'alpha' });
+  assert.match(h.$('provider-status').textContent, /重启 Luna 后这个进程才会用它/);
+});
+
+test('探测模型列表把候选放进模型一栏，失败时把接口自己的话显示出来', async () => {
+  const h = navigationHarness({ respond: async (url) => {
+    if (url === '/api/provider/models') {
+      return { ok: true, json: async () => ({ models: ['alpha', 'beta'], problem: '' }) };
+    }
+    if (url === '/api/provider') {
+      return { ok: true, json: async () => ({
+        base_url: 'https://api.test/v1', model: '', key_set: true, key_hint: '••••abcd',
+        configured: false, missing: ['model'], file: 'provider.yaml', restart_needed: false,
+      }) };
+    }
+  } });
+  await h.settle();
+  await h.click('settings-toggle');
+  await h.click('settings-tab-model');
+  await h.settle();
+  await h.settle();
+  await h.click('provider-probe');
+  await h.settle();
+  await h.settle();
+
+  const options = h.$('provider-model-options').childNodes.map((node) => node.value);
+  assert.deepEqual(options, ['alpha', 'beta']);
+  assert.match(h.$('provider-status').textContent, /2 个模型/);
+  assert.equal(h.$('provider-probe').disabled, false, '探测结束后按钮可以再点');
+});
+
+test('接口回绝探测时，界面显示的是接口说的话而不是一个笼统失败', async () => {
+  const h = navigationHarness({ respond: async (url) => {
+    if (url === '/api/provider/models') {
+      return { ok: true, json: async () => ({ models: [], problem: 'https://api.test/v1/models answered 401 Unauthorized: invalid key' }) };
+    }
+    if (url === '/api/provider') {
+      return { ok: true, json: async () => ({
+        base_url: 'https://api.test/v1', model: '', key_set: false, key_hint: '',
+        configured: false, missing: ['api_key', 'model'], file: 'provider.yaml', restart_needed: false,
+      }) };
+    }
+  } });
+  await h.settle();
+  await h.click('settings-toggle');
+  await h.click('settings-tab-model');
+  await h.settle();
+  await h.settle();
+  await h.click('provider-probe');
+  await h.settle();
+  await h.settle();
+
+  assert.match(h.$('provider-status').textContent, /401 Unauthorized/);
+  assert.equal(h.$('provider-status').classList.contains('failure'), true);
+});

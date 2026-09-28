@@ -644,7 +644,14 @@ func run() error {
 	for _, model := range cfg.Models {
 		modelNames = append(modelNames, model.Name)
 	}
-	commands, err := command.New(append(command.Builtins(), command.ModelCommand(modelNames))...)
+	// A Luna with no provider has no models to switch between, and a command that
+	// offers no choice is not a command: /model appears once there is something
+	// to switch to, which is what the settings page is for.
+	builtins := command.Builtins()
+	if len(modelNames) > 0 {
+		builtins = append(builtins, command.ModelCommand(modelNames))
+	}
+	commands, err := command.New(builtins...)
 	if err != nil {
 		return fmt.Errorf("build the command table: %w", err)
 	}

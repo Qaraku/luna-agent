@@ -1045,6 +1045,10 @@ body {
 .section-heading span { color: var(--luna-text-muted); font-size: var(--luna-font-label); }
 .settings-field { display: grid; gap: var(--luna-space-2); }
 .settings-field label { color: var(--luna-text-muted); font-size: var(--luna-font-meta); }
+/* 模型服务那一页的表单：地址、密钥、模型三行加一排动作，行距与设置里其他表单一致。 */
+.provider-form { display: grid; gap: var(--luna-space-3); margin: var(--luna-space-3) 0; }
+.settings-actions { display: flex; gap: var(--luna-space-2); }
+.provider-status { min-height: 18px; }
 .availability { min-height: 18px; margin: var(--luna-space-3) 0 0; color: var(--luna-text-muted); font-size: var(--luna-font-meta); }
 .availability.ready { color: var(--luna-success); }
 .availability.unavailable { color: var(--luna-danger); }

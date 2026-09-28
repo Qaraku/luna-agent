@@ -127,10 +127,6 @@ Requirements: Go 1.24 or newer, and Node.js 22 only if you want to run the brows
 git clone https://github.com/Qaraku/luna-agent
 cd luna-agent
 
-export OPENAI_BASE_URL=https://your-provider.example/v1
-export OPENAI_API_KEY=...            # never committed, never sent to the browser
-export OPENAI_MODEL_NAME=your-model
-
 go run ./cmd/luna -addr 127.0.0.1:0
 ```
 
@@ -141,7 +137,18 @@ LISTEN_URL=http://127.0.0.1:<port>
 ROOT=/path/to/repo
 ```
 
-Open that URL. Roots are resolved in this order: an explicit `-root` (which must hold `web/index.html` and `plugins/`), then the executable's grandparent — the `<repo>/.runtime/luna` layout — then the working directory, which is the candidate that makes `go run ./cmd/luna` work from a fresh checkout.
+Open that URL, then open **Settings → 模型服务** and fill in the endpoint, the API
+key and the model. Luna writes them to its own `provider.yaml` in the
+configuration directory, so a first run works with nothing configured: the page
+that configures it is served by the same process.
+
+The dialog can ask the endpoint which models it serves (`获取模型列表`), and the
+model field suggests what came back while still accepting a name typed by hand.
+Saving is followed by a restart, because the model is built when the process
+starts; the page says so, and says when the running process is already using what
+is stored.
+
+Roots are resolved in this order: an explicit `-root` (which must hold `web/index.html` and `plugins/`), then the executable's grandparent — the `<repo>/.runtime/luna` layout — then the working directory, which is the candidate that makes `go run ./cmd/luna` work from a fresh checkout.
 
 Sessions are written under the user's data root at `sessions/`; `-sessions-dir` points them at another directory. A checkout whose sessions still live in `.runtime/sessions/` keeps using that location, so an existing installation never moves on its own — startup logs one line per decision saying which location is in use, and where the data would live after a move. Memory facts live in the Memory capability's state root at `.runtime/memory.jsonl` — the namespace is the capability's own claim and the file name is its own choice, not a kernel setting — and that root defaults to the data root, or stays at `.runtime/memory.jsonl` under the resolved root when the file is already there. `-state-dir` moves the state root.
 
@@ -156,41 +163,49 @@ Runtime candidate builds need the Go toolchain on `PATH`, because each reload co
 
 ### Configuration
 
-Settings come from two places: the environment, and a user configuration file.
-The file wins where it states a value and the environment fills in the rest, so
-a Luna that has always been configured by environment variables stays configured
-exactly as before, while one whose launcher cannot export variables can be
-configured by the file instead.
+Where Luna calls and with which key is a setting of the installation, not
+something a launcher exports. It is stored in Luna's own file, written by the
+settings page:
 
-The file is read from `$XDG_CONFIG_HOME/luna/config.yaml`
-(`~/.config/luna/config.yaml` by default), and `-config-file` points somewhere
-else. Luna only reads it: a file the user owns is not rewritten by the program,
-comments included.
+```yaml
+# ~/.config/luna/provider.yaml   (0600; Luna writes this one)
+base_url: https://your-provider.example/v1
+api_key: sk-...                 # written by the settings page, never returned to the browser
+model: your-model
+```
+
+`config.yaml`, the file a person edits by hand, stays theirs: Luna reads it and
+never rewrites it, comments included. It supplies the run budgets, and it fills
+in any provider setting `provider.yaml` leaves out, so an installation configured
+by hand keeps working.
 
 ```yaml
 # ~/.config/luna/config.yaml
-model: your-model
-base_url: https://your-provider.example/v1
-api_key_env: OPENAI_API_KEY   # names the variable holding the key, never the key
 reasoning_effort: high
 max_iterations: 64            # how many model turns one run may take
 run_timeout: 20m              # how long one run may take
+models:                       # other models /model can switch to; each inherits the endpoint above
+  - name: another-model
 ```
 
 A missing file is not an error, an empty file is an empty configuration, and an
 unknown key is refused rather than ignored — a misspelled setting that does
 nothing is worse than one that fails to load. Startup says which file it read.
 
+A Luna with no provider at all is not an error either: it starts, says what is
+unset, and serves the page that sets it. A run started meanwhile fails with a
+sentence naming the missing settings rather than with a provider error.
+
 | Variable | Required | Notes |
 |---|---|---|
 | `LUNA_HOME` | no | One directory holding everything: configuration, sessions, capability state and cache. Setting it overrides every XDG root and every previous location, so a development checkout can keep its files next to itself (`LUNA_HOME=$PWD/.runtime`). A relative value is refused rather than ignored. Startup prints it |
-| `OPENAI_BASE_URL` | yes | OpenAI-compatible endpoint. `base_url` in the file overrides it |
-| `OPENAI_API_KEY` | yes | Environment only; there is no browser or file path to it. The file names the variable to read (`api_key_env`), never the value |
-| `OPENAI_MODEL_NAME` | yes | Canonical name. `model` in the file overrides it |
-| `OPENAI_MODEL` / `OPENAI_MODEL_ID` | no | Accepted aliases; if several are set their non-empty values must agree, otherwise startup fails with a clear error |
 | `LUNA_REASONING_EFFORT` | no | How hard the model should think before it answers, sent as the API's own `reasoning_effort`. One of `minimal`, `low`, `medium`, `high`, `none`. Unset means the field is not sent at all, so a provider that does not define it is unaffected. Whether a level changes anything is the provider's business: against `api.deepseek.com` it is accepted and makes no measurable difference |
 | `LUNA_MAX_ITERATIONS` | no | How many model turns one run may take before it is stopped as a runaway loop (`max_iterations` in the file overrides it). A backstop, not a work budget: the default is 64 turns, which one turn may spend on several tool calls, and a task that needs more can be given more. Reaching it fails the run with a message naming the number and this variable |
 | `LUNA_RUN_TIMEOUT` | no | How long one run may take, as a Go duration such as `20m` or `90s` (`run_timeout` in the file overrides it). Default `15m`. Reaching it ends the run as `run.cancelled` with the reason `timeout`, which is not a failure |
+
+There is no environment variable for the endpoint, the key or the model: which
+provider a Luna calls is a property of that installation, and one variable that
+could silently override it would be a second answer to the same question.
 
 Startup errors name the missing variable but never print its value.
 
@@ -201,6 +216,9 @@ Startup errors name the missing variable but never print its value.
 | `GET` | `/healthz` | Configuration readiness plus an active generation for every allowlisted plugin tool; implies no provider call |
 | `GET` | `/api/state` | Bounded runtime state: model name, provider host, host PID, one plugin record per allowlisted plugin tool (tool name, candidate, version, generation, plugin PID, status, in-flight calls), busy flag, the two run budgets it enforces (`max_iterations`, `run_timeout_ms`), the reasoning tier it was started with (omitted when none was chosen), the current run and session ids (empty when idle), lifecycle events, and `capabilities[]` — one entry per registered capability carrying its `id`, `title`, `deployment`, `state`, `contributions`, `claims`, `permissions` and `panels`. No API key, and none of any capability's stored data |
 | `GET` | `/api/commands` | The composer's command table: one entry per command with `name`, `summary`, `usage`, `category`, `aliases`, `args` (`none` / `text` / `options`), `options` when the command takes a fixed set, and `busy` (`allow` / `reject`, i.e. whether it works while a run is active). The browser draws its candidates and its help list from this, so the table is described once. No commands is an empty list |
+| `GET` | `/api/provider` | What this installation calls: `base_url`, `model`, `key_set`, `key_hint`, the file's name, `missing` (what is still unset, empty when nothing is), `configured` (what the running process is using) and `restart_needed` (what is stored is not what is running). The key itself is never in the answer — only whether one is set and its last four characters |
+| `PUT` | `/api/provider` | `{"base_url":"...","api_key":"...","model":"..."}` stores it. An empty `api_key` keeps the stored one, because the browser is never given it; `"clear_api_key":true` is how a key is removed. An endpoint that cannot be called is `400` and nothing is written. A mutation, so it requires the exact origin |
+| `POST` | `/api/provider/models` | Asks the endpoint which models it serves and answers `{"models":[...],"problem":""}`; a failure comes back as the provider's own words in `problem`, not as an HTTP error, because the page shows them next to the field that caused them. Sends the stored key unless the request carries one, so a half-typed form can be tested. Requires the exact origin: it spends this installation's key on an outbound call |
 | `GET` | `/api/models` | The models a run may be sent to — `name`, `provider`, and `default` on the first entry — plus which one a session would use and where that choice came from: `{"name":"...","origin":"session"\|"global"}`. `?session=<id>` names the session; without it the answer describes the configuration alone. An unknown session is `404`, a malformed one `400` |
 | `GET` | `/api/skills` | Every skill discovery found, in discovery order: `name`, `description`, `scope`, `enabled`, and `disabled_reason` when it is turned off. A long description is truncated with the fact stated rather than cut silently. No skills is an empty list |
 | `POST` | `/api/skills/{name}/enable` · `/disable` | Turns one skill off or on and returns its new state. The preference is written to `$XDG_CONFIG_HOME/luna/settings.yaml` — Luna's own file, since it is the side that writes it — and the running list follows immediately, without a rebuild: the manifest is read once per run. An unknown name is `404` (nothing is stored for a skill that is not there), and both are mutations, so they require the exact origin |

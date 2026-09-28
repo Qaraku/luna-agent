@@ -2616,7 +2616,10 @@ if (typeof document !== 'undefined') {
     if (pane === 'settings-pane-skills') updateSkills();
     else if (pane === 'settings-pane-workspace') updateWorkspaces();
     else if (pane === 'settings-pane-extensions') updateUIPlugins();
-    else if (pane === 'settings-pane-model') updateModelList();
+    else if (pane === 'settings-pane-model') {
+      updateModelList();
+      updateProvider();
+    }
   }
 
   // updateVisibleSettingsPane 在设置被重新打开时只刷新当前可见的那一页，而不是
@@ -3033,7 +3036,117 @@ if (typeof document !== 'undefined') {
     await updateState();
   }
 
-  // 模型服务参数是这个进程启动时定下的，界面只读显示：模型、提供方与思考档位来自
+  // --- 设置：模型服务（可编辑）-----------------------------------------------
+  // 这台机器调用哪个接口、用哪个密钥、问哪个模型，是安装的设置而不是启动参数：
+  // 界面把它写进 Luna 自己的 provider.yaml，下一次启动读的就是它。密钥只写不读 ——
+  // GET /api/provider 只回答"是否已设置"和末四位，所以这个输入框永远是空的，
+  // 空的意思就是"沿用已保存的那个"。
+  const providerForm = $('provider-form');
+  const providerBaseURL = $('provider-base-url');
+  const providerAPIKey = $('provider-api-key');
+  const providerModel = $('provider-model');
+  const providerModelOptions = $('provider-model-options');
+  const providerKeyState = $('provider-key-state');
+  const providerProbe = $('provider-probe');
+  const providerStatus = $('provider-status');
+  // 最近一次从服务端读到的设置：保存与探测都以它为基础，界面不自己记密钥。
+  let providerView = null;
+
+  function setProviderStatus(text, className = '') {
+    providerStatus.textContent = text;
+    providerStatus.className = `luna-status provider-status${className ? ` ${className}` : ''}`;
+  }
+
+  // setProviderModelOptions 填的是输入框自己的候选（datalist）：下拉里有接口给出的
+  // 名字，也可以直接手打一个不在列表里的。候选只在探测成功后更新，重读这一页不会
+  // 把它们清掉。
+  function setProviderModelOptions(names) {
+    providerModelOptions.replaceChildren();
+    for (const name of names || []) {
+      const option = document.createElement('option');
+      option.value = name;
+      providerModelOptions.append(option);
+    }
+  }
+
+  // renderProvider 只改内容，不重建输入框：重读这一页不会清掉正在输入的内容，也不会
+  // 把焦点移走。
+  function renderProvider(view) {
+    providerView = view;
+    providerBaseURL.value = view.base_url || '';
+    providerModel.value = view.model || '';
+    providerAPIKey.value = '';
+    if (view.key_set) {
+      providerAPIKey.placeholder = `已保存 ${view.key_hint}，留空即沿用`;
+      providerKeyState.textContent = `已保存一个密钥（${view.key_hint}）。换密钥就填新的；界面取不回原值。`;
+    } else {
+      providerAPIKey.placeholder = '还没有密钥';
+      providerKeyState.textContent = '还没有密钥。';
+    }
+    const notes = [];
+    if ((view.missing || []).length > 0) notes.push(`还缺 ${view.missing.join('、')}。`);
+    if (view.restart_needed) notes.push('已保存的设置与这个进程正在用的不同：重启 Luna 后生效。');
+    setProviderStatus(notes.join(' '));
+    return view;
+  }
+
+  async function updateProvider() {
+    setProviderStatus('正在读取…');
+    try {
+      const response = await fetch('/api/provider', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      renderProvider(await response.json());
+    } catch (error) {
+      setProviderStatus(`读不到模型服务设置：${error.message}`, 'failure');
+    }
+  }
+
+  // 探测由服务端发起：密钥在它手里，浏览器只收到一张模型名单。失败时把接口自己的
+  // 话原样显示出来 —— 一个人要改的是他刚填的那个地址或密钥。
+  async function probeProviderModels() {
+    providerProbe.disabled = true;
+    setProviderStatus('正在向接口要模型列表…');
+    try {
+      const response = await fetch('/api/provider/models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ base_url: providerBaseURL.value.trim(), api_key: providerAPIKey.value }),
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json();
+      setProviderModelOptions(payload.models || []);
+      if (payload.problem) setProviderStatus(`接口说：${payload.problem}`, 'failure');
+      else setProviderStatus(`接口给出了 ${(payload.models || []).length} 个模型：模型一栏可以下拉选，也可以自己填。`);
+    } catch (error) {
+      setProviderStatus(`探测失败：${error.message}`, 'failure');
+    } finally {
+      providerProbe.disabled = false;
+    }
+  }
+  providerProbe.addEventListener('click', probeProviderModels);
+
+  providerForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const body = { base_url: providerBaseURL.value.trim(), model: providerModel.value.trim() };
+    // 空输入框的意思是"沿用"：界面从来没有过原值，不能把"没重填"当成"清空"。
+    if (providerAPIKey.value) body.api_key = providerAPIKey.value;
+    setProviderStatus('正在保存…');
+    try {
+      const response = await fetch('/api/provider', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+      renderProvider(payload);
+      setProviderStatus(payload.restart_needed ? '已保存。重启 Luna 后这个进程才会用它。' : '已保存，这个进程正在用的就是它。');
+    } catch (error) {
+      setProviderStatus(`保存失败：${error.message}`, 'failure');
+    }
+  });
+
+  // 模型服务参数是这台机器启动时定下的，界面只读显示：模型、提供方与思考档位来自
   // 同一份状态；档位的说明与“推理过程是否展示”分开写。
   function renderModelFacts(state) {
     const payload = state && typeof state === 'object' ? state : {};
