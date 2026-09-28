@@ -12,6 +12,14 @@
 //     containment code, so the boundary has one implementation whatever the tool
 //     does with the path. The host then hands the plugin the already-resolved
 //     absolute path.
+//   - ResolveWrite answers the same question for a path something is about to
+//     be written to, on the same boundary: the same normalization, the same
+//     refusal of an absolute path and of a `..` escape, and the same
+//     symbolic-link resolution. It differs only where a write differs — the file
+//     itself may not exist yet, so what has to be there is its directory — and
+//     it refuses a target that is itself a symbolic link, because a write
+//     replaces that link rather than the file it points at. It creates nothing
+//     and it writes nothing: it says where a write would go.
 //   - Read, List, Search and Find run on the plugin side and never interpret a
 //     path. They receive the validated path plus the caps, and all four refuse to
 //     overstate what they found: Read reads at most one byte past the cap so an
@@ -86,11 +94,19 @@ var (
 	// boundary is a caller mistake, not a request to search everywhere.
 	ErrNoRoot        = errors.New("no read root was given")
 	ErrSymlinkEscape = errors.New("path leaves the read root through a symbolic link")
-	ErrNotFound      = errors.New("file not found")
-	ErrNotRegular    = errors.New("path is not a regular file")
-	ErrNotDir        = errors.New("path is not a directory")
-	ErrTooLarge      = errors.New("file exceeds the single-read limit")
-	ErrBinary        = errors.New("file is not text")
+	// ErrWriteTargetSymlink reports a write whose target is itself a symbolic
+	// link, whatever it points at. A write is refused rather than followed
+	// because the last component of a path is the name being written to, not a
+	// name to follow: os.Rename replaces the link itself rather than the file
+	// it points at, so accepting the path would answer a question about one
+	// file with a write to another. It therefore stays a refusal even when the
+	// link points inside the root.
+	ErrWriteTargetSymlink = errors.New("the target is a symbolic link; a write would replace the link itself, not the file it points to")
+	ErrNotFound           = errors.New("file not found")
+	ErrNotRegular         = errors.New("path is not a regular file")
+	ErrNotDir             = errors.New("path is not a directory")
+	ErrTooLarge           = errors.New("file exceeds the single-read limit")
+	ErrBinary             = errors.New("file is not text")
 	// ErrRangeInvalid reports a line range that is not a range: a negative
 	// start_line or max_lines. Zero is not a range either — it is how the
 	// protocol says "not asked for" — so a negative value is refused and
@@ -258,6 +274,43 @@ func ResolveSearchInRoots(roots []string, requested string) (Resolved, error) {
 	})
 }
 
+// ResolveWrite validates a requested path against a root and returns where a
+// write to it would go. requested is the raw, model-supplied path; the file it
+// names may not exist yet, but the directory it would be created in must
+// already be there. The resolver creates nothing — no directory, no file — and
+// writes nothing: it answers where a write would go, and the caller is the one
+// that decides whether to write there.
+//
+// The boundary is the read boundary. ResolveWrite applies the same
+// normalization, the same refusal of an absolute path and of a `..` escape and
+// the same symbolic-link resolution as Resolve (both are described in one place
+// in resolveWrite and resolveWithinRoot), so a path a read may not reach is not
+// one a write may reach either, and the two cannot drift apart. What differs is
+// only what the resolved path has to be: for a write, the directory has to
+// exist and the target, if it is already there, has to be a regular file. A
+// target that is itself a symbolic link is refused — see ErrWriteTargetSymlink.
+func ResolveWrite(root, requested string) (Resolved, error) {
+	resolved, err := resolveWrite(root, requested)
+	if err != nil {
+		return Resolved{}, err
+	}
+	return Resolved{Path: resolved, Root: root}, nil
+}
+
+// ResolveWriteInRoots is ResolveWrite against several roots: the first root
+// that admits the path wins. See resolveInRoots for what "first" and "admits"
+// mean, and for why the `..` climb is decided once before any root is asked: a
+// path that rises above the root it is resolved against escapes, and it stays
+// an escape when the directory it lands in is another root of the same call —
+// a sibling root does not rescue it, so the answer does not depend on the order
+// the roots were given in. Every other refusal is per root and is moved past, so
+// a name that only one of the working directories holds is found.
+func ResolveWriteInRoots(roots []string, requested string) (Resolved, error) {
+	return resolveInRoots(roots, requested, func(root string) (string, error) {
+		return resolveWrite(root, requested)
+	})
+}
+
 // ValidateQuery checks one literal query before any work is done with it. It
 // lives here, next to the search that consumes it, so the host can refuse a
 // query on the same terms the plugin would: an empty literal matches every line
@@ -356,6 +409,129 @@ func resolveInRoots(roots []string, requested string, check func(root string) (s
 		}
 	}
 	return Resolved{}, firstErr
+}
+
+// resolveWrite is the write-side counterpart of resolveWithinRoot: the same
+// normalization, the same containment and the same symbolic-link resolution,
+// with the one difference a write has to state — the file itself may not exist
+// yet, so what has to be there is its directory. The parent is therefore what
+// is resolved and contained, and the target, if it is already there, is checked
+// on top of that.
+//
+// It writes nothing and creates nothing, including no directory: a missing
+// directory is reported rather than made, because whether a directory should be
+// brought into being is the caller's decision, not the boundary's.
+//
+// What it refuses, and why:
+//
+//   - the same pre-checks resolveWithinRoot makes, in the same order: an
+//     empty path, a NUL byte, an absolute path, and a path that climbs above
+//     the root with `..` (ErrPathEscape) or otherwise lands outside it
+//     (ErrPathOutside);
+//   - a last component that names no file — empty (a trailing separator), `.`
+//     or `..` — since the request was for a directory rather than a file to
+//     write (ErrNotRegular);
+//   - a parent directory that is not there, or that is not a directory
+//     (ErrNotFound and ErrNotDir respectively);
+//   - a parent that, once symbolic links are resolved, is not inside the root
+//     (ErrSymlinkEscape), which is how a directory link out of the root is
+//     caught even though the file below it does not exist yet;
+//   - an existing target that is not a regular file (ErrNotRegular);
+//   - an existing target whose resolution is not inside the root
+//     (ErrSymlinkEscape);
+//   - a target that is itself a symbolic link (ErrWriteTargetSymlink). The
+//     link is refused rather than followed or replaced: what the caller is told
+//     is the name the write goes to, and os.Rename would replace the link
+//     itself while a plain O_CREATE over the name would follow it, so either
+//     way the answer would not be about the file the caller named. This holds
+//     even for a link that points inside the root.
+//
+// The failure to examine the target is also a refusal rather than a create: an
+// unexaminable name cannot be shown not to be a symbolic link, and an unknown
+// last component is not one a write may take.
+func resolveWrite(root, requested string) (string, error) {
+	if strings.TrimSpace(requested) == "" {
+		return "", ErrPathEmpty
+	}
+	if strings.ContainsRune(requested, 0) {
+		return "", fmt.Errorf("%w: %q contains a NUL byte", ErrPathInvalid, requested)
+	}
+	if filepath.IsAbs(requested) {
+		return "", fmt.Errorf("%w: %q", ErrPathAbsolute, requested)
+	}
+	joined := filepath.Join(root, filepath.FromSlash(requested))
+	if !withinRoot(root, joined) {
+		// The containment rule is resolveWithinRoot's, and so is the way the
+		// common cause is reported separately.
+		if climbsAboveRoot(requested) {
+			return "", fmt.Errorf("%w with a .. component: %q", ErrPathEscape, requested)
+		}
+		return "", fmt.Errorf("%w: %q", ErrPathOutside, requested)
+	}
+	if !namesAFile(requested) {
+		return "", fmt.Errorf("%w: %q names a directory, not a file to write", ErrNotRegular, requested)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		// Without the root's real path there is nothing to contain the write
+		// against, and a root that cannot be resolved is not one a write may
+		// be placed in.
+		return "", fmt.Errorf("%w: %q", ErrNotFound, requested)
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(joined))
+	if err != nil {
+		// The directory the file would be created in is not there. Nothing is
+		// created here to make the path work.
+		return "", fmt.Errorf("%w: %q", ErrNotFound, requested)
+	}
+	if !withinRoot(resolvedRoot, parent) {
+		return "", fmt.Errorf("%w: %q", ErrSymlinkEscape, requested)
+	}
+	info, err := os.Stat(parent)
+	if err != nil {
+		return "", fmt.Errorf("%w: %q", ErrNotFound, requested)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%w: %q", ErrNotDir, requested)
+	}
+	target := filepath.Join(parent, filepath.Base(joined))
+	info, err = os.Lstat(target)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// A new file. Where it would go is stated and nothing is created.
+			return target, nil
+		}
+		return "", fmt.Errorf("%w: %q cannot be examined for writing (%s)", ErrNotRegular, requested, pathError(err))
+	}
+	if info.Mode()&fs.ModeSymlink != 0 {
+		return "", fmt.Errorf("%w: %q", ErrWriteTargetSymlink, requested)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%w: %q", ErrNotRegular, requested)
+	}
+	resolved, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return "", fmt.Errorf("%w: %q", ErrNotFound, requested)
+	}
+	if !withinRoot(resolvedRoot, resolved) {
+		return "", fmt.Errorf("%w: %q", ErrSymlinkEscape, requested)
+	}
+	return resolved, nil
+}
+
+// namesAFile reports whether the last component of a requested path names a file
+// to write rather than a directory. The path is split on the separator, so a
+// component never contains one; what is left to refuse is a component that names
+// no file at all — an empty one (a trailing separator, as in `docs/`) and the
+// two directory names `.` and `..`, which normalization would otherwise carry
+// into the root itself or its parent.
+func namesAFile(requested string) bool {
+	parts := strings.Split(filepath.ToSlash(requested), "/")
+	switch parts[len(parts)-1] {
+	case "", ".", "..":
+		return false
+	}
+	return true
 }
 
 // Read returns the text of an already-validated path. A path is never
@@ -1102,6 +1278,19 @@ func withinRoot(root, path string) bool {
 	}
 	return strings.HasPrefix(path, root+string(filepath.Separator))
 }
+
+// Within reports whether path is root itself or lies below it, by the rule
+// withinRoot applies: both paths are cleaned and compared as whole components,
+// so `…/repo-other` is not inside `…/repo` just because its name starts with
+// the same characters. Both paths must be absolute, and a relative or empty root
+// never acts as a prefix.
+//
+// It is exported for callers that have to answer the question one step earlier
+// than any single path: whether a directory may be written in at all. It is the
+// same function the read and write boundaries are decided by, not a second
+// implementation of the rule, so an authorization table and a resolution cannot
+// disagree about where a root ends.
+func Within(root, path string) bool { return withinRoot(root, path) }
 
 // climbsAboveRoot reports whether a path uses enough `..` components to rise
 // above the directory it is resolved against. A `..` that stays inside, such as
