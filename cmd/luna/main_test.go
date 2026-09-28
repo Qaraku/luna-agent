@@ -15,6 +15,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/plugins/filewrite"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	"github.com/Qaraku/luna-agent/internal/plugins/terminal"
+	"github.com/Qaraku/luna-agent/internal/plugins/web"
 	"github.com/Qaraku/luna-agent/internal/plugins/workspace"
 	"github.com/Qaraku/luna-agent/internal/provider"
 	"github.com/Qaraku/luna-agent/internal/settings"
@@ -792,6 +793,42 @@ func TestTheFileWriteCapabilityIsOffUntilTheSettingsSaySo(t *testing.T) {
 		registry := plugin.NewRegistry(plugin.PermissionStateWrite)
 		if err := registerFileWrite(registry, settingsPath, true); err == nil {
 			t.Fatal("a registry that did not grant filesystem writes accepted the file write capability")
+		}
+	})
+}
+
+// 抓网页的能力跟前面两个一样是「不自己跑」的那一类：注册了但没启用，直到用户在设置里
+// 打开它；没授权 net.fetch 的注册表必须拒它。
+func TestTheWebCapabilityIsOffUntilTheSettingsSaySo(t *testing.T) {
+	t.Run("a capability nobody asked for is not running", func(t *testing.T) {
+		registry := plugin.NewRegistry(plugin.PermissionStateWrite, plugin.PermissionNetworkFetch)
+		if err := registerWeb(registry, false); err != nil {
+			t.Fatal(err)
+		}
+		entry, found := registry.Entry(web.PluginID)
+		if !found {
+			t.Fatal("the web capability was not registered, so the settings page has nothing to turn on")
+		}
+		if entry.State != plugin.StateRegistered {
+			t.Fatalf("state = %q, want %q", entry.State, plugin.StateRegistered)
+		}
+		if tools := toolsOf(registry); slices.Contains(tools, web.FetchToolName) {
+			t.Fatalf("tools = %v, want no %s", tools, web.FetchToolName)
+		}
+	})
+	t.Run("the user's choice turns it on", func(t *testing.T) {
+		registry := plugin.NewRegistry(plugin.PermissionStateWrite, plugin.PermissionNetworkFetch)
+		if err := registerWeb(registry, true); err != nil {
+			t.Fatal(err)
+		}
+		if tools := toolsOf(registry); !slices.Contains(tools, web.FetchToolName) {
+			t.Fatalf("tools = %v, want %s", tools, web.FetchToolName)
+		}
+	})
+	t.Run("a registry that did not grant it refuses it", func(t *testing.T) {
+		registry := plugin.NewRegistry(plugin.PermissionStateWrite)
+		if err := registerWeb(registry, true); err == nil {
+			t.Fatal("a registry that did not grant network fetches accepted the web capability")
 		}
 	})
 }

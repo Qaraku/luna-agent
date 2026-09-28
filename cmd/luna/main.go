@@ -28,6 +28,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	skillsplugin "github.com/Qaraku/luna-agent/internal/plugins/skills"
 	"github.com/Qaraku/luna-agent/internal/plugins/terminal"
+	"github.com/Qaraku/luna-agent/internal/plugins/web"
 	"github.com/Qaraku/luna-agent/internal/plugins/workspace"
 	"github.com/Qaraku/luna-agent/internal/provider"
 	"github.com/Qaraku/luna-agent/internal/settings"
@@ -539,6 +540,27 @@ func registerFileWrite(registry *plugin.Registry, settingsPath string, enabled b
 	return nil
 }
 
+// registerWeb registers the capability that fetches pages from the network and, when
+// the user has asked for it, turns it on.
+//
+// Like the other two it is registered either way, so the settings page can list it and
+// the setting can decide. It asks for net.fetch, and the reach it has once switched on
+// is its own business: the capability refuses anything that is not a public http(s)
+// text response, so turning it on does not hand the model a way into this machine or
+// into the local network.
+func registerWeb(registry *plugin.Registry, enabled bool) error {
+	if err := registry.Register(web.New()); err != nil {
+		return fmt.Errorf("register web capability: %w", err)
+	}
+	if !enabled {
+		return nil
+	}
+	if err := registry.Enable(web.PluginID); err != nil {
+		return fmt.Errorf("enable web capability: %w", err)
+	}
+	return nil
+}
+
 func run() error {
 	addr := flag.String("addr", "127.0.0.1:0", "literal loopback listen address")
 	rootFlag := flag.String("root", "", "repository root holding web/ and plugins/ (default: auto-detect)")
@@ -633,13 +655,14 @@ func run() error {
 	// Memory capability is the first one: a built-in plugin that claims a state
 	// namespace, which the kernel resolves into a directory under whichever state
 	// root is in use — the kernel never learns which file it keeps inside.
-	// Three abilities are grantable here: a capability may keep its own state in a
+	// Four abilities are grantable here: a capability may keep its own state in a
 	// directory the kernel resolves for it, it may run commands in the directories
-	// this run works in, and it may create or replace files in the directories the
-	// user allows. Granting one is what lets a capability ask for it at all; whether
-	// this machine's user has turned the capability on, and which directories it may
-	// write in, are separate questions the settings file answers below.
-	registry := plugin.NewRegistry(plugin.PermissionStateWrite, plugin.PermissionProcessExec, plugin.PermissionFilesystemWrite)
+	// this run works in, it may create or replace files in the directories the
+	// user allows, and it may fetch pages from the network. Granting one is what
+	// lets a capability ask for it at all; whether this machine's user has turned
+	// the capability on, and which directories it may write in, are separate
+	// questions the settings file answers below.
+	registry := plugin.NewRegistry(plugin.PermissionStateWrite, plugin.PermissionProcessExec, plugin.PermissionFilesystemWrite, plugin.PermissionNetworkFetch)
 	memoryDir, err := plugin.StateDirFor(memory.Descriptor(), statePath)
 	if err != nil {
 		return fmt.Errorf("resolve memory state directory: %w", err)
@@ -717,6 +740,12 @@ func run() error {
 	// settings file on every call, so a directory allowed in the settings page takes
 	// effect on the model's next call rather than at the next start-up.
 	if err := registerFileWrite(registry, settingsPath, userSettings.CapabilityEnabled(filewrite.PluginID)); err != nil {
+		return err
+	}
+	// The capability that fetches pages is the third one the user decides about. It
+	// asks for net.fetch, and what it can reach is decided by the capability: only
+	// public addresses, only text, with every cap reported instead of hidden.
+	if err := registerWeb(registry, userSettings.CapabilityEnabled(web.PluginID)); err != nil {
 		return err
 	}
 	listener, err := httpapi.Listen(*addr)
