@@ -384,6 +384,12 @@ provider 与模型不需要。探测失败不算服务错误，它是一次回�
 
 合成约 8 MiB、主要由工具结果构成的会话，在本机三次单次基准中，列表/消息读取的分配量从约 **34.7 MB/op 降为 8.7 MB/op**（约少 75%，这是该夹具的分配量，不是生产内存或速度承诺）。可用 `go test ./internal/store -run '^$' -bench BenchmarkSessionProjection -benchtime=1x -count=3 -benchmem` 复现。资源回归同时覆盖较大行、长残行、无关记录损坏、读取错误、并发追加边界和缓冲复用。对照旧切行规则的模糊测试发现并修复了损坏字符串报错文本的差异；失败样例保留在 `internal/store/testdata/fuzz/FuzzSessionRecordScan/`。
 
+## 未发布改动的组合验证
+
+在提交 `788dcba` 的 `git archive` 干净副本上，完整运行了仓库规定的自动检查：`go test -race ./...`、`go vet ./...`、根应用构建、`gofmt -l internal cmd plugins`、`node --check web/app.js` 与 `node --test web/app.test.cjs`。全部通过；格式检查无输出，前端测试为 **125 项通过、0 失败**。原工作树的 `git diff --check` 同样通过。
+
+这次验证覆盖前述会话完成时序、记忆检索、配置保存事务及会话流式读取组合后的代码，不依赖未提交的流程文件。没有调用真实模型、重启用户服务或做真实浏览器验收；自动检查通过不等于这些验收已完成，也不构成发布或打标签授权。
+
 ## 构建方式
 
 一次一个切片。切片通过编译加上聚焦的单元测试来验证；针对真实 provider 的端到端验证
