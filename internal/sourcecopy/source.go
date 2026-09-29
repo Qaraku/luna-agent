@@ -44,6 +44,11 @@ func command(ctx context.Context, repo string, limit int, args ...string) ([]byt
 	return out.Bytes(), nil
 }
 func Export(ctx context.Context, repo, commit, dest string, paths []string) error {
+	return ExportFiltered(ctx, repo, commit, dest, paths, nil)
+}
+
+// ExportFiltered在读取blob正文之前检查文件名；拒绝不合适的已提交路径而非静默遗漏。
+func ExportFiltered(ctx context.Context, repo, commit, dest string, paths []string, allow func(string) bool) error {
 	if !CommitPattern.MatchString(commit) || len(paths) == 0 {
 		return errors.New("source export requires a complete commit and explicit paths")
 	}
@@ -80,6 +85,9 @@ func Export(ctx context.Context, repo, commit, dest string, paths []string) erro
 		fields := strings.Fields(meta)
 		if !ok || len(fields) != 3 || fields[1] != "blob" || (fields[0] != "100644" && fields[0] != "100755") || !release.SafePath(name) {
 			return errors.New("unsupported tracked source entry (links and submodules are not copied)")
+		}
+		if allow != nil && !allow(name) {
+			return errors.New("selected commit contains an excluded source path")
 		}
 		count++
 		if count > 10000 {

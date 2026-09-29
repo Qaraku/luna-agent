@@ -25,6 +25,8 @@ func Handle(args []string, out io.Writer) (bool, error) {
 			return true, errors.New("version takes no arguments")
 		}
 		return true, json.NewEncoder(out).Encode(buildinfo.Current())
+	case "dev":
+		return true, devCommand(args[1:], out)
 	case "release":
 		return true, releaseCommand(args[1:], out)
 	default:

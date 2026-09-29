@@ -33,3 +33,11 @@ func TestFileReadToolOwnsPartialReadGuidance(t *testing.T) {
 		}
 	}
 }
+
+func TestCoreDevelopmentInstructionKeepsCandidateAndRuntimeSeparate(t *testing.T) {
+	for _, required := range []string{"luna dev", "source/", "LUNA_HOME", "候选补丁", "不在后台覆盖"} {
+		if !strings.Contains(instruction, required) {
+			t.Errorf("missing controlled self-development guidance %q", required)
+		}
+	}
+}
