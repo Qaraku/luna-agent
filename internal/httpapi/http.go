@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Qaraku/luna-agent/internal/agent"
+	"github.com/Qaraku/luna-agent/internal/buildinfo"
 	"github.com/Qaraku/luna-agent/internal/command"
 	"github.com/Qaraku/luna-agent/internal/fileread"
 	"github.com/Qaraku/luna-agent/internal/plugin"
@@ -51,6 +52,7 @@ type Sessions interface {
 }
 
 type Info struct {
+	Distribution bool
 	BoundHost    string
 	Model        string
 	ProviderHost string
@@ -418,6 +420,15 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		st := s.state()
 		plugins := pluginsReady(st.Plugins)
 		send(w, 200, map[string]any{"ready": st.ModelConfigured && plugins, "model_configured": st.ModelConfigured, "plugin_active": plugins})
+	case "/api/version":
+		if r.Method != http.MethodGet {
+			method(w, http.MethodGet)
+			return
+		}
+		send(w, 200, struct {
+			buildinfo.Info
+			Distribution bool `json:"distribution"`
+		}{buildinfo.Current(), s.info.Distribution})
 	case "/api/state":
 		if r.Method != http.MethodGet {
 			method(w, http.MethodGet)

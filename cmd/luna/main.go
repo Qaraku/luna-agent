@@ -24,6 +24,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/fileread"
 	"github.com/Qaraku/luna-agent/internal/httpapi"
 	"github.com/Qaraku/luna-agent/internal/layout"
+	"github.com/Qaraku/luna-agent/internal/maintenance"
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/Qaraku/luna-agent/internal/plugins/filewrite"
@@ -644,6 +645,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	verifyContext, stopVerify := context.WithTimeout(context.Background(), 30*time.Second)
+	defer stopVerify()
+	toolSources := append([]pluginhost.ToolSpec{}, pluginhost.Allowlist...)
+	toolSources = append(toolSources, jsonformat.Source())
+	pluginOptions, distribution, err := releaseOptions(verifyContext, root, paths.Cache, toolSources)
+	if err != nil {
+		return err
+	}
+	pluginOptions.ReadRoot = projectRoot(root, *readRoot)
+	pluginOptions.ReadLimit = *readLimit
+	stopVerify()
+
 	var sessionsDefault, stateDefault string
 	var dataNotes []string
 	if pinnedHome != "" {
@@ -813,9 +826,7 @@ func run() error {
 		log.Printf("luna: package %q is unavailable; inspect package management for details", problem)
 	}
 	stopRestore()
-	toolSources := append([]pluginhost.ToolSpec{}, pluginhost.Allowlist...)
-	toolSources = append(toolSources, jsonformat.Source())
-	plugins, err := pluginhost.New(ctx, root, pluginhost.Options{Tools: toolSources, ReadRoot: projectRoot(root, *readRoot), ReadLimit: *readLimit})
+	plugins, err := pluginhost.New(ctx, root, pluginOptions)
 	if err != nil {
 		return fmt.Errorf("start plugin host: %w", err)
 	}
@@ -864,7 +875,7 @@ func run() error {
 	// capabilities are both written there, and the same value serves both seams
 	// the HTTP layer uses.
 	prefs := newUserPreferences(skillSet, settingsPath, userSettings)
-	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Missing: cfg.Missing, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(prefs), httpapi.WithCapabilityPreference(prefs), httpapi.WithWriteDirs(prefs), httpapi.WithWorkspaces(workspaceStore), httpapi.WithProvider(runtime), httpapi.WithConfigSource(runtime), httpapi.WithRunTimeout(runTimeout), httpapi.WithFallbackRoot(projectRoot(root, *readRoot)))
+	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{Distribution: distribution, BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Missing: cfg.Missing, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(prefs), httpapi.WithCapabilityPreference(prefs), httpapi.WithWriteDirs(prefs), httpapi.WithWorkspaces(workspaceStore), httpapi.WithProvider(runtime), httpapi.WithConfigSource(runtime), httpapi.WithRunTimeout(runTimeout), httpapi.WithFallbackRoot(projectRoot(root, *readRoot)))
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: writeDeadlineFor(runTimeout), IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() {
@@ -892,6 +903,13 @@ func run() error {
 func main() {
 	if code, handled := terminal.NetworkHelper(os.Args); handled {
 		os.Exit(code)
+	}
+	if handled, err := maintenance.Handle(os.Args[1:], os.Stdout); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "luna:", err)
+			os.Exit(1)
+		}
+		return
 	}
 	if err := run(); err != nil {
 		log.Printf("luna: %v", err)

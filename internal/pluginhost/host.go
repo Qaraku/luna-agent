@@ -108,6 +108,10 @@ func (s State) Active(tool string) *Record {
 }
 
 type Options struct {
+	// Prebuilt非nil表示分发模式，所有登记工具必须有固定二进制；不回退源码构建。
+	Prebuilt map[string]PrebuiltBinary
+	// RuntimeDir存放可回收的插件代次；空值仅保留源码运行的旧路径。
+	RuntimeDir string
 	// Tools 可由可信装配方提供；nil 使用默认清单。每项在启动前验证并复制。
 	Tools        []ToolSpec
 	BuildTimeout time.Duration
@@ -363,6 +367,15 @@ func New(ctx context.Context, root string, opts Options) (*Host, error) {
 	}
 	h := &Host{root: resolved, opts: opts, next: 1}
 	h.withDefaults()
+	if opts.Prebuilt != nil {
+		h.opts.Prebuilt = make(map[string]PrebuiltBinary, len(opts.Prebuilt))
+		for name, binary := range opts.Prebuilt {
+			h.opts.Prebuilt[name] = binary
+		}
+		if !filepath.IsAbs(opts.RuntimeDir) {
+			return nil, fmt.Errorf("prebuilt runtime directory must be absolute")
+		}
+	}
 	if err := h.resolveReadRoot(); err != nil {
 		return nil, err
 	}
@@ -376,7 +389,12 @@ func New(ctx context.Context, root string, opts Options) (*Host, error) {
 			return nil, fmt.Errorf("invalid or duplicate registered tool %q", spec.Tool)
 		}
 		seen[spec.Tool] = true
-		if _, err := fileread.ResolveDir(filepath.Join(h.root, "plugins"), spec.Dir); err != nil && !(spec.Lazy && errors.Is(err, fileread.ErrNotFound)) {
+		if h.opts.Prebuilt != nil {
+			binary, ok := h.opts.Prebuilt[spec.Tool]
+			if !ok || binary.validate() != nil {
+				return nil, fmt.Errorf("missing or invalid prebuilt tool %s", spec.Tool)
+			}
+		} else if _, err := fileread.ResolveDir(filepath.Join(h.root, "plugins"), spec.Dir); err != nil && !(spec.Lazy && errors.Is(err, fileread.ErrNotFound)) {
 			return nil, fmt.Errorf("source for %s: %w", spec.Tool, err)
 		}
 		h.tools = append(h.tools, &toolRuntime{spec: spec})
@@ -421,39 +439,17 @@ func watchStartup(ctx context.Context, kill func()) func() {
 	return func() { once.Do(func() { close(done) }); <-exited }
 }
 func (h *Host) start(parent context.Context, rt *toolRuntime) (*generation, error) {
-	source, err := fileread.ResolveDir(filepath.Join(h.root, "plugins"), rt.spec.Dir)
-	if err != nil {
-		return nil, fmt.Errorf("source for %s: %w", rt.spec.Tool, err)
-	}
-	relative, err := filepath.Rel(h.root, source)
+	path, err := h.prepareExecutable(parent, rt.spec)
 	if err != nil {
 		return nil, err
 	}
-	buildCtx, buildCancel := context.WithTimeout(parent, h.opts.BuildTimeout)
-	defer buildCancel()
-	runtimeDir := filepath.Join(h.root, ".runtime")
-	if err := os.MkdirAll(runtimeDir, 0700); err != nil {
-		return nil, err
-	}
-	f, err := os.CreateTemp(runtimeDir, "plugin-"+rt.spec.Tool+"-")
-	if err != nil {
-		return nil, err
-	}
-	path := f.Name()
-	_ = f.Close()
 	ok := false
 	defer func() {
 		if !ok {
 			_ = os.Remove(path)
 		}
 	}()
-	dir := "./" + filepath.ToSlash(relative)
-	cmd := exec.CommandContext(buildCtx, "go", "build", "-o", path, dir)
-	cmd.Dir = h.root
-	cmd.Env = minimalEnv()
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("build %s: %w: %.2000s", dir, err, out)
-	}
+	dir := rt.spec.Dir
 	proc := exec.Command(path)
 	proc.Env = minimalEnv()
 	client := plugin.NewClient(&plugin.ClientConfig{HandshakeConfig: pluginprotocol.Handshake, Plugins: map[string]plugin.Plugin{"tool": &pluginprotocol.ToolPlugin{}}, Cmd: proc, SkipHostEnv: true, AllowedProtocols: []plugin.Protocol{plugin.ProtocolNetRPC}, StartTimeout: h.opts.StartTimeout, Logger: hclog.NewNullLogger(), SyncStdout: io.Discard, SyncStderr: io.Discard})
