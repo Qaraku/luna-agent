@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -20,6 +21,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/agent"
 	"github.com/Qaraku/luna-agent/internal/command"
 	"github.com/Qaraku/luna-agent/internal/config"
+	"github.com/Qaraku/luna-agent/internal/fileread"
 	"github.com/Qaraku/luna-agent/internal/httpapi"
 	"github.com/Qaraku/luna-agent/internal/layout"
 	"github.com/Qaraku/luna-agent/internal/plugin"
@@ -214,7 +216,7 @@ func workspaceLookup(sessions *store.Store, items *workspacedata.Store) workspac
 // one the Workspace capability contributes when the operator did not name another.
 // Pointing -rules-file somewhere else stays possible; the point of the default is
 // that a project agent reads its project's rules without being told to.
-const defaultRulesName = "AGENTS.md"
+const defaultRulesName = workspace.RulesFileName
 
 // fileExists reports whether a path is a regular file: the project rules file we
 // could read, or a capability's own state file when compatibility asks whether
@@ -225,37 +227,22 @@ func fileExists(path string) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
-// resolveRulesFile decides which file to read the project's rules from. An
-// explicit -rules-file always wins; otherwise the project's own AGENTS.md is used
-// when it is there, because a project agent that does not read its project's rules
-// is a project agent in name only. Neither being present is not an error: it just
-// means there are no rules to contribute.
-func resolveRulesFile(explicit, root string) string {
+// loadProjectRules 让自动发现的 AGENTS.md 复用文件工具边界；显式 CLI 覆盖仍按用户选择读取。
+func loadProjectRules(root, explicit string, maxText int) (string, string) {
 	if explicit != "" {
-		return explicit
+		return loadRules(explicit, maxText)
 	}
-	candidate := filepath.Join(root, defaultRulesName)
-	if fileExists(candidate) {
-		return candidate
+	path, err := fileread.Resolve(root, defaultRulesName, maxText)
+	if errors.Is(err, fileread.ErrNotFound) {
+		return "", ""
 	}
-	return ""
+	if err != nil {
+		return "", fmt.Sprintf("project rules file %q cannot be read: %s", defaultRulesName, err)
+	}
+	return loadRules(path, maxText)
 }
 
-// loadRules reads the project-rule file the Workspace capability will
-// contribute.
-//
-// Reading belongs to this layer, not to the capability: the capability never
-// opens a path, so it needs no filesystem permission — and the Kernel only
-// enforces permissions it can, so a permission declared but not enforced would
-// be a claim that means nothing. Here there is a path, and the file is read
-// with the capability's own text ceiling.
-//
-// The second return value is a problem statement for the operator when no rules
-// can be contributed: a file that cannot be opened, that is empty, or that is
-// larger than the ceiling yields no text rather than a truncated rule set. The
-// statement names the file, never the absolute path it sits in, and it is for
-// the operator only — it is never handed to the capability, so it cannot reach
-// the model.
+// loadRules 只返回完整文本；超限、二进制或不可读时给出不含绝对路径和内容的说明。
 func loadRules(path string, maxText int) (text, problem string) {
 	if path == "" {
 		return "", ""
@@ -272,12 +259,16 @@ func loadRules(path string, maxText int) (text, problem string) {
 	if err != nil {
 		return "", fmt.Sprintf("project rules file %q cannot be read: %s", name, fileReason(err))
 	}
+	// 必须在去除空白前检查实际读入字节数，否则大文件的前缀可能被误当作完整规则。
+	if len(data) > maxText {
+		return "", fmt.Sprintf("project rules file %q is larger than %d bytes", name, maxText)
+	}
+	if bytes.IndexByte(data, 0) >= 0 {
+		return "", fmt.Sprintf("project rules file %q is not text (contains NUL)", name)
+	}
 	text = strings.TrimSpace(string(data))
 	if text == "" {
 		return "", fmt.Sprintf("project rules file %q is empty", name)
-	}
-	if len(text) > maxText {
-		return "", fmt.Sprintf("project rules file %q is larger than %d bytes", name, maxText)
 	}
 	return text, ""
 }
@@ -573,7 +564,7 @@ func run() error {
 	readLimit := flag.Int("read-limit", 0, "single-read cap in bytes for luna_read_file (default: 262144)")
 	sessionsFlag := flag.String("sessions-dir", "", "directory holding the append-only session files (default: chosen at startup — <data-dir>/sessions, or the previous <root>/.runtime/sessions/ while the sessions are still there; startup logs which one is in use)")
 	stateFlag := flag.String("state-dir", "", "root directory holding capability state (default: chosen at startup — <data-dir>, or the previous <root> while that is where the capability state already is; startup logs which one is in use)")
-	rulesFlag := flag.String("rules-file", "", "file holding the project rules the workspace capability contributes (default: none)")
+	rulesFlag := flag.String("rules-file", "", "file holding the project rules the workspace capability contributes (default: project AGENTS.md when present)")
 	configFlag := flag.String("config-file", "", "user configuration file to read (default: <config-dir>/config.yaml)")
 	skillDirs := repeatedPath{}
 	flag.Var(&skillDirs, "skills-dir", "extra directory to discover skills in (may be repeated; the user-level <data-dir>/skills is always read)")
@@ -688,8 +679,7 @@ func run() error {
 	// root, so it claims no namespace and asks for no permission. The rules are
 	// read here and handed in as text — the capability opens no file, so it
 	// needs no permission the Kernel cannot yet enforce.
-	rulesFile := resolveRulesFile(*rulesFlag, projectRoot(root, *readRoot))
-	rules, rulesProblem := loadRules(rulesFile, workspace.MaxRulesTextBytes)
+	rules, rulesProblem := loadProjectRules(projectRoot(root, *readRoot), *rulesFlag, workspace.MaxRulesTextBytes)
 	if rulesProblem != "" {
 		log.Printf("luna: %s; no project rules will be contributed", rulesProblem)
 	}

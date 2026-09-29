@@ -55,7 +55,7 @@ const (
 	// The capability never emits a rules block larger than this. An over-long set
 	// of rules is refused, not cut, because a rule that stops mid-sentence is a
 	// rule the project never wrote.
-	RulesBudgetBytes = 4 * 1024
+	RulesBudgetBytes = 32 * 1024
 )
 
 const (
@@ -79,8 +79,8 @@ const (
 // MaxRulesTextBytes is the most rule text the capability accepts — the whole
 // text of one directory's rules, or of the fallback root's. The composition root
 // reads the fallback rules file with this ceiling: a file larger than it yields
-// no rules rather than a truncated rule set. A workspace of several directories
-// gets this text budget divided between them instead, see rulesBudget.
+// no rules rather than a truncated rule set. 多目录按完整文件的实际占用共享规则块，
+// 没有规则的目录不预留份额。
 const MaxRulesTextBytes = RulesBudgetBytes - rulesBlockOverhead
 
 // Target is a workspace as this capability needs it: the name to show and the

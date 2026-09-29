@@ -21,7 +21,7 @@ func WithCapabilities(reg *plugin.Registry) Option { return func(r *Runner) { r.
 
 // MaxContributedContextBytes bounds what every capability may add to one run's
 // system message, on top of each contribution's own budget.
-const MaxContributedContextBytes = 32 * 1024
+const MaxContributedContextBytes = 64 * 1024
 
 // capabilityTools returns the model-visible tools of every enabled capability.
 func (r *Runner) capabilityTools() []contributedTool {

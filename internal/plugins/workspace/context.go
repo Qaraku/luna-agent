@@ -98,13 +98,6 @@ func rulesSectionLabel(dir string) string {
 	return "\nRules from \"" + dir + "\":\n"
 }
 
-// minPerDirRulesText is the least text one directory's rules may be given before
-// the capability stops dividing the rules budget. Below this a rules file this
-// small could only hold a sentence, and a sentence that gets cut is exactly what
-// this capability refuses to do; so a workspace with this many directories
-// contributes no rules at all, and says so to the operator.
-const minPerDirRulesText = 64
-
 // rulesBlock renders the fallback project-rule contribution, or reports that
 // there is none to make. It contributes nothing in three honest cases and never
 // a shortened rule set:
@@ -135,68 +128,35 @@ func (p *Plugin) rulesBlock() (plugin.ContextBlock, bool) {
 	}, true
 }
 
-// workspaceRulesBlock renders the rules of every directory in a workspace as one
-// instruction block, or reports that there is none to make.
-//
-// The block's declared budget is the total for all the directories: a workspace
-// of several directories must not fill the prompt, so the text budget is divided
-// between them and no directory's rules can push another's out. A directory's
-// rules that do not fit its share are dropped with a statement for the operator,
-// never cut: the same rule the fallback path follows, applied per directory.
-//
-// A directory with no AGENTS.md, or with an empty one, simply states no rules and
-// nothing is said about it — that is the ordinary case, and a statement per
-// directory would make the operator's log unreadable. A file that is there but
-// cannot be used is reported, because "the directory has no rules" and "the rules
-// could not be read" are different facts.
+// workspaceRulesBlock 按工作区顺序纳入完整规则文件；空目录不占预算份额。
+// 每个文件的读取仍有上限，累计放不下时只跳过整份文件并报告，绝不截断规则。
 func (p *Plugin) workspaceRulesBlock(target Target) (plugin.ContextBlock, bool, error) {
-	labels := make([]string, 0, len(target.Dirs))
-	overhead := rulesBlockOverhead
-	for _, dir := range target.Dirs {
-		label := rulesSectionLabel(dirName(dir))
-		labels = append(labels, label)
-		overhead += len(label)
-	}
-	perDir := (RulesBudgetBytes - overhead) / len(target.Dirs)
-	if perDir < minPerDirRulesText {
-		p.reportProblem(fmt.Sprintf(
-			"the workspace rules block cannot hold %d directories: each would get less than %d bytes, so no workspace rules are contributed",
-			len(target.Dirs), minPerDirRulesText))
-		return plugin.ContextBlock{}, false, nil
-	}
+	used := rulesBlockOverhead
 	sections := make([]string, 0, len(target.Dirs))
-	for i, dir := range target.Dirs {
-		text, ok := p.readDirRules(dir, perDir)
+	for _, dir := range target.Dirs {
+		text, ok := p.readDirRules(dir, MaxRulesTextBytes)
 		if !ok {
 			continue
 		}
-		sections = append(sections, labels[i]+text)
+		section := rulesSectionLabel(dirName(dir)) + text
+		if len(section) > RulesBudgetBytes-used {
+			p.reportProblem(fmt.Sprintf("%s in the workspace directory %q was not contributed: the complete section needs %d bytes, but only %d of the %d-byte rules block remain", RulesFileName, dirName(dir), len(section), RulesBudgetBytes-used, RulesBudgetBytes))
+			continue
+		}
+		sections = append(sections, section)
+		used += len(section)
 	}
 	if len(sections) == 0 {
 		return plugin.ContextBlock{}, false, nil
 	}
-	full := rulesBlockHeader + "\n" + strings.Join(sections, "")
-	// The arithmetic above already keeps this true; it is checked because a
-	// block larger than the declared budget would be truncated by the Kernel,
-	// and a truncated rule set is the one thing this capability refuses to
-	// contribute. This is the version disagreeing with itself, not the project's
-	// rules being long.
-	if len(full) > RulesBudgetBytes {
-		return plugin.ContextBlock{}, false, fmt.Errorf(
-			"the workspace rules block is %d bytes, over the %d-byte budget it declares", len(full), RulesBudgetBytes)
-	}
-	return plugin.ContextBlock{
-		ID:   RulesContextID,
-		Kind: plugin.ContextInstruction,
-		Text: full,
-	}, true, nil
+	return plugin.ContextBlock{ID: RulesContextID, Kind: plugin.ContextInstruction, Text: rulesBlockHeader + "\n" + strings.Join(sections, "")}, true, nil
 }
 
 // readDirRules reads one directory's rules through internal/fileread, the same
 // bounded text read the Skills capability uses for its own root, so a workspace
 // directory and a skill directory cannot disagree about what a readable file is.
 //
-// budget is that directory's share of the rules text; a file over it is refused
+// budget bounds a complete rule file before allocation; a file over it is refused
 // rather than read partly, and the refusal is stated to the operator. Nothing
 // here reaches the model: the model either reads the directory's rules or is not
 // told about them at all.

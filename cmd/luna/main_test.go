@@ -540,27 +540,31 @@ func TestTheRulesReadCeilingIsTheCapabilitysOwn(t *testing.T) {
 // An explicit choice is never second-guessed, and the default is the project's own
 // rules file rather than nothing: a project agent that ignores the file its project
 // keeps its rules in is not reading the project. Neither case is an error.
-func TestTheRulesDefaultToTheProjectsOwnFile(t *testing.T) {
+func TestProjectRulesDefaultAndExplicitSelection(t *testing.T) {
 	root := t.TempDir()
-	if got := resolveRulesFile("/somewhere/else.md", root); got != "/somewhere/else.md" {
-		t.Fatalf("explicit choice was overridden: %q", got)
-	}
-	if got := resolveRulesFile("", root); got != "" {
-		t.Fatalf("a project without a rules file named one anyway: %q", got)
+	if text, problem := loadProjectRules(root, "", workspace.MaxRulesTextBytes); text != "" || problem != "" {
+		t.Fatalf("missing rules: %d bytes, %q", len(text), problem)
 	}
 	rules := filepath.Join(root, defaultRulesName)
-	if err := os.WriteFile(rules, []byte("- be truthful\n"), 0o644); err != nil {
+	if err := os.WriteFile(rules, []byte("project rules"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if got := resolveRulesFile("", root); got != rules {
-		t.Fatalf("the project's own rules file was not picked up: %q", got)
+	if text, problem := loadProjectRules(root, "", workspace.MaxRulesTextBytes); text != "project rules" || problem != "" {
+		t.Fatalf("default selection: %q", problem)
 	}
-	// 目录同名不算规则文件：读它会得到一句无意义的错误。
-	if err := os.Mkdir(filepath.Join(root, "dir-"+defaultRulesName), 0o755); err != nil {
+	explicit := filepath.Join(t.TempDir(), "chosen.md")
+	if err := os.WriteFile(explicit, []byte("explicit rules"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if got := resolveRulesFile("", filepath.Join(root, "dir-"+defaultRulesName)); got != "" {
-		t.Fatalf("a directory was treated as a rules file: %q", got)
+	if text, problem := loadProjectRules(root, explicit, workspace.MaxRulesTextBytes); text != "explicit rules" || problem != "" {
+		t.Fatalf("explicit selection: %q", problem)
+	}
+	directoryRoot := t.TempDir()
+	if err := os.Mkdir(filepath.Join(directoryRoot, defaultRulesName), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if text, problem := loadProjectRules(directoryRoot, "", workspace.MaxRulesTextBytes); text != "" || problem == "" {
+		t.Fatalf("a directory must be reported, not treated as a rule file: %q", problem)
 	}
 }
 
