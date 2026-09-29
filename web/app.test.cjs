@@ -604,7 +604,7 @@ test('visible sessions refresh without diagnostics or replacing the focused acti
   assert.equal(h.document.activeElement, h.$('session-toggle'));
   const hiddenCount = h.calls.length;
   await h.poll();
-  assert.deepEqual(h.calls.slice(hiddenCount).map(({ url }) => url), ['/api/state', '/api/execution', '/api/models', '/api/reasoning'], '侧栏关闭后仍刷新主界面的会话设置，不读取隐藏的会话列表');
+  assert.deepEqual(h.calls.slice(hiddenCount).map(({ url }) => url), ['/api/state', '/api/execution', '/api/setup', '/api/models', '/api/reasoning'], '侧栏关闭后仍刷新主界面的会话设置，不读取隐藏的会话列表');
 });
 
 test('capability panels come only from enabled capabilities, in the kernel order', () => {
@@ -4726,4 +4726,63 @@ test('Composer widget 数据源超时后释放请求并允许重试',async(t)=>{
  function withSource(){return {id:'slow',title:'慢数据',entry:'/api/memory/panel.js',source:'/api/memory/slow'};}
  await h.poll();await h.expireNetworkRequests();assert.match(h.$('conversation-status').textContent,/请求超时/);
  await h.poll();assert.equal(requests,2);cap.state='disabled';await h.poll();
+});
+
+function presetControlHarness({hash='',server={created:false,selection:null},failSave=false,failCatalog=false}={}) {
+ const json=(payload,ok=true)=>({ok,status:ok?200:409,json:async()=>payload});
+ const entries=[{owner:'presets',id:'general',title:'通用助手',revision:'one',capabilities:null},{owner:'presets',id:'research',title:'资料研究',revision:'two',capabilities:['web']}];
+ const h=navigationHarness({hash,respond:async(url,options)=>{
+  if(url==='/api/commands')return json({commands:[{name:'preset',summary:'预设',args:'text',busy:'reject'}]});
+  if(url==='/api/presets')return failCatalog?json({error:'catalog disabled'},false):json({presets:entries});
+  if(url.startsWith('/api/setup'))return json({selection:url.includes('session=cccccccc')?server.selection:null,unavailable_capabilities:server.selection?.id==='research'?['web']:[]});
+  if(url==='/api/sessions'&&options?.method==='POST'){server.created=true;return json({id:'cccccccc',title:'',records:[]});}
+  if(url==='/api/sessions/cccccccc/setup'){
+   if(failSave)return json({error:'synthetic preset conflict'},false);
+   const body=JSON.parse(options.body);server.selection=body.reset?null:entries.find(entry=>entry.id===body.id);return json({session_id:'cccccccc',selection:server.selection});
+  }
+  if(url==='/api/sessions/cccccccc')return json({id:'cccccccc',title:'',records:[]});
+  if(url.startsWith('/api/models'))return json({models:[{name:'one'}],current:{name:'one',origin:server.selection?'setup':'global'}});
+  if(url.startsWith('/api/reasoning'))return json({levels:['high','max'],current:{reasoning_effort:'high',origin:server.selection?'setup':'global'}});
+  if(url==='/api/state')return json({model:'one',capabilities:[],busy:false});
+ }});
+ h.server=server;h.pick=async(value)=>{const row=[...h.$('command-menu').children].find(row=>row.textContent.includes(value));assert.ok(row,'预设候选应包含 '+value);row.emit('mousedown');await h.settle();};return h;
+}
+
+test('预设快速选择保留草稿，只创建空会话且不授予权限',async()=>{
+ const h=presetControlHarness();await h.settle();h.$('message').value='保留这段草稿';
+ await h.click('session-preset');await h.pick('research');
+ assert.equal(h.server.selection.id,'research');assert.equal(h.$('message').value,'保留这段草稿');
+ assert.match(h.$('session-preset').textContent,/资料研究/);
+ assert.match(h.$('session-preset').title,/web/,'未启用能力须可见');
+ const saved=h.calls.find(call=>call.url==='/api/sessions/cccccccc/setup');assert.deepEqual(JSON.parse(saved.options.body),{owner:'presets',id:'research'});
+ assert.equal(h.calls.some(call=>call.url==='/api/runs'||call.url.includes('/execution')&&call.options?.method==='POST'),false);
+ assert.equal(h.$('chat-form').contains(h.$('session-preset')),false,'详细预设入口仍在折叠菜单中');
+ const restored=presetControlHarness({hash:h.location.hash,server:h.server});await restored.settle();assert.match(restored.$('session-preset').textContent,/资料研究/);
+ await restored.click('session-new');await restored.settle();assert.match(restored.$('session-preset').textContent,/未选择/);
+});
+
+test('预设命令直接保存会话选择，失败保留命令和旧选择',async()=>{
+ for(const failSave of [false,true]){
+  const h=presetControlHarness({failSave});await h.settle();h.$('message').value='/preset research';h.$('chat-form').emit('submit');await h.settle();
+  assert.equal(h.calls.some(call=>call.url==='/api/runs'),false);
+  if(failSave){assert.equal(h.server.selection,null);assert.equal(h.$('message').value,'/preset research');assert.match(h.$('conversation-status').textContent,/synthetic preset conflict/);}
+  else{assert.equal(h.server.selection.id,'research');assert.equal(h.$('message').value,'');h.$('message').value='/preset --default';h.$('chat-form').emit('submit');await h.settle();assert.equal(h.server.selection,null);}
+ }
+});
+
+
+test('预设管理入口使用能力面板，关闭后卸载模块',async()=>{
+ let mounts=0,unmounts=0;
+ const h=navigationHarness({panelModules:{'/api/presets/panel.js':{mount(){mounts++},unmount(){unmounts++}}},respond:async url=>url==='/api/state'?{ok:true,json:async()=>({model:'one',capabilities:[{id:'presets',title:'工作预设',state:'enabled',panels:[{id:'presets',title:'工作预设',entry:'/api/presets/panel.js'}]}],busy:false})}:undefined});
+ await h.settle();await h.click('composer-add');await h.click('composer-presets');await h.settle();assert.equal(h.$('capability-panel-presets').hidden,false);assert.equal(mounts,1);h.key('Escape');await h.settle();assert.equal(unmounts,1);
+});
+
+test('切换会话取消未完成的预设候选请求，迟到结果不重新打开菜单',async()=>{
+ let release;const h=navigationHarness({hash:'#session=aaaaaaaa',respond:async(url)=>{if(url==='/api/presets'){await new Promise(resolve=>release=resolve);return {ok:true,json:async()=>({presets:[{id:'stale',title:'旧会话'}]})};}}});
+ await h.settle();await h.click('session-preset');await h.click('session-new');const call=h.calls.find(item=>item.url==='/api/presets');assert.equal(call.options.signal.aborted,true);release();await h.settle();assert.equal(h.$('command-menu').hidden,true);assert.doesNotMatch(h.$('session-preset').textContent,/旧会话/);
+});
+
+
+test('预设目录停用后仍可从快速入口清除旧绑定',async()=>{
+ const server={created:true,selection:{owner:'presets',id:'research',title:'资料研究',revision:'old'}};const h=presetControlHarness({hash:'#session=cccccccc',server,failCatalog:true});await h.settle();await h.click('session-preset');await h.pick('--default');assert.equal(server.selection,null);assert.match(h.$('session-preset').textContent,/未选择/);
 });

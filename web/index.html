@@ -63,11 +63,14 @@
           <ul id="command-menu" class="command-menu" role="listbox" aria-label="命令候选" hidden></ul>
           <section id="composer-actions" class="composer-popover" aria-label="能力与运行组件" hidden>
             <button id="composer-capabilities" class="composer-menu-action" type="button">管理能力</button>
+            <button id="composer-presets" class="composer-menu-action" type="button">管理预设</button>
             <button id="composer-workspace" class="composer-menu-action" type="button">选择项目</button>
             <h3 class="composer-menu-label">运行组件</h3>
             <div id="widget-menu"></div>
           </section>
           <section id="composer-settings" class="composer-popover composer-popover-end" aria-label="模型与思考" hidden>
+            <button id="session-preset" class="composer-menu-action" type="button" aria-controls="command-menu" aria-expanded="false">预设：未选择</button>
+            <p id="session-preset-detail" class="luna-muted" hidden></p>
             <button id="session-model" class="composer-menu-action" type="button" aria-controls="command-menu" aria-expanded="false">模型：读取中</button>
             <button id="session-reasoning" class="composer-menu-action" type="button" aria-controls="command-menu" aria-expanded="false">思考：读取中</button>
           </section>

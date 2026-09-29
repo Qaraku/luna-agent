@@ -1606,6 +1606,11 @@ if (typeof document !== 'undefined') {
   let currentWorkspaceID = '';
   let sessionModelChoice = null;
   let sessionReasoningChoice = null;
+  let sessionSetupChoice = null;
+  let sessionSetupProblem = '';
+  let setupRevision = 0;
+  let setupController = null;
+  let presetPickerController = null;
   let sessionControlsProblem = '';
   let sessionControlsRevision = 0;
   let controlPickerRevision = 0;
@@ -2547,8 +2552,11 @@ if (typeof document !== 'undefined') {
 
   function closeCommandMenu() {
     controlPickerRevision += 1;
+    presetPickerController?.abort();
+    presetPickerController = null;
     $('session-model').setAttribute('aria-expanded', 'false');
     $('session-reasoning').setAttribute('aria-expanded', 'false');
+    $('session-preset').setAttribute('aria-expanded', 'false');
     commandItems = [];
     commandSelection = -1;
     commandMenuNode.replaceChildren();
@@ -2612,9 +2620,10 @@ if (typeof document !== 'undefined') {
     const item = commandItems[commandSelection];
     if (!item) { closeCommandMenu(); return; }
     closeCommandMenu();
-    if (execute && item.value !== undefined && ['model', 'reasoning', 'permissions'].includes(item.name)) {
+    if (execute && item.value !== undefined && ['model', 'reasoning', 'permissions', 'preset'].includes(item.name)) {
       if (item.name === 'model') applyModelChoice(item.value);
       else if(item.name==='permissions') applyPermissionCommand(item.value);
+      else if(item.name==='preset') applyPresetChoice(item.value);
       else applyReasoningChoice(item.value);
       input.focus();
       return;
@@ -2622,7 +2631,7 @@ if (typeof document !== 'undefined') {
     input.value = item.insert;
     resizeInput();
     input.focus();
-    if (execute && ['model', 'reasoning'].includes(item.name)) openControlPicker(item.name);
+    if (execute && ['model', 'reasoning', 'preset'].includes(item.name)) openControlPicker(item.name);
   }
 
   // The answer to `/help` is the table itself: every command, in the order the
@@ -2872,7 +2881,13 @@ if (typeof document !== 'undefined') {
     const effortButton = $('session-reasoning');
     modelButton.textContent = '模型：' + model;
     effortButton.textContent = '思考：' + effort;
-    const source = (choice) => choice?.origin === 'session' ? '当前会话选择' : '跟随全局默认';
+    const source = (choice) => choice?.origin === 'session' ? '当前会话选择' : choice?.origin === 'setup' ? '继承工作预设' : '跟随全局默认';
+    const presetButton = $('session-preset');
+    presetButton.textContent = '预设：' + (sessionSetupChoice?.title || sessionSetupChoice?.id || '未选择');
+    presetButton.title = [sessionSetupChoice?.revision ? '固定版本 ' + sessionSetupChoice.revision.slice(0, 12) : '为当前会话选择工作方式；不会授予权限', sessionSetupProblem].filter(Boolean).join(' · ');
+    presetButton.disabled = running || switching;
+    $('session-preset-detail').textContent = sessionSetupProblem;
+    $('session-preset-detail').hidden = !sessionSetupProblem;
     modelButton.title = model + ' · ' + source(sessionModelChoice) + (sessionControlsProblem ? ' · 更新失败：' + sessionControlsProblem : '');
     effortButton.title = effort + ' · ' + source(sessionReasoningChoice) + (sessionControlsProblem ? ' · 更新失败：' + sessionControlsProblem : '');
     modelButton.disabled = effortButton.disabled = running || switching;
@@ -2888,6 +2903,7 @@ if (typeof document !== 'undefined') {
 
   async function updateSessionControls() {
     updateExecutionState();
+    updateSetupState();
     const revision = ++sessionControlsRevision;
     const id = currentSessionID;
     const query = sessionQuery();
@@ -2908,6 +2924,7 @@ if (typeof document !== 'undefined') {
 
   async function openControlPicker(kind) {
     if (running || switching) return;
+    if (kind === 'preset') return openPresetPicker();
     closeComposerPopover(false);
     const revision = ++controlPickerRevision;
     const id = currentSessionID;
@@ -2921,12 +2938,12 @@ if (typeof document !== 'undefined') {
       if (kind === 'model') {
         sessionModelChoice = current;
         options = (payload.models || []).map(model => ({ value: model.name, summary: model.provider || '' }));
-        options.push({ value: '--default', summary: '跟随全局默认模型' });
+        options.push({ value: '--default', summary: '继承预设或全局模型' });
       } else {
         sessionReasoningChoice = current;
-        options = [{ value: '--default', summary: '跟随全局设置' }, { value: '--off', summary: '不发送思考字段（不同于 none）' }, ...(payload.levels || []).map(value => ({ value }))];
+        options = [{ value: '--default', summary: '继承预设或全局设置' }, { value: '--off', summary: '不发送思考字段（不同于 none）' }, ...(payload.levels || []).map(value => ({ value }))];
       }
-      const chosen = current.origin === 'global' ? '--default' : kind === 'model' ? current.name : current.reasoning_effort || '--off';
+      const chosen = current.origin !== 'session' ? '--default' : kind === 'model' ? current.name : current.reasoning_effort || '--off';
       options = options.map(option => ({ ...option, summary: [option.value === chosen ? '当前' : '', option.summary].filter(Boolean).join(' · ') }));
       const items = commandCandidates([{ name: kind, args: 'options', options }], '/' + kind + ' ').items;
       renderCommandList(items);
@@ -3013,6 +3030,78 @@ if (typeof document !== 'undefined') {
     } catch (error) { setConversationStatus('切换失败：' + error.message, true); }
   }
 
+  async function updateSetupState() {
+    const revision = ++setupRevision;
+    const id = currentSessionID;
+    setupController?.abort();
+    const controller = new AbortController();
+    setupController = controller;
+    const deadline = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch('/api/setup' + sessionQuery(), { cache: 'no-store', signal: controller.signal });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      const payload = await response.json();
+      if (revision !== setupRevision || id !== currentSessionID || controller.signal.aborted) return;
+      sessionSetupChoice = payload.selection || null;
+      sessionSetupProblem = payload.problem || (payload.unavailable_capabilities?.length ? '尚未启用：' + payload.unavailable_capabilities.join('、') : '');
+    } catch (error) {
+      if (revision !== setupRevision || id !== currentSessionID) return;
+      sessionSetupProblem = controller.signal.aborted ? '预设读取超时，可重新打开菜单' : '预设读取失败：' + error.message;
+    } finally {
+      clearTimeout(deadline);
+      if (setupController === controller) setupController = null;
+    }
+    if (revision === setupRevision && id === currentSessionID) renderSessionControls();
+  }
+
+  async function openPresetPicker() {
+    if (running || switching) return;
+    closeComposerPopover(false);
+    const revision = ++controlPickerRevision;
+    const id = currentSessionID;
+    presetPickerController?.abort();
+    const controller = new AbortController();
+    presetPickerController = controller;
+    const deadline = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch('/api/presets', { cache: 'no-store', signal: controller.signal });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      const payload = await response.json();
+      if (revision !== controlPickerRevision || id !== currentSessionID || running || switching) return;
+      const options = (Array.isArray(payload.presets) ? payload.presets : []).map(preset => ({
+        value: preset.id,
+        summary: [preset.title, preset.id === sessionSetupChoice?.id && sessionSetupChoice?.owner === 'presets' ? preset.revision === sessionSetupChoice.revision ? '当前版本' : '会话仍使用旧版本；点击采用新版' : '', preset.builtin ? '内置' : '自定义'].filter(Boolean).join(' · ')
+      }));
+      options.push({ value: '--default', summary: '清除预设，保留其他会话设置' });
+      const items = commandCandidates([{ name: 'preset', args: 'options', options }], '/preset ').items;
+      renderCommandList(items);
+      $('session-preset').setAttribute('aria-expanded', 'true');
+      input.focus();
+    } catch (error) {
+      if (revision !== controlPickerRevision || id !== currentSessionID) return;
+      setConversationStatus(controller.signal.aborted ? '读取预设超时，请重试。' : '读取预设失败：' + error.message + '。可清除旧绑定，或在设置中启用工作预设能力。', true);
+      if (sessionSetupChoice) {
+        renderCommandList(commandCandidates([{ name: 'preset', args: 'options', options: [{ value: '--default', summary: '清除当前预设，保留其他会话设置' }] }], '/preset ').items);
+        $('session-preset').setAttribute('aria-expanded', 'true');
+      }
+    } finally { clearTimeout(deadline); if (presetPickerController === controller) presetPickerController = null; }
+  }
+
+  async function applyPresetChoice(value) {
+    if (!value) return openPresetPicker();
+    try {
+      const split = value.indexOf(':');
+      const body = value === '--default' ? { reset: true } : { owner: split < 0 ? 'presets' : value.slice(0, split), id: split < 0 ? value : value.slice(split + 1) };
+      const result = await saveSessionSetting('setup', body);
+      sessionSetupChoice = result.selection || null;
+      sessionSetupProblem = '';
+      clearControlDraft('preset');
+      renderSessionControls();
+      setConversationStatus(sessionSetupChoice ? '已选择“' + (sessionSetupChoice.title || sessionSetupChoice.id) + '”。权限保持不变，已有模型/思考选择优先。' : '已清除预设，其他会话设置保持不变。');
+      await updateSessionControls();
+    } catch (error) { setConversationStatus('切换预设失败：' + error.message, true); }
+  }
+
   let composerPopover = null;
   function closeComposerPopover(restoreFocus = true) {
     if (!composerPopover) return;
@@ -3051,8 +3140,15 @@ if (typeof document !== 'undefined') {
   }
   $('composer-capabilities').addEventListener('click', () => openComposerSettings('capabilities'));
   $('composer-workspace').addEventListener('click', () => openComposerSettings('workspace'));
+  $('composer-presets').addEventListener('click', () => {
+    closeComposerPopover(false);
+    const record = capabilityPanelNodes.get('presets');
+    if (record) openDrawer(record.panel);
+    else { openComposerSettings('capabilities'); setConversationStatus('请先启用工作预设能力。'); }
+  });
   $('composer-project-change').addEventListener('click', () => openComposerSettings('workspace'));
 
+  $('session-preset').addEventListener('click', () => openControlPicker('preset'));
   $('session-model').addEventListener('click', () => openControlPicker('model'));
   $('session-reasoning').addEventListener('click', () => openControlPicker('reasoning'));
 
@@ -3079,6 +3175,7 @@ if (typeof document !== 'undefined') {
     }
     if (command.name === 'permissions') { applyPermissionCommand(argument); return; }
     if (command.name === 'reasoning') { applyReasoningChoice(argument); return; }
+    if (command.name === 'preset') { applyPresetChoice(argument); return; }
     if (command.name === 'model') {
       applyModelChoice(argument);
       return;
@@ -5042,7 +5139,10 @@ if (typeof document !== 'undefined') {
       renderModelList();
       setModelSwitchStatus('正在读取当前会话的模型…');
     }
-    sessionModelChoice = sessionReasoningChoice = null;
+    sessionModelChoice = sessionReasoningChoice = sessionSetupChoice = null;
+    sessionSetupProblem = '';
+    setupRevision += 1;
+    setupController?.abort();
     sessionControlsRevision += 1;
     rerenderSessions();
     switching = true;
@@ -5074,7 +5174,10 @@ if (typeof document !== 'undefined') {
   function dropSession() {
     currentSessionID = '';
     resetExecutionState();
-    sessionModelChoice = sessionReasoningChoice = null;
+    sessionModelChoice = sessionReasoningChoice = sessionSetupChoice = null;
+    sessionSetupProblem = '';
+    setupRevision += 1;
+    setupController?.abort();
     closeCommandMenu();
     updateSessionControls();
     history.replaceState(null, '', `${location.pathname}${location.search}`);
