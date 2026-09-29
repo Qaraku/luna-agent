@@ -232,3 +232,36 @@ func selectedReasoning(cfg *store.ConfigRecord) (*string, string) {
 	}
 	return nil, originGlobal
 }
+
+func (s *Server) listSetups(w http.ResponseWriter, r *http.Request) {
+	type choice struct {
+		runconfig.Selection
+		SourceTitle string `json:"source_title"`
+	}
+	choices := []choice{}
+	if s.capabilities != nil {
+		for _, entry := range s.capabilities.Enabled() {
+			source, ok := entry.Plugin.(plugin.SetupCatalog)
+			if !ok {
+				continue
+			}
+			items, err := source.Setups()
+			if err != nil {
+				fail(w, 500, err)
+				return
+			}
+			if len(choices)+len(items) > 256 {
+				fail(w, 500, fmt.Errorf("setup catalog exceeds 256 items"))
+				return
+			}
+			for _, selection := range items {
+				if selection.Owner != entry.Descriptor.ID || selection.Validate() != nil {
+					fail(w, 500, fmt.Errorf("setup source returned invalid metadata"))
+					return
+				}
+				choices = append(choices, choice{*selection.Clone(), entry.Descriptor.Title})
+			}
+		}
+	}
+	send(w, 200, map[string]any{"presets": choices})
+}

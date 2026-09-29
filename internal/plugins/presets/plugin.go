@@ -187,3 +187,15 @@ func asset(contentType string, body []byte) http.HandlerFunc {
 		_, _ = w.Write(body)
 	}
 }
+
+func (p *Plugin) Setups() ([]runconfig.Selection, error) {
+	entries, err := p.store.List(false)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]runconfig.Selection, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, *entry.Selection.Clone())
+	}
+	return out, nil
+}

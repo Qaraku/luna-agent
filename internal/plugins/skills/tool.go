@@ -29,11 +29,12 @@ const skillViewDescription = "Read one installed skill: its own " + skills.FileN
 // and a name the user turned off. A nil state is the empty selection — nothing
 // turned off.
 type SkillViewTool struct {
-	found   []skills.Skill
-	state   *selection
-	limit   int
-	source  func(context.Context) ([]skills.Skill, error)
-	library *Library
+	found    []skills.Skill
+	state    *selection
+	limit    int
+	source   func(context.Context) ([]skills.Skill, error)
+	library  *Library
+	external ExternalSkillSource
 }
 
 // NewSkillViewTool wires the tool to the skills discovery produced and to the
@@ -157,7 +158,12 @@ func (t *SkillViewTool) Invoke(ctx context.Context, arguments string) (string, e
 	if err != nil {
 		return "", err
 	}
-	if t.library != nil && selected.Revision != "" {
+	if t.external != nil && selected.Owner != "" && selected.Owner != PluginID {
+		if err := t.external.VerifySkill(*selected, requested, text); err != nil {
+			return "", plugin.Unavailable(err)
+		}
+	}
+	if t.library != nil && selected.Revision != "" && selected.Owner == PluginID {
 		if err := t.library.Verify(name, selected.Revision, requested, text); err != nil {
 			return "", plugin.Unavailable(err)
 		}

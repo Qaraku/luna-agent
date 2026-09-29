@@ -47,4 +47,4 @@ jobs:
         run: node --check web/app.js && node --check web/runtime-widgets.js
 
       - name: Test browser JavaScript
-        run: node --test web/app.test.cjs web/runtime-widgets.test.cjs internal/plugins/presets/panel.test.mjs internal/plugins/skills/library_panel.test.mjs internal/plugins/memory/panel.test.mjs
+        run: node --test web/app.test.cjs web/runtime-widgets.test.cjs internal/plugins/presets/panel.test.mjs internal/plugins/skills/library_panel.test.mjs internal/plugins/memory/panel.test.mjs internal/plugins/packages/panel.test.mjs

@@ -270,6 +270,22 @@ func (s *Server) setPluginState(w http.ResponseWriter, id, action string) {
 		return
 	}
 	enabled := action == "enable"
+	if entry, ok := s.capabilities.Entry(id); ok {
+		if owner, managed := entry.Plugin.(plugin.StateController); managed {
+			if err := owner.SetEnabled(enabled); err != nil {
+				fail(w, 409, err)
+				return
+			}
+			updated, exists := s.capabilities.Entry(id)
+			if !exists {
+				fail(w, 500, fmt.Errorf("managed capability disappeared"))
+				return
+			}
+			s.addEvent("capability_"+action, "managed capability "+id+" changed state")
+			send(w, 200, capabilityViewOf(updated))
+			return
+		}
+	}
 	// 先写选择、再改运行态，顺序不能反。
 	//
 	// 这两样东西的寿命不一样：选择是持久的，它决定下次启动时这个能力在不在；运行态

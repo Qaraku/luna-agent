@@ -93,6 +93,7 @@ type Skill struct {
 	Scope Scope
 	// Revision 只用于受管理的不可变目录；普通用户目录为空。
 	Revision string
+	Owner    string
 }
 
 // Problem 是一次发现里需要报告的一件事：一个被拒绝的 SKILL.md、一个被遮住的同名
@@ -345,4 +346,12 @@ func List(found []Skill, budget int) (string, bool) {
 		return trailer, true
 	}
 	return "", true
+}
+
+// ParseDefinition 校验已经由可信来源读取的技能定义，复用普通目录发现的规则。
+func ParseDefinition(name, dir string, raw []byte) (Skill, error) {
+	if len(raw) > MaxSkillFileBytes || !utf8.Valid(raw) || strings.ContainsRune(string(raw), 0) {
+		return Skill{}, errors.New("invalid or oversized skill text")
+	}
+	return parse(name, dir, raw)
 }

@@ -51,10 +51,11 @@ const listBlockHeader = "The skills installed here, one line each. A skill is a 
 // name leaves the set of skills they read. That is why it is a setting the user
 // owns rather than a state the registry keeps.
 type Plugin struct {
-	found   []skills.Skill
-	state   *selection
-	tool    *SkillViewTool
-	library *Library
+	found    []skills.Skill
+	state    *selection
+	tool     *SkillViewTool
+	library  *Library
+	external ExternalSkillSource
 }
 
 // SkillStatus is one discovered skill and whether it is in service, as anything
@@ -99,7 +100,7 @@ func (p *Plugin) Skills() ([]SkillStatus, error) {
 	}
 	statuses := make([]SkillStatus, 0, len(found))
 	for _, skill := range found {
-		status := SkillStatus{Name: skill.Name, Description: skill.Description, Scope: skill.Scope, Enabled: !p.state.off(skill.Name), Revision: skill.Revision, Managed: skill.Revision != ""}
+		status := SkillStatus{Name: skill.Name, Description: skill.Description, Scope: skill.Scope, Enabled: !p.state.off(skill.Name), Revision: skill.Revision, Managed: skill.Owner == PluginID}
 		if !status.Enabled {
 			status.DisabledReason = DisabledReasonSetting
 		}

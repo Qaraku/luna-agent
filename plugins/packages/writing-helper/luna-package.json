@@ -1,0 +1,54 @@
+{
+  "format": 1,
+  "id": "writing-helper",
+  "version": "0.1.0",
+  "title": "写作助手示例包",
+  "description": "演示隔离工具、只读技能与工作预设的组合；不读取项目、不联网、不写状态。",
+  "files": [
+    "tools/text_stats.py",
+    "skills/writing-review/SKILL.md"
+  ],
+  "tools": [
+    {
+      "name": "text-stats",
+      "description": "统计给定文本的字符数、非空行数和按空白分隔的词数。中文词数不代表自然语言分词。",
+      "entry": "tools/text_stats.py",
+      "interpreter": "python3",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 8000
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "additionalProperties": false
+      },
+      "access": {},
+      "timeout_seconds": 10
+    }
+  ],
+  "skills": [
+    "skills/writing-review"
+  ],
+  "presets": [
+    {
+      "id": "writing",
+      "title": "写作审阅",
+      "instructions": "保留原意，先指出关键问题，再给出修改稿；有必要时使用写作检查技能和文本统计工具。",
+      "capabilities": [
+        "skills",
+        "pkg-writing-helper"
+      ],
+      "tools": null,
+      "resources": {
+        "skills": [
+          "pkg_writing-helper__writing-review"
+        ]
+      }
+    }
+  ]
+}

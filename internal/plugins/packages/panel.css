@@ -1,0 +1,11 @@
+/* 包审阅是独立面板，沿用宿主主题与控件。 */
+.package-install-form, .package-list, .package-review, .package-field { display: grid; gap: var(--luna-space-2); min-width: 0; }
+.package-install-form, .package-review { margin-bottom: var(--luna-space-4); }
+.package-field .luna-input { width: 100%; min-width: 0; box-sizing: border-box; }
+.package-actions { display: flex; gap: var(--luna-space-2); flex-wrap: wrap; }
+.package-row { padding: var(--luna-space-3); border: 1px solid var(--luna-border); border-radius: var(--luna-radius-md); }
+.package-row h3 { margin: 0; font-size: var(--luna-font-ui); }
+.package-check { display: flex; align-items: flex-start; gap: var(--luna-space-2); }
+.package-detail { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24rem; overflow: auto; }
+.package-error { color: var(--luna-danger); overflow-wrap: anywhere; }
+.package-review[hidden], .package-check[hidden] { display: none; }

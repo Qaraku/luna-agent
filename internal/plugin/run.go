@@ -74,3 +74,8 @@ type SetupProvider interface {
 type RunResourceRevisionProvider interface {
 	RunResourceRevisions(context.Context) (map[string]string, error)
 }
+
+// SetupCatalog 向宿主的通用会话选择器提供可用组合，编辑仍由所属能力负责。
+type SetupCatalog interface {
+	Setups() ([]runconfig.Selection, error)
+}

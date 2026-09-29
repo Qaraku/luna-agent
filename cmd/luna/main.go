@@ -29,6 +29,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/plugins/filewrite"
 	"github.com/Qaraku/luna-agent/internal/plugins/jsonformat"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
+	packageplugins "github.com/Qaraku/luna-agent/internal/plugins/packages"
 	"github.com/Qaraku/luna-agent/internal/plugins/presets"
 	"github.com/Qaraku/luna-agent/internal/plugins/runtimewidgets"
 	"github.com/Qaraku/luna-agent/internal/plugins/sessionhistory"
@@ -782,6 +783,23 @@ func run() error {
 			return err
 		}
 	}
+	packageDir, err := plugin.StateDirFor(packageplugins.ManagerDescriptor(), statePath)
+	if err != nil {
+		return err
+	}
+	packageManager, err := packageplugins.OpenManager(packageDir, statePath, registry)
+	if err != nil {
+		return fmt.Errorf("open package manager: %w", err)
+	}
+	skillSet.SetExternalSource(packageManager)
+	if err = registry.Register(packageManager); err != nil {
+		return err
+	}
+	if userSettings.CapabilityEnabledByDefault(packageplugins.ManagerID, true) {
+		if err = registry.Enable(packageplugins.ManagerID); err != nil {
+			return err
+		}
+	}
 	listener, err := httpapi.Listen(*addr)
 	if err != nil {
 		return err
@@ -790,6 +808,11 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	restoreContext, stopRestore := context.WithTimeout(ctx, 60*time.Second)
+	for _, problem := range packageManager.Restore(restoreContext) {
+		log.Printf("luna: package %q is unavailable; inspect package management for details", problem)
+	}
+	stopRestore()
 	toolSources := append([]pluginhost.ToolSpec{}, pluginhost.Allowlist...)
 	toolSources = append(toolSources, jsonformat.Source())
 	plugins, err := pluginhost.New(ctx, root, pluginhost.Options{Tools: toolSources, ReadRoot: projectRoot(root, *readRoot), ReadLimit: *readLimit})

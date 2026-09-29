@@ -39,6 +39,13 @@ func ManagedDescriptor() plugin.Descriptor {
 }
 func (p *Plugin) allSkills(ctx context.Context) ([]catalog.Skill, error) {
 	out := append([]catalog.Skill{}, p.found...)
+	if p.external != nil {
+		additional, err := p.external.ExternalSkills(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, additional...)
+	}
 	if p.library == nil {
 		return out, nil
 	}
@@ -48,7 +55,7 @@ func (p *Plugin) allSkills(ctx context.Context) ([]catalog.Skill, error) {
 	}
 	info, _ := plugin.Run(ctx)
 	for _, entry := range entries {
-		for _, installed := range p.found {
+		for _, installed := range out {
 			if installed.Name == entry.Name {
 				return nil, fmt.Errorf("learned skill %q conflicts with an installed source; rename or remove the external duplicate", entry.Name)
 			}
@@ -63,7 +70,7 @@ func (p *Plugin) allSkills(ctx context.Context) ([]catalog.Skill, error) {
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, catalog.Skill{Name: entry.Name, Description: entry.Description, Dir: dir, Scope: catalog.ScopeUser, Revision: entry.Revision})
+		out = append(out, catalog.Skill{Name: entry.Name, Description: entry.Description, Dir: dir, Scope: catalog.ScopeUser, Revision: entry.Revision, Owner: PluginID})
 	}
 	return out, nil
 }
@@ -85,4 +92,16 @@ func (p *Plugin) checkLearnedName(name string) error {
 		}
 	}
 	return nil
+}
+
+// ExternalSkillSource 在已有目录中提供只读版本化资源；学习库不覆盖它们。
+type ExternalSkillSource interface {
+	ExternalSkills(context.Context) ([]catalog.Skill, error)
+	VerifySkill(catalog.Skill, string, string) error
+}
+
+func (p *Plugin) SetExternalSource(source ExternalSkillSource) {
+	p.external = source
+	p.tool.source = p.allSkills
+	p.tool.external = source
 }

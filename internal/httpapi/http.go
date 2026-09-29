@@ -463,6 +463,12 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.getExecution(w, r)
+	case "/api/setups":
+		if r.Method != http.MethodGet {
+			method(w, http.MethodGet)
+			return
+		}
+		s.listSetups(w, r)
 	case "/api/setup":
 		if r.Method != http.MethodGet {
 			method(w, http.MethodGet)
