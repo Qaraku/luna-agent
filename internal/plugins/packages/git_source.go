@@ -98,7 +98,12 @@ func readGitPackage(parent context.Context, source Source) (Manifest, map[string
 		return empty, nil, err
 	}
 	defer os.RemoveAll(dir)
-	if _, err = gitCommand(ctx, dir, 4096, "init", "--bare", "--template=", dir); err != nil {
+	initArgs := []string{"init", "--bare", "--template="}
+	if len(source.Revision) == 64 {
+		initArgs = append(initArgs, "--object-format=sha256")
+	}
+	initArgs = append(initArgs, dir)
+	if _, err = gitCommand(ctx, dir, 4096, initArgs...); err != nil {
 		return empty, nil, err
 	}
 	if _, err = gitCommand(ctx, dir, 4096, "fetch", "--depth=1", "--no-tags", "--", source.Location, source.Revision); err != nil {
@@ -108,7 +113,23 @@ func readGitPackage(parent context.Context, source Source) (Manifest, map[string
 	if err != nil || strings.TrimSpace(string(head)) != source.Revision {
 		return empty, nil, fmt.Errorf("Git source did not resolve to the requested immutable commit")
 	}
-	raw, err := gitCommand(ctx, dir, MaxManifestBytes, "show", source.Revision+":"+ManifestName)
+	manifestTree, err := gitCommand(ctx, dir, 4096, "ls-tree", "-z", source.Revision, "--", ManifestName)
+	if err != nil {
+		return empty, nil, err
+	}
+	rows := bytes.Split(manifestTree, []byte{0})
+	if len(rows) != 2 || len(rows[1]) != 0 {
+		return empty, nil, fmt.Errorf("package manifest must be a regular Git blob")
+	}
+	parts := bytes.SplitN(rows[0], []byte{'\t'}, 2)
+	if len(parts) != 2 || string(parts[1]) != ManifestName {
+		return empty, nil, fmt.Errorf("invalid Git manifest entry")
+	}
+	fields := strings.Fields(string(parts[0]))
+	if len(fields) != 3 || (fields[0] != "100644" && fields[0] != "100755") || fields[1] != "blob" || !gitRevision.MatchString(fields[2]) {
+		return empty, nil, fmt.Errorf("package manifest must not be a link or submodule")
+	}
+	raw, err := gitCommand(ctx, dir, MaxManifestBytes, "cat-file", "blob", fields[2])
 	if err != nil {
 		return empty, nil, err
 	}

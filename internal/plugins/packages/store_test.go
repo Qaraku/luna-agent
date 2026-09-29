@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func packageSource(t *testing.T) string {
@@ -139,5 +140,49 @@ func TestStageRejectsNormalizedManifestBeyondReadLimit(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(filepath.Join(store.dir, "versions", "sample")); len(entries) != 0 {
 		t.Fatal("unreadable candidate was published")
+	}
+}
+
+func TestGitPackageSupportsSHA256RepositoryAndRejectsManifestLink(t *testing.T) {
+	for _, format := range []string{"sha1", "sha256"} {
+		t.Run(format, func(t *testing.T) {
+			source := packageSource(t)
+			os.Remove(filepath.Join(source, ".env"))
+			git := func(args ...string) string {
+				t.Helper()
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, "git", args...)
+				cmd.Dir = source
+				cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
+				raw, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("git fixture: %v %s", err, raw)
+				}
+				return strings.TrimSpace(string(raw))
+			}
+			git("init", "-q", "--object-format="+format)
+			git("add", ManifestName, "tool.py")
+			git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture")
+			commit := git("rev-parse", "HEAD")
+			store, _ := OpenStore(t.TempDir())
+			if _, err := store.Stage(context.Background(), Source{Kind: "git", Location: source, Revision: commit}); err != nil {
+				t.Fatal("supported Git object format refused", err)
+			}
+			manifest, err := os.ReadFile(filepath.Join(source, ManifestName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			os.Remove(filepath.Join(source, ManifestName))
+			if err = os.Symlink(string(manifest), filepath.Join(source, ManifestName)); err != nil {
+				t.Fatal(err)
+			}
+			git("add", ManifestName)
+			git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "manifest link")
+			commit = git("rev-parse", "HEAD")
+			if _, err := store.Stage(context.Background(), Source{Kind: "git", Location: source, Revision: commit}); err == nil {
+				t.Fatal("Git manifest symlink was accepted as a regular manifest")
+			}
+		})
 	}
 }
