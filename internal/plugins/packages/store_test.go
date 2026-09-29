@@ -186,3 +186,55 @@ func TestGitPackageSupportsSHA256RepositoryAndRejectsManifestLink(t *testing.T) 
 		})
 	}
 }
+
+func TestPackageStoreCountsAllStagedIdentitiesTowardItsLimit(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := Source{Kind: "local", Location: t.TempDir()}
+	for i := 0; i < MaxInstalledPackages; i++ {
+		m := sampleManifest()
+		m.ID = fmt.Sprintf("package-%d", i)
+		if _, err := store.stageFiles(context.Background(), source, m, map[string]packageFile{"tool.py": {data: []byte("fixture")}}); err != nil {
+			t.Fatal(i, err)
+		}
+	}
+	m := sampleManifest()
+	m.ID = "one-more"
+	if _, err := store.stageFiles(context.Background(), source, m, map[string]packageFile{"tool.py": {data: []byte("fixture")}}); err == nil {
+		t.Fatal("staged identities grew beyond the disk quota before catalog registration")
+	}
+	entries, err := os.ReadDir(filepath.Join(store.dir, "versions"))
+	if err != nil || len(entries) != MaxInstalledPackages {
+		t.Fatal("identity quota was not enforced", len(entries), err)
+	}
+}
+func TestConcurrentPackageStagesCannotOverfillRevisionQuota(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := Source{Kind: "local", Location: t.TempDir()}
+	start := make(chan struct{})
+	done := make(chan error, MaxPackageRevisions+8)
+	for i := 0; i < MaxPackageRevisions+8; i++ {
+		go func(i int) {
+			<-start
+			m := sampleManifest()
+			_, err := store.stageFiles(context.Background(), source, m, map[string]packageFile{"tool.py": {data: []byte(fmt.Sprint(i))}})
+			done <- err
+		}(i)
+	}
+	close(start)
+	success := 0
+	for i := 0; i < MaxPackageRevisions+8; i++ {
+		if <-done == nil {
+			success++
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(store.dir, "versions", "sample"))
+	if err != nil || len(entries) != MaxPackageRevisions || success != MaxPackageRevisions {
+		t.Fatalf("quota drift: successes=%d revisions=%d err=%v", success, len(entries), err)
+	}
+}

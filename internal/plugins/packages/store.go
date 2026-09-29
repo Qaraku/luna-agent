@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	catalog "github.com/Qaraku/luna-agent/internal/skills"
@@ -44,7 +45,10 @@ type Version struct {
 	CreatedAt     time.Time    `json:"created_at"`
 	Root          string       `json:"-"`
 }
-type Store struct{ dir string }
+type Store struct {
+	dir string
+	mu  sync.Mutex
+}
 type packageFile struct {
 	data       []byte
 	executable bool
@@ -64,7 +68,7 @@ func OpenStore(dir string) (*Store, error) {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("package root must be a real directory")
 	}
-	return &Store{dir}, nil
+	return &Store{dir: dir}, nil
 }
 func digest(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }
 func revisionDigest(v Version) string {
@@ -180,6 +184,11 @@ func readPackageFile(ctx context.Context, root *os.Root, name string, limit int6
 	return data, info.Mode().Perm()&0111 != 0, nil
 }
 func (s *Store) stageFiles(ctx context.Context, source Source, m Manifest, files map[string]packageFile) (Version, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return Version{}, err
+	}
 	if err := m.Validate(); err != nil {
 		return Version{}, err
 	}
@@ -230,8 +239,29 @@ func (s *Store) stageFiles(ctx context.Context, source Source, m Manifest, files
 		return Version{}, err
 	}
 	parent := filepath.Join(s.dir, "versions", m.ID)
+	if err := safePackageDirectories(s.dir, []string{"versions"}); err != nil {
+		return Version{}, err
+	}
+	identities, err := os.ReadDir(filepath.Join(s.dir, "versions"))
+	if err != nil {
+		return Version{}, err
+	}
+	found := false
+	for _, entry := range identities {
+		if entry.Name() == m.ID {
+			found = true
+			break
+		}
+	}
+	if !found && len(identities) >= MaxInstalledPackages {
+		return Version{}, fmt.Errorf("staged package identity limit is %d; retained candidates were not deleted", MaxInstalledPackages)
+	}
 	if err := safePackageDirectories(s.dir, []string{"versions", m.ID}); err != nil {
 		return Version{}, err
+	}
+	if !found {
+		// 失败时仅移除本次创建且仍为空的标识目录；有保留版本的目录不会被删除。
+		defer func() { _ = os.Remove(parent) }()
 	}
 	entries, err := os.ReadDir(parent)
 	if err != nil {
