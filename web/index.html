@@ -235,6 +235,13 @@
             </dl>
             <p id="update-status" class="luna-muted" role="status"></p>
             <button id="update-refresh" class="luna-button" type="button">重新读取版本</button>
+            <h3>私人数据备份与恢复</h3>
+            <p id="backup-privacy" class="luna-muted">位置计划只记录本实例的数据目录。实际备份必须在停止所有实例和外部写入后执行；归档可能包含凭据、对话和插件代码，不加密、不上传，请放在私有位置。</p>
+            <a id="backup-plan-download" class="luna-button" href="/api/backup-plan" download="luna-data-plan.json">下载数据位置计划</a>
+            <pre id="backup-guidance" class="technical-detail">luna data backup -plan /绝对路径/luna-data-plan.json -out /私有目录/backup.tar.gz -offline -include-private
+luna data inspect -archive /私有目录/backup.tar.gz
+luna data restore -archive /私有目录/backup.tar.gz -dest /绝对路径/新数据目录 -include-private</pre>
+            <p class="luna-muted">恢复只写入新目录，不覆盖旧资料、不启动程序。恢复完成后使用新目录作为 LUNA_HOME；额外技能目录按命令返回的 extra_skills 加回。项目代码不在备份中，工作区路径可能需要调整。</p>
             <h3>主程序手动更新</h3>
             <p class="luna-muted">只从可信来源获取程序包。在本地终端安装到一个新目录，核对版本，备份私人数据后，由你停止旧实例并启动新版本。不会静默下载、重启或替换正在运行的程序。</p>
             <pre class="technical-detail">luna release install -archive /绝对路径/luna.tar.gz -dest /绝对路径/新安装目录

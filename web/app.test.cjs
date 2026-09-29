@@ -4884,3 +4884,13 @@ test('更新页关闭后取消读取，迟到结果不覆盖下一次打开', as
  pending({ok:true,json:async()=>({version:'late'})});await h.settle();
  assert.doesNotMatch(h.$('update-version').textContent,/late/);
 });
+
+
+test('备份入口只下载位置计划，提示停机和私人归档，不暴露在线恢复动作', async()=>{
+ const h=navigationHarness();await h.settle();await h.click('settings-toggle');await h.click('settings-tab-updates');
+ const link=h.$('backup-plan-download');assert.equal(link.getAttribute('href'),'/api/backup-plan');assert.equal(link.getAttribute('download'),'luna-data-plan.json');
+ assert.equal(h.$('settings-pane-updates').contains(link),true);
+ assert.match(h.$('backup-guidance').textContent,/-offline/);assert.match(h.$('backup-guidance').textContent,/-include-private/);
+ assert.match(h.$('backup-privacy').textContent,/不加密/);
+ assert.equal(h.$('chat-form').contains(link),false);
+});
