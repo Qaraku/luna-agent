@@ -87,10 +87,14 @@ func TestAnUnknownNameIsNotStoredInTheSelection(t *testing.T) {
 	if plugin.SetDisabled("  ", true) {
 		t.Fatal("a blank name was accepted")
 	}
-	if names := plugin.Skills(); len(names) != 2 {
+	names, err := plugin.Skills()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 2 {
 		t.Fatalf("skills=%+v, want both untouched", names)
 	}
-	for _, status := range plugin.Skills() {
+	for _, status := range names {
 		if !status.Enabled {
 			t.Fatalf("%s is off after no accepted change", status.Name)
 		}
@@ -99,7 +103,10 @@ func TestAnUnknownNameIsNotStoredInTheSelection(t *testing.T) {
 
 func TestSkillsReportsTheStateTheInterfaceShows(t *testing.T) {
 	plugin := New(twoSkills(), "beta")
-	statuses := plugin.Skills()
+	statuses, err := plugin.Skills()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(statuses) != 2 {
 		t.Fatalf("statuses=%+v, want both discovered skills", statuses)
 	}

@@ -1,14 +1,5 @@
-// Package skills 是 Skills 能力：把发现到的 skill 清单交给模型，并让它按需读取其中
-// 一个的正文。
-//
-// 它对应渐进披露的两级：清单（一条 skill 类型的上下文贡献，每个 skill 一行）与正文
-// （`luna_skill_view` 工具，读一个 skill 的 SKILL.md 或它目录下的一个文件）。清单进
-// 每一次运行，正文只在模型真的要用时被读。
-//
-// 边界由内核强制：读取复用 `internal/fileread`，根是那个 skill 自己的目录，因此模型
-// 给的路径永远走不出一个 skill。能力自己不解析第二套根。它不认领状态命名空间、不
-// 声明权限——它只读发现期已经确定的目录，没有任何内核目前无法强制的需求。它也不贡献
-// 路由或面板：skill 是用户放在磁盘上的文件，不是这个能力自己的数据。
+// Package skills 提供按需读取的程序性知识。正式应用同时启用个人学习库；
+// 只读构造保留给不需要学习与持久化的嵌入方。
 package skills
 
 import (
@@ -52,21 +43,18 @@ const listBlockHeader = "The skills installed here, one line each. A skill is a 
 
 // Plugin contributes the manifest and the tool that reads one skill.
 //
-// It holds the skills discovered at start-up and which of them the user has
-// turned off, and nothing else: no state directory, no route, no panel, and no
-// permission. Being built in is a deployment choice, not a privilege: it
-// declares the same contributions and asks for the same permissions any other
-// built-in capability would, which here means no claims and no permissions at
-// all.
+// 只读构造保留外部发现结果；管理型构造另持有自己的修订库并声明状态写入、
+// 路由、面板与管理工具。两种部署都遵守同一套能力声明与运行授权。
 //
 // Turning a skill off is not a lifecycle state change of this capability: the
 // capability stays in service, its manifest and its tool stay declared, and one
 // name leaves the set of skills they read. That is why it is a setting the user
 // owns rather than a state the registry keeps.
 type Plugin struct {
-	found []skills.Skill
-	state *selection
-	tool  *SkillViewTool
+	found   []skills.Skill
+	state   *selection
+	tool    *SkillViewTool
+	library *Library
 }
 
 // SkillStatus is one discovered skill and whether it is in service, as anything
@@ -77,6 +65,8 @@ type SkillStatus struct {
 	Description string
 	Scope       skills.Scope
 	Enabled     bool
+	Revision    string
+	Managed     bool
 	// DisabledReason says why the skill is not in service, written for the
 	// person who turned it off. It is empty for a skill that is on.
 	DisabledReason string
@@ -102,16 +92,20 @@ func New(found []skills.Skill, disabled ...string) *Plugin {
 // Skills returns every discovered skill and whether it is in service, in
 // discovery order. It reads the current selection and changes nothing: the
 // interface uses it to show the list and to answer whether a name exists.
-func (p *Plugin) Skills() []SkillStatus {
-	statuses := make([]SkillStatus, 0, len(p.found))
-	for _, skill := range p.found {
-		status := SkillStatus{Name: skill.Name, Description: skill.Description, Scope: skill.Scope, Enabled: !p.state.off(skill.Name)}
+func (p *Plugin) Skills() ([]SkillStatus, error) {
+	found, err := p.allSkills(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	statuses := make([]SkillStatus, 0, len(found))
+	for _, skill := range found {
+		status := SkillStatus{Name: skill.Name, Description: skill.Description, Scope: skill.Scope, Enabled: !p.state.off(skill.Name), Revision: skill.Revision, Managed: skill.Revision != ""}
 		if !status.Enabled {
 			status.DisabledReason = DisabledReasonSetting
 		}
 		statuses = append(statuses, status)
 	}
-	return statuses
+	return statuses, nil
 }
 
 // SetDisabled turns one discovered skill off or on and reports whether a skill
@@ -126,7 +120,11 @@ func (p *Plugin) Skills() []SkillStatus {
 func (p *Plugin) SetDisabled(name string, disabled bool) bool {
 	target := strings.TrimSpace(name)
 	found := false
-	for _, skill := range p.found {
+	available, err := p.allSkills(context.Background())
+	if err != nil {
+		return false
+	}
+	for _, skill := range available {
 		if skill.Name == target {
 			found = true
 			break
@@ -164,25 +162,31 @@ func Descriptor() plugin.Descriptor {
 }
 
 // Descriptor implements plugin.Plugin.
-func (p *Plugin) Descriptor() plugin.Descriptor { return Descriptor() }
+func (p *Plugin) Descriptor() plugin.Descriptor {
+	if p.library != nil {
+		return ManagedDescriptor()
+	}
+	return Descriptor()
+}
 
-// Tools returns the model-visible surface: exactly luna_skill_view.
-func (p *Plugin) Tools() []plugin.Tool { return []plugin.Tool{p.tool} }
+// Tools 返回声明过的工具；管理型实例额外提供受审批约束的学习工具。
+func (p *Plugin) Tools() []plugin.Tool {
+	tools := []plugin.Tool{p.tool}
+	if p.library != nil {
+		tools = append(tools, manageTool{p})
+	}
+	return tools
+}
 
-// Contexts renders the manifest of discovered skills, or contributes nothing
-// when there are none in service. It reads nothing at run time: the skills were
-// discovered once at start-up, so two reads of the same run cannot disagree.
-//
-// It does read the current selection, which is what makes turning a skill off
-// take effect on the next run: a skill the user turned off is not in the
-// manifest, so the model is not told about it at all.
-//
-// An empty manifest is no block at all rather than a header with nothing under
-// it: telling the model there are skills, and then naming none, would be a
-// statement about this installation that is not true.
+// Contexts 只提供名字和描述。受管理技能的描述与路径遵守本轮冻结修订，
+// 正文仍按需读取；目录损坏要报告，不能假装没有技能。
 func (p *Plugin) Contexts(ctx context.Context) ([]plugin.ContextBlock, error) {
 	selected := make([]skills.Skill, 0)
-	for _, skill := range p.state.on(p.found) {
+	found, err := p.allSkills(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, skill := range p.state.on(found) {
 		if plugin.ResourceSelected(ctx, PluginID, skill.Name) {
 			selected = append(selected, skill)
 		}
@@ -205,10 +209,17 @@ var (
 )
 
 // RunResources 只提供名字；宿主负责冻结本轮选择，正文仍按需读取。
-func (p *Plugin) RunResources(context.Context) ([]string, error) {
+func (p *Plugin) RunResources(ctx context.Context) ([]string, error) {
 	names := make([]string, 0)
-	for _, skill := range p.state.on(p.found) {
+	found, err := p.allSkills(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, skill := range p.state.on(found) {
 		names = append(names, skill.Name)
 	}
 	return names, nil
 }
+
+// ApplyDisabled 供已验证名称的可信偏好事务使用；写盘后只更新内存，不进行第二次可能失败的目录读取。
+func (p *Plugin) ApplyDisabled(name string, disabled bool) { p.state.set(name, disabled) }

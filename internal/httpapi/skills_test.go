@@ -17,12 +17,13 @@ import (
 // discovered or where a preference is stored — that is the point of the seam
 // under test.
 type fakeCatalog struct {
-	skills []SkillRef
-	asked  []string
-	err    error
+	skills  []SkillRef
+	asked   []string
+	err     error
+	listErr error
 }
 
-func (c *fakeCatalog) Skills() []SkillRef { return c.skills }
+func (c *fakeCatalog) Skills() ([]SkillRef, error) { return c.skills, c.listErr }
 
 func (c *fakeCatalog) SetState(name string, enabled bool) (SkillRef, bool, error) {
 	c.asked = append(c.asked, fmt.Sprintf("%s=%t", name, enabled))
@@ -227,5 +228,12 @@ func TestWithoutACatalogTheListIsEmptyAndChangesAreRefused(t *testing.T) {
 	}
 	if w := skillRequest(t, h, http.MethodPost, "/api/skills/demo/disable", true); w.Code != http.StatusInternalServerError {
 		t.Fatalf("status=%d, want 500 (body=%s)", w.Code, w.Body.String())
+	}
+}
+
+func TestSkillCatalogFailureIsNotAnEmptySuccessfulList(t *testing.T) {
+	w := skillRequest(t, handlerWithSkills(t, &fakeCatalog{listErr: errors.New("library is corrupt")}), http.MethodGet, "/api/skills", false)
+	if w.Code != 500 || !strings.Contains(w.Body.String(), "library is corrupt") {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body)
 	}
 }

@@ -37,12 +37,13 @@ type Selection struct {
 
 // Snapshot 记录本轮实际可用集合，不把后续设置或后续目录内容冒充本轮状态。
 type Snapshot struct {
-	Selection       *Selection          `json:"selection,omitempty"`
-	Model           string              `json:"model,omitempty"`
-	ReasoningEffort string              `json:"reasoning_effort,omitempty"`
-	Capabilities    []string            `json:"capabilities"`
-	Tools           []string            `json:"tools"`
-	Resources       map[string][]string `json:"resources,omitempty"`
+	Selection         *Selection                   `json:"selection,omitempty"`
+	Model             string                       `json:"model,omitempty"`
+	ReasoningEffort   string                       `json:"reasoning_effort,omitempty"`
+	Capabilities      []string                     `json:"capabilities"`
+	Tools             []string                     `json:"tools"`
+	Resources         map[string][]string          `json:"resources,omitempty"`
+	ResourceRevisions map[string]map[string]string `json:"resource_revisions,omitempty"`
 }
 
 func (s *Selection) AllowsCapability(id string) bool {
@@ -158,6 +159,15 @@ func (s *Snapshot) Clone() *Snapshot {
 		next.Resources = make(map[string][]string, len(s.Resources))
 		for k, v := range s.Resources {
 			next.Resources[k] = slices.Clone(v)
+		}
+	}
+	if s.ResourceRevisions != nil {
+		next.ResourceRevisions = map[string]map[string]string{}
+		for owner, versions := range s.ResourceRevisions {
+			next.ResourceRevisions[owner] = map[string]string{}
+			for name, revision := range versions {
+				next.ResourceRevisions[owner][name] = revision
+			}
 		}
 	}
 	return &next

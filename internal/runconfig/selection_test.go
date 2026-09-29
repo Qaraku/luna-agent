@@ -60,3 +60,12 @@ func TestSelectionValidationBoundsContentAndRejectsDuplicates(t *testing.T) {
 	}
 }
 func ptr(s string) *string { return &s }
+
+func TestSnapshotCloneSeparatesResourceRevisions(t *testing.T) {
+	source := &Snapshot{ResourceRevisions: map[string]map[string]string{"catalog": {"one": "v1"}}}
+	cloned := source.Clone()
+	cloned.ResourceRevisions["catalog"]["one"] = "v2"
+	if source.ResourceRevisions["catalog"]["one"] != "v1" {
+		t.Fatal("resource version snapshot is shared")
+	}
+}

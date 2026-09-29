@@ -91,6 +91,8 @@ type Skill struct {
 	// 走不出这一个 skill。
 	Dir   string
 	Scope Scope
+	// Revision 只用于受管理的不可变目录；普通用户目录为空。
+	Revision string
 }
 
 // Problem 是一次发现里需要报告的一件事：一个被拒绝的 SKILL.md、一个被遮住的同名

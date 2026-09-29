@@ -14,8 +14,9 @@ type RunInfo struct {
 	RunID     string
 	SessionID string
 	// Selection 与 Resources 是本轮选择及已冻结的资源名字，只能缩小可用集合。
-	Selection *runconfig.Selection
-	Resources map[string][]string
+	Selection         *runconfig.Selection
+	Resources         map[string][]string
+	ResourceRevisions map[string]map[string]string
 	// ExecutionMode 来自宿主授权快照，不接受模型参数或未经核准的持久化字段。
 	ExecutionMode ExecutionMode
 	// Permissions 与 Approve 只来自宿主运行快照，不从工具参数或会话文件直接恢复。
@@ -66,4 +67,9 @@ func ResourceSelected(ctx context.Context, owner, name string) bool {
 // 不解释目录内容；配置目录的读写由该能力已声明的路由提供。
 type SetupProvider interface {
 	ResolveSetup(id, revision string) (*runconfig.Selection, error)
+}
+
+// RunResourceRevisionProvider 一次提供资源名及不可变版本，避免分别读取名字和版本产生竞态。
+type RunResourceRevisionProvider interface {
+	RunResourceRevisions(context.Context) (map[string]string, error)
 }

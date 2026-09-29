@@ -1,0 +1,11 @@
+/* 个人技能库使用宿主主题，不注入内联样式或 HTML。 */
+.skill-library-list, .skill-library-editor, .skill-library-review, .skill-library-history { display: grid; gap: var(--luna-space-3); min-width: 0; }
+.skill-library-row { border: 1px solid var(--luna-border); border-radius: var(--luna-radius-md); padding: var(--luna-space-3); min-width: 0; }
+.skill-library-row h3 { margin: 0; font-size: var(--luna-font-ui); }
+.skill-library-actions { display: flex; flex-wrap: wrap; gap: var(--luna-space-2); }
+.skill-library-field { display: grid; gap: var(--luna-space-2); min-width: 0; }
+.skill-library-field .luna-input { box-sizing: border-box; width: 100%; min-width: 0; }
+.skill-library-field textarea { resize: vertical; min-height: 6rem; }
+.skill-library-editor, .skill-library-review, .skill-library-history { margin-top: var(--luna-space-4); }
+.skill-library-diff { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 28rem; overflow: auto; }
+.skill-library-editor[hidden], .skill-library-review[hidden], .skill-library-history[hidden] { display: none; }

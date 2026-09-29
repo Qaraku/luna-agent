@@ -82,13 +82,16 @@ func (c *userPreferences) SetDirs(dirs []string) error {
 
 // Skills lists every discovered skill with its state, which is what the
 // settings page renders.
-func (c *userPreferences) Skills() []httpapi.SkillRef {
-	statuses := c.capability.Skills()
+func (c *userPreferences) Skills() ([]httpapi.SkillRef, error) {
+	statuses, err := c.capability.Skills()
+	if err != nil {
+		return nil, err
+	}
 	refs := make([]httpapi.SkillRef, 0, len(statuses))
 	for _, status := range statuses {
 		refs = append(refs, skillRef(status))
 	}
-	return refs
+	return refs, nil
 }
 
 // SetState turns one skill off or on, and reports whether a skill by that name
@@ -109,7 +112,11 @@ func (c *userPreferences) SetState(name string, enabled bool) (httpapi.SkillRef,
 	target := strings.TrimSpace(name)
 	var status skillsplugin.SkillStatus
 	found := false
-	for _, candidate := range c.capability.Skills() {
+	statuses, err := c.capability.Skills()
+	if err != nil {
+		return httpapi.SkillRef{}, false, err
+	}
+	for _, candidate := range statuses {
 		if candidate.Name == target {
 			status, found = candidate, true
 			break
@@ -125,7 +132,7 @@ func (c *userPreferences) SetState(name string, enabled bool) (httpapi.SkillRef,
 	}
 	c.settings = next
 	// The capability cannot fail here: the name was just found in its own list.
-	c.capability.SetDisabled(target, !enabled)
+	c.capability.ApplyDisabled(target, !enabled)
 
 	status.Enabled = enabled
 	if enabled {
@@ -143,5 +150,6 @@ func skillRef(status skillsplugin.SkillStatus) httpapi.SkillRef {
 		Scope:          string(status.Scope),
 		Enabled:        status.Enabled,
 		DisabledReason: status.DisabledReason,
+		Revision:       status.Revision, Managed: status.Managed,
 	}
 }

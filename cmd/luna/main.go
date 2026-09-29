@@ -727,20 +727,26 @@ func run() error {
 	if err := registry.Enable(workspace.PluginID); err != nil {
 		return fmt.Errorf("enable workspace capability: %w", err)
 	}
-	// Skills are files the user owns and Luna only reads. Discovery happens once,
-	// here, and what it could not accept is reported rather than hidden: a skill
-	// that was rejected or shadowed is exactly the thing its author needs to hear
-	// about. The capability owns the manifest and the tool that reads one skill.
+	// 外部技能按既有目录规则发现；个人学习库有独立状态与不可变修订，不覆盖外部来源。
 	discovered, skillProblems := skills.Discover(skillRoots(paths, skillDirs))
 	for _, problem := range skillProblems {
 		log.Printf("luna: skill %s", problem)
 	}
-	skillSet := skillsplugin.New(discovered, userSettings.DisabledSkills()...)
+	skillLibraryDir, err := plugin.StateDirFor(skillsplugin.ManagedDescriptor(), statePath)
+	if err != nil {
+		return fmt.Errorf("resolve skill library directory: %w", err)
+	}
+	skillSet, err := skillsplugin.NewManaged(skillLibraryDir, discovered, userSettings.DisabledSkills()...)
+	if err != nil {
+		return fmt.Errorf("open skill library: %w", err)
+	}
 	if err := registry.Register(skillSet); err != nil {
 		return fmt.Errorf("register skills capability: %w", err)
 	}
-	if err := registry.Enable(skillsplugin.PluginID); err != nil {
-		return fmt.Errorf("enable skills capability: %w", err)
+	if userSettings.CapabilityEnabledByDefault(skillsplugin.PluginID, true) {
+		if err := registry.Enable(skillsplugin.PluginID); err != nil {
+			return fmt.Errorf("enable skills capability: %w", err)
+		}
 	}
 	// The terminal capability is the first one that does not run on its own: the
 	// user's settings say whether it is on, and a capability that starts processes

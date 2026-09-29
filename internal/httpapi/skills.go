@@ -22,6 +22,8 @@ type SkillRef struct {
 	Scope          string
 	Enabled        bool
 	DisabledReason string
+	Revision       string
+	Managed        bool
 }
 
 // SkillCatalog is the Skills capability as this layer uses it: which skills
@@ -30,7 +32,7 @@ type SkillRef struct {
 // and a change to what the next run reads, and those two must happen together.
 type SkillCatalog interface {
 	// Skills lists every discovered skill, in discovery order.
-	Skills() []SkillRef
+	Skills() ([]SkillRef, error)
 	// SetState turns one skill off or on and returns its new state. found is
 	// false when no skill by that name was discovered, and then nothing was
 	// written. An error means the new state could not be recorded, and then
@@ -51,6 +53,8 @@ type skillView struct {
 	Scope          string `json:"scope"`
 	Enabled        bool   `json:"enabled"`
 	DisabledReason string `json:"disabled_reason"`
+	Revision       string `json:"revision,omitempty"`
+	Managed        bool   `json:"managed,omitempty"`
 }
 
 type skillsResponse struct {
@@ -84,6 +88,7 @@ func skillRefView(ref SkillRef) skillView {
 		Scope:          ref.Scope,
 		Enabled:        ref.Enabled,
 		DisabledReason: ref.DisabledReason,
+		Revision:       ref.Revision, Managed: ref.Managed,
 	}
 }
 
@@ -97,7 +102,12 @@ func skillRefView(ref SkillRef) skillView {
 func (s *Server) sendSkills(w http.ResponseWriter) {
 	views := make([]skillView, 0)
 	if s.skills != nil {
-		for _, ref := range s.skills.Skills() {
+		refs, err := s.skills.Skills()
+		if err != nil {
+			fail(w, 500, err)
+			return
+		}
+		for _, ref := range refs {
 			views = append(views, skillRefView(ref))
 		}
 	}

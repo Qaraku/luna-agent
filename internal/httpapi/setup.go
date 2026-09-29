@@ -115,14 +115,15 @@ func (s *Server) setSessionSetup(w http.ResponseWriter, r *http.Request, id stri
 }
 
 type setupView struct {
-	Selection    *runconfig.Selection `json:"selection"`
-	Active       bool                 `json:"active"`
-	Capabilities []string             `json:"available_capabilities"`
-	Unavailable  []string             `json:"unavailable_capabilities"`
-	Tools        []string             `json:"available_tools"`
-	Resources    map[string][]string  `json:"available_resources"`
-	Pending      bool                 `json:"snapshot_pending"`
-	Problem      string               `json:"problem,omitempty"`
+	Selection    *runconfig.Selection         `json:"selection"`
+	Active       bool                         `json:"active"`
+	Capabilities []string                     `json:"available_capabilities"`
+	Unavailable  []string                     `json:"unavailable_capabilities"`
+	Tools        []string                     `json:"available_tools"`
+	Resources    map[string][]string          `json:"available_resources"`
+	Pending      bool                         `json:"snapshot_pending"`
+	Revisions    map[string]map[string]string `json:"resource_revisions,omitempty"`
+	Problem      string                       `json:"problem,omitempty"`
 }
 
 func (s *Server) getSetup(w http.ResponseWriter, r *http.Request) {
@@ -148,6 +149,7 @@ func (s *Server) getSetup(w http.ResponseWriter, r *http.Request) {
 			view.Capabilities = frozen.Capabilities
 			view.Tools = frozen.Tools
 			view.Resources = frozen.Resources
+			view.Revisions = frozen.ResourceRevisions
 		}
 		send(w, 200, view)
 		return

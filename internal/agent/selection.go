@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/runconfig"
@@ -37,13 +38,25 @@ type preparedAgent struct {
 
 func (p *preparedAgent) freezeResources(ctx context.Context) (context.Context, error) {
 	resources := make(map[string][]string)
+	revisions := make(map[string]map[string]string)
 	info, _ := plugin.Run(ctx)
 	for _, entry := range p.entries {
 		provider, ok := entry.Plugin.(plugin.RunResourceProvider)
 		if !ok {
 			continue
 		}
-		names, err := provider.RunResources(ctx)
+		var names []string
+		var versions map[string]string
+		var err error
+		if versioned, ok := entry.Plugin.(plugin.RunResourceRevisionProvider); ok {
+			versions, err = versioned.RunResourceRevisions(ctx)
+			for name := range versions {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+		} else {
+			names, err = provider.RunResources(ctx)
+		}
 		if err != nil {
 			return ctx, fmt.Errorf("capability %s resources: %w", entry.Descriptor.ID, err)
 		}
@@ -54,8 +67,17 @@ func (p *preparedAgent) freezeResources(ctx context.Context) (context.Context, e
 			}
 		}
 		resources[entry.Descriptor.ID] = selected
+		if versions != nil {
+			kept := map[string]string{}
+			for _, name := range selected {
+				kept[name] = versions[name]
+			}
+			revisions[entry.Descriptor.ID] = kept
+		}
 	}
 	info.Resources = resources
+	info.ResourceRevisions = revisions
+	p.snapshot.ResourceRevisions = revisions
 	p.snapshot.Resources = resources
 	return plugin.WithRun(ctx, info), nil
 }

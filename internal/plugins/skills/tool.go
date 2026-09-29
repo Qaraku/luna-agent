@@ -20,8 +20,7 @@ import (
 const skillViewDescription = "Read one installed skill: its own " + skills.FileName + " when no path is given, or one file inside that skill's directory. Use it when the skills list in your context has an entry that looks relevant to the task in hand — read that skill before starting that kind of work, and follow it where it applies. " +
 	"`name` is the skill's name as it appears in that list. `path` is optional and names a file inside the skill's own directory, relative to it; a path that leaves that directory is refused. Frontmatter fields at the top of a " + skills.FileName + " are not part of the answer."
 
-// SkillViewTool is luna_skill_view: the read side of a skill, and the only way
-// one is opened. Its boundary is the skill's own directory and it reuses
+// SkillViewTool 是按需读取技能正文的入口；管理工具另提供受控的修订检查。 Its boundary is the skill's own directory and it reuses
 // internal/fileread rather than checking paths itself, so a skill read cannot
 // reach anywhere the file tools could not.
 //
@@ -30,9 +29,11 @@ const skillViewDescription = "Read one installed skill: its own " + skills.FileN
 // and a name the user turned off. A nil state is the empty selection — nothing
 // turned off.
 type SkillViewTool struct {
-	found []skills.Skill
-	state *selection
-	limit int
+	found   []skills.Skill
+	state   *selection
+	limit   int
+	source  func(context.Context) ([]skills.Skill, error)
+	library *Library
 }
 
 // NewSkillViewTool wires the tool to the skills discovery produced and to the
@@ -115,10 +116,25 @@ func (t *SkillViewTool) Invoke(ctx context.Context, arguments string) (string, e
 	if t.state.off(name) {
 		return "", fmt.Errorf("the skill %q is turned off in the user's settings; it is not read while it is off", name)
 	}
-	dir, ok := t.dirOf(name)
-	if !ok {
+	available := t.found
+	if t.source != nil {
+		var err error
+		available, err = t.source(ctx)
+		if err != nil {
+			return "", plugin.Unavailable(err)
+		}
+	}
+	var selected *skills.Skill
+	for i := range available {
+		if available[i].Name == name {
+			selected = &available[i]
+			break
+		}
+	}
+	if selected == nil {
 		return "", fmt.Errorf("no skill named %q is installed here", name)
 	}
+	dir := selected.Dir
 	// The skill's own directory is the root of this read, so no path the model
 	// sends can leave the one skill it named. An empty path means the skill
 	// file itself.
@@ -141,24 +157,17 @@ func (t *SkillViewTool) Invoke(ctx context.Context, arguments string) (string, e
 	if err != nil {
 		return "", err
 	}
+	if t.library != nil && selected.Revision != "" {
+		if err := t.library.Verify(name, selected.Revision, requested, text); err != nil {
+			return "", plugin.Unavailable(err)
+		}
+	}
 	if readTheSkill {
 		// The frontmatter is what discovery read; the model is here for the
 		// procedure, so it is not repeated.
 		return skills.Body(text), nil
 	}
 	return text, nil
-}
-
-// dirOf finds one discovered skill by name. The manifest the model read is built
-// from exactly this list, so a name that is not here is one the model did not
-// see.
-func (t *SkillViewTool) dirOf(name string) (string, bool) {
-	for _, skill := range t.found {
-		if skill.Name == name {
-			return skill.Dir, true
-		}
-	}
-	return "", false
 }
 
 // The tool is a capability contribution, so it is exactly this interface and
