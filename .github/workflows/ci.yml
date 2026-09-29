@@ -44,7 +44,7 @@ jobs:
           node-version: '22'
 
       - name: Check browser JavaScript syntax
-        run: node --check web/app.js
+        run: node --check web/app.js && node --check web/runtime-widgets.js
 
       - name: Test browser JavaScript
-        run: node --test web/app.test.cjs
+        run: node --test web/app.test.cjs web/runtime-widgets.test.cjs

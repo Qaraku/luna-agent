@@ -60,18 +60,11 @@ function pluginRows(plugins) {
   });
 }
 
-function candidateLabel(value) {
-  return {
-    v1: '稳定版本 v1',
-    v2: '候选版本 v2',
-    broken: '故障演练 broken'
-  }[value] || value;
-}
-
-function reloadCopy(state, candidate, technical = '') {
-  if (state === 'pending') return { summary: `正在验证 ${candidate}…`, technical: '' };
-  if (state === 'success') return { summary: `${candidate} 已启用。`, technical: '' };
-  return { summary: `无法启用 ${candidate}，当前版本保持不变。`, technical };
+function reloadCopy(state, tool, technical = '') {
+  const target = tool || '全部已注册工具';
+  if (state === 'pending') return { summary: '正在重建 ' + target + '…', technical: '' };
+  if (state === 'success') return { summary: target + ' 已重载。', technical: '' };
+  return { summary: '重载 ' + target + ' 失败，旧实现继续服务。', technical };
 }
 
 // --- Runtime UI plugins ---------------------------------------------------
@@ -382,6 +375,27 @@ function capabilityPanels(capabilities) {
   return panels;
 }
 
+// Widget 入口必须留在贡献能力自己的路由范围，不能借目录遍历导入其他模块。
+function capabilityWidgets(capabilities) {
+  const widgets = [];
+  for (const capability of Array.isArray(capabilities) ? capabilities : []) {
+    if (capability?.state !== 'enabled') continue;
+    const prefixes = (Array.isArray(capability.claims) ? capability.claims : []).filter(claim => claim?.kind === 'route-prefix').map(claim => claim.id);
+    for (const widget of Array.isArray(capability.widgets) ? capability.widgets : []) {
+      if (!widget || !/^[a-z][a-z0-9_.:-]{0,63}$/.test(widget.id) || typeof widget.title !== 'string' || !widget.title.trim() || widget.title.length > 80) continue;
+      const entry = capabilityPanelEntryURL(widget.entry);
+      if (!entry || entry.split('/').some(part => part === '.' || part === '..') || !prefixes.some(prefix => typeof prefix === 'string' && entry.startsWith(prefix + '/'))) continue;
+      let source='';
+      if (widget.source !== undefined && widget.source !== '') {
+        source=capabilityPanelEntryURL(widget.source);
+        if (!source || source.split('/').some(part=>part==='.'||part==='..') || !prefixes.some(prefix=>typeof prefix==='string'&&source.startsWith(prefix+'/'))) continue;
+      }
+      widgets.push({ id: widget.id, title: widget.title, entry, source, owner: capability.id });
+    }
+  }
+  return widgets;
+}
+
 // 一个贡献面板的失败文字：哪一块面板、哪一步没走通。宿主不为失败的面板编内容，
 // 也不把别的能力的名字借给它。
 function capabilityPanelEntryError(title) {
@@ -416,9 +430,9 @@ function capabilityPanelUnmountError(title, detail) {
 
 const CAPABILITY_STATE_LABELS = { enabled: '已启用', disabled: '已停用', registered: '已注册', failed: '启动失败' };
 const CAPABILITY_DEPLOYMENT_LABELS = { builtin: '内置', process: '子进程', browser: '浏览器模块' };
-const CAPABILITY_KIND_LABELS = { tool: '工具', context: '上下文', route: '路由', panel: '面板' };
+const CAPABILITY_KIND_LABELS = { tool: '工具', context: '上下文', route: '路由', panel: '面板', widget: '运行组件' };
 // 贡献分组的固定显示顺序；payload 里出现这里没有的种类时排在后面，按它自己的名字。
-const CAPABILITY_KIND_ORDER = ['tool', 'context', 'route', 'panel'];
+const CAPABILITY_KIND_ORDER = ['tool', 'context', 'route', 'panel', 'widget'];
 
 // capabilityLabel 只查一张封闭的标签表。表里没有的取值原样带出来，而不是就近映射
 // 成别的意思——界面看不懂的值必须留得下来，不能悄悄变成“未知”以外的某个档。
@@ -645,8 +659,8 @@ function skillRows(payload) {
 // 两个运行预算（一轮最多多少轮模型回合、最多多长时间）也是进程启动时定下的，
 // 但它们会真的结束一次运行，所以必须看得见；界面只转述服务端报出的数字。
 
-const REASONING_EFFORT_LABELS = { minimal: '极简', low: '低', medium: '中', high: '高', none: '不思考' };
-const REASONING_EFFORT_LEVELS = ['minimal', 'low', 'medium', 'high', 'none'];
+const REASONING_EFFORT_LABELS = { none: '不思考', minimal: '极简', low: '低', medium: '中', high: '高', xhigh: '更高', max: '最高' };
+const REASONING_EFFORT_LEVELS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 // runBudgetView 把两个预算翻成一行字。缺任何一个都不编造：服务端没有报出的数字
 // 就是"这个进程没有报告"，而不是零。
@@ -672,8 +686,8 @@ function reasoningEffortView(value) {
     return {
       present: false,
       value: '',
-      label: '进程未发送该档位',
-      note: '这个进程没有发送思考档位，模型服务自己的默认档位生效。要固定它，设置 LUNA_REASONING_EFFORT 后重启 Luna。'
+      label: '不发送思考档位',
+      note: '未发送 reasoning_effort，使用模型服务的默认档位；可通过 /reasoning 或输入区设置切换。'
     };
   }
   return {
@@ -682,7 +696,7 @@ function reasoningEffortView(value) {
     label: REASONING_EFFORT_LEVELS.includes(text)
       ? `${REASONING_EFFORT_LABELS[text]}（${text}）`
       : `${text}（未识别）`,
-    note: '思考档位在启动时决定，本进程内不能切换；要改需要设置 LUNA_REASONING_EFFORT 后重启 Luna。它决定模型怎么想，与推理过程是否展示无关。'
+    note: '可通过 /reasoning 或输入区设置切换，后续运行生效。它决定模型怎么想，与推理过程是否展示无关。支持范围由所选提供方和模型决定，不支持时明确报错，不静默降档。'
   };
 }
 
@@ -863,7 +877,7 @@ function replaySession(detail) {
       unknown += 1;
       continue;
     }
-    if (record.type === 'session') continue;
+    if (record.type === 'session' || record.type === 'config') continue;
     if (record.type === 'message') {
       const text = typeof record.text === 'string' ? record.text : '';
       if (record.role === 'user') {
@@ -892,6 +906,8 @@ function replaySession(detail) {
       const failed = status !== '' && status !== 'ok';
       if (open) {
         open.status = status;
+        const reported = usageSnapshot(record.usage);
+        if (reported) open.usage = reported;
         open.failed = failed;
         open = null;
       } else if (failed) {
@@ -1103,6 +1119,54 @@ function usageText(data) {
 // 这一段是否还在产生取——进行中给最新到达的一段（前面省略），它会一直滑动，折起来
 // 也看得到推理在长；已经结束的条目给开头（后面省略），不再像一段被切掉两头的残片。
 // 没有文本时给空串。
+// 用量只接受可精确表示的非负整数。旧事件缺少完整性字段时按部分报告显示。
+function usageSnapshot(data) {
+  if (!data || typeof data !== 'object' || (data.scope && data.scope !== 'run')) return null;
+  const valid = value => Number.isSafeInteger(value) && value >= 0;
+  if (!valid(data.input_tokens) || !valid(data.output_tokens)) return null;
+  const total = data.input_tokens + data.output_tokens;
+  if (!valid(total)) return null;
+  const result = { input_tokens: data.input_tokens, output_tokens: data.output_tokens, total_tokens: total,
+    model_calls: valid(data.model_calls) ? data.model_calls : 0, reported_calls: valid(data.reported_calls) ? data.reported_calls : 0, complete: false };
+  for (const key of ['cached_tokens', 'reasoning_tokens']) {
+    if (data[key] !== undefined) { if (!valid(data[key])) return null; result[key] = data[key]; }
+  }
+  result.complete = data.complete === true && result.model_calls > 0 && result.reported_calls === result.model_calls;
+  return result;
+}
+
+function usageFromRecords(records) {
+  const runs = new Map();
+  let latest = '';
+  (Array.isArray(records) ? records : []).forEach((record, index) => {
+    if (!record || !['message', 'tool_call', 'run'].includes(record.type)) return;
+    const id = typeof record.run_id === 'string' && record.run_id ? record.run_id : record.type === 'run' ? 'legacy-' + index : '';
+    if (!id) return;
+    if (!runs.has(id)) runs.set(id, null);
+    latest = id;
+    if (record.type === 'run') runs.set(id, usageSnapshot(record.usage));
+  });
+  return { runs, latest };
+}
+
+function usageBarView(runs, currentID, waiting = false) {
+  const current = runs.get(currentID);
+  const describe = (value, label) => !value ? label + ' 未报告' : label + (value.complete ? ' ' : ' 已报告 ') + formatTokenCount(value.total_tokens) + ' tokens' + (value.complete ? '' : '（不完整）');
+  const currentText = currentID ? describe(current, '本轮') : waiting ? '本轮 等待报告' : '本轮 尚无运行';
+  let total = 0, known = 0, incomplete = false, overflow = false;
+  for (const value of runs.values()) {
+    if (!value) { incomplete = true; continue; }
+    known += 1;
+    total += value.total_tokens;
+    if (!Number.isSafeInteger(total)) overflow = true;
+    if (!value.complete) incomplete = true;
+  }
+  const session = overflow ? '会话 用量超出可精确统计范围' : !runs.size ? '会话 尚无运行' : !known ? '会话 用量未报告'
+    : '会话 ' + (incomplete ? '已报告 ' : '') + formatTokenCount(total) + ' tokens' + (incomplete ? '（含未报告或不完整用量）' : '');
+  const detail = current ? '本轮 ' + usageText(current) + (current.complete ? '' : ' · 仅为已报告小计') : currentText;
+  return { text: currentText + ' · ' + session, title: detail + '\n' + session };
+}
+
 function reasoningPreview(value, streaming = false, max = REASONING_PREVIEW_CHARS) {
   const text = typeof value === 'string' ? value : '';
   const flat = text.replace(/\s+/g, ' ').trim();
@@ -1281,6 +1345,7 @@ function commandCandidates(commands, draft) {
     if (!option || typeof option.value !== 'string' || !option.value) continue;
     if (!option.value.toLowerCase().startsWith(prefix)) continue;
     items.push({
+      name: command.name,
       value: option.value,
       label: option.value,
       usage: `/${command.name} ${option.value}`,
@@ -1397,14 +1462,14 @@ function writeDirsWithout(dirs, dir) {
 
 if (typeof module !== 'undefined') {
   module.exports = {
-    parseEventBlock, toolSummary, toolLabel, toolActivityLabel, candidateLabel, reloadCopy, valueOrDash,
+    parseEventBlock, toolSummary, toolLabel, toolActivityLabel, reloadCopy, valueOrDash,
     pluginStatusLabel, pluginRows, parseInline, parseMarkdownBlocks,
     isSessionID, parseSessionHash, sessionHash, sessionTitle, sessionTime, relativeTime, runCountLabel,
     workspaceBadge, WORKSPACE_NAME_MAX_CHARS, WORKSPACE_DIR_MAX_LINES,
     runStatusLabel, sessionRows, argumentsText, toolCallFacts, replaySession, runPayload,
     clipText, toolArgumentsText, toolResultText, formatElapsed, formatDuration, toolFailureKind,
     toolRefusalReason, toolRefusedLabel, toolStateLabel, runPhaseText, runPhaseEntryText, runPhaseVisible,
-    runOutcomeLabel, runTraceMeta, replayRunState, formatTokenCount, usageText, reasoningPreview,
+    runOutcomeLabel, runTraceMeta, replayRunState, formatTokenCount, usageText, usageSnapshot, usageFromRecords, usageBarView, reasoningPreview,
     TOOL_TEXT_MAX_CHARS, TOOL_TEXT_MAX_LINES, TOOL_REFUSAL_PREFIX,
     RUN_NOTE_LABEL, RUN_REASONING_LABEL, RUN_CANCELLED_COPY, REASONING_PREVIEW_CHARS,
     uiPluginText, uiPluginNameValid, uiPluginEntrySafe, uiPluginEntryURL, uiPluginRows, uiPluginMissingExports,
@@ -1414,7 +1479,7 @@ if (typeof module !== 'undefined') {
     uiPluginHostAPI, UI_PLUGIN_API_VERSION, UI_PLUGIN_ENTRY_REASON, UI_PLUGIN_REQUIRED_EXPORTS,
     capabilityPanelText, capabilityPanelEntryURL, capabilityPanelElementID, capabilityPanels,
     capabilityPanelEntryError, capabilityPanelImportError, capabilityPanelMissingExportError,
-    capabilityPanelMountError, capabilityPanelUnmountError,
+    capabilityPanelMountError, capabilityPanelUnmountError, capabilityWidgets,
     capabilityStatePath, capabilityStateLabel, capabilityDeploymentLabel, capabilityKindLabel,
     capabilityRows, capabilityGroups, capabilityClaimRows, capabilityPermissionRows,
     SKILLS_PATH, SKILL_SCOPE_LABELS, SKILL_DESCRIPTION_MAX_CHARS,
@@ -1428,7 +1493,19 @@ if (typeof module !== 'undefined') {
 
 if (typeof document !== 'undefined') {
   const $ = (id) => document.getElementById(id);
-  // 外观是唯一持久化的浏览器设置；切换只改根 token，不重建会话或插件。
+  let widgetStorage;
+  try { widgetStorage = window.localStorage; } catch (_) {}
+  const runtimeWidgets = LunaRuntimeWidgets.createHost({
+    document, window, root: $('runtime-widget-layer'), menu: $('widget-menu'), storage: widgetStorage,
+    getBounds: () => ({ width: window.innerWidth, height: Math.max(64, $('chat-form').getBoundingClientRect().top - 12) }),
+    onError: () => { const node = $('conversation-status'); node.textContent = '某个运行组件无法更新，可隐藏后重新打开。'; node.hidden = false; }
+  });
+  runtimeWidgets.register({ id: 'usage', title: 'Token 用量', mount(body) {
+    const node = $('session-usage'); body.append(node);
+    return { update(view) { node.textContent = view?.text || '尚无运行'; node.title = view?.title || ''; } };
+  } });
+  runtimeWidgets.register({ id: 'activity', title: '运行活动', mount(body) { body.append($('run-status')); } });
+  // 外观和组件布局属于浏览器偏好；会话内容与执行授权仍由服务端管理。
   const themeMedia = window.matchMedia('(prefers-color-scheme: dark)');
   // 外观只有一个入口：设置面板里的 #theme-select。
   const themeControls = [$('theme-select')];
@@ -1473,6 +1550,7 @@ if (typeof document !== 'undefined') {
   // 打开的面板登记在案：运行详情是内核自己的，能力贡献的面板在 syncCapabilityPanels
   // 里按 /api/state 增减。界面插件与插件诊断不再是页头面板，它们是设置里的分类。
   const panels = {
+    execution: { element: $('execution-panel'), toggle: $('session-execution'), close: $('execution-close'), refresh: refreshExecutionPanel, teardown: () => { $('execution-confirm').checked = false; } },
     runtime: { element: runtimeDrawer, toggle: runtimeToggle, close: runtimeClose, refresh: updateState },
     sessions: { element: sessionSidebar, toggle: sessionToggle, close: sessionClose, refresh: updateSessions },
     // 打开设置时重新读一次状态：能力清单与模型服务参数都是这一刻的事实，不是页
@@ -1507,6 +1585,7 @@ if (typeof document !== 'undefined') {
 
   let running = false;
   let reloading = false;
+  let reloadableTools = [];
   let currentTurn = null;
   // 推理条目的展开状态只在会话内记住（进程内变量）：用户展开过一次，后面的推理
   // 条目沿用同一个选择；刷新后回到默认折叠，不新增浏览器存储键。
@@ -1518,9 +1597,27 @@ if (typeof document !== 'undefined') {
   let switching = false;
   let sessionsPayload = null;
   let currentSessionID = '';
+  const approvalCards = new Map();
+  let approvalRevision = 0;
+  let lastCompletedRunID = '';
+  let remoteCancelID = '';
   // 当前会话绑定的工作区 id（空表示没有绑定）。它来自会话回放或绑定接口的答复，
   // 所以设置里的工作区一页能把"正在用"标出来，而不是自己猜。
   let currentWorkspaceID = '';
+  let sessionModelChoice = null;
+  let sessionReasoningChoice = null;
+  let sessionControlsProblem = '';
+  let sessionControlsRevision = 0;
+  let controlPickerRevision = 0;
+  let lastRuntimeState = null;
+  let sessionExecution = null;
+  let executionError = '';
+  let permissionDraftDirty = false;
+  let executionRevision = 0;
+  let executionDialogSessionID = '';
+  let sessionUsageByRun = new Map();
+  let usageRunID = '';
+
 
   // --- 侧栏折叠与宽度 ---------------------------------------------------------
   // 只存在浏览器本地；桌面端生效，窄屏始终走 drawer（见 CSS 的 min-width 查询）。
@@ -1922,10 +2019,19 @@ if (typeof document !== 'undefined') {
   // 一块面板。它属于整轮运行，落在标题那一行的元信息里，所以它不再夹在推理与
   // 工具卡片之间，也不再是一条会随事件插进时间线中间的行。
   function applyUsage(turnState, data) {
-    const text = usageText(data);
-    if (!text) return;
-    turnState.usage = text;
+    if (!turnState.runID || data.run_id !== turnState.runID) return;
+    const snapshot = usageSnapshot(data);
+    sessionUsageByRun.set(turnState.runID, snapshot);
+    usageRunID = turnState.runID;
+    turnState.usage = snapshot ? usageText(data) : '';
+    if (data.scope === 'run' && data.complete === false && turnState.usage) turnState.usage += ' · 已报告部分用量';
     updateRunMeta(turnState);
+    renderUsageBar();
+  }
+
+  function renderUsageBar() {
+    const view = usageBarView(sessionUsageByRun, usageRunID, running);
+    runtimeWidgets.update('usage', view);
   }
 
   // 推理条目：一行标号 + 折叠时的实时预览 + 展开后的全文。默认折叠，因为回答才是
@@ -2126,6 +2232,7 @@ if (typeof document !== 'undefined') {
   }
 
   function setSendAction(action) {
+    send.type = action === 'send' ? 'submit' : 'button';
     const label = action === 'send' ? '发送' : action === 'cancelling' ? '正在取消' : '停止';
     send.dataset.action = action;
     send.setAttribute('aria-label', label);
@@ -2134,7 +2241,10 @@ if (typeof document !== 'undefined') {
   }
 
   function beginRun() {
+    closeComposerPopover(false);
+    closeCommandMenu();
     running = true;
+    usageRunID = '';
     liveRun = { runID: '', state: 'connecting', toolName: '', startedAt: 0, notice: '', cancelling: false };
     applyRunStatus();
     startStatusTicker();
@@ -2145,6 +2255,8 @@ if (typeof document !== 'undefined') {
   // 收到终止事件就立刻退出运行状态，不留一个还在转的 loading。
   function endRun() {
     if (!running && !liveRun) return;
+    if(liveRun?.runID)lastCompletedRunID=liveRun.runID;
+    clearApprovals();
     running = false;
     liveRun = null;
     stopStatusTicker();
@@ -2189,6 +2301,9 @@ if (typeof document !== 'undefined') {
     if (type === 'run.started') {
       const startedAt = Date.now();
       const runID = typeof data.run_id === 'string' ? data.run_id : '';
+      usageRunID = runID;
+      if (runID && !sessionUsageByRun.has(runID)) sessionUsageByRun.set(runID, null);
+      renderUsageBar();
       if (currentTurn) {
         currentTurn.runID = runID;
         currentTurn.startedAt = startedAt;
@@ -2225,6 +2340,13 @@ if (typeof document !== 'undefined') {
       }
       applyRunStatus();
       appendReasoning(data.text);
+    } else if (type === 'approval.requested') {
+      showApproval(data);
+      if (liveRun) liveRun.notice = '等待你的审批';
+      applyRunStatus();
+    } else if (type === 'approval.resolved') {
+      if (data.session_id === currentSessionID) removeApproval(data.id);
+      applyRunStatus();
     } else if (type === 'tool.started') {
       if (currentTurn) startToolCard(currentTurn, data);
       if (liveRun) {
@@ -2233,6 +2355,7 @@ if (typeof document !== 'undefined') {
       }
       applyRunStatus();
     } else if (type === 'tool.finished') {
+      refreshWidgetSources();
       if (currentTurn) finishToolCard(currentTurn, data, 'ok');
       if (liveRun) {
         liveRun.state = 'waiting';
@@ -2318,6 +2441,8 @@ if (typeof document !== 'undefined') {
 
   async function submitMessage(rawMessage) {
     if (running || switching) return;
+    if(remoteBusy()){setConversationStatus('已有运行进行中，请先停止它或等待完成。',true);return;}
+    if (!executionReady()) { setConversationStatus('请先读取执行权限，或在权限面板中确认 Full access / 切回隔离。', true); return; }
     const message = rawMessage.trim();
     if (!message) return;
     let admitted = false;
@@ -2359,15 +2484,14 @@ if (typeof document !== 'undefined') {
 
   // 运行期间同一个发送按钮就是 Stop：点击它取消这次运行，而不是再发一条消息。
   send.addEventListener('click', (event) => {
-    if (!liveRun) return;
+    if (!liveRun) {if(remoteRunID()){event.preventDefault();cancelRemoteRun();}return;}
     event.preventDefault();
     cancelRun();
   });
 
   input.addEventListener('keydown', (event) => {
-    // While the candidate list is open the keyboard serves it first: move,
-    // complete, dismiss. The list does not decide whether a message is sent;
-    // with it closed this whole layer is absent and Enter sends as before.
+    // 候选打开时方向键选择，Tab 只补全；Enter 选中模型/思考参数后直接保存设置，
+    // 不启动模型。列表关闭时 Enter 保持原有发送语义。
     if (commandItems.length) {
       if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
         event.preventDefault();
@@ -2380,22 +2504,22 @@ if (typeof document !== 'undefined') {
         return;
       }
       if (event.key === 'Tab' || (event.key === 'Enter' && !event.shiftKey && !event.isComposing)) {
-        // Completion writes the name and a space into the draft and stops
-        // there: a command is submitted by whoever decided to send it.
+        // 命令名进入参数选择；参数确认仅调用设置接口。Tab 始终不提交。
         event.preventDefault();
-        completeCommandSelection();
+        completeCommandSelection(event.key !== 'Tab');
         return;
       }
     }
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
-      form.requestSubmit();
+      if (!running && !switching) form.requestSubmit();
     }
   });
 
   function resizeInput() {
     input.style.height = 'auto';
     input.style.height = `${Math.min(input.scrollHeight, 144)}px`;
+    runtimeWidgets.reflow();
   }
   input.addEventListener('input', resizeInput);
 
@@ -2422,6 +2546,9 @@ if (typeof document !== 'undefined') {
   }
 
   function closeCommandMenu() {
+    controlPickerRevision += 1;
+    $('session-model').setAttribute('aria-expanded', 'false');
+    $('session-reasoning').setAttribute('aria-expanded', 'false');
     commandItems = [];
     commandSelection = -1;
     commandMenuNode.replaceChildren();
@@ -2442,7 +2569,7 @@ if (typeof document !== 'undefined') {
     commandMenuNode.replaceChildren();
     items.forEach((item, index) => {
       const row = make('li', 'command-menu-row');
-      // 候选是可点的，但补全本身不发送：点一行与键盘选中是同一件事。
+      // 点击与 Enter 一致：选中命令名后展开选项，选中参数后保存会话设置。
       row.setAttribute('role', 'option');
       row.setAttribute('aria-selected', index === commandSelection ? 'true' : 'false');
       row.append(make('span', 'command-menu-name', item.label));
@@ -2451,7 +2578,7 @@ if (typeof document !== 'undefined') {
       row.addEventListener('mousedown', (event) => {
         event.preventDefault();
         commandSelection = index;
-        completeCommandSelection();
+        completeCommandSelection(true);
       });
       commandMenuNode.append(row);
     });
@@ -2462,7 +2589,7 @@ if (typeof document !== 'undefined') {
   // so completion, deletion and paste all leave the list showing what the line
   // means now instead of what it meant before.
   function refreshCommandMenu() {
-    const view = commandCandidates(commandTable, input.value.trim());
+    const view = commandCandidates(commandTable, input.value.trimStart());
     if (view.mode === 'none') {
       closeCommandMenu();
       return;
@@ -2481,17 +2608,21 @@ if (typeof document !== 'undefined') {
     if (row && typeof row.scrollIntoView === 'function') row.scrollIntoView({ block: 'nearest' });
   }
 
-  function completeCommandSelection() {
+  function completeCommandSelection(execute = false) {
     const item = commandItems[commandSelection];
-    if (!item) {
-      closeCommandMenu();
+    if (!item) { closeCommandMenu(); return; }
+    closeCommandMenu();
+    if (execute && item.value !== undefined && ['model', 'reasoning', 'permissions'].includes(item.name)) {
+      if (item.name === 'model') applyModelChoice(item.value);
+      else if(item.name==='permissions') applyPermissionCommand(item.value);
+      else applyReasoningChoice(item.value);
+      input.focus();
       return;
     }
     input.value = item.insert;
-    // 补全只改草稿：光标回到输入框，发送仍由用户决定。
-    closeCommandMenu();
     resizeInput();
     input.focus();
+    if (execute && ['model', 'reasoning'].includes(item.name)) openControlPicker(item.name);
   }
 
   // The answer to `/help` is the table itself: every command, in the order the
@@ -2508,39 +2639,422 @@ if (typeof document !== 'undefined') {
   // models are, or which of them this session should use. The answer is a
   // session record, so the choice survives a reload and travels with the
   // session — the browser keeps no copy of it.
-  async function applyModelChoice(name) {
+  function sessionQuery() {
+    return isSessionID(currentSessionID) ? '?session=' + encodeURIComponent(currentSessionID) : '';
+  }
+
+  const permissionKinds=['read','write','network','exec'];
+  const defaultPermissions={read:'allow',write:'ask',network:'ask',exec:'ask'};
+  function validPermissions(value) {return value&&permissionKinds.every(kind=>['allow','ask','deny'].includes(value[kind]));}
+  function permissionSummary(value) {
+    if (permissionKinds.some(kind=>value[kind]==='ask')) return '需审批 ▾';
+    if (value.read==='allow'&&['write','network','exec'].every(kind=>value[kind]==='deny')) return '只读 ▾';
+    return permissionKinds.every(kind=>value[kind]==='allow')?'已授权 ▾':'自定义权限 ▾';
+  }
+  function executionReady() {
+    return Boolean(sessionExecution && ['sandbox', 'full_access'].includes(sessionExecution.mode) && !executionError && !sessionExecution.needs_confirmation && !sessionExecution.problem);
+  }
+
+  function resetExecutionState() {
+    permissionDraftDirty=false;
+    executionRevision += 1;
+    sessionExecution = null;
+    executionError = '';
+    $('execution-confirm').checked = false;
+    executionDialogSessionID = currentSessionID;
+  }
+
+  function renderExecutionState() {
+    const control = $('session-execution');
+    const view = sessionExecution;
+    const full = view?.mode === 'full_access' && !view.needs_confirmation;
+    let label = executionError ? '权限读取失败' : !view ? '读取权限…' : view.problem ? '权限需修复' : view.needs_confirmation ? 'Full access 待确认' : full ? 'Full access' : validPermissions(view.permissions) ? permissionSummary(view.permissions) : '隔离 ▾';
+    control.textContent = label;
+    control.classList.toggle('is-full-access', full);
+    control.title = full ? '当前会话已获本次服务中的宿主用户文件与网络权限' : '查看并更改当前会话的命令执行权限';
+    control.disabled = switching;
+    if (activePanel === panels.execution && executionDialogSessionID !== currentSessionID) {
+      $('execution-confirm').checked = false;
+      executionDialogSessionID = currentSessionID;
+    }
+    $('execution-current').textContent = executionError ? '读取失败：' + executionError : view?.needs_confirmation ? '此会话保存了 Full access 偏好，但本次服务尚未授权。请重新确认或切回隔离。' : view?.problem || label;
+    const busy = running || switching || Boolean(lastRuntimeState?.busy);
+    $('execution-confirm').disabled = busy || !view || Boolean(executionError);
+    $('execution-full').disabled = busy || !view || Boolean(executionError) || !$('execution-confirm').checked;
+    $('execution-sandbox').disabled = busy;
+    const valid=validPermissions(view?.permissions);
+    for (const kind of permissionKinds) {
+      const node=$('permission-'+kind);node.disabled=busy||!valid;
+      if (!permissionDraftDirty) node.value=valid?view.permissions[kind]:'';
+    }
+    $('permission-save').disabled=busy||!valid;
+    $('permission-default').disabled=busy;
+    $('permission-note').textContent=!valid?'服务端尚未返回有效的权限矩阵。':view.permissions_need_confirmation?'此前的提升授权已失效；当前使用上方的有效策略，可重新选择并应用。':full?'Full access 绕过细粒度限制；应用矩阵会退出 Full access。':busy?'本轮使用已核准的策略；可以查看，停止后才能修改。':'允许、询问、拒绝分别生效；询问会在操作发生前暂停。';
+    const scope=view?.scopes;
+    const project=Array.isArray(scope?.project_dirs)?scope.project_dirs:[];
+    const automatic=Array.isArray(scope?.automatic_write_dirs)?scope.automatic_write_dirs:[];
+    $('permission-scope').textContent=!scope?'范围尚未返回。':[
+      full?'Full access 命令可访问宿主；下列目录仅是文件工具的项目范围。':'文件工具与受限命令的项目目录：',
+      project.length?project.join('\n'):'未绑定项目目录',
+      '自动写入范围（仍受会话策略约束）：',automatic.length?automatic.join('\n'):'未设置；项目内写入需逐次批准',
+      scope.network==='host'?'命令使用宿主网络。':'受限联网仅通过公共 HTTP(S)/CONNECT 代理；拒绝宿主与私网地址，不提供直接套接字或 UDP。',
+      scope.write_problem||''
+    ].filter(Boolean).join('\n');
+    $('execution-pending').hidden=!approvalCards.size;
+    $('execution-pending').textContent='查看待审批操作（'+approvalCards.size+'）';
+  }
+
+  async function updateExecutionState() {
+    const revision = ++executionRevision;
+    const id = currentSessionID;
     try {
-      if (!isSessionID(currentSessionID)) {
-        setConversationStatus('这个会话还没有消息，还没有可以记住选择的地方。先发一条消息，再用 /model 切换。', true);
-        return;
-      }
-      const query = `?session=${encodeURIComponent(currentSessionID)}`;
-      const response = await fetch(`/api/models${query}`, { cache: 'no-store' });
+      const response = await fetch('/api/execution' + sessionQuery(), { cache: 'no-store' });
       if (!response.ok) throw new Error(await errorMessage(response));
-      const payload = await response.json();
-      const current = payload.current || {};
-      const names = (payload.models || []).map((model) => model.name);
-      if (!name) {
-        const origin = current.origin === 'session' ? '这个会话选的' : '配置里的默认';
-        setConversationStatus(`当前模型：${current.name}（${origin}）。可用：${names.join('、')||'无'}。`);
-        return;
-      }
-      const switchResponse = await fetch(`/api/sessions/${currentSessionID}/model`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: name })
-      });
-      if (!switchResponse.ok) throw new Error(await errorMessage(switchResponse));
-      const chosen = await switchResponse.json();
-      setConversationStatus(`已切换：这个会话的后续运行使用 ${chosen.model}。`);
-      // 设置里已经读过模型清单时跟着重读一次，这一页显示的就是服务端刚报的状态。
-      if (modelListed) await updateModelList();
+      const view = await response.json();
+      if (!['sandbox', 'full_access'].includes(view.mode)) throw new Error('服务端没有返回有效的执行权限');
+      if (revision !== executionRevision || id !== currentSessionID) return false;
+      sessionExecution = view;
+      executionError = '';
     } catch (error) {
-      // The server owns what is a valid model, so its refusal is the answer;
-      // saying anything else here would be this file guessing at the rules.
-      setConversationStatus(`切换失败：${error.message}`, true);
+      if (revision !== executionRevision || id !== currentSessionID) return false;
+      sessionExecution = null;
+      executionError = error.message;
+    }
+    setSessionControls();
+    return !executionError;
+  }
+
+  function refreshExecutionPanel() {
+    permissionDraftDirty=false;
+    executionDialogSessionID = currentSessionID;
+    $('execution-confirm').checked = false;
+    $('execution-status').textContent = '';
+    renderExecutionState();
+    updateExecutionState();
+  }
+
+  async function chooseExecution(mode) {
+    if (running || switching || lastRuntimeState?.busy) return;
+    if (executionDialogSessionID !== currentSessionID) {
+      $('execution-confirm').checked = false;
+      $('execution-status').textContent = '会话已改变，请重新查看并确认权限。';
+      renderExecutionState();
+      return;
+    }
+    if (mode === 'full_access' && !$('execution-confirm').checked) {
+      $('execution-status').textContent = '请先阅读风险说明并勾选确认。';
+      return;
+    }
+    try {
+      const body = mode === 'full_access' ? { mode, confirm_full_access: true } : { mode };
+      const view = await saveSessionSetting('execution', body);
+      if (!['sandbox', 'full_access'].includes(view.mode)) throw new Error('服务端未确认有效执行权限');
+      executionRevision += 1;
+      sessionExecution = view;
+      permissionDraftDirty=false;
+      executionError = '';
+      $('execution-confirm').checked = false;
+      setSessionControls();
+      closeDrawer();
+    } catch (error) {
+      $('execution-confirm').checked = false;
+      $('execution-status').textContent = '权限设置未成功确认：' + error.message;
+      await updateExecutionState();
     }
   }
+
+  async function savePermissionPolicy(policy) {
+    if (running||switching||lastRuntimeState?.busy) {setConversationStatus('请先停止当前运行，再修改权限。',true);return false;}
+    if (!validPermissions(policy)) {setConversationStatus('权限矩阵不完整。',true);return false;}
+    try {
+      const view=await saveSessionSetting('execution',{permissions:policy,confirm_permissions:true});
+      if (!validPermissions(view.permissions)) throw new Error('服务端没有确认完整权限矩阵');
+      sessionExecution=view;executionError='';permissionDraftDirty=false;
+      $('execution-confirm').checked=false;setSessionControls();closeDrawer();
+      clearControlDraft('permissions');return true;
+    } catch(error) { $('execution-status').textContent='权限未保存：'+error.message;setConversationStatus('权限未保存：'+error.message,true);return false; }
+  }
+  async function applyPermissionCommand(argument) {
+    if (!argument) {openDrawer(panels.execution);return;}
+    if (argument==='--default') {await savePermissionPolicy({...defaultPermissions});return;}
+    const parts=argument.trim().split(/[=\s]+/);
+    if (parts.length!==2||!permissionKinds.includes(parts[0])||!['allow','ask','deny'].includes(parts[1])) {setConversationStatus('用法：/permissions read|write|network|exec allow|ask|deny，或 --default。',true);return;}
+    if (!validPermissions(sessionExecution?.permissions)) {setConversationStatus('请先重新读取权限，不能猜测未返回的策略。',true);return;}
+    await savePermissionPolicy({...sessionExecution.permissions,[parts[0]]:parts[1]});
+  }
+  for(const kind of permissionKinds) $('permission-'+kind).addEventListener('change',()=>{permissionDraftDirty=true;});
+  $('permission-form').addEventListener('submit',event=>{event.preventDefault();savePermissionPolicy(Object.fromEntries(permissionKinds.map(kind=>[kind,$('permission-'+kind).value])));});
+  $('permission-default').addEventListener('click',()=>savePermissionPolicy({...defaultPermissions}));
+  $('execution-workspace').addEventListener('click',()=>openComposerSettings('workspace'));
+  $('execution-pending').addEventListener('click',()=>{closeDrawer(false);const first=approvalCards.values().next().value;if(first){first.card.scrollIntoView?.({block:'nearest'});first.allow.focus();}});
+
+  $('execution-confirm').addEventListener('change', renderExecutionState);
+  $('execution-full').addEventListener('click', () => chooseExecution('full_access'));
+  $('execution-sandbox').addEventListener('click', () => chooseExecution('sandbox'));
+  $('execution-capabilities').addEventListener('click', () => { openDrawer(panels.settings); $('settings-tab-capabilities').click(); });
+
+  function removeApproval(id) {
+    const record=approvalCards.get(id);
+    if (!record) return;
+    const focused=record.card.contains(document.activeElement);
+    record.card.remove();approvalCards.delete(id);
+    $('approval-list').hidden=!approvalCards.size;
+    if (focused) input.focus();
+  }
+  function clearApprovals() {
+    approvalRevision++;
+    for (const id of [...approvalCards.keys()]) removeApproval(id);
+  }
+  function showApproval(view) {
+    if (!view || view.session_id!==currentSessionID || typeof view.run_id!=='string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(view.id) || approvalCards.has(view.id)) return;
+    const operation=view.operation;
+    if (!operation || typeof operation.tool!=='string') return;
+    const card=make('section','approval-card');card.id='approval-'+view.id;
+    card.append(make('h3','approval-title','需要你的批准'),make('p','',textOr(operation.summary,operation.tool)));
+    for (const [label,value] of [['目标',operation.target],['工作目录',operation.cwd],['命令',operation.command]]) {
+      if (typeof value==='string'&&value) {card.append(make('div','approval-label',label),make('pre','approval-operation',value));}
+    }
+    if (Array.isArray(operation.read_roots)&&operation.read_roots.length) card.append(make('p','approval-scope','读取范围：'+operation.read_roots.join('、')));
+    if (Array.isArray(operation.write_roots)&&operation.write_roots.length) card.append(make('p','approval-scope','写入范围：'+operation.write_roots.join('、')));
+    const names={read:'文件读取',write:'文件修改',network:'联网',exec:'命令执行'};
+    const requested=(Array.isArray(operation.ask)?operation.ask:operation.permissions||[]).map(kind=>names[kind]||kind).join('、');
+    if (requested) card.append(make('p','approval-scope','本次请求：'+requested));
+    if (operation.scope_approval) card.append(make('p','approval-scope','仅批准这一次的目标范围，不会加入自动写入目录。'));
+    if (typeof operation.preview==='string'&&operation.preview) {
+      const detail=make('details');detail.append(make('summary','','内容预览'),make('pre','approval-operation',operation.preview));card.append(detail);
+    }
+    const actions=make('div','approval-actions');
+    const allow=make('button','luna-button','批准这一次'),deny=make('button','luna-button','拒绝');
+    allow.id='approval-approve-'+view.id;deny.id='approval-deny-'+view.id;allow.type=deny.type='button';
+    const status=make('p','luna-status');status.setAttribute('role','status');
+    actions.append(allow,deny);card.append(actions,status);
+    const record={view,card,allow,deny,status,busy:false};approvalCards.set(view.id,record);
+    allow.addEventListener('click',()=>decideApproval(record,'approve'));
+    deny.addEventListener('click',()=>decideApproval(record,'deny'));
+    const stick=nearBottom();$('approval-list').append(card);$('approval-list').hidden=false;contentChanged(stick);
+  }
+  async function decideApproval(record,decision) {
+    const {view}=record;
+    if (record.busy||view.session_id!==currentSessionID||approvalCards.get(view.id)!==record) return;
+    record.busy=true;record.allow.disabled=record.deny.disabled=true;record.status.textContent='正在提交…';
+    try {
+      const response=await fetch('/api/approvals/'+encodeURIComponent(view.id),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run_id:view.run_id,session_id:view.session_id,decision})});
+      if (!response.ok) {
+        if (response.status===404||response.status===409) {removeApproval(view.id);setConversationStatus('这项审批已结束或失效。');return;}
+        throw new Error(await errorMessage(response));
+      }
+      removeApproval(view.id);
+    } catch (error) {
+      if (approvalCards.get(view.id)===record) record.status.textContent='审批未提交：'+error.message;
+    } finally {record.busy=false;record.allow.disabled=record.deny.disabled=false;}
+  }
+  async function refreshApprovals() {
+    const id=currentSessionID,revision=++approvalRevision;
+    if (!id || (!running&&!lastRuntimeState?.busy)) {for(const key of [...approvalCards.keys()])removeApproval(key);return;}
+    try {
+      const response=await fetch('/api/approvals?session='+encodeURIComponent(id),{cache:'no-store'});
+      if (!response.ok) return;
+      const payload=await response.json();
+      if (revision!==approvalRevision||id!==currentSessionID) return;
+      const list=Array.isArray(payload.approvals)?payload.approvals:[];
+      const wanted=new Set(list.map(view=>view.id));
+      for (const key of [...approvalCards.keys()]) if(!wanted.has(key)) removeApproval(key);
+      for (const view of list) showApproval(view);
+    } catch (_) { /* 现有审批卡保留，单次轮询失败不冒充取消。 */ }
+  }
+
+  function renderSessionControls() {
+    renderUsageBar();
+    renderExecutionState();
+    const model = sessionModelChoice?.name || '未配置';
+    const effort = sessionReasoningChoice ? reasoningEffortView(sessionReasoningChoice.reasoning_effort).label : '未读取';
+    const modelButton = $('session-model');
+    const effortButton = $('session-reasoning');
+    modelButton.textContent = '模型：' + model;
+    effortButton.textContent = '思考：' + effort;
+    const source = (choice) => choice?.origin === 'session' ? '当前会话选择' : '跟随全局默认';
+    modelButton.title = model + ' · ' + source(sessionModelChoice) + (sessionControlsProblem ? ' · 更新失败：' + sessionControlsProblem : '');
+    effortButton.title = effort + ' · ' + source(sessionReasoningChoice) + (sessionControlsProblem ? ' · 更新失败：' + sessionControlsProblem : '');
+    modelButton.disabled = effortButton.disabled = running || switching;
+    if (sessionModelChoice?.name) $('model').textContent = sessionModelChoice.name;
+    if (sessionReasoningChoice) $('effort').textContent = effort;
+    const summary = $('session-settings');
+    const shortEffort = sessionReasoningChoice?.reasoning_effort || '自动';
+    summary.textContent = model + ' · ' + shortEffort + ' ▾';
+    summary.title = modelButton.title + ' · ' + effortButton.title;
+    summary.disabled = switching;
+    summary.classList.toggle('has-error', Boolean(sessionControlsProblem));
+  }
+
+  async function updateSessionControls() {
+    updateExecutionState();
+    const revision = ++sessionControlsRevision;
+    const id = currentSessionID;
+    const query = sessionQuery();
+    try {
+      const responses = await Promise.all([fetch('/api/models' + query, { cache: 'no-store' }), fetch('/api/reasoning' + query, { cache: 'no-store' })]);
+      for (const response of responses) if (!response.ok) throw new Error(await errorMessage(response));
+      const [models, reasoning] = await Promise.all(responses.map(response => response.json()));
+      if (revision !== sessionControlsRevision || id !== currentSessionID) return;
+      sessionModelChoice = models.current || null;
+      sessionReasoningChoice = reasoning.current || null;
+      sessionControlsProblem = '';
+    } catch (error) {
+      if (revision !== sessionControlsRevision || id !== currentSessionID) return;
+      sessionControlsProblem = error.message;
+    }
+    renderSessionControls();
+  }
+
+  async function openControlPicker(kind) {
+    if (running || switching) return;
+    closeComposerPopover(false);
+    const revision = ++controlPickerRevision;
+    const id = currentSessionID;
+    try {
+      const response = await fetch('/api/' + (kind === 'model' ? 'models' : 'reasoning') + sessionQuery(), { cache: 'no-store' });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      const payload = await response.json();
+      if (revision !== controlPickerRevision || id !== currentSessionID || running || switching) return;
+      const current = payload.current || {};
+      let options;
+      if (kind === 'model') {
+        sessionModelChoice = current;
+        options = (payload.models || []).map(model => ({ value: model.name, summary: model.provider || '' }));
+        options.push({ value: '--default', summary: '跟随全局默认模型' });
+      } else {
+        sessionReasoningChoice = current;
+        options = [{ value: '--default', summary: '跟随全局设置' }, { value: '--off', summary: '不发送思考字段（不同于 none）' }, ...(payload.levels || []).map(value => ({ value }))];
+      }
+      const chosen = current.origin === 'global' ? '--default' : kind === 'model' ? current.name : current.reasoning_effort || '--off';
+      options = options.map(option => ({ ...option, summary: [option.value === chosen ? '当前' : '', option.summary].filter(Boolean).join(' · ') }));
+      const items = commandCandidates([{ name: kind, args: 'options', options }], '/' + kind + ' ').items;
+      renderCommandList(items);
+      $('session-' + kind).setAttribute('aria-expanded', items.length ? 'true' : 'false');
+      renderSessionControls();
+      input.focus();
+    } catch (error) { setConversationStatus('读取选项失败：' + error.message, true); }
+  }
+
+  // 首次设置即分配会话身份，不需要先花一次模型调用；hash 用 replaceState 更新，
+  // 避免随后触发回放清空当前草稿。调用方持有 switching，防止交叉创建或发送。
+  async function ensureSession() {
+    if (isSessionID(currentSessionID)) return currentSessionID;
+    const response = await fetch('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    if (!response.ok) throw new Error(await errorMessage(response));
+    const session = await response.json();
+    if (!isSessionID(session.id)) throw new Error('服务端没有返回有效的会话标识');
+    currentSessionID = session.id;
+    syncCapabilityWidgets(capabilityWidgets(lastRuntimeState?.capabilities));
+    resetExecutionState();
+    history.replaceState(null, '', location.pathname + location.search + sessionHash(session.id));
+    rerenderSessions();
+    await updateSessions();
+    return session.id;
+  }
+
+  async function saveSessionSetting(field, body) {
+    if (running || switching) throw new Error('运行或会话更新期间不能修改设置');
+    switching = true;
+    sessionControlsRevision += 1;
+    executionRevision += 1;
+    modelListRevision += 1;
+    closeCommandMenu();
+    setSessionControls();
+    try {
+      const id = await ensureSession();
+      const response = await fetch('/api/sessions/' + id + '/' + field, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (!response.ok) throw new Error(await errorMessage(response));
+      return await response.json();
+    } finally {
+      switching = false;
+      setSessionControls();
+    }
+  }
+
+  function clearControlDraft(kind) {
+    const text = input.value.trimStart();
+    if (text === '/' + kind || text.startsWith('/' + kind + ' ')) { input.value = ''; resizeInput(); }
+  }
+
+  async function applyModelChoice(name) {
+    if (!name) return openControlPicker('model');
+    try {
+      const chosen = await saveSessionSetting('model', name === '--default' ? { reset: true } : { model: name });
+      sessionModelChoice = { name: chosen.model, origin: chosen.origin };
+      if (modelPayload && modelListed) {
+        modelPayload = { ...modelPayload, current: sessionModelChoice };
+        modelPayloadSessionID = currentSessionID;
+        renderModelList();
+      }
+      clearControlDraft('model');
+      renderSessionControls();
+      setConversationStatus('这个会话的后续运行使用 ' + (chosen.model || '全局默认模型') + '。');
+      await updateSessionControls();
+      if (modelListed) await updateModelList();
+      return true;
+    } catch (error) {
+      setConversationStatus('切换失败：' + error.message, true);
+      if (modelListed) setModelSwitchStatus('切换失败：' + error.message, 'failure');
+      return false;
+    }
+  }
+
+  async function applyReasoningChoice(value) {
+    if (!value) return openControlPicker('reasoning');
+    try {
+      const body = value === '--default' ? { reset: true } : { reasoning_effort: value === '--off' ? '' : value };
+      const chosen = await saveSessionSetting('reasoning', body);
+      sessionReasoningChoice = chosen.current || null;
+      clearControlDraft('reasoning');
+      renderSessionControls();
+      setConversationStatus('后续运行的思考设置：' + reasoningEffortView(sessionReasoningChoice?.reasoning_effort).label + '。具体支持情况由模型服务决定。');
+      await updateSessionControls();
+    } catch (error) { setConversationStatus('切换失败：' + error.message, true); }
+  }
+
+  let composerPopover = null;
+  function closeComposerPopover(restoreFocus = true) {
+    if (!composerPopover) return;
+    const { panel, toggle } = composerPopover;
+    composerPopover = null;
+    panel.hidden = true;
+    toggle.setAttribute('aria-expanded', 'false');
+    if (restoreFocus) toggle.focus();
+  }
+  function toggleComposerPopover(panel, toggle) {
+    const wasOpen = composerPopover?.panel === panel;
+    closeComposerPopover(false);
+    closeCommandMenu();
+    if (wasOpen) return;
+    composerPopover = { panel, toggle };
+    panel.hidden = false;
+    toggle.setAttribute('aria-expanded', 'true');
+    panel.querySelector('button')?.focus();
+  }
+  for (const [button, panel] of [['composer-add', 'composer-actions'], ['session-settings', 'composer-settings'], ['conversation-workspace', 'composer-project']]) {
+    $(button).addEventListener('click', () => toggleComposerPopover($(panel), $(button)));
+  }
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && composerPopover) { event.preventDefault(); closeComposerPopover(); }
+  });
+  document.addEventListener('click', event => {
+    if (composerPopover && !composerPopover.panel.contains(event.target) && !composerPopover.toggle.contains(event.target)) closeComposerPopover(false);
+    if (commandItems.length && !commandMenuNode.contains(event.target) && !form.contains(event.target)) closeCommandMenu();
+  });
+  document.addEventListener('focusin', event => {
+    if (composerPopover && !composerPopover.panel.contains(event.target) && !composerPopover.toggle.contains(event.target)) closeComposerPopover(false);
+  });
+  function openComposerSettings(pane) {
+    openDrawer(panels.settings);
+    $('settings-tab-' + pane).click();
+  }
+  $('composer-capabilities').addEventListener('click', () => openComposerSettings('capabilities'));
+  $('composer-workspace').addEventListener('click', () => openComposerSettings('workspace'));
+  $('composer-project-change').addEventListener('click', () => openComposerSettings('workspace'));
+
+  $('session-model').addEventListener('click', () => openControlPicker('model'));
+  $('session-reasoning').addEventListener('click', () => openControlPicker('reasoning'));
 
   function submitCommand(draft) {
     const parts = draft.slice(1).split(/\s+/);
@@ -2563,6 +3077,8 @@ if (typeof document !== 'undefined') {
       setConversationStatus(`Luna 正在运行，/${command.name} 现在不能执行。等这次运行结束后再试。`, true);
       return;
     }
+    if (command.name === 'permissions') { applyPermissionCommand(argument); return; }
+    if (command.name === 'reasoning') { applyReasoningChoice(argument); return; }
     if (command.name === 'model') {
       applyModelChoice(argument);
       return;
@@ -2582,6 +3098,7 @@ if (typeof document !== 'undefined') {
 
   function setBackgroundInert(value) {
     if ('inert' in appShell) appShell.inert = value;
+    $('runtime-widget-layer').inert = value;
     sessionSidebar.inert = value && activePanel !== panels.sessions;
   }
 
@@ -2595,6 +3112,8 @@ if (typeof document !== 'undefined') {
   }
 
   function openDrawer(panel) {
+    closeComposerPopover(false);
+    closeCommandMenu();
     if (panel === panels.sessions && !sessionMedia.matches) return;
     if (activePanel === panel) return;
     // 面板共用一个模态层；立即隐藏旧面板，避免关闭动画留下可聚焦的控件。
@@ -2789,28 +3308,61 @@ if (typeof document !== 'undefined') {
     reloadTechnical.open = false;
   }
 
+  function refreshReloadButton() {
+    const selected = $('reload-tool').value;
+    reloadButton.disabled = reloading || reloadableTools.length === 0 || (selected !== '' && !reloadableTools.includes(selected));
+  }
+
+  function renderReloadTools(state) {
+    const offered = Array.isArray(state.reloadable_tools) ? state.reloadable_tools : (state.plugins || []).map(record => record.tool);
+    const names = [...new Set(offered.filter(name => typeof name === 'string' && /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(name)))];
+    if (names.join('\n') !== reloadableTools.join('\n')) {
+      const select = $('reload-tool');
+      const previous = select.value;
+      select.replaceChildren();
+      for (const name of ['', ...names]) {
+        const option = make('option', '', name || '全部已注册工具');
+        option.setAttribute('value', name);
+        option.value = name;
+        select.append(option);
+      }
+      // 注册项消失时保留不可提交的选中项，不悄悄把“一个工具”改成“全部”。
+      if (previous && !names.includes(previous)) {
+        const missing = make('option', '', previous + '（已移除）');
+        missing.setAttribute('value', previous);
+        missing.value = previous;
+        missing.disabled = true;
+        select.append(missing);
+      }
+      select.value = previous;
+      reloadableTools = names;
+    }
+    refreshReloadButton();
+  }
+
+  $('reload-tool').addEventListener('change', refreshReloadButton);
   reloadForm.addEventListener('submit', async (event) => {
     event.preventDefault();
-    if (reloading) return;
-    const candidate = $('candidate').value;
+    if (reloading || reloadButton.disabled) return;
+    const tool = $('reload-tool').value;
     reloading = true;
-    reloadButton.disabled = true;
-    updateReloadStatus(reloadCopy('pending', candidate));
+    refreshReloadButton();
+    updateReloadStatus(reloadCopy('pending', tool));
     try {
       const response = await fetch('/api/reload', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ candidate })
+        body: JSON.stringify({ tool })
       });
       if (!response.ok) throw new Error(await errorMessage(response));
       const body = await response.json();
-      updateReloadStatus(reloadCopy('success', candidate), 'success');
+      updateReloadStatus(reloadCopy('success', tool), 'success');
       renderState(body);
     } catch (error) {
-      updateReloadStatus(reloadCopy('failure', candidate, error.message), 'failure');
+      updateReloadStatus(reloadCopy('failure', tool, error.message), 'failure');
     } finally {
       reloading = false;
-      reloadButton.disabled = false;
+      refreshReloadButton();
     }
   });
 
@@ -3776,7 +4328,7 @@ if (typeof document !== 'undefined') {
 
     const use = item.querySelector('.workspace-use');
     use.hidden = row.current;
-    use.disabled = workspaceBusy || !isSessionID(currentSessionID);
+    use.disabled = workspaceBusy || running || switching;
     use.textContent = '这个会话用它';
     use.setAttribute('aria-label', `让这个会话使用工作区 ${row.name}`);
   }
@@ -3832,41 +4384,21 @@ if (typeof document !== 'undefined') {
   // bindWorkspace 是这一页唯一的写操作。服务端的答复带着绑定之后的完整工作区，
   // 所以页头标识与这一页的标记同时更新，两边不会各说一套。
   async function bindWorkspace(row) {
-    if (!row || !row.id || workspaceBusy) return;
-    if (!isSessionID(currentSessionID)) {
-      setWorkspaceStatus('这个会话还没有消息，还没有可以记录绑定的地方。先发一条消息，再试试。', 'failure');
-      return;
-    }
+    if (!row || !row.id || workspaceBusy || running || switching) return;
     workspaceBusy = true;
     renderWorkspaces();
-    setWorkspaceStatus(`正在把这个会话绑到 ${row.name}…`);
-    let failure = '';
     try {
-      const response = await fetch(`/api/sessions/${currentSessionID}/workspace`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workspace: row.id })
-      });
-      if (!response.ok) failure = await errorMessage(response);
-      else {
-        const payload = await response.json();
-        currentWorkspaceID = payload.workspace ? textOr(payload.workspace.id) : '';
-        setConversationWorkspace(payload.workspace || null);
-      }
+      const payload = await saveSessionSetting('workspace', { workspace: row.id });
+      currentWorkspaceID = payload.workspace ? textOr(payload.workspace.id) : '';
+      setConversationWorkspace(payload.workspace || null);
+      workspaceBusy = false;
+      await updateWorkspaces();
+      setWorkspaceStatus('这个会话现在工作在 ' + row.name + '。下一次运行就能读到里面的项目规则与文件。');
     } catch (error) {
-      failure = error.message;
-    }
-    workspaceBusy = false;
-    if (failure) {
+      workspaceBusy = false;
       renderWorkspaces();
-      setWorkspaceStatus(`绑定 ${row.name} 失败：${failure}（它仍按上一次读到的状态显示）`, 'failure');
-      return;
+      setWorkspaceStatus('绑定失败：' + error.message, 'failure');
     }
-    if (!(await updateWorkspaces())) {
-      setWorkspaceStatus(`绑定 ${row.name} 的请求已经发出，但重新读取工作区失败：界面仍按上一次读到的状态显示。`, 'failure');
-      return;
-    }
-    setWorkspaceStatus(`这个会话现在工作在 ${row.name}。下一次运行就能读到里面的项目规则与文件。`);
   }
 
   workspaceRefresh.addEventListener('click', () => updateWorkspaces());
@@ -3939,7 +4471,7 @@ if (typeof document !== 'undefined') {
     const button = make('button', `luna-button ${action === 'allow' ? 'write-dirs-allow' : 'write-dirs-remove'}`, label);
     button.type = 'button';
     button.disabled = writeDirsBusy;
-    button.setAttribute('aria-label', action === 'allow' ? `允许写入 ${dir}` : `不再允许写入 ${dir}`);
+    button.setAttribute('aria-label', action === 'allow' ? `允许自动写入 ${dir}` : `移出自动写入范围 ${dir}`);
     button.addEventListener('click', () => (action === 'allow' ? allowWriteDir(dir) : removeWriteDir(dir)));
     item.append(path, button);
     return item;
@@ -3968,7 +4500,7 @@ if (typeof document !== 'undefined') {
     }
     writeDirsCandidatesEmpty.hidden = candidates.length > 0;
     writeDirsCandidatesEmpty.textContent = workspaceDirs.length
-      ? '工作区里的目录都已经允许写入了。'
+      ? '当前项目目录都已列入自动写入范围。'
       : '还没有读到工作区目录：这一节照样可以直接填一个绝对路径。';
   }
 
@@ -3984,7 +4516,7 @@ if (typeof document !== 'undefined') {
     } catch (error) {
       // 读失败不把清单清空：上一次读到的那份留在屏幕上，原因写在状态行里。
       renderWriteDirs();
-      setWriteDirsStatus(`读取允许写入的目录失败：${error.message}`, true);
+      setWriteDirsStatus(`读取自动写入范围失败：${error.message}`, true);
       return false;
     }
   }
@@ -4025,13 +4557,13 @@ if (typeof document !== 'undefined') {
 
   async function removeWriteDir(dir) {
     if (writeDirsBusy) return false;
-    return commitWriteDirs(writeDirsWithout(allowedWriteDirs(), dir), `已不再允许写入 ${dir}。`);
+    return commitWriteDirs(writeDirsWithout(allowedWriteDirs(), dir), `已将 ${dir} 移出自动写入范围，下一轮生效。`);
   }
 
   // 候选与手填的绝对路径走同一条路：加进现有清单，整份提交。
   async function allowWriteDir(dir) {
     if (writeDirsBusy) return false;
-    return commitWriteDirs(writeDirsWith(allowedWriteDirs(), dir), `已允许写入 ${dir}。`);
+    return commitWriteDirs(writeDirsWith(allowedWriteDirs(), dir), `已将 ${dir} 加入自动写入范围，下一轮生效；仍遵循会话写入策略。`);
   }
 
   // 手填的那一栏先做一次本地检查：不是绝对路径就地说清、不发请求（服务端也会拒，
@@ -4043,7 +4575,7 @@ if (typeof document !== 'undefined') {
       return;
     }
     if (allowedWriteDirs().includes(dir)) {
-      setWriteDirsStatus(`${dir} 已经在允许写入的清单里了。`, true);
+      setWriteDirsStatus(`${dir} 已经在自动写入范围里了。`, true);
       return;
     }
     if (await allowWriteDir(dir)) writeDirsAdd.value = '';
@@ -4063,6 +4595,8 @@ if (typeof document !== 'undefined') {
   // 来自 /api/models，界面不自己推断。
 
   let modelPayload = null;
+  let modelPayloadSessionID = null;
+  let modelListRevision = 0;
   let modelListed = false;
   let modelBusy = false;
 
@@ -4094,14 +4628,14 @@ if (typeof document !== 'undefined') {
     item.querySelector('.model-provider').textContent = row.provider ? `提供方 ${row.provider}` : '';
     const use = item.querySelector('.model-use');
     use.hidden = row.current;
-    use.disabled = modelBusy || !isSessionID(currentSessionID);
+    use.disabled = modelBusy || running || switching;
     use.textContent = '这个会话用它';
     use.setAttribute('aria-label', `让这个会话使用模型 ${row.name}`);
   }
 
   function renderModelList(payload) {
     if (payload !== undefined) modelPayload = payload;
-    const listed = modelListed && modelPayload ? modelPayload : null;
+    const listed = modelListed && modelPayload && modelPayloadSessionID === currentSessionID ? modelPayload : null;
     const current = listed && listed.current ? textOr(listed.current.name) : '';
     const rows = listed && Array.isArray(listed.models) ? listed.models.map((model) => ({
       name: textOr(model.name), provider: textOr(model.provider), isDefault: Boolean(model.default), current: textOr(model.name) === current
@@ -4117,59 +4651,39 @@ if (typeof document !== 'undefined') {
       const origin = listed.current && listed.current.origin === 'session' ? '这个会话选的' : '配置里的默认';
       setModelSwitchStatus(`当前：${current || '未报告'}（${origin}）。`);
     }
-    if (listed && rows.length && !isSessionID(currentSessionID)) {
-      setModelSwitchStatus('这个会话还没有消息，还没有可以记住选择的地方。先发一条消息，再回到这一页。');
-    }
+
   }
 
   async function updateModelList() {
     if (modelBusy) return false;
+    const id = currentSessionID;
+    const revision = ++modelListRevision;
+    if (modelPayloadSessionID !== id) {
+      renderModelList();
+      setModelSwitchStatus('正在读取当前会话的模型…');
+    }
     try {
-      const response = await fetch('/api/models', { cache: 'no-store' });
+      const response = await fetch('/api/models' + sessionQuery(), { cache: 'no-store' });
       if (!response.ok) throw new Error(await errorMessage(response));
-      modelPayload = await response.json();
+      const payload = await response.json();
+      if (id !== currentSessionID || revision !== modelListRevision) return false;
+      modelPayload = payload;
+      modelPayloadSessionID = id;
       modelListed = true;
       renderModelList();
       return true;
     } catch (error) {
+      if (id !== currentSessionID || revision !== modelListRevision) return false;
       modelListed = false;
       renderModelList();
-      setModelSwitchStatus(`读取模型清单失败：${error.message}`, 'failure');
+      setModelSwitchStatus('读取模型清单失败：' + error.message, 'failure');
       return false;
     }
   }
 
   async function chooseModel(row) {
-    if (!row || !row.name || modelBusy) return;
-    if (!isSessionID(currentSessionID)) {
-      setModelSwitchStatus('这个会话还没有消息，还没有可以记住选择的地方。先发一条消息，再试试。', 'failure');
-      return;
-    }
-    modelBusy = true;
-    renderModelList();
-    setModelSwitchStatus(`正在把 ${row.name} 设为这个会话的模型…`);
-    let failure = '';
-    try {
-      const response = await fetch(`/api/sessions/${currentSessionID}/model`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: row.name })
-      });
-      if (!response.ok) failure = await errorMessage(response);
-    } catch (error) {
-      failure = error.message;
-    }
-    modelBusy = false;
-    if (failure) {
-      renderModelList();
-      setModelSwitchStatus(`切换 ${row.name} 失败：${failure}（它仍按上一次读到的状态显示）`, 'failure');
-      return;
-    }
-    if (!(await updateModelList())) {
-      setModelSwitchStatus(`切换 ${row.name} 的请求已经发出，但重新读取模型清单失败：界面仍按上一次读到的状态显示。`, 'failure');
-      return;
-    }
-    setModelSwitchStatus(`这个会话接下来的运行使用 ${row.name}。`);
+    if (!row || !row.name || modelBusy || running || switching) return;
+    await applyModelChoice(row.name);
   }
 
   // textOr 把服务端字段翻成字符串：缺字段渲染成空，而不是 "undefined"。
@@ -4179,6 +4693,8 @@ if (typeof document !== 'undefined') {
 
 
   function renderState(state) {
+    lastRuntimeState = state;
+    renderReloadTools(state);
     $('model').textContent = valueOrDash(state.model);
     $('provider').textContent = valueOrDash(state.provider_host);
     $('host-pid').textContent = valueOrDash(state.host_pid);
@@ -4220,10 +4736,13 @@ if (typeof document !== 'undefined') {
     // 页头入口与面板容器只随这一份状态变化。一次读不到状态时这里不会被调用，
     // 所以"读不到"不会被当成"停用"，页头保持原样。
     syncCapabilityPanels(capabilityPanels(state.capabilities));
+    syncCapabilityWidgets(capabilityWidgets(state.capabilities));
+    refreshApprovals();
     // 设置里的能力清单与模型服务参数读的是同一份状态：停用后入口、面板与这里的
     // "未在服务"一起变，不会各说一套。
     renderCapabilities(state.capabilities);
     renderModelFacts(state);
+    setSessionControls();
   }
 
   async function updateState() {
@@ -4231,6 +4750,7 @@ if (typeof document !== 'undefined') {
       const response = await fetch('/api/state', { cache: 'no-store' });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       renderState(await response.json());
+      if (!running && !switching) updateSessionControls();
     } catch (_) {
       runtimeAvailability.textContent = '运行详情暂不可用';
       runtimeAvailability.className = 'availability unavailable';
@@ -4365,8 +4885,28 @@ if (typeof document !== 'undefined') {
   // A single place decides whether the composer and the session controls accept
   // input: a run and a replay in flight both block the controls that would mix
   // two states. 运行期间发送按钮是 Stop，它必须保持可点：取消就是它的用途。
+  function remoteBusy(){return Boolean(lastRuntimeState?.busy&&lastRuntimeState.current_run_id!==lastCompletedRunID);}
+  function remoteRunID(){return !running&&currentSessionID&&remoteBusy()&&lastRuntimeState.current_session_id===currentSessionID?lastRuntimeState.current_run_id||'':'';}
+  async function cancelRemoteRun(){
+    const id=remoteRunID();if(!id||remoteCancelID)return;
+    remoteCancelID=id;setSessionControls();
+    try {
+      const response=await fetch('/api/runs/'+encodeURIComponent(id)+'/cancel',{method:'POST'});
+      if(!response.ok&&response.status!==404)throw new Error(await errorMessage(response));
+      if(response.status===404){lastCompletedRunID=id;remoteCancelID='';}
+      await updateState();
+    }catch(error){remoteCancelID='';setConversationStatus('停止失败：'+error.message,true);}
+    setSessionControls();
+  }
   function setSessionControls() {
-    send.disabled = switching || Boolean(running && liveRun && liveRun.cancelling);
+    renderSessionControls();
+    const remote=remoteRunID();
+    if(remoteCancelID&&remoteCancelID!==remote)remoteCancelID='';
+    const cancelling=Boolean(running&&liveRun?.cancelling)||Boolean(remote&&remoteCancelID===remote);
+    const action=cancelling?'cancelling':running||remote?'cancel':'send';
+    if(send.dataset.action!==action)setSendAction(action);
+    send.disabled=switching||cancelling||(!running&&!remote&&(!executionReady()||remoteBusy()));
+    if(!running&&!remote&&remoteBusy())send.title='另一个会话正在运行';
     sessionNew.disabled = running || switching;
     rerenderSessions();
   }
@@ -4384,6 +4924,7 @@ if (typeof document !== 'undefined') {
   function setConversationWorkspace(workspace) {
     const badge = workspaceBadge(workspace);
     const node = $('conversation-workspace');
+    $('composer-project-detail').textContent = badge ? [badge.label, badge.title].filter(Boolean).join('\n') : '';
     if (!badge) {
       node.textContent = '';
       node.removeAttribute('title');
@@ -4397,6 +4938,16 @@ if (typeof document !== 'undefined') {
   }
 
   function resetConversation() {
+    clearApprovals();
+    closeComposerPopover(false);
+    runtimeWidgets.resetData();
+    resetCapabilityWidgets();
+    currentWorkspaceID = '';
+    if (workspaceListed) renderWorkspaces();
+    if (modelListed || (activePanel === panels.settings && !$('settings-pane-model').hidden)) { renderModelList(); updateModelList(); }
+    sessionUsageByRun = new Map();
+    usageRunID = '';
+    renderUsageBar();
     setConversationTitle();
     setConversationWorkspace(null);
     conversation.replaceChildren();
@@ -4425,10 +4976,10 @@ if (typeof document !== 'undefined') {
   function assistantReplayNode(record) {
     const node = assistantTurnNode();
     for (const tool of record.tools) node.timeline.insertBefore(toolRowNode(tool).card, node.body);
-    if (record.tools.length) {
+    if (record.tools.length || record.usage) {
       // 回放出来的调用也排在同一条时间线里：它同样是"过程"，不是回答。
       const state = replayRunState(record.status);
-      node.meta.textContent = runTraceMeta(record.tools.length, null, state);
+      node.meta.textContent = [runTraceMeta(record.tools.length, null, state), record.usage ? usageText(record.usage) : ''].filter(Boolean).join(' · ');
       node.meta.dataset.state = state;
       node.meta.hidden = false;
     }
@@ -4448,6 +4999,10 @@ if (typeof document !== 'undefined') {
   }
 
   function renderReplayedSession(detail) {
+    const usage = usageFromRecords(detail?.records);
+    sessionUsageByRun = usage.runs;
+    usageRunID = usage.latest;
+    renderUsageBar();
     const replay = replaySession(detail);
     setConversationTitle(replay.title);
     setConversationWorkspace(detail ? detail.workspace : null);
@@ -4478,7 +5033,17 @@ if (typeof document !== 'undefined') {
   // 等待期间的表现发生在主区：一段占位骨架 + aria-busy。侧栏只做导航，这里既不
   // 写"正在恢复会话…"，也不在成功时补一句"已恢复"。
   async function loadSession(id) {
+    clearApprovals();
     currentSessionID = id;
+    resetCapabilityWidgets();
+    resetExecutionState();
+    modelListRevision += 1;
+    if (modelListed || (activePanel === panels.settings && !$('settings-pane-model').hidden)) {
+      renderModelList();
+      setModelSwitchStatus('正在读取当前会话的模型…');
+    }
+    sessionModelChoice = sessionReasoningChoice = null;
+    sessionControlsRevision += 1;
     rerenderSessions();
     switching = true;
     setSessionControls();
@@ -4499,6 +5064,8 @@ if (typeof document !== 'undefined') {
     } finally {
       switching = false;
       setSessionControls();
+      updateSessionControls();
+      if (modelListed || (activePanel === panels.settings && !$('settings-pane-model').hidden)) updateModelList();
     }
   }
 
@@ -4506,6 +5073,10 @@ if (typeof document !== 'undefined') {
   // is the truth after a new session is started or a stored one is gone.
   function dropSession() {
     currentSessionID = '';
+    resetExecutionState();
+    sessionModelChoice = sessionReasoningChoice = null;
+    closeCommandMenu();
+    updateSessionControls();
     history.replaceState(null, '', `${location.pathname}${location.search}`);
     resetConversation();
     rerenderSessions();
@@ -4515,7 +5086,7 @@ if (typeof document !== 'undefined') {
     if (running || switching) return;
     if (activePanel === panels.sessions) closeDrawer();
     dropSession();
-    setConversationStatus('新会话：发送第一条消息后开始记录。');
+    setConversationStatus('新会话：可以先选择模型、思考档位和工作区。');
   }
 
   function switchSession(id) {
@@ -4532,8 +5103,11 @@ if (typeof document !== 'undefined') {
   function adoptSession(id) {
     if (!isSessionID(id) || id === currentSessionID) return;
     currentSessionID = id;
+    syncCapabilityWidgets(capabilityWidgets(lastRuntimeState?.capabilities));
+    resetExecutionState();
     location.hash = sessionHash(id);
     rerenderSessions();
+    updateSessionControls();
     // 会话 id 与标题已经出现在列表里，这里不再重复一句"已开始记录"。
   }
 
@@ -4581,6 +5155,77 @@ if (typeof document !== 'undefined') {
   const capabilityPanelKey = (id) => `capability:${id}`;
 
   // 键是面板 id；每条记录是宿主为这个面板拥有的全部 DOM 与当前挂载状态。
+  const capabilityWidgetNodes = new Map();
+  function resetCapabilityWidgets() {
+    for (const record of capabilityWidgetNodes.values()) record.dispose();
+    capabilityWidgetNodes.clear();
+  }
+  function mountRuntimeInstance(widget,key,data) {
+    const sessionID=currentSessionID;
+    const dispose=runtimeWidgets.register({id:key,title:widget.title,mount(target){
+      let live=true,loaded=null,latest=data;
+      const widgetURL=capabilityPanelEntryURL(widget.entry);
+      const base=uiPluginHostAPI(UI_PLUGIN_API_VERSION,()=>{});
+      (async()=>{
+        try {
+          const imported=await import(widgetURL);if(!live)return;
+          const missing=uiPluginMissingExports(imported);if(missing.length)throw new Error('组件缺少导出：'+missing.join('、'));
+          loaded=imported;imported.mount(target,Object.freeze({...base,sessionID,data:latest}));runtimeWidgets.reflow();
+        } catch(error) {
+          if(!live)return;try{loaded?.unmount(target);}catch(_){};loaded=null;
+          target.replaceChildren(make('p','runtime-widget-error','组件加载失败：'+uiPluginErrorDetail(error)));
+        }
+      })();
+      return {update(value){latest=value;if(loaded&&typeof loaded.update==='function')loaded.update(target,value);},unmount(){live=false;loaded?.unmount(target);loaded=null;}};
+    }});
+    if(data!==undefined)runtimeWidgets.update(key,data);
+    return {title:widget.title,dispose,update(value){runtimeWidgets.update(key,value);},suggest(layout){
+      if(!layout||typeof layout!=='object')return;
+      runtimeWidgets.move(key,layout,'model');
+      if(layout.visible===true)runtimeWidgets.show(key,'model');
+      else if(layout.visible===false)runtimeWidgets.hide(key,'model');
+    }};
+  }
+  function widgetSource(widget) {
+    let live=true,revision=0,active=null;const children=new Map(),sessionID=currentSessionID;
+    return {...widget,sessionID,
+      dispose(){live=false;revision++;if(active){clearTimeout(active.timer);active.controller.abort();active=null;}for(const child of children.values())child.dispose();children.clear();},
+      async refresh(){
+        if(!live||active||!sessionID||sessionID!==currentSessionID)return;
+        const request=++revision;
+        const controller=new AbortController();let expired=false;
+        const timer=setTimeout(()=>{expired=true;controller.abort();},15000);active={controller,timer};
+        try {
+          const response=await fetch(widget.source+'?session='+encodeURIComponent(sessionID),{cache:'no-store',signal:controller.signal});if(!response.ok)throw new Error(await errorMessage(response));
+          const payload=await response.json();if(!live||request!==revision||sessionID!==currentSessionID)return;
+          const list=(Array.isArray(payload.instances)?payload.instances:[]).slice(0,32).filter(item=>item&&/^[a-z][a-z0-9_-]{0,47}$/.test(item.id)&&typeof item.title==='string'&&item.title.trim()&&item.title.length<=80);
+          const wanted=new Map(list.map(item=>[item.id,item]));
+          for(const [id,child] of children){if(!wanted.has(id)||wanted.get(id).title!==child.title){child.dispose();children.delete(id);}}
+          for(const item of wanted.values()){
+            let child=children.get(item.id);
+            if(!child){child=mountRuntimeInstance({...widget,title:item.title},'instance:'+widget.id+':'+sessionID+':'+item.id,item.data);children.set(item.id,child);}
+            else child.update(item.data);
+            child.suggest(item.layout);
+          }
+        } catch(error) {if(live&&request===revision&&sessionID===currentSessionID&&(error.name!=='AbortError'||expired))setConversationStatus(expired?'运行组件数据请求超时，可稍后重试。':'运行组件数据暂不可用：'+error.message,true);}
+        finally{clearTimeout(timer);if(active?.controller===controller)active=null;}
+      }
+    };
+  }
+  function refreshWidgetSources(){for(const record of capabilityWidgetNodes.values())record.refresh?.();}
+  function syncCapabilityWidgets(list) {
+    const wanted=new Map(list.map(widget=>[widget.id,widget]));
+    for(const [id,record] of capabilityWidgetNodes){const widget=wanted.get(id);if(!widget||widget.entry!==record.entry||widget.source!==record.source||widget.title!==record.title||widget.owner!==record.owner||record.sessionID!==currentSessionID){record.dispose();capabilityWidgetNodes.delete(id);}}
+    for(const widget of wanted.values()){
+      if(capabilityWidgetNodes.has(widget.id))continue;
+      try{
+        if(widget.source)capabilityWidgetNodes.set(widget.id,widgetSource(widget));
+        else {const instance=mountRuntimeInstance(widget,'cap:'+widget.id);capabilityWidgetNodes.set(widget.id,{...widget,sessionID:currentSessionID,dispose:instance.dispose});}
+      }catch(error){setConversationStatus('运行组件注册失败：'+uiPluginErrorDetail(error),true);}
+    }
+    refreshWidgetSources();
+  }
+
   const capabilityPanelNodes = new Map();
 
   // 贡献面板的页头入口共用一个中性图标：具体是什么面板由 title 与 aria-label

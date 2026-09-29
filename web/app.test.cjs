@@ -17,6 +17,7 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
       if (!this.handlers.has(type)) this.handlers.set(type, []);
       this.handlers.get(type).push(handler);
     },
+    removeEventListener(type, handler) { this.handlers.set(type, (this.handlers.get(type) || []).filter(fn => fn !== handler)); },
     emit(type, extra = {}) {
       const event = { type, target: this, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...extra };
       for (const handler of this.handlers.get(type) || []) handler(event);
@@ -77,6 +78,8 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
         deleteProperty: (_target, name) => { element.removeAttribute(attribute(name)); return true; }
       });
     }
+    getBoundingClientRect() { return { left: 20, top: 80, width: Number.parseInt(this.style.width) || 300, height: 160 }; }
+    get ownerDocument() { return document; }
     get children() { return this.childNodes.filter((child) => child.tagName !== '#TEXT'); }
     get childElementCount() { return this.children.length; }
     get firstElementChild() { return this.children[0]; }
@@ -194,6 +197,7 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
   } });
   const calls = [];
   const frames = [];
+  const networkTimers = [];
   const intervals = [];
   const location = { pathname: '/', search: '', _hash: hash };
   Object.defineProperty(location, 'hash', {
@@ -204,7 +208,7 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
     sessions: { sessions: [{ id: 'aaaaaaaa', title: '会话 A', run_count: 1 }, { id: 'bbbbbbbb', title: '会话 B', run_count: 2 }] }
   };
   const context = vm.createContext({
-    document, window, location, URLSearchParams, TextDecoder, console,
+    document, window, location, URLSearchParams, TextDecoder, console, AbortController,
     // 基座跑在 vm 里，而 vm 的动态导入回调需要 `--experimental-vm-modules`（门禁命令里没有这个
     // 开关），所以能力面板那一处 `await import(url)` 在求值前被换成这个函数（见下面的替换与断言）。
     // 没注册模块时按"加载失败"拒绝：与浏览器里模块拉不回来时的表现一致，现有的失败路径用例照旧。
@@ -220,10 +224,11 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
     // setTimeout 与 rAF 共用一个待执行队列，settle() 按登记顺序把它们跑完。定时器
     // 必须有身份：clearTimeout 要真的把回调从队列里摘掉，否则一个已经被取消的瞬时
     // 提示仍然会照常触发，测试看到的状态变化顺序就和浏览器不一致。
-    setTimeout: (fn) => { const timer = { run: fn }; frames.push(timer); return timer; },
+    setTimeout: (fn, delay = 0) => { const timer = { run: fn }; (delay >= 10000 ? networkTimers : frames).push(timer); return timer; },
     clearTimeout: (timer) => {
       const index = frames.indexOf(timer);
       if (index >= 0) frames.splice(index, 1);
+      const delayed = networkTimers.indexOf(timer); if (delayed >= 0) networkTimers.splice(delayed, 1);
     },
     setInterval: (fn) => { intervals.push(fn); return fn; },
     clearInterval: (fn) => {
@@ -234,7 +239,7 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
       calls.push({ url, options });
       const custom = respond && await respond(url, options, data);
       if (custom) return custom;
-      const payload = url === '/api/sessions' ? data.sessions
+      const payload = url.startsWith('/api/execution') ? { mode: 'sandbox', requested_mode: 'sandbox', needs_confirmation: false, grant_scope: 'session_and_process' } : url === '/api/sessions' ? data.sessions
         : url.startsWith('/api/sessions/') ? { records: [{ type: 'message', role: 'user', text: '已保存的消息' }] } : {};
       return { ok: true, json: async () => payload };
     }
@@ -253,13 +258,14 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
   // --experimental-vm-modules）。替换点必须**恰好一处**：app.js 里另一处动态导入是 UI 插件那条
   // 路径（`await import(node.row.url)`），指名 `url` 才只命中能力面板这一处；数量不对就直接抛错，
   // 否则这条缝会在某次改名后悄悄失效，而用它写的行为用例会变成空过。
+  vm.runInContext(source('runtime-widgets.js'), context, { filename: 'runtime-widgets.js' });
   const appSource = source('app.js');
   const capabilityImport = 'await import(url)';
   const importSites = appSource.split(capabilityImport).length - 1;
   if (importSites !== 1) {
     throw new Error(`navigationHarness: 期望 app.js 里恰好一处 "${capabilityImport}"，实际 ${importSites} 处`);
   }
-  vm.runInContext(appSource.replace(capabilityImport, 'await importPanelModule(url)'), context, { filename: 'app.js' });
+  vm.runInContext(appSource.replace(capabilityImport, 'await importPanelModule(url)').replace('await import(widgetURL)', 'await importPanelModule(widgetURL)'), context, { filename: 'app.js' });
   const settle = async () => {
     await new Promise((resolve) => setImmediate(resolve));
     while (frames.length) frames.shift().run();
@@ -267,6 +273,7 @@ function navigationHarness({ narrow = false, hash = '', respond, dark = false, s
   };
   return {
     document, window, location, data, calls, settle, storage, storageCalls, bootstrapTheme,
+    async expireNetworkRequests() { for (const timer of networkTimers.splice(0)) timer.run(); await settle(); },
     $: document.getElementById,
     async click(id) { const node = document.getElementById(id); node.focus(); node.click(); await settle(); },
     async poll() { for (const fn of intervals) fn(); await settle(); },
@@ -597,7 +604,7 @@ test('visible sessions refresh without diagnostics or replacing the focused acti
   assert.equal(h.document.activeElement, h.$('session-toggle'));
   const hiddenCount = h.calls.length;
   await h.poll();
-  assert.deepEqual(h.calls.slice(hiddenCount).map(({ url }) => url), ['/api/state']);
+  assert.deepEqual(h.calls.slice(hiddenCount).map(({ url }) => url), ['/api/state', '/api/execution', '/api/models', '/api/reasoning'], '侧栏关闭后仍刷新主界面的会话设置，不读取隐藏的会话列表');
 });
 
 test('capability panels come only from enabled capabilities, in the kernel order', () => {
@@ -720,7 +727,7 @@ test('the navigation column carries no run state; a new session says so where th
   // 主区短暂停留后自己消失。
   h.$('session-new').click();
   assert.equal(sidebar(), '', '侧栏不承载操作反馈');
-  assert.equal(main().textContent, '新会话：发送第一条消息后开始记录。', '瞬时提示出现在主区');
+  assert.equal(main().textContent, '新会话：可以先选择模型、思考档位和工作区。', '瞬时提示出现在主区');
   assert.equal(main().hidden, false);
   await h.settle();
   assert.equal(main().textContent, '', '瞬时提示自行消失');
@@ -1083,14 +1090,14 @@ test('the capability state path refuses anything the kernel could not have regis
   assert.equal(capabilityRows([{ id: '../memory', title: 'Memory', state: 'enabled' }])[0].action, '');
 });
 
-test('the reasoning tier is read as a startup parameter and never guessed', () => {
+test('reasoning 档位可按会话切换，未发送值不猜测为 medium', () => {
   const { reasoningEffortView, REASONING_EFFORT_LEVELS } = require('./app.js');
-  assert.deepEqual(REASONING_EFFORT_LEVELS, ['minimal', 'low', 'medium', 'high', 'none']);
+  assert.deepEqual(REASONING_EFFORT_LEVELS, ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
   const high = reasoningEffortView('high');
   assert.equal(high.present, true);
   assert.equal(high.value, 'high');
   assert.equal(high.label, '高（high）');
-  assert.match(high.note, /LUNA_REASONING_EFFORT/);
+  assert.match(high.note, /\/reasoning/);
   assert.match(high.note, /推理过程是否展示无关/, '档位与推理展示是两件事，文案分开说');
   assert.equal(reasoningEffortView('none').label, '不思考（none）');
   assert.equal(reasoningEffortView(' medium ').value, 'medium', '两侧空白不算另一个档位');
@@ -1100,9 +1107,9 @@ test('the reasoning tier is read as a startup parameter and never guessed', () =
     const view = reasoningEffortView(absent);
     assert.equal(view.present, false, `${JSON.stringify(absent)} 就是“没有发送档位”`);
     assert.equal(view.value, '');
-    assert.equal(view.label, '进程未发送该档位');
+    assert.equal(view.label, '不发送思考档位');
     assert.match(view.note, /默认档位/);
-    assert.match(view.note, /LUNA_REASONING_EFFORT/);
+    assert.match(view.note, /\/reasoning/);
     assert.doesNotMatch(view.label + view.note, /medium/, '没有发送档位不是 medium，也不是“默认 medium”');
   }
   // 只有 provider 认的那几个档位是已知的：大小写不同就是另一个值。
@@ -1474,12 +1481,12 @@ test('the model service block shows the running model and the tier the process s
   assert.equal(h.$('settings-model').textContent, 'fixture-model');
   assert.equal(h.$('settings-provider').textContent, 'example.invalid');
   assert.equal(h.$('settings-effort').textContent, '高（high）');
-  assert.match(h.$('settings-effort-note').textContent, /LUNA_REASONING_EFFORT/);
+  assert.match(h.$('settings-effort-note').textContent, /\/reasoning/);
 
   // 同一个进程没有发送档位：界面上说清是“进程没发、provider 默认”，不是 medium。
   h.capabilityState.reasoning_effort = undefined;
   await h.poll();
-  assert.equal(h.$('settings-effort').textContent, '进程未发送该档位');
+  assert.equal(h.$('settings-effort').textContent, '不发送思考档位');
   assert.doesNotMatch(h.$('settings-effort').textContent + h.$('settings-effort-note').textContent, /medium/);
 });
 
@@ -1545,7 +1552,7 @@ test('tool copy names each tool and falls back without inventing one', () => {
 });
 
 test('tool activity copy is per tool while values remain exact', () => {
-  const { toolActivityLabel, candidateLabel, reloadCopy } = require('./app.js');
+  const { toolActivityLabel, reloadCopy } = require('./app.js');
   assert.equal(toolActivityLabel('luna_text_transform', 'running'), '正在转换文本…');
   assert.equal(toolActivityLabel('luna_text_transform', 'finished'), '文本转换完成');
   assert.equal(toolActivityLabel('luna_text_transform', 'failed'), '文本转换失败');
@@ -1554,13 +1561,10 @@ test('tool activity copy is per tool while values remain exact', () => {
   assert.equal(toolActivityLabel('luna_read_file', 'failed'), '读取文件失败');
   assert.equal(toolActivityLabel('luna_read_file', 'unknown-state'), '读取文件');
   assert.equal(toolActivityLabel(undefined, 'running'), '正在调用工具…');
-  assert.equal(candidateLabel('v1'), '稳定版本 v1');
-  assert.equal(candidateLabel('v2'), '候选版本 v2');
-  assert.equal(candidateLabel('broken'), '故障演练 broken');
-  assert.deepEqual(reloadCopy('pending', 'v2'), { summary: '正在验证 v2…', technical: '' });
-  assert.deepEqual(reloadCopy('success', 'v2'), { summary: 'v2 已启用。', technical: '' });
-  assert.deepEqual(reloadCopy('failure', 'broken', 'handshake timeout'), {
-    summary: '无法启用 broken，当前版本保持不变。', technical: 'handshake timeout'
+  assert.deepEqual(reloadCopy('pending', 'luna_read_file'), { summary: '正在重建 luna_read_file…', technical: '' });
+  assert.deepEqual(reloadCopy('success', 'luna_read_file'), { summary: 'luna_read_file 已重载。', technical: '' });
+  assert.deepEqual(reloadCopy('failure', '', 'handshake timeout'), {
+    summary: '重载 全部已注册工具 失败，旧实现继续服务。', technical: 'handshake timeout'
   });
 });
 
@@ -1636,11 +1640,11 @@ test('chat markup is conversation-first with an accessible hidden runtime drawer
   assert.match(html, /<section class="drawer-section" aria-labelledby="plugins-title">/);
   assert.match(html, /<h3 id="plugins-title">工具插件<\/h3>/);
 
-  for (const id of ['model', 'provider', 'host-pid', 'busy', 'plugins', 'plugins-empty', 'candidate', 'reload', 'reload-status', 'events']) {
+  for (const id of ['model', 'provider', 'host-pid', 'busy', 'plugins', 'plugins-empty', 'reload-tool', 'reload', 'reload-status', 'events']) {
     assert.match(html, new RegExp(`id="${id}"`));
   }
   for (const value of ['v1', 'v2', 'broken']) {
-    assert.match(html, new RegExp(`<option value="${value}"`));
+    assert.equal(html.includes('value="' + value + '"'), false, '标记不内置演示版本');
   }
 });
 
@@ -1737,14 +1741,14 @@ test('styles expose semantic light and dark tokens with opt-in controls and read
   assert.match(css, /@media\s*\(max-width:\s*600px\)/);
   assert.equal(/\.section-kicker|\.empty-kicker/.test(css), false, 'unused kicker styles must not remain');
   assert.equal(/\.turn\.assistant\s*\{[^}]*padding-right/.test(css), false, 'assistant turns must share one right edge with user turns');
-  assert.match(css, /\.composer-hint[^}]*font-size:\s*var\(--luna-font-label\)/s);
+  assert.doesNotMatch(source('index.html'), /id="composer-hint"/, '快捷键提示不再常驻');
   assert.match(css, /max-height:\s*92dvh/);
   assert.match(css, /prefers-reduced-motion:\s*reduce/);
   const reducedMotion = css.slice(css.indexOf('prefers-reduced-motion'));
   assert.equal(/transform:\s*none/.test(reducedMotion), false, 'reduced motion must not cancel the drawer transform');
   assert.match(css, /\.luna-mark[^}]*width:\s*24px/s);
   assert.equal(/gradient\s*\(/i.test(css), false, 'gradients are not allowed');
-  assert.match(css, /\.composer\s*\{[^}]*border-radius:\s*var\(--luna-radius-lg\)/s, '输入和发送在同一个有边界的容器中');
+  assert.match(css, /\.composer\s*\{[^}]*border-radius:\s*var\(--luna-radius-composer\)/s, '输入和发送在同一个有边界的容器中');
   assert.match(css, /\.composer textarea\s*\{[^}]*border:\s*0/s);
   assert.match(css, /\.session-row\s*\{[^}]*border:\s*0/s, '历史记录是列表行而不是卡片');
   assert.match(css, /\.session-row\s*\{[^}]*height:\s*var\(--luna-row-h\)/s, '会话项是紧凑单行');
@@ -2497,6 +2501,7 @@ test('assistant text streams into the answer as it arrives', async () => {
   assert.equal(view.statusElapsed.getAttribute('aria-hidden'), 'true', '秒表不该被逐秒播报');
   assert.equal(view.send.dataset.action, 'cancel');
   assert.equal(view.send.getAttribute('aria-label'), '停止');
+  assert.equal(view.send.type, 'button', '空输入不能通过表单校验阻断停止');
   assert.equal(view.send.disabled, false, '运行期间这个按钮必须可点：它就是 Stop');
 
   h.stream().push(sse('run.started', { run_id: 'run-1', session_id: 'aaaaaaaa' }));
@@ -3338,7 +3343,7 @@ test('设置里的工作区一页列出工作区、标出当前会话用的那�
 
 test('设置里的模型服务一页列出模型、标出当前这个会话用的，并切换它', async () => {
   const h = navigationHarness({ hash: '#session=aaaaaaaa', respond: async (url) => {
-    if (url === '/api/models') {
+    if (url.startsWith('/api/models')) {
       return { ok: true, json: async () => ({
         models: [{ name: 'alpha', provider: 'api.test', default: true }, { name: 'beta', provider: 'api.test' }],
         current: { name: 'beta', origin: 'session' }
@@ -3380,9 +3385,9 @@ test('运行详情只说这一次运行用什么，开发诊断在设置里', as
   await h.click('runtime-toggle');
   await h.settle();
   assert.equal(h.$('budgets').textContent, '64 轮模型回合 · 15 分钟', '预算按服务端报出的数字显示，不写死');
-  assert.equal(h.$('runtime-drawer').contains(h.$('candidate')), false, '候选版本不在运行详情里');
+  assert.equal(h.$('runtime-drawer').contains(h.$('reload-tool')), false, '源码重载不在运行详情里');
   assert.equal(h.$('runtime-drawer').contains(h.$('events')), false, '生命周期不在运行详情里');
-  assert.equal(h.$('settings-pane-diagnostics').contains(h.$('candidate')), true, '候选版本在设置 → 诊断里');
+  assert.equal(h.$('settings-pane-diagnostics').contains(h.$('reload-tool')), true, '源码重载在设置 → 诊断里');
   assert.equal(h.$('settings-pane-diagnostics').contains(h.$('plugins')), true, '插件代次在设置 → 诊断里');
   await h.click('runtime-toggle');
   await h.click('settings-toggle');
@@ -3926,7 +3931,7 @@ test('「允许写入的目录」列出服务端持有的清单，空清单说�
   await openWorkspacePane(empty);
   assert.equal(empty.$('write-dirs-list').children.length, 0);
   assert.equal(empty.$('write-dirs-empty').hidden, false);
-  assert.equal(empty.$('write-dirs-empty').textContent, '还没有允许任何目录，Luna 什么也写不了。');
+  assert.equal(empty.$('write-dirs-empty').textContent, '尚未设置自动写入目录；项目内写入需要逐次批准。');
 });
 
 test('移除一行后 PUT 的是剩余清单，界面按答复重绘', async () => {
@@ -3947,7 +3952,7 @@ test('移除一行后 PUT 的是剩余清单，界面按答复重绘', async () 
     h.$('write-dirs-candidates').children.map((row) => row.querySelector('.write-dirs-path').getAttribute('title')),
     ['/home/j/probe/scratch']
   );
-  assert.match(h.$('write-dirs-status').textContent, /已不再允许写入 \/home\/j\/probe\/scratch。/);
+  assert.match(h.$('write-dirs-status').textContent, /已将 \/home\/j\/probe\/scratch 移出自动写入范围，下一轮生效。/);
   await h.settle();
   assert.equal(h.$('write-dirs-status').textContent, '', '一次操作的结果自己消失');
   assert.equal(h.$('write-dirs-status').classList.contains('failure'), false);
@@ -3979,7 +3984,7 @@ test('从一个工作区目录点「允许」后 PUT 的是并集，界面按答
   );
   assert.equal(h.$('write-dirs-candidates').children.length, 0);
   assert.equal(h.$('write-dirs-candidates-empty').hidden, false);
-  assert.equal(h.$('write-dirs-candidates-empty').textContent, '工作区里的目录都已经允许写入了。');
+  assert.equal(h.$('write-dirs-candidates-empty').textContent, '当前项目目录都已列入自动写入范围。');
   await h.settle();
   assert.equal(h.$('write-dirs-status').textContent, '');
 });
@@ -4109,7 +4114,7 @@ test('允许写入这一节的纯函数只认绝对路径，并为缩略显示�
   assert.deepEqual(writeDirsWithout(undefined, '/a'), []);
 });
 
-test('允许写入这一节的结构、空态文案与样式都在', () => {
+test('自动写入范围的结构、空态文案与样式都在', () => {
   const html = source('index.html');
   const css = source('style.css');
   const js = source('app.js');
@@ -4119,8 +4124,8 @@ test('允许写入这一节的结构、空态文案与样式都在', () => {
     'write-dirs-add', 'write-dirs-add-button', 'write-dirs-candidates', 'write-dirs-candidates-empty']) {
     assert.match(pane, new RegExp(`id="${id}"`), `${id} 在工作区这一页里`);
   }
-  assert.match(html, /<h4>允许写入的目录<\/h4>/);
-  assert.match(html, /id="write-dirs-empty"[^>]*hidden[^>]*>还没有允许任何目录，Luna 什么也写不了。/);
+  assert.match(html, /<h4>自动写入范围<\/h4>/);
+  assert.match(html, /id="write-dirs-empty"[^>]*hidden[^>]*>尚未设置自动写入目录；项目内写入需要逐次批准。/);
   assert.match(html, /<label class="sr-only" for="write-dirs-add">/);
   assert.equal(html.includes('style='), false, 'HTML 里不写内联样式');
   assert.equal(/id="write-dirs-save"/.test(html), false, '每次变更立即提交，没有"保存"按钮');
@@ -4139,4 +4144,586 @@ test('允许写入这一节的结构、空态文案与样式都在', () => {
   assert.ok(block.length > 0, '这一节的样式块必须在');
   assert.equal(/gradient\s*\(/i.test(block), false);
   assert.doesNotMatch(block, /#[0-9a-f]{3,8}\b/i, '颜色只来自 --luna-* token');
+});
+
+// 使用同一份服务端状态恢复第二个页面，验证选择不是浏览器里的临时变量。
+function sessionControlHarness({ hash = '', storage, server = { model: '', effort: null, created: false }, failCreate = false, failSave = false } = {}) {
+ const response = (payload, ok = true) => ({ ok, status: ok ? 200 : 500, json: async () => payload });
+ const h = navigationHarness({ hash, storage, respond: async (url, options) => {
+  const body = options?.body ? JSON.parse(options.body) : {};
+  if (url === '/api/commands') return response({ commands: [
+   { name: 'model', summary: '模型', args: 'options', busy: 'reject', options: [{ value: 'one' }, { value: 'two' }, { value: '--default' }] },
+   { name: 'reasoning', summary: '思考', args: 'options', busy: 'reject', options: ['--default', '--off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map(value => ({ value })) }
+  ] });
+  if (url.startsWith('/api/models')) { const chosen = url.includes('session=cccccccc') ? server.model : ''; return response({ models: [{ name: 'one', default: true }, { name: 'two' }], current: { name: chosen || 'one', origin: chosen ? 'session' : 'global' } }); }
+  if (url.startsWith('/api/reasoning')) { const chosen = url.includes('session=cccccccc') ? server.effort : null; return response({ levels: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'], current: { reasoning_effort: chosen ?? 'medium', origin: chosen === null ? 'global' : 'session' } }); }
+  if (url === '/api/sessions' && options?.method === 'POST') {
+   if (failCreate) return response({ error: 'synthetic creation failure' }, false);
+   server.created = true;
+   return response({ id: 'cccccccc', title: '', records: [] });
+  }
+  if (url === '/api/sessions/cccccccc/model') {
+   if (failSave) return response({ error: 'synthetic save failure' }, false);
+   server.model = body.reset ? '' : body.model;
+   return response({ session_id: 'cccccccc', model: server.model || 'one', origin: server.model ? 'session' : 'global' });
+  }
+  if (url === '/api/sessions/cccccccc/reasoning') {
+   if (failSave) return response({ error: 'synthetic save failure' }, false);
+   server.effort = body.reset ? null : body.reasoning_effort;
+   return response({ session_id: 'cccccccc', current: { reasoning_effort: server.effort ?? 'medium', origin: server.effort === null ? 'global' : 'session' } });
+  }
+  if (url === '/api/sessions/cccccccc') return response({ id: 'cccccccc', title: '', records: [] });
+  if (url === '/api/state') return response({ model: 'one', reasoning_effort: 'medium', capabilities: [], busy: false });
+ } });
+ h.server = server;
+ h.pick = async (value) => {
+  const row = [...h.$('command-menu').children].find(row => row.textContent.includes(value));
+  assert.ok(row, '应提供选项 ' + value);
+  row.emit('mousedown');
+  await h.settle();
+ };
+ return h;
+}
+
+test('主界面可在第一条消息前选择模型和思考档位，刷新仍来自同一会话', async () => {
+ const h = sessionControlHarness();
+ await h.settle();
+ assert.ok(h.$('session-control-bar'), '运行设置必须常驻主页面');
+ assert.equal(h.$('runtime-drawer').contains(h.$('session-control-bar')), false);
+ h.$('message').value = '保留尚未发送的草稿';
+ await h.click('session-model');
+ assert.equal(h.calls.filter(x => x.url === '/api/sessions' && x.options?.method === 'POST').length, 0, '查看选项不创建会话');
+ await h.pick('two');
+ assert.equal(h.server.model, 'two');
+ assert.equal(h.location.hash, '#session=cccccccc');
+ assert.equal(h.$('message').value, '保留尚未发送的草稿');
+ assert.match(h.$('session-model').textContent, /two/);
+ await h.click('session-reasoning');
+ await h.pick('high');
+ assert.equal(h.server.effort, 'high');
+ assert.match(h.$('session-reasoning').textContent, /high|高/);
+ assert.equal(h.calls.filter(x => x.url === '/api/sessions' && x.options?.method === 'POST').length, 1, '两次设置共用一个空会话');
+ assert.equal(h.calls.some(x => x.url === '/api/runs'), false, '设置命令不产生模型调用');
+ const restored = sessionControlHarness({ hash: h.location.hash, server: h.server });
+ await restored.settle();
+ assert.match(restored.$('session-model').textContent, /two/);
+ assert.match(restored.$('session-reasoning').textContent, /high|高/);
+ await restored.click('session-reasoning');
+ await restored.pick('--off');
+ assert.equal(h.server.effort, '');
+ await restored.click('session-reasoning');
+ await restored.pick('--default');
+ assert.equal(h.server.effort, null);
+ await restored.click('session-model');
+ await restored.pick('--default');
+ assert.equal(h.server.model, '');
+});
+
+test('命令参数候选保留尾部空格，Enter 直接应用选择，Tab 仅补全', async () => {
+ const h = sessionControlHarness();
+ await h.settle();
+ const input = h.$('message');
+ input.value = '/reasoning ';
+ input.emit('input');
+ assert.equal(h.$('command-menu').hidden, false);
+ assert.ok(h.$('command-menu').textContent.includes('high'));
+ input.emit('keydown', { key: 'Tab', shiftKey: false });
+ await h.settle();
+ assert.equal(h.server.created, false, 'Tab 不提交设置');
+ input.value = '/reasoning high';
+ input.emit('input');
+ input.emit('keydown', { key: 'Enter', shiftKey: false });
+ await h.settle();
+ assert.equal(h.server.effort, 'high');
+ assert.equal(h.calls.some(x => x.url === '/api/runs'), false);
+});
+
+test('空会话创建或设置保存失败时保留草稿和真实选择，不假报切换成功', async () => {
+ for (const flags of [{ failCreate: true }, { failSave: true }]) {
+  const h = sessionControlHarness(flags);
+  await h.settle();
+  h.$('message').value = '未发送草稿';
+  await h.click('session-model');
+  await h.pick('two');
+  assert.equal(h.server.model, '');
+  assert.equal(h.$('message').value, '未发送草稿');
+  assert.match(h.$('conversation-status').textContent, /synthetic/);
+  assert.match(h.$('session-model').textContent, /one/);
+  assert.equal(h.$('session-new').disabled, false, '错误路径必须恢复控件');
+ }
+});
+
+test('离开已配置会话后，新会话恢复全局显示，不沿用前一会话选择', async () => {
+ const h = sessionControlHarness({ hash: '#session=cccccccc', server: { model: 'two', effort: 'high', created: true } });
+ await h.settle();
+ assert.match(h.$('session-model').textContent, /two/);
+ assert.match(h.$('session-reasoning').textContent, /high|高/);
+ await h.click('session-new');
+ await h.settle();
+ assert.equal(h.location.hash, '');
+ assert.match(h.$('session-model').textContent, /one/);
+ assert.match(h.$('session-reasoning').textContent, /medium|中/);
+ assert.equal(h.calls.filter(call => call.url === '/api/sessions' && call.options?.method === 'POST').length, 0);
+});
+
+function reportedUsage(input, output, complete = true) {
+ return { input_tokens: input, output_tokens: output, total_tokens: input + output, model_calls: 1, reported_calls: 1, complete };
+}
+
+test('状态栏用量按运行替换快照，保留历史已报告小计，不因重复事件翻倍', async () => {
+ const records = [
+  { type: 'run', run_id: 'old-known', status: 'ok', usage: reportedUsage(100, 20) },
+  { type: 'run', run_id: 'old-unknown', status: 'ok' }
+ ];
+ const h = runHarness({ hash: '#session=aaaaaaaa', respond: async (url) => {
+  if (url === '/api/sessions/aaaaaaaa') return { ok: true, json: async () => ({ id: 'aaaaaaaa', records }) };
+ } });
+ await h.settle();
+ assert.ok(h.$('session-usage'), '用量必须在主页面可见');
+ assert.equal(h.$('runtime-drawer').contains(h.$('session-usage')), false);
+ assert.match(h.$('session-usage').textContent, /本轮.*未报告/);
+ assert.match(h.$('session-usage').textContent, /会话.*120.*含未报告/);
+ await h.startRun('继续');
+ const stream = h.stream();
+ stream.push(sse('run.started', { run_id: 'new-run', session_id: 'aaaaaaaa' }));
+ stream.push(sse('usage.updated', { run_id: 'new-run', scope: 'run', ...reportedUsage(10, 5) }));
+ await h.settle();
+ assert.match(h.$('session-usage').textContent, /本轮 15 tokens.*会话.*135 tokens/);
+ const updated = { run_id: 'new-run', scope: 'run', ...reportedUsage(20, 10) };
+ stream.push(sse('usage.updated', updated));
+ stream.push(sse('usage.updated', updated));
+ stream.push(sse('usage.updated', { run_id: 'foreign', scope: 'run', ...reportedUsage(9999, 9999) }));
+ stream.push(sse('run.finished', { run_id: 'new-run', answer: '好了' }));
+ await h.settle();
+ stream.end();
+ await h.settle();
+ assert.match(h.$('session-usage').textContent, /本轮 30 tokens.*会话.*150 tokens/);
+ assert.match(h.$('session-usage').title, /输入 20.*输出 10/);
+ await h.click('session-new');
+ assert.match(h.$('session-usage').textContent, /会话 尚无运行/);
+ assert.doesNotMatch(h.$('session-usage').textContent, /150/);
+});
+
+test('刷新从持久化运行恢复用量，未报告和部分报告不能显示为完整零用量', async () => {
+ for (const [usage, expected] of [[undefined, /未报告/], [reportedUsage(4, 5, false), /已报告 9 tokens.*不完整/], [reportedUsage(0, 0), /本轮 0 tokens/]]) {
+  const h = navigationHarness({ hash: '#session=aaaaaaaa', respond: async (url) => {
+   if (url === '/api/sessions/aaaaaaaa') return { ok: true, json: async () => ({ records: [
+    { type: 'message', role: 'user', run_id: 'r', text: '测试' },
+    { type: 'config', model: 'm', reasoning_effort: 'high' },
+    { type: 'message', role: 'assistant', run_id: 'r', text: '回答' },
+    { type: 'run', run_id: 'r', status: 'ok', usage }
+   ] }) };
+  } });
+  await h.settle();
+  assert.ok(h.$('session-usage'));
+  assert.match(h.$('session-usage').textContent, expected);
+  assert.equal(h.$('session-notices').textContent.includes('无法识别'), false, '配置记录是已知元数据');
+ }
+});
+
+test('配置记录不会被会话回放误报为未知记录', () => {
+ const { replaySession } = require('./app.js');
+ assert.deepEqual(replaySession({ records: [{ type: 'config', model: 'one' }] }).notices, []);
+});
+
+test('用量格式拒绝负值和不精确数字，缓存与推理不重复加到总数', () => {
+ const { usageSnapshot, usageBarView } = require('./app.js');
+ for (const value of [-1, NaN, Infinity, '10', Number.MAX_SAFE_INTEGER + 1]) {
+  assert.equal(usageSnapshot({ input_tokens: value, output_tokens: 2 }), null);
+ }
+ const usage = usageSnapshot({ ...reportedUsage(10, 5), cached_tokens: 8, reasoning_tokens: 4, total_tokens: 999 });
+ assert.equal(usage.total_tokens, 15);
+ assert.match(usageBarView(new Map([['r', usage]]), 'r').text, /本轮 15 tokens.*会话 15 tokens/);
+});
+
+test('重载界面选择注册工具而不是演示版本，发送工具身份且保留选择', async () => {
+ const h = navigationHarness({ respond: async (url, options) => {
+  const state = { reloadable_tools: ['luna_read_file', 'luna_text_transform'], plugins: [], capabilities: [], events: [] };
+  if (url === '/api/state') return { ok: true, json: async () => state };
+  if (url === '/api/reload') return { ok: true, json: async () => state };
+ } });
+ await h.settle();
+ assert.ok(!h.$('candidate'), '演示版本选择器已移除');
+ const select = h.$('reload-tool');
+ assert.ok(select);
+ assert.deepEqual([...select.children].map(o => o.getAttribute('value')), ['', 'luna_read_file', 'luna_text_transform']);
+ select.value = 'luna_read_file';
+ await h.poll();
+ assert.equal(select.value, 'luna_read_file', '轮询不清空选择');
+ h.$('reload-form').emit('submit');
+ await h.settle();
+ const posted = h.calls.filter(call => call.url === '/api/reload');
+ assert.equal(posted.length, 1);
+ assert.deepEqual(JSON.parse(posted[0].options.body), { tool: 'luna_read_file' });
+ assert.match(h.$('reload-status').textContent, /重载|重建/);
+});
+
+test('新建会话清除旧工作区选择，设置面板与页头保持一致', async () => {
+ const h = navigationHarness({ hash: '#session=aaaaaaaa', respond: async (url) => {
+  if (url === '/api/sessions/aaaaaaaa') return { ok: true, json: async () => ({ id: 'aaaaaaaa', workspace: { id: 'ws-a', name: '项目 A', dirs: ['/work/a'] }, records: [] }) };
+  if (url === '/api/workspaces') return { ok: true, json: async () => ({ workspaces: [{ id: 'ws-a', name: '项目 A', dirs: ['/work/a'] }] }) };
+ } });
+ await h.settle();
+ await h.click('settings-toggle');
+ await h.click('settings-tab-workspace');
+ assert.equal(h.$('workspace-list').querySelector('.workspace-badge').hidden, false);
+ await h.click('settings-close');
+ await h.click('session-new');
+ assert.equal(h.$('conversation-workspace').hidden, true);
+ await h.click('settings-toggle');
+ await h.click('settings-tab-workspace');
+ assert.equal(h.$('workspace-list').querySelector('.workspace-badge').hidden, true, '空会话不应仍标出上一会话的工作区');
+});
+
+test('上一会话迟到的模型列表或错误不能覆盖当前会话', async () => {
+ for (const failure of [false, true]) {
+  let hold = false;
+  const pending = [];
+  const payload = name => ({ models: [{ name: 'alpha', default: true }, { name: 'beta' }], current: { name, origin: 'session' } });
+  const h = navigationHarness({ hash: '#session=aaaaaaaa', respond: async url => {
+   if (url.startsWith('/api/models')) {
+    if (url.includes('session=aaaaaaaa') && hold) return new Promise(resolve => pending.push(resolve));
+    return { ok: true, json: async () => payload(url.includes('session=bbbbbbbb') ? 'beta' : 'alpha') };
+   }
+  } });
+  await h.settle();
+  hold = true;
+  await h.click('settings-toggle');
+  await h.click('settings-tab-model');
+  assert.ok(pending.length > 0);
+  await h.click('settings-close');
+  h.location.hash = '#session=bbbbbbbb';
+  await h.settle();
+  await h.click('settings-toggle');
+  await h.click('settings-tab-model');
+  assert.match(h.$('settings-model-status').textContent, /beta/);
+  for (const resolve of pending) resolve(failure ? { ok: false, status: 500, json: async () => ({ error: 'late error from A' }) } : { ok: true, json: async () => payload('alpha') });
+  await h.settle();
+  assert.match(h.$('settings-model-status').textContent, /beta/, '迟到的 A 结果不能改变 B 的模型状态');
+  assert.equal(h.$('settings-model-list').querySelectorAll('.model-badge').filter(node => node.textContent === '这个会话在用').length, 1);
+ }
+});
+
+test('模型设置面板打开时切换会话会主动刷新绑定，而不是留下旧会话标记', async () => {
+ const h = navigationHarness({ hash: '#session=aaaaaaaa', respond: async url => {
+  if (url.startsWith('/api/models')) return { ok: true, json: async () => ({ models: [{ name: 'alpha' }, { name: 'beta' }], current: { name: url.includes('session=bbbbbbbb') ? 'beta' : 'alpha', origin: 'session' } }) };
+ } });
+ await h.settle();
+ await h.click('settings-toggle');
+ await h.click('settings-tab-model');
+ assert.match(h.$('settings-model-status').textContent, /alpha/);
+ h.location.hash = '#session=bbbbbbbb';
+ await h.settle();
+ assert.match(h.$('settings-model-status').textContent, /beta/);
+});
+
+function executionHarness({ hash = '', server = { requested: 'sandbox', granted: false }, failSave = false } = {}) {
+ const response = (data, ok = true) => ({ ok, status: ok ? 200 : 500, json: async () => data });
+ const view = id => { const own = id === 'cccccccc'; const requested = own ? server.requested : 'sandbox'; const granted = own && server.granted; return { mode: requested === 'full_access' && granted ? 'full_access' : 'sandbox', requested_mode: requested, needs_confirmation: requested === 'full_access' && !granted, grant_scope: 'session_and_process' }; };
+ const h = navigationHarness({ hash, respond: async (url, options) => {
+  if (url.startsWith('/api/execution')) return response(view(new URL('http://test' + url).searchParams.get('session')));
+  if (url === '/api/sessions' && options?.method === 'POST') return response({ id: 'cccccccc', records: [] });
+  if (url === '/api/sessions/cccccccc/execution') {
+   if (failSave) return response({ error: 'synthetic approval save failure' }, false);
+   const body = JSON.parse(options.body);
+   if (body.mode === 'full_access') assert.equal(body.confirm_full_access, true);
+   server.requested = body.mode; server.granted = body.mode === 'full_access';
+   return response(view('cccccccc'));
+  }
+ } });
+ h.server = server;
+ return h;
+}
+
+test('Full access 必须显式勾选确认，状态栏显示真实授权且不自动启用能力', async () => {
+ const h = executionHarness(); await h.settle();
+ assert.ok(h.$('session-execution'), '权限控制必须在主界面');
+ assert.match(h.$('session-execution').textContent, /隔离/);
+ h.$('message').value = '保留草稿';
+ await h.click('session-execution');
+ assert.equal(h.$('execution-panel').hidden, false);
+ assert.ok(!h.$('execution-confirm').checked, '授权不得预勾选');
+ assert.equal(h.$('execution-full').disabled, true);
+ await h.click('execution-full');
+ assert.equal(h.calls.some(call => call.url.endsWith('/execution') && call.options?.method === 'POST'), false);
+ h.$('execution-confirm').checked = true;
+ h.$('execution-confirm').emit('change');
+ await h.click('execution-full');
+ assert.equal(h.server.granted, true);
+ assert.match(h.$('session-execution').textContent, /Full access/);
+ assert.equal(h.$('message').value, '保留草稿');
+ assert.equal(h.calls.some(call => call.url.startsWith('/api/plugins/')), false);
+ await h.click('session-execution');
+ assert.ok(!h.$('execution-confirm').checked, '每次打开确认都重新开始');
+ await h.click('execution-sandbox');
+ assert.equal(h.server.granted, false);
+ assert.match(h.$('session-execution').textContent, /隔离/);
+});
+
+test('服务重启后的 Full access 偏好只显示待确认，不能直接发起运行', async () => {
+ const h = executionHarness({ hash: '#session=cccccccc', server: { requested: 'full_access', granted: false } });
+ await h.settle();
+ assert.match(h.$('session-execution').textContent, /待确认/);
+ h.$('message').value = '不应运行'; h.$('chat-form').emit('submit'); await h.settle();
+ assert.equal(h.calls.some(call => call.url === '/api/runs'), false);
+ await h.click('session-execution');
+ assert.ok(!h.$('execution-confirm').checked);
+});
+
+test('会话切换清除尚未提交的权限确认，保存失败不显示已授权', async () => {
+ const h = executionHarness({ hash: '#session=cccccccc' }); await h.settle();
+ await h.click('session-execution');
+ h.$('execution-confirm').checked = true; h.$('execution-confirm').emit('change');
+ h.location.hash = '#session=bbbbbbbb'; await h.settle();
+ assert.ok(!h.$('execution-confirm').checked);
+ assert.equal(h.$('execution-full').disabled, true);
+ const failed = executionHarness({ failSave: true }); await failed.settle();
+ await failed.click('session-execution');
+ failed.$('execution-confirm').checked = true; failed.$('execution-confirm').emit('change');
+ await failed.click('execution-full');
+ assert.equal(failed.server.granted, false);
+ assert.doesNotMatch(failed.$('session-execution').textContent, /Full access/);
+ assert.match(failed.$('execution-status').textContent, /synthetic approval save failure/);
+});
+
+
+test('Composer 收束为输入和操作两层，统计与提示不占固定 footer', async () => {
+ const h = sessionControlHarness();
+ await h.settle();
+ const form = h.$('chat-form');
+ assert.equal(form.contains(h.$('session-control-bar')), true);
+ assert.equal(form.contains(h.$('session-execution')), true);
+ assert.equal(form.contains(h.$('session-settings')), true);
+ assert.equal(form.contains(h.$('session-usage')), false);
+ assert.equal(h.$('composer-hint'), null);
+ assert.equal(h.$('session-run-state'), null);
+ assert.equal(h.$('widget-usage').hidden, true);
+ assert.equal(h.$('widget-activity').hidden, true);
+ assert.equal(h.$('send').getAttribute('aria-label'), '发送');
+});
+
+test('Composer 设置摘要与能力菜单可关闭且保留草稿，widget 可隐藏后恢复', async () => {
+ const h = sessionControlHarness();
+ await h.settle();
+ h.$('message').value = '未发送草稿';
+ await h.click('session-settings');
+ assert.equal(h.$('composer-settings').hidden, false);
+ assert.match(h.$('session-settings').textContent, /one/);
+ h.key('Escape');
+ assert.equal(h.$('composer-settings').hidden, true);
+ assert.equal(h.document.activeElement, h.$('session-settings'));
+ await h.click('composer-add');
+ assert.equal(h.$('composer-actions').hidden, false);
+ await h.click('widget-toggle-usage');
+ assert.equal(h.$('widget-usage').hidden, false);
+ await h.click('widget-hide-usage');
+ assert.equal(h.$('widget-usage').hidden, true);
+ await h.click('widget-toggle-usage');
+ assert.equal(h.$('widget-usage').hidden, false);
+ assert.equal(h.$('message').value, '未发送草稿');
+});
+
+test('Composer reasoning 识别 xhigh 和 max，不冒称必须重启', () => {
+ const { reasoningEffortView, REASONING_EFFORT_LEVELS } = require('./app.js');
+ for (const level of ['xhigh', 'max']) {
+  assert.ok(REASONING_EFFORT_LEVELS.includes(level));
+  const view = reasoningEffortView(level);
+  assert.doesNotMatch(view.label, /未识别/);
+  assert.doesNotMatch(view.note, /不能切换|重启/);
+ }
+});
+
+test('Composer 能力 widget 无需打开面板即可注册，停用即卸载且清理异常不残留', async () => {
+ let mounted = 0, unmounted = 0;
+ const h = capabilityHarness({ panelModules: {
+  '/api/memory/metric.js': {
+   mount(target) { mounted++; const text = target.ownerDocument?.createElement?.('p'); if (text) target.append(text); },
+   unmount() { unmounted++; throw Error('cleanup'); }
+  }
+ } });
+ await h.settle();
+ const capability = h.capabilityState.capabilities[0];
+ capability.claims = [{kind:'route-prefix',id:'/api/memory'}];
+ capability.widgets = [{id:'metric',title:'指标',entry:'/api/memory/metric.js'}];
+ await h.poll();
+ assert.equal(mounted, 1);
+ assert.ok(h.$('widget-cap:metric'));
+ assert.equal(h.$('widget-cap:metric').hidden, true);
+ await h.click('widget-toggle-cap:metric');
+ assert.equal(h.$('widget-cap:metric').hidden, false);
+ capability.state = 'disabled';
+ await h.poll();
+ assert.equal(unmounted, 1);
+ assert.equal(h.$('widget-cap:metric'), null);
+ assert.equal(h.$('widget-toggle-cap:metric'), null);
+});
+
+test('Composer widget 迟到模块不复活已停用的能力，外站和跨能力入口不加载', async () => {
+ let release, mounted = 0;
+ const pending = new Promise(resolve => { release = resolve; });
+ const h = capabilityHarness({ panelModules: {'/api/memory/metric.js': pending} });
+ await h.settle();
+ const capability = h.capabilityState.capabilities[0];
+ capability.claims = [{kind:'route-prefix',id:'/api/memory'}];
+ capability.widgets = [{id:'metric',title:'指标',entry:'/api/memory/metric.js'}, {id:'bad',title:'不加载',entry:'https://bad.invalid/widget.js'}, {id:'other',title:'不加载',entry:'/api/other/widget.js'}];
+ await h.poll();
+ assert.ok(h.$('widget-cap:metric'), '合法的组件应开始加载，不能把所有模块都忽略');
+ assert.equal(h.$('widget-cap:bad'), null);
+ assert.equal(h.$('widget-cap:other'), null);
+ capability.state = 'disabled';
+ await h.poll();
+ release({ mount(){ mounted++; }, unmount(){} });
+ await h.settle();
+ assert.equal(mounted, 0);
+ assert.equal(h.$('widget-cap:metric'), null);
+});
+
+
+test('Composer widget 拖动和键盘调整保存位置，刷新不恢复运行数据', async () => {
+ const h = sessionControlHarness(); await h.settle();
+ await h.click('widget-toggle-usage');
+ const card = h.$('widget-usage'), handle = card.querySelector('.runtime-widget-handle');
+ handle.emit('pointerdown', { pointerId: 7, button: 0, clientX: 30, clientY: 90 });
+ h.document.emit('pointermove', { pointerId: 7, clientX: 240, clientY: 130 });
+ h.document.emit('pointerup', { pointerId: 7 });
+ assert.equal(card.dataset.placement, 'float');
+ handle.emit('keydown', { key: 'ArrowLeft' });
+ const saved = JSON.parse(h.storage.get('luna.widgets.v1')).usage;
+ assert.equal(saved.userMoved, true);
+ assert.ok(saved.x >= 0 && saved.x <= 1);
+ const restored = sessionControlHarness({ storage: h.storage }); await restored.settle();
+ assert.equal(restored.$('widget-usage').hidden, false);
+ assert.equal(restored.$('widget-usage').dataset.placement, 'float');
+ assert.match(restored.$('session-usage').textContent, /尚无运行/);
+});
+
+
+test('Composer xhigh 和 max 可从实际选择器保存，并同步摘要', async () => {
+ const h = sessionControlHarness(); await h.settle();
+ for (const level of ['xhigh', 'max']) {
+  await h.click('session-settings');
+  await h.click('session-reasoning');
+  await h.pick(level);
+  assert.equal(h.server.effort, level);
+  assert.match(h.$('session-settings').textContent, new RegExp(level));
+ }
+ assert.equal(h.calls.some(call => call.url === '/api/runs'), false);
+});
+
+
+test('Composer 审批卡在正文中展示准确操作，只提交一次身份绑定决策', async () => {
+ const decisions=[];
+ const h=runHarness({respond:async(url,options)=>{
+  if(url==='/api/approvals/approval-1'){decisions.push(JSON.parse(options.body));return {ok:true,json:async()=>({})};}
+ }});
+ await h.settle();await h.startRun();const stream=h.stream();
+ stream.push(sse('run.started',{run_id:'run-1',session_id:'aaaaaaaa'}));
+ stream.push(sse('approval.requested',{id:'approval-1',run_id:'run-1',session_id:'aaaaaaaa',operation:{tool:'luna_write_file',summary:'写入项目文件',target:'/project/a.txt',preview:'new content',permissions:['read','write'],ask:['write'],scope_approval:true}}));
+ await h.settle();
+ const card=h.$('approval-approval-1');assert.ok(card);
+ assert.equal(h.$('chat-form').contains(card),false);
+ assert.match(card.textContent,/a.txt/);assert.match(card.textContent,/new content/);
+ await h.click('approval-approve-approval-1');
+ assert.deepEqual(decisions,[{run_id:'run-1',session_id:'aaaaaaaa',decision:'approve'}]);
+ assert.equal(h.$('approval-approval-1'),null);
+ stream.push(sse('run.finished',{run_id:'run-1',answer:'done'}));stream.end();await h.settle();
+});
+
+test('Composer 审批拒绝不会提交授权参数，失败保留卡片且仍能停止', async () => {
+ const h=runHarness({respond:async(url)=>url==='/api/approvals/approval-2'?{ok:false,status:500,json:async()=>({error:'temporary failure'})}:undefined});
+ await h.settle();await h.startRun();const stream=h.stream();
+ stream.push(sse('run.started',{run_id:'run-1',session_id:'aaaaaaaa'}));
+ stream.push(sse('approval.requested',{id:'approval-2',run_id:'run-1',session_id:'aaaaaaaa',operation:{tool:'luna_run',summary:'执行命令',command:'make test',permissions:['exec'],ask:['exec']}}));
+ await h.settle();await h.click('approval-deny-approval-2');
+ assert.match(h.$('approval-approval-2').textContent,/temporary failure/);
+ assert.equal(h.$('send').disabled,false);
+ await h.click('send');assert.equal(h.cancelCalls().length,1);
+ stream.push(sse('run.cancelled',{run_id:'run-1',reason:'user'}));stream.end();await h.settle();
+ assert.equal(h.$('approval-approval-2'),null);
+});
+
+
+test('Composer 权限矩阵逐项保存，命令与点击使用同一个会话设置接口', async () => {
+ const state={policy:{read:'allow',write:'ask',network:'ask',exec:'ask'},calls:[]};
+ const response=data=>({ok:true,json:async()=>data});
+ const h=navigationHarness({respond:async(url,options)=>{
+  if(url.startsWith('/api/execution'))return response({mode:'sandbox',requested_mode:'sandbox',needs_confirmation:false,permissions:state.policy,requested_permissions:state.policy});
+  if(url==='/api/commands')return response({commands:[{name:'permissions',args:'options',busy:'allow',options:[{value:'network=deny'}]}]});
+  if(url==='/api/sessions'&&options?.method==='POST')return response({id:'cccccccc'});
+  if(url==='/api/sessions/cccccccc/execution'){const body=JSON.parse(options.body);state.calls.push(body);state.policy=body.permissions;return response({mode:'sandbox',requested_mode:'sandbox',permissions:state.policy,requested_permissions:state.policy});}
+ }});
+ await h.settle();await h.click('session-execution');
+ assert.equal(h.$('permission-write').value,'ask');
+ h.$('permission-network').value='deny';h.$('permission-network').emit('change');
+ h.$('permission-exec').value='allow';h.$('permission-exec').emit('change');
+ h.$('permission-form').emit('submit');await h.settle();
+ assert.equal(state.calls.length,1);assert.equal(state.calls[0].confirm_permissions,true);
+ assert.deepEqual(state.policy,{read:'allow',write:'ask',network:'deny',exec:'allow'});
+ h.$('message').value='/permissions write deny';h.$('chat-form').emit('submit');await h.settle();
+ assert.equal(state.policy.write,'deny');assert.equal(state.policy.exec,'allow');
+ assert.equal(h.calls.some(call=>call.url==='/api/runs'),false);
+});
+
+
+test('Composer 模型 widget 使用真实文本渲染器，更新不能覆盖用户隐藏和位置',async()=>{
+ const moduleSource=fs.readFileSync(path.join(root,'../internal/plugins/runtimewidgets/widget.js'),'utf8');
+ const renderer=await import('data:text/javascript;base64,'+Buffer.from(moduleSource).toString('base64'));
+ const instances=[{id:'job',title:'生成进度',data:{kind:'progress',text:'<img src=x onerror=alert(1)>',progress:35,origin:'model'},layout:{visible:true,placement:'right'}}];
+ const h=capabilityHarness({hash:'#session=aaaaaaaa',panelModules:{'/api/runtime-widgets/widget.js':renderer},respond:async(url)=>url.startsWith('/api/runtime-widgets/instances')?{ok:true,json:async()=>({instances})}:undefined});
+ await h.settle();h.capabilityState.capabilities=[{id:'runtime-widgets',state:'enabled',claims:[{kind:'route-prefix',id:'/api/runtime-widgets'}],widgets:[{id:'runtime-cards',title:'模型运行组件',entry:'/api/runtime-widgets/widget.js',source:'/api/runtime-widgets/instances'}]}];
+ await h.poll();const id='instance:runtime-cards:aaaaaaaa:job';const card=h.$('widget-'+id);assert.ok(card);
+ assert.match(card.textContent,/模型提供/);assert.match(card.textContent,/35%/);assert.equal(card.querySelector('img'),null);
+ const handle=card.querySelector('.runtime-widget-handle');handle.emit('keydown',{key:'ArrowLeft'});
+ const savedLeft=card.style.left;await h.click('widget-hide-'+id);
+ instances[0].data.progress=70;instances[0].layout={visible:true,placement:'left'};await h.poll();
+ assert.equal(card.hidden,true);assert.equal(card.dataset.placement,'float');assert.equal(card.style.left,savedLeft);
+ assert.match(card.textContent,/70%/);
+ h.capabilityState.capabilities[0].state='disabled';await h.poll();assert.equal(h.$('widget-'+id),null);
+});
+
+
+test('Composer 刷新后可恢复待审批并停止当前会话的运行，不误发新消息',async()=>{
+ const calls=[];let busy=true;
+ const approval={id:'pending-refresh',run_id:'run-restored',session_id:'aaaaaaaa',operation:{tool:'luna_run',summary:'等待执行',command:'make test',permissions:['exec'],ask:['exec']}};
+ const h=navigationHarness({hash:'#session=aaaaaaaa',respond:async(url,options)=>{
+  if(url==='/api/state')return {ok:true,json:async()=>({busy,current_run_id:busy?'run-restored':'',current_session_id:busy?'aaaaaaaa':'',capabilities:[]})};
+  if(url.startsWith('/api/approvals?'))return {ok:true,json:async()=>({approvals:busy?[approval]:[]})};
+  if(url==='/api/runs/run-restored/cancel'){calls.push(url);busy=false;return {ok:true,status:202,json:async()=>({})};}
+ }});
+ await h.settle();await h.poll();
+ assert.ok(h.$('approval-pending-refresh'));assert.equal(h.$('send').getAttribute('aria-label'),'停止');assert.equal(h.$('send').disabled,false);
+ h.$('message').value='保留刷新后的草稿';await h.click('send');await h.poll();
+ assert.deepEqual(calls,['/api/runs/run-restored/cancel']);assert.equal(h.calls.some(call=>call.url==='/api/runs'),false);
+ assert.equal(h.$('send').getAttribute('aria-label'),'发送');assert.equal(h.$('message').value,'保留刷新后的草稿');assert.equal(h.$('approval-pending-refresh'),null);
+});
+
+
+test('Composer 矮视口菜单使用有界浮层，不继续堆叠底栏',()=>{
+ const css=source('style.css');
+ assert.match(css,/@media \(max-height: 540px\)/);
+ assert.match(css,/max-height: calc\(100dvh - var\(--luna-topbar-h\) - 24px\)/);
+ assert.match(css,/max-height: min\(620px, calc\(100dvh - 140px\)\)/);
+});
+
+
+test('Composer widget 数据请求合并并在能力停用时取消',async(t)=>{
+ let requests=0,signal;const releases=[];t.after(()=>releases.forEach(resolve=>resolve({ok:true,json:async()=>({instances:[]})})));
+ const h=capabilityHarness({hash:'#session=aaaaaaaa',respond:async(url,options)=>{
+  if(url.startsWith('/api/memory/instances')){requests++;signal=options.signal;return new Promise((resolve,reject)=>{releases.push(resolve);signal?.addEventListener('abort',()=>reject(Object.assign(new Error('aborted'),{name:'AbortError'})),{once:true});});}
+ }});
+ await h.settle();const cap=h.capabilityState.capabilities[0];cap.claims=[{kind:'route-prefix',id:'/api/memory'}];cap.widgets=[{id:'pending',title:'等待数据',entry:'/api/memory/panel.js',source:'/api/memory/instances'}];
+ await h.poll();await h.poll();assert.equal(requests,1,'未完成请求不能随每次轮询叠加');assert.equal(signal?.aborted,false);
+ cap.state='disabled';await h.poll();assert.equal(signal.aborted,true);
+});
+
+
+test('Composer widget 数据源超时后释放请求并允许重试',async(t)=>{
+ let requests=0;const releases=[];t.after(()=>releases.forEach(resolve=>resolve({ok:true,json:async()=>({instances:[]})})));
+ const h=capabilityHarness({hash:'#session=aaaaaaaa',respond:async(url,options)=>{
+  if(url.startsWith('/api/memory/slow')){requests++;return new Promise((resolve,reject)=>{releases.push(resolve);options.signal.addEventListener('abort',()=>reject(Object.assign(new Error('aborted'),{name:'AbortError'})),{once:true});});}
+ }});
+ await h.settle();const cap=h.capabilityState.capabilities[0];cap.claims=[{kind:'route-prefix',id:'/api/memory'}];cap.widgets=[withSource()];
+ function withSource(){return {id:'slow',title:'慢数据',entry:'/api/memory/panel.js',source:'/api/memory/slow'};}
+ await h.poll();await h.expireNetworkRequests();assert.match(h.$('conversation-status').textContent,/请求超时/);
+ await h.poll();assert.equal(requests,2);cap.state='disabled';await h.poll();
 });

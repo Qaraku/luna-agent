@@ -11,6 +11,10 @@
   --luna-radius-sm: 6px;
   --luna-radius-md: 8px;
   --luna-radius-lg: 12px;
+  --luna-radius-popover: 16px;
+  --luna-radius-composer: 26px;
+  --luna-radius-composer-compact: 22px;
+  --luna-radius-dialog: 20px;
   --luna-control-sm: 28px;
   --luna-control-md: 32px;
   --luna-control-lg: 36px;
@@ -724,64 +728,77 @@ body {
    输入区是主要交互组件，但和内容面共用一个表面关系：一个圆角边界，不加阴影。 */
 
 .composer-shell {
-  border-top: 1px solid var(--luna-border-weak);
   background: var(--luna-bg);
-  padding-block: var(--luna-space-3);
+  padding-block: 8px 14px;
 }
-.composer-inner { display: grid; gap: var(--luna-space-2); }
+.composer-inner { position: relative; }
 .composer {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: end;
-  gap: var(--luna-space-1);
-  padding: var(--luna-space-1);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px 8px;
   border: 1px solid var(--luna-border);
-  border-radius: var(--luna-radius-lg);
+  border-radius: var(--luna-radius-composer);
   background: var(--luna-raised);
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
-.composer:focus-within { border-color: var(--luna-accent); box-shadow: 0 0 0 3px var(--luna-focus); }
+.composer:focus-within { border-color: var(--luna-accent); box-shadow: 0 0 0 2px var(--luna-focus); }
 .composer textarea {
-  width: 100%;
-  min-height: var(--luna-control-lg);
-  max-height: 132px;
-  resize: none;
-  overflow-y: auto;
-  padding: var(--luna-space-2) var(--luna-space-2) var(--luna-space-2) var(--luna-space-3);
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  font-size: var(--luna-font-body);
-  line-height: 1.6;
+  width: 100%; min-height: 40px; max-height: 144px;
+  resize: none; overflow-y: auto;
+  padding: 5px 7px; border: 0; border-radius: 0;
+  background: transparent; font-size: var(--luna-font-body); line-height: 1.6;
 }
 .composer textarea:focus-visible { outline: none; }
 .composer textarea::placeholder { color: var(--luna-text-muted); }
+.composer-toolbar, .composer-tools, .composer-submit { display: flex; align-items: center; min-width: 0; gap: 6px; }
+.composer-toolbar { justify-content: space-between; }
+.composer-tools { flex: 1 1 auto; }
+.composer-submit { flex: 0 1 auto; max-width: 54%; }
+.composer-control, .composer-icon {
+  min-width: 0; min-height: 34px; padding: 5px 8px;
+  border: 0; border-radius: 999px; background: transparent;
+  color: var(--luna-text-muted); font: inherit; font-size: var(--luna-font-meta);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer;
+}
+.composer-icon { flex: none; width: 34px; padding: 0; font-size: 23px; }
+.composer-control:hover, .composer-icon:hover { background: var(--luna-hover); color: var(--luna-text); }
+.composer-control:disabled { opacity: .6; cursor: default; }
+.composer-summary { text-align: right; }
+.composer-control.has-error, .composer-control.is-full-access { color: var(--luna-danger); }
+.composer-project { max-width: 160px; background: var(--luna-bg); cursor: pointer; border-radius: 999px; }
 .send-button {
-  display: inline-grid;
-  place-items: center;
-  width: var(--luna-control-lg);
-  height: var(--luna-control-lg);
-  padding: 0;
-  border: 0;
-  border-radius: var(--luna-radius-md);
-  background: var(--luna-accent);
-  color: var(--luna-accent-contrast);
+  display: inline-grid; place-items: center; flex: none;
+  width: 36px; height: 36px; padding: 0; border: 0; border-radius: 50%;
+  background: var(--luna-accent); color: var(--luna-accent-contrast);
   transition: opacity 120ms ease;
 }
 .send-button:hover { opacity: .88; }
 .send-button:disabled { opacity: .4; }
-/* 运行期间同一个按钮变成 Stop：方块比发送的箭头小一号，命中区域不变。 */
 .send-button .stop-icon { width: 12px; height: 12px; }
-.composer-hint {
-  margin: 0;
-  color: var(--luna-text-muted);
-  font-size: var(--luna-font-label);
-  text-align: right;
+/* 菜单浮在输入区上方，不参与正文或 composer 的高度计算。 */
+.composer-popover, .command-menu {
+  position: absolute; z-index: 25; bottom: calc(100% + 8px);
+  left: var(--luna-gutter); right: var(--luna-gutter);
+  box-shadow: var(--luna-elevation);
 }
+.composer-popover {
+  right: auto; width: min(340px, calc(100% - 2 * var(--luna-gutter)));
+  max-height: min(380px, 56dvh); overflow: auto; padding: 8px;
+  border: 1px solid var(--luna-border); border-radius: var(--luna-radius-popover); background: var(--luna-raised);
+}
+.composer-popover-end { left: auto; right: var(--luna-gutter); }
+.composer-menu-action {
+  display: block; width: 100%; min-height: 38px; padding: 8px 10px;
+  border: 0; border-radius: 9px; background: transparent;
+  color: var(--luna-text); text-align: left; font: inherit;
+  overflow-wrap: anywhere; cursor: pointer;
+}
+.composer-menu-action:hover { background: var(--luna-hover); }
+.composer-menu-action:disabled { opacity: .6; cursor: default; }
+.composer-menu-label { margin: 10px 10px 4px; color: var(--luna-text-muted); font-size: var(--luna-font-meta); font-weight: 500; }
+.composer-project-detail { margin: 8px 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
 
-/* 命令候选：在输入框上方展开，是输入区的一部分，不是浮层——它和输入框共用
-   同一条内容边线，出现与消失只改变主区高度。行内三段是命令名、用法与说明，
-   全部来自服务端的命令表（见 app.js 的 renderCommandList）。 */
 .command-menu {
   display: flex;
   flex-direction: column;
@@ -1458,7 +1475,6 @@ body {
     height: 44px;
   }
   .session-row { height: 44px; }
-  .composer-hint { display: none; }
   .latest-button { right: var(--luna-gutter); bottom: 76px; }
   .runtime-drawer {
     top: auto;
@@ -1507,5 +1523,80 @@ body {
     animation-iteration-count: 1 !important;
     scroll-behavior: auto !important;
     transition-duration: .01ms !important;
+  }
+}
+
+/* Runtime 组件脱离正文流；默认隐藏，展示与位置由用户决定。 */
+.runtime-widget-layer { position: fixed; z-index: 30; inset: 0; pointer-events: none; }
+.runtime-zone { position: absolute; display: flex; flex-direction: column; align-items: flex-end; gap: 10px; max-height: calc(100dvh - 210px); overflow-y: auto; scrollbar-width: thin; }
+.runtime-zone-right { top: 70px; right: 16px; }
+.runtime-zone-left { top: 70px; left: calc(var(--luna-sidebar-w) + 16px); align-items: flex-start; }
+.runtime-zone-bottom { bottom: 128px; right: 16px; }
+.runtime-zone-float { inset: 0; max-height: none; overflow: visible; }
+.runtime-widget {
+  flex: none; max-width: calc(100vw - 24px); max-height: min(420px, 55dvh);
+  pointer-events: auto; overflow: auto; border: 1px solid var(--luna-border);
+  border-radius: var(--luna-radius-popover); background: var(--luna-raised); box-shadow: var(--luna-elevation);
+}
+.runtime-widget[data-placement="float"] { position: absolute; }
+.runtime-widget-header { display: flex; align-items: center; gap: 4px; padding: 6px 8px; }
+.runtime-widget-handle { flex: 1; min-width: 0; padding: 6px; border: 0; background: transparent; color: var(--luna-text-muted); font: inherit; font-size: var(--luna-font-meta); text-align: left; cursor: grab; touch-action: none; }
+.runtime-widget-hide { width: 28px; height: 28px; border: 0; border-radius: 50%; background: transparent; color: var(--luna-text-muted); cursor: pointer; font-size: 19px; }
+.runtime-widget-hide:hover { background: var(--luna-hover); }
+.runtime-widget-body { padding: 0 14px 12px; font-size: var(--luna-font-meta); }
+.runtime-widget-options { position: relative; }
+.runtime-widget-options summary { cursor: pointer; list-style: none; padding: 4px 7px; }
+.runtime-widget-options[open] { background: var(--luna-raised); }
+.runtime-widget-options select { display: block; max-width: 125px; margin-block: 5px; font: inherit; font-size: var(--luna-font-meta); }
+.session-usage { margin: 0; line-height: 1.6; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.runtime-widget .run-status { padding: 0; max-width: none; }
+.runtime-drawer.execution-panel { top: auto; bottom: 116px; right: var(--luna-gutter); height: auto; max-height: min(620px, calc(100dvh - 140px)); border: 1px solid var(--luna-border); border-radius: var(--luna-radius-dialog); transform: translateY(12px); }
+.runtime-drawer.execution-panel.is-open { transform: translateY(0); }
+@media (max-width: 800px) {
+  .composer-shell { padding-bottom: max(8px, env(safe-area-inset-bottom)); }
+  .composer { padding-inline: 8px; border-radius: var(--luna-radius-composer-compact); }
+  .composer-control { padding-inline: 5px; }
+  .composer-tools, .composer-submit { gap: 2px; }
+  .composer-project { max-width: 82px; }
+  .composer-summary { max-width: 160px; }
+  .send-button { width: 36px; height: 36px; }
+  .runtime-zone { left: 12px; right: 12px; top: auto; bottom: 130px; max-height: 40dvh; align-items: flex-end; }
+  .runtime-zone-float { inset: 0; max-height: none; }
+  .runtime-widget[data-placement="float"] { max-height: 40dvh; }
+  .runtime-drawer.execution-panel { left: 12px; right: 12px; width: auto; bottom: 116px; }
+}
+
+.execution-panel .drawer-body { display: grid; align-content: start; gap: 14px; }
+.execution-panel p { line-height: 1.65; }
+.execution-confirm-label { display: flex; align-items: flex-start; gap: 8px; line-height: 1.65; }
+.execution-confirm-label input { margin-top: 5px; flex: none; }
+.execution-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.execution-danger { color: var(--luna-danger); }
+
+/* 审批是待用户操作的正文卡片，不是固定底栏或统计组件。 */
+.approval-list { display: grid; gap: var(--luna-space-3); margin-top: var(--luna-space-4); }
+.approval-card { padding: var(--luna-space-4); border: 1px solid var(--luna-border); border-radius: var(--luna-radius-lg); background: var(--luna-raised); }
+.approval-title { margin: 0 0 var(--luna-space-2); font-size: var(--luna-font-body); }
+.approval-label, .approval-scope { color: var(--luna-text-muted); font-size: var(--luna-font-meta); overflow-wrap: anywhere; }
+.approval-operation { margin-block: var(--luna-space-2); max-height: 200px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: var(--luna-font-meta)/1.6 var(--luna-font-mono); }
+.approval-actions { display: flex; gap: var(--luna-space-2); margin-top: var(--luna-space-3); }
+
+.permission-matrix { display: grid; grid-template-columns: minmax(0, 1fr) minmax(100px, 1fr); align-items: center; gap: var(--luna-space-2) var(--luna-space-3); }
+.permission-actions { grid-column: 1 / -1; display: flex; gap: var(--luna-space-2); padding-top: var(--luna-space-2); }
+#execution-advanced { border-top: 1px solid var(--luna-border-weak); padding-top: var(--luna-space-3); }
+#execution-advanced > summary { cursor: pointer; color: var(--luna-text-muted); }
+
+.permission-scope { max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: var(--luna-font-meta)/1.6 var(--luna-font-mono); }
+
+/* 软键盘或矮窗口下用有界浮层，避免向上菜单被对话区 overflow 裁掉。 */
+@media (max-height: 540px) {
+  .composer-popover, .command-menu {
+    position: fixed; top: calc(var(--luna-topbar-h) + 8px); bottom: auto;
+    left: var(--luna-gutter); right: var(--luna-gutter);
+    max-height: calc(100dvh - var(--luna-topbar-h) - 24px);
+    max-width: var(--luna-content-max); margin-inline: auto;
+  }
+  .runtime-drawer.execution-panel {
+    top: 12px; bottom: 12px; height: auto; max-height: calc(100dvh - 24px);
   }
 }
