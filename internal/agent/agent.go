@@ -391,6 +391,11 @@ func strictToolSchema() *jsonschema.Schema {
 }
 
 func (t *TextTransformTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.Option) (string, error) {
+	release, trackingErr := trackTool(ctx)
+	if trackingErr != nil {
+		return "", trackingErr
+	}
+	defer release()
 	var raw any
 	if err := json.Unmarshal([]byte(arguments), &raw); err != nil {
 		raw = arguments
@@ -444,6 +449,11 @@ func readFileSchema() *jsonschema.Schema {
 }
 
 func (t *ReadFileTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.Option) (string, error) {
+	release, trackingErr := trackTool(ctx)
+	if trackingErr != nil {
+		return "", trackingErr
+	}
+	defer release()
 	var raw any
 	if err := json.Unmarshal([]byte(arguments), &raw); err != nil {
 		raw = arguments
@@ -520,6 +530,11 @@ func listDirSchema() *jsonschema.Schema {
 }
 
 func (t *ListDirTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.Option) (string, error) {
+	release, trackingErr := trackTool(ctx)
+	if trackingErr != nil {
+		return "", trackingErr
+	}
+	defer release()
 	var raw any
 	if err := json.Unmarshal([]byte(arguments), &raw); err != nil {
 		raw = arguments
@@ -625,6 +640,11 @@ func searchFilesSchema() *jsonschema.Schema {
 }
 
 func (t *SearchFilesTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.Option) (string, error) {
+	release, trackingErr := trackTool(ctx)
+	if trackingErr != nil {
+		return "", trackingErr
+	}
+	defer release()
 	var raw any
 	if err := json.Unmarshal([]byte(arguments), &raw); err != nil {
 		raw = arguments
@@ -710,6 +730,11 @@ func findFilesSchema() *jsonschema.Schema {
 }
 
 func (t *FindFilesTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.Option) (string, error) {
+	release, trackingErr := trackTool(ctx)
+	if trackingErr != nil {
+		return "", trackingErr
+	}
+	defer release()
 	var raw any
 	if err := json.Unmarshal([]byte(arguments), &raw); err != nil {
 		raw = arguments
@@ -1386,9 +1411,15 @@ func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err
 	if !permissions.Valid() {
 		return "", fmt.Errorf("invalid run permission policy")
 	}
+	drain := &toolDrain{}
+	parent = context.WithValue(parent, toolDrainKey{}, drain)
 	ctx := plugin.WithRun(WithRoots(WithRun(parent, req.RunID, recorder), req.Roots), plugin.RunInfo{RunID: req.RunID, SessionID: req.SessionID, WorkspaceID: req.WorkspaceID, Selection: req.Setup, ExecutionMode: req.ExecutionMode, Permissions: &permissions, AutomaticWriteDirs: append([]string{}, req.AutomaticWriteDirs...), WriteScopeError: req.WriteScopeError, Approve: req.Approve})
 	emit(ctx, Event{Type: "run.started", Data: RunStarted{RunID: req.RunID, SessionID: req.SessionID}})
 	defer func() {
+		drain.closeAndWait()
+		if late := recorder.Err(); err == nil && late != nil {
+			err = late
+		}
 		status := runStatus(err)
 		if appendErr := r.appendRun(req, startedAt, status, usage.emit(ctx, req.RunID, err == nil)); appendErr != nil && err == nil {
 			// The run itself succeeded but its transcript entry did not: the

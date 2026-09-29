@@ -55,6 +55,11 @@ func (t contributedTool) Info(context.Context) (*schema.ToolInfo, error) {
 }
 
 func (t contributedTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.Option) (string, error) {
+	release, trackingErr := trackTool(ctx)
+	if trackingErr != nil {
+		return "", trackingErr
+	}
+	defer release()
 	if info, ok := plugin.Run(ctx); ok && (!info.Selection.AllowsTool(t.tool.Name()) || (t.owner != "" && !info.Selection.AllowsCapability(t.owner))) {
 		return refusalPrefix + "tool is not selected for this run", nil
 	}
