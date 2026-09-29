@@ -56,10 +56,11 @@ type runIDKey struct{}
 // A name that is not in the list fails the run: falling back to the default
 // would show the user a switch that never happened.
 type RunRequest struct {
-	RunID     string
-	SessionID string
-	Message   string
-	Model     string
+	RunID       string
+	SessionID   string
+	WorkspaceID string
+	Message     string
+	Model       string
 	// ReasoningEffort 为 nil 时继承全局，指向空字符串时明确不发送思考字段。
 	Setup         *runconfig.Selection
 	configuration *runconfig.Snapshot
@@ -1343,7 +1344,8 @@ func (r *Runner) appendMessage(req RunRequest, role, text string, at time.Time) 
 	if r.transcript == nil || req.SessionID == "" {
 		return nil
 	}
-	if err := r.transcript.AppendMessage(req.SessionID, store.MessageRecord{RunID: req.RunID, Role: role, Text: text, At: at}); err != nil {
+	workspace := req.WorkspaceID
+	if err := r.transcript.AppendMessage(req.SessionID, store.MessageRecord{RunID: req.RunID, Role: role, Text: text, At: at, WorkspaceID: &workspace}); err != nil {
 		return fmt.Errorf("persist %s message: %w", role, err)
 	}
 	return nil
@@ -1384,7 +1386,7 @@ func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err
 	if !permissions.Valid() {
 		return "", fmt.Errorf("invalid run permission policy")
 	}
-	ctx := plugin.WithRun(WithRoots(WithRun(parent, req.RunID, recorder), req.Roots), plugin.RunInfo{RunID: req.RunID, SessionID: req.SessionID, Selection: req.Setup, ExecutionMode: req.ExecutionMode, Permissions: &permissions, AutomaticWriteDirs: append([]string{}, req.AutomaticWriteDirs...), WriteScopeError: req.WriteScopeError, Approve: req.Approve})
+	ctx := plugin.WithRun(WithRoots(WithRun(parent, req.RunID, recorder), req.Roots), plugin.RunInfo{RunID: req.RunID, SessionID: req.SessionID, WorkspaceID: req.WorkspaceID, Selection: req.Setup, ExecutionMode: req.ExecutionMode, Permissions: &permissions, AutomaticWriteDirs: append([]string{}, req.AutomaticWriteDirs...), WriteScopeError: req.WriteScopeError, Approve: req.Approve})
 	emit(ctx, Event{Type: "run.started", Data: RunStarted{RunID: req.RunID, SessionID: req.SessionID}})
 	defer func() {
 		status := runStatus(err)
@@ -1414,6 +1416,7 @@ func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err
 		return "", err
 	}
 	req.configuration = prepared.snapshot
+	req.configuration.WorkspaceID = req.WorkspaceID
 	ctx, err = prepared.freezeResources(ctx)
 	if err != nil {
 		return "", err

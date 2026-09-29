@@ -130,6 +130,8 @@ type State struct {
 
 // sessionSummary is the frozen list shape of GET /api/sessions.
 type sessionSummary struct {
+	Archived  bool      `json:"archived,omitempty"`
+	Workspace string    `json:"workspace,omitempty"`
 	ID        string    `json:"id"`
 	Title     string    `json:"title"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -145,6 +147,7 @@ type sessionSummary struct {
 // workspace list to find out where a session works; the records stay on the wire
 // unchanged, so this field adds a reading and changes none.
 type sessionDetail struct {
+	Archived  bool           `json:"archived,omitempty"`
 	ID        string         `json:"id"`
 	Title     string         `json:"title"`
 	CreatedAt time.Time      `json:"created_at"`
@@ -442,7 +445,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case "/api/sessions":
 		switch r.Method {
 		case http.MethodGet:
-			s.listSessions(w)
+			s.listSessions(w, r)
 		case http.MethodPost:
 			s.createSession(w, r)
 		default:
@@ -562,6 +565,14 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			s.setSkillState(w, name, action)
 			return
 		}
+		if id, ok := sessionMetadataPath(r.URL.Path); ok {
+			if r.Method != http.MethodPost {
+				method(w, http.MethodPost)
+				return
+			}
+			s.setSessionMetadata(w, r, id)
+			return
+		}
 		if id, ok := sessionSetupPath(r.URL.Path); ok {
 			if r.Method != http.MethodPost {
 				method(w, http.MethodPost)
@@ -659,19 +670,6 @@ func sessionStatus(err error) int {
 	}
 }
 
-func (s *Server) listSessions(w http.ResponseWriter) {
-	summaries, err := s.sessions.List()
-	if err != nil {
-		fail(w, 500, err)
-		return
-	}
-	list := make([]sessionSummary, 0, len(summaries))
-	for _, summary := range summaries {
-		list = append(list, sessionSummary{ID: summary.ID, Title: summary.Title, UpdatedAt: summary.UpdatedAt, RunCount: summary.RunCount})
-	}
-	send(w, 200, map[string]any{"sessions": list})
-}
-
 func (s *Server) readSession(w http.ResponseWriter, id string) {
 	session, err := s.sessions.Read(id)
 	if err != nil {
@@ -682,7 +680,7 @@ func (s *Server) readSession(w http.ResponseWriter, id string) {
 	if records == nil {
 		records = []store.Record{}
 	}
-	send(w, 200, sessionDetail{ID: session.ID, Title: session.Title, CreatedAt: session.CreatedAt, UpdatedAt: session.UpdatedAt, RunCount: session.RunCount, Truncated: session.Truncated, Workspace: s.sessionWorkspace(session), Records: records})
+	send(w, 200, sessionDetail{ID: session.ID, Title: session.Title, CreatedAt: session.CreatedAt, UpdatedAt: session.UpdatedAt, RunCount: session.RunCount, Truncated: session.Truncated, Workspace: s.sessionWorkspace(session), Records: records, Archived: session.Archived})
 }
 
 // uiPluginRef is the frozen list shape of GET /api/ui-plugins.
@@ -890,6 +888,7 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	// single-run slot.
 	runModel := ""
 	var runReasoning *string
+	var runWorkspace string
 	var runSetup *runconfig.Selection
 	var runRoots []string
 	if in.SessionID != "" {
@@ -958,8 +957,14 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 		fail(w, 409, fmt.Errorf("execution permission needs user confirmation in this service process; confirm Full access or select sandbox"))
 		return
 	}
+	if execution.config != nil && execution.config.Archived {
+		s.runMu.Unlock()
+		fail(w, 409, fmt.Errorf("this session is archived; restore it before starting a run"))
+		return
+	}
 	runRoots = append([]string(nil), execution.Scopes.ProjectDirs...)
 	if execution.config != nil {
+		runWorkspace = execution.config.Workspace
 		runModel, _ = selectedModel(execution.config)
 		runReasoning, _ = selectedReasoning(execution.config)
 	}
@@ -973,6 +978,7 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	writeScopeError := execution.Scopes.WriteProblem
 	id := newRunID()
 	s.busy = true
+	s.sessionID = in.SessionID
 	s.runID = id
 	s.cancelRun = cancelRun
 	s.runMu.Unlock()
@@ -1029,7 +1035,7 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 				s.activeConfiguration = snapshot.Clone()
 			}
 		}
-		answer, err := s.runner.Run(runCtx, agent.RunRequest{Configured: configured, RunID: id, SessionID: sessionID, Message: in.Message, Model: runModel, ReasoningEffort: runReasoning, Setup: runSetup, ExecutionMode: execution.Mode, Permissions: &policy, AutomaticWriteDirs: automaticWriteDirs, WriteScopeError: writeScopeError, Approve: approve, Roots: runRoots, Sink: sink})
+		answer, err := s.runner.Run(runCtx, agent.RunRequest{Configured: configured, RunID: id, SessionID: sessionID, WorkspaceID: runWorkspace, Message: in.Message, Model: runModel, ReasoningEffort: runReasoning, Setup: runSetup, ExecutionMode: execution.Mode, Permissions: &policy, AutomaticWriteDirs: automaticWriteDirs, WriteScopeError: writeScopeError, Approve: approve, Roots: runRoots, Sink: sink})
 		close(sink.events)
 		result <- runResult{answer, err}
 	}()

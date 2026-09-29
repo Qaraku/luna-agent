@@ -80,3 +80,24 @@ func TestInvalidSelectionNeverCallsModel(t *testing.T) {
 		t.Fatalf("invalid selection reached model: %v", err)
 	}
 }
+
+func TestMessageAndRunReceiptKeepTheAdmittedWorkspace(t *testing.T) {
+	transcript := &fakeTranscript{}
+	m := &captureModel{answer: "ok"}
+	runner, err := NewRunner(context.Background(), m, fakeInvoker{}, &recordingReader{}, WithTranscript(transcript))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = runner.Run(context.Background(), RunRequest{SessionID: "aaaaaaaa", RunID: "run", WorkspaceID: "project-a", Message: "scope", Sink: &collectingSink{}}); err != nil {
+		t.Fatal(err)
+	}
+	messages, _, runs := transcript.snapshot()
+	for _, message := range messages {
+		if message.WorkspaceID == nil || *message.WorkspaceID != "project-a" {
+			t.Fatal("message scope was not recorded")
+		}
+	}
+	if len(runs) != 1 || runs[0].Configuration.WorkspaceID != "project-a" {
+		t.Fatal("run scope was not recorded")
+	}
+}

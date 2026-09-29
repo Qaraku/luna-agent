@@ -108,11 +108,13 @@ type SessionRecord struct {
 
 // MessageRecord is one persisted conversation message.
 type MessageRecord struct {
-	Type  string    `json:"type"`
-	RunID string    `json:"run_id"`
-	Role  string    `json:"role"`
-	Text  string    `json:"text"`
-	At    time.Time `json:"at"`
+	Type  string `json:"type"`
+	RunID string `json:"run_id"`
+	Role  string `json:"role"`
+	Text  string `json:"text"`
+	// nil 表示旧记录未声明归属；指向空串表示本轮明确未绑定项目。
+	WorkspaceID *string   `json:"workspace_id,omitempty"`
+	At          time.Time `json:"at"`
 }
 
 // ToolCallRecord is one completed tool call. Arguments is the raw JSON text the
@@ -156,8 +158,10 @@ type RunRecord struct {
 // The record is appended, never edited: the newest statement is the one in
 // force, and what was chosen before stays in the file as history.
 type ConfigRecord struct {
-	Type  string `json:"type"`
-	Model string `json:"model"`
+	Type          string  `json:"type"`
+	Model         string  `json:"model"`
+	TitleOverride *string `json:"title_override,omitempty"`
+	Archived      bool    `json:"archived,omitempty"`
 	// Workspace is the id of the workspace the session works in, or empty when
 	// the session is not bound to one. It is an id and not a name, so renaming
 	// a workspace does not detach every session that points at it.
@@ -220,6 +224,7 @@ func (r Record) Time() time.Time {
 
 // Session is one session read back from disk.
 type Session struct {
+	Archived  bool
 	ID        string
 	CreatedAt time.Time
 	Title     string
@@ -235,8 +240,10 @@ type Session struct {
 	Truncated bool
 }
 
-// Summary is the list view of a session, without its records.
+// Summary 是不含消息正文的会话投影，含最新标题、归档状态和项目绑定。
 type Summary struct {
+	Archived  bool
+	Workspace string
 	ID        string
 	Title     string
 	UpdatedAt time.Time
@@ -454,7 +461,11 @@ func (s *Store) List() ([]Summary, error) {
 		if err != nil {
 			return nil, err
 		}
-		summaries = append(summaries, Summary{ID: session.ID, Title: session.Title, UpdatedAt: session.UpdatedAt, RunCount: session.RunCount})
+		workspace := ""
+		if session.Config != nil {
+			workspace = session.Config.Workspace
+		}
+		summaries = append(summaries, Summary{ID: session.ID, Title: session.Title, UpdatedAt: session.UpdatedAt, RunCount: session.RunCount, Archived: session.Archived, Workspace: workspace})
 	}
 	sort.Slice(summaries, func(i, j int) bool {
 		if !summaries[i].UpdatedAt.Equal(summaries[j].UpdatedAt) {
@@ -524,12 +535,21 @@ func (s *Store) readFile(path, id string, keepRecords bool, visit func(Record)) 
 	if err != nil {
 		return Session{}, err
 	}
+	if session.Config != nil {
+		session.Archived = session.Config.Archived
+		if session.Config.TitleOverride != nil {
+			session.Title = *session.Config.TitleOverride
+		}
+	}
 	session.Truncated = truncated
 	return session, nil
 }
 
 // line is the superset of the frozen record fields used for decoding.
 type line struct {
+	TitleOverride   *string              `json:"title_override"`
+	Archived        bool                 `json:"archived"`
+	WorkspaceID     *string              `json:"workspace_id"`
 	Type            string               `json:"type"`
 	ID              string               `json:"id"`
 	CreatedAt       time.Time            `json:"created_at"`
@@ -568,13 +588,13 @@ func decodeLine(data []byte) (Record, error) {
 	case TypeSession:
 		return Record{Type: TypeSession, Session: &SessionRecord{Type: raw.Type, ID: raw.ID, CreatedAt: raw.CreatedAt, Title: raw.Title, AutoTitle: raw.AutoTitle}}, nil
 	case TypeMessage:
-		return Record{Type: TypeMessage, Message: &MessageRecord{Type: raw.Type, RunID: raw.RunID, Role: raw.Role, Text: raw.Text, At: raw.At}}, nil
+		return Record{Type: TypeMessage, Message: &MessageRecord{Type: raw.Type, RunID: raw.RunID, Role: raw.Role, Text: raw.Text, At: raw.At, WorkspaceID: raw.WorkspaceID}}, nil
 	case TypeToolCall:
 		return Record{Type: TypeToolCall, ToolCall: &ToolCallRecord{Type: raw.Type, RunID: raw.RunID, Name: raw.Name, Arguments: raw.Arguments, Result: raw.Result, Error: raw.Error, At: raw.At}}, nil
 	case TypeRun:
 		return Record{Type: TypeRun, Run: &RunRecord{Type: raw.Type, RunID: raw.RunID, StartedAt: raw.StartedAt, EndedAt: raw.EndedAt, Status: raw.Status, Usage: raw.Usage, Configuration: raw.Configuration}}, nil
 	case TypeConfig:
-		return Record{Type: TypeConfig, Config: &ConfigRecord{Type: raw.Type, Model: raw.Model, Workspace: raw.Workspace, ReasoningEffort: raw.ReasoningEffort, ExecutionMode: raw.ExecutionMode, Permissions: raw.Permissions, Setup: raw.Setup, At: raw.At}}, nil
+		return Record{Type: TypeConfig, Config: &ConfigRecord{Type: raw.Type, Model: raw.Model, Workspace: raw.Workspace, ReasoningEffort: raw.ReasoningEffort, ExecutionMode: raw.ExecutionMode, Permissions: raw.Permissions, Setup: raw.Setup, At: raw.At, TitleOverride: raw.TitleOverride, Archived: raw.Archived}}, nil
 	}
 	return Record{}, fmt.Errorf("unknown record type %q", raw.Type)
 }

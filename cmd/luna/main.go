@@ -31,6 +31,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	"github.com/Qaraku/luna-agent/internal/plugins/presets"
 	"github.com/Qaraku/luna-agent/internal/plugins/runtimewidgets"
+	"github.com/Qaraku/luna-agent/internal/plugins/sessionhistory"
 	skillsplugin "github.com/Qaraku/luna-agent/internal/plugins/skills"
 	"github.com/Qaraku/luna-agent/internal/plugins/terminal"
 	"github.com/Qaraku/luna-agent/internal/plugins/web"
@@ -769,6 +770,15 @@ func run() error {
 	}
 	if err := registerRuntimeWidgets(registry, userSettings.CapabilityEnabled(runtimewidgets.PluginID)); err != nil {
 		return err
+	}
+	historyCapability := sessionhistory.New(sessions)
+	if err := registry.Register(historyCapability); err != nil {
+		return fmt.Errorf("register history capability: %w", err)
+	}
+	if userSettings.CapabilityEnabled(sessionhistory.PluginID) {
+		if err := registry.Enable(sessionhistory.PluginID); err != nil {
+			return err
+		}
 	}
 	listener, err := httpapi.Listen(*addr)
 	if err != nil {

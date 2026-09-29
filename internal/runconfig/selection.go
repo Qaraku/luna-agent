@@ -37,6 +37,7 @@ type Selection struct {
 
 // Snapshot 记录本轮实际可用集合，不把后续设置或后续目录内容冒充本轮状态。
 type Snapshot struct {
+	WorkspaceID       string                       `json:"workspace_id,omitempty"`
 	Selection         *Selection                   `json:"selection,omitempty"`
 	Model             string                       `json:"model,omitempty"`
 	ReasoningEffort   string                       `json:"reasoning_effort,omitempty"`

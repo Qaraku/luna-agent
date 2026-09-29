@@ -11,8 +11,9 @@ import (
 // 这是插件能得到的全部运行身份。插件进程、代次这类部署形态自己的元数据不在这里：
 // 那些是宿主给界面看的，不是插件用来记账的。
 type RunInfo struct {
-	RunID     string
-	SessionID string
+	RunID       string
+	SessionID   string
+	WorkspaceID string
 	// Selection 与 Resources 是本轮选择及已冻结的资源名字，只能缩小可用集合。
 	Selection         *runconfig.Selection
 	Resources         map[string][]string
