@@ -26,6 +26,12 @@ Luna Agent 是一个有边界的本地预览（preview），由三个刻意分�
 
 `internal/privatebackup` 负责有界归档、逐文件校验和新目录恢复；来源缺失、空目录、文件模式和额外技能根明确记录。目标预留用不创建根的 `Reserve`，成功后 `Initialize` 写入可随目录移动的格式标记；中断恢复的 pending 标记阻止半成品目录被误当作正常数据使用；损坏归档、数据格式不兼容或目标已存在时拒绝，不运行插件代码、不启动服务、不恢复进程授权。详见 `docs/backups.md`。
 
+### 独立开发与候选补丁
+
+`internal/devworkspace` 由本地维护命令 `dev create/status/export/inspect` 提供，不注册HTTP代码写入接口。固定提交通过 `sourcecopy.ExportFiltered` 复制正式应用源码，过滤在读取blob正文之前执行；新副本与原仓库没有Git配置/objects硬链接关系。可写source与基线/摘要元数据分开放置，工作区绑定不能把外部元数据变成模型授权。
+
+状态按有界文件快照计算，新增文件须明确选择。导出用临时Git元数据和独立当前树计算补丁，强制保留原始字节，禁用hooks、fsmonitor、filters、外部diff和textconv；从不对候选.git执行宿主Git操作。复制与导出后校验快照，失败保留原副本和已有候选。候选只携带补丁与来源/变更摘要，用户在另一可信checkout采用，之后仍需单独构建、备份、切换程序；没有自我提权或自动覆盖运行实例。详见 `docs/self-development.md`。
+
 ## 权限边界
 
 ### 权威核心

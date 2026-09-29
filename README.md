@@ -239,6 +239,10 @@ Luna 的通用行为指令位于 `internal/agent/prompts/core.md`，构建时嵌
 
 私人资料通过 `luna data plan/backup/inspect/restore` 独立备份和恢复：网页只下载位置计划，实际备份需停机及私人内容确认，恢复只写入新目录。当前进程用数据根锁避免协作实例并发写入，格式标记随数据保留。详见 [私人备份说明](docs/backups.md)。
 
+## 参与改进 Luna 自己
+
+`luna dev create/status/export/inspect` 从完整本地提交创建独立源码副本，保留基线并导出可审阅的候选补丁。只把 `source/` 绑定为模型工作区，继续使用既有权限，试运行使用独立 `LUNA_HOME`；不会修改原仓库、自动采用补丁或重启实例。设置的“安装与更新”页有入口说明。完整流程、过滤规则与用户采用步骤见 [受控自我开发](docs/self-development.md)。
+
 ## 快速开始
 
 以下为源码运行。环境要求：Go 1.24 或更新版本；只有运行浏览器 JavaScript 测试时才需要 Node.js 22。当前 Go 1.27 验证环境会出现 Sonic 不支持该工具链并回退到 `encoding/json` 的提示；这不是启动失败，应用会继续运行。该提示反映依赖与工具链的兼容范围，不是模型服务配置错误。
