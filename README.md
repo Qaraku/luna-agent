@@ -235,7 +235,9 @@ Luna 的通用行为指令位于 `internal/agent/prompts/core.md`，构建时嵌
 
 ## 程序安装与更新
 
-主程序支持从固定 Git 提交生成带运行资源和预编译工具的离线包；分发运行不需要 Go，源码运行仍支持构建式热重载。`luna version` 查看构建身份，`luna release install` 只安装到新目录，`luna release inspect` 校验内容。用户手动停止旧实例、选择新程序，不静默覆盖程序或私人数据。界面入口为“设置 → 安装与更新”。打包、安装、数据保护与回退注意事项见 [分发说明](docs/distribution.md)。
+主程序支持从固定 Git 提交生成带运行资源和预编译工具的离线包；分发运行不需要 Go，源码运行仍支持构建式热重载。`luna version` 查看构建身份，`luna release install` 只安装到新目录，`luna release inspect` 校验内容。用户手动停止旧实例、选择新程序，不静默覆盖程序或私人数据。界面入口为“设置 → 安装与更新”。打包、安装与回退注意事项见 [分发说明](docs/distribution.md)。
+
+私人资料通过 `luna data plan/backup/inspect/restore` 独立备份和恢复：网页只下载位置计划，实际备份需停机及私人内容确认，恢复只写入新目录。当前进程用数据根锁避免协作实例并发写入，格式标记随数据保留。详见 [私人备份说明](docs/backups.md)。
 
 ## 快速开始
 
