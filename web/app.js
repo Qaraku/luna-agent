@@ -3265,6 +3265,7 @@ if (typeof document !== 'undefined') {
     const panel = activePanel;
     activePanel = null;
     // 面板可以带自己的收尾：贡献面板就在这里跑模块的 unmount 并移除容器。
+    if (panel === panels.settings) cancelVersionRead();
     if (typeof panel.teardown === 'function') panel.teardown();
     panel.element.classList.remove('is-open');
     panel.element.hidden = true;
@@ -3345,10 +3346,41 @@ if (typeof document !== 'undefined') {
     setSidebarWidth(sidebarWidth + moves[event.key]);
   });
 
+  let versionRequest = null;
+  function cancelVersionRead() {
+    if (!versionRequest) return;
+    versionRequest.controller.abort(); clearTimeout(versionRequest.timer); versionRequest = null;
+  }
+  async function updateVersion() {
+    cancelVersionRead();
+    const current = { controller: new AbortController(), timer: null };
+    versionRequest = current;
+    current.timer = setTimeout(() => current.controller.abort(), 10000);
+    $('update-status').textContent = '正在读取当前构建…';
+    try {
+      const response = await fetch('/api/version', { signal: current.controller.signal });
+      if (!response.ok) throw new Error('version unavailable');
+      const info = await response.json();
+      if (versionRequest !== current || current.controller.signal.aborted) return;
+      $('update-version').textContent = String(info.version || '未知');
+      $('update-build').textContent = String(info.commit || '未知');
+      $('update-mode').textContent = info.distribution ? '分发包 · 固定二进制' : '源码运行 · 本地构建';
+      $('update-schema').textContent = String(info.os || '—') + '/' + String(info.arch || '—') + ' · 格式 ' + String(info.data_schema ?? '—');
+      $('update-status').textContent = '这是当前运行版本，不代表已检查远程更新。';
+    } catch (_) {
+      if (versionRequest === current) $('update-status').textContent = '版本信息读取失败或超时，可重新读取；不会执行安装操作。';
+    } finally {
+      clearTimeout(current.timer);
+      if (versionRequest === current) versionRequest = null;
+    }
+  }
+  $('update-refresh').addEventListener('click', updateVersion);
+
   // 设置模态的分类导航：同一时刻只有一个 pane 可见，方向键在同一组 tab 内移动。
   const settingsTabs = [...$('settings-panel').querySelectorAll('[role="tab"]')];
   function selectSettingsTab(tab) {
     if (!tab) return;
+    if (tab.dataset.pane !== 'settings-pane-updates') cancelVersionRead();
     for (const item of settingsTabs) {
       const active = item === tab;
       item.setAttribute('aria-selected', active ? 'true' : 'false');
@@ -3372,6 +3404,7 @@ if (typeof document !== 'undefined') {
       updateWriteDirs();
     }
     else if (pane === 'settings-pane-extensions') updateUIPlugins();
+    else if (pane === 'settings-pane-updates') updateVersion();
     else if (pane === 'settings-pane-model') {
       updateModelList();
       updateProvider();

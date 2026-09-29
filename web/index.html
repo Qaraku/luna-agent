@@ -157,6 +157,7 @@
           <button id="settings-tab-skills" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-skills" data-pane="settings-pane-skills" tabindex="-1">技能</button>
           <button id="settings-tab-workspace" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-workspace" data-pane="settings-pane-workspace" tabindex="-1">工作区</button>
           <button id="settings-tab-extensions" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-extensions" data-pane="settings-pane-extensions" tabindex="-1">界面扩展</button>
+          <button id="settings-tab-updates" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-updates" data-pane="settings-pane-updates" tabindex="-1">安装与更新</button>
           <button id="settings-tab-diagnostics" class="settings-tab" role="tab" type="button" aria-selected="false" aria-controls="settings-pane-diagnostics" data-pane="settings-pane-diagnostics" tabindex="-1">诊断</button>
         </nav>
         <div class="settings-panes">
@@ -224,9 +225,25 @@
             <p id="ui-plugins-status" class="ui-plugin-status" role="status" hidden></p>
             <button id="ui-plugins-retry" class="ui-plugin-retry" type="button" hidden>重新读取插件列表</button>
           </section>
+          <section id="settings-pane-updates" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-updates" tabindex="0" hidden>
+            <h3>安装与更新</h3>
+            <dl class="settings-facts">
+              <div><dt>程序版本</dt><dd id="update-version">—</dd></div>
+              <div><dt>源码提交</dt><dd id="update-build">—</dd></div>
+              <div><dt>运行方式</dt><dd id="update-mode">—</dd></div>
+              <div><dt>平台与数据格式</dt><dd id="update-schema">—</dd></div>
+            </dl>
+            <p id="update-status" class="luna-muted" role="status"></p>
+            <button id="update-refresh" class="luna-button" type="button">重新读取版本</button>
+            <h3>主程序手动更新</h3>
+            <p class="luna-muted">只从可信来源获取程序包。在本地终端安装到一个新目录，核对版本，备份私人数据后，由你停止旧实例并启动新版本。不会静默下载、重启或替换正在运行的程序。</p>
+            <pre class="technical-detail">luna release install -archive /绝对路径/luna.tar.gz -dest /绝对路径/新安装目录
+luna release inspect -dir /绝对路径/新安装目录</pre>
+            <p class="luna-muted">插件包在“能力 → 管理插件包”独立更新；个人技能和预设不随主程序包覆盖。代码回退不是数据回退：旧程序可能不理解新的数据记录，需使用兼容备份。</p>
+          </section>
           <section id="settings-pane-diagnostics" class="settings-pane" role="tabpanel" aria-labelledby="settings-tab-diagnostics" tabindex="0" hidden>
             <h3>诊断</h3>
-            <p class="luna-muted">这一页是给开发与排查用的：工具插件的代次与进程、真实源码的重建与替换、本进程的生命周期事件。日常使用不需要它，工具插件的替换能力由内核提供，这一页只是它的入口。</p>
+            <p class="luna-muted">这一页是给开发与排查用的：工具插件的代次与进程、源码构建或分发二进制的重新加载、本进程的生命周期事件。日常使用不需要它，工具插件的替换能力由内核提供，这一页只是它的入口。</p>
             <dl class="settings-facts">
               <div><dt>主进程 PID</dt><dd id="host-pid">—</dd></div>
             </dl>
@@ -236,13 +253,13 @@
               <p id="plugins-empty" class="plugin-empty" hidden>暂未读到工具插件。</p>
             </section>
             <section class="drawer-section" aria-labelledby="reload-title">
-              <h3 id="reload-title">重载工具源码</h3>
+              <h3 id="reload-title">重载工具实现</h3>
               <form id="reload-form" class="reload-form">
                 <div class="reload-controls">
                   <select id="reload-tool" class="luna-input" aria-label="重载工具">
                     <option value="">全部已注册工具</option>
                   </select>
-                  <button id="reload" class="luna-button" type="submit" disabled>重建并重载</button>
+                  <button id="reload" class="luna-button" type="submit" disabled>重载工具</button>
                 </div>
               </form>
               <p id="reload-status" class="reload-status" role="status"></p>

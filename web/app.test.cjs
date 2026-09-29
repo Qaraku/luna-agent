@@ -4858,3 +4858,29 @@ test('插件包管理入口使用能力面板，不把安装当成模型调用',
 test('包预设选择保留真实能力来源，不误写到内置预设目录',async()=>{
  let selected;const h=navigationHarness({hash:'#session=aaaaaaaa',respond:async(url,options)=>{if(url==='/api/setups')return {ok:true,json:async()=>({presets:[{owner:'pkg-study',id:'pkg_study__research',title:'研究',revision:'r',source_title:'Study'}]})};if(url==='/api/sessions/aaaaaaaa/setup'){selected=JSON.parse(options.body);return {ok:true,json:async()=>({selection:{...selected,title:'研究'}})}}}});await h.settle();await h.click('session-preset');const row=[...h.$('command-menu').children].find(node=>node.textContent.includes('pkg-study:pkg_study__research'));assert.ok(row);row.emit('mousedown');await h.settle();assert.deepEqual(selected,{owner:'pkg-study',id:'pkg_study__research'});
 });
+
+
+test('更新页按需读取构建信息，不在输入区添加维护状态', async () => {
+ let calls=0;
+ const h=navigationHarness({respond:async url=>{
+  if(url==='/api/version'){calls++;return {ok:true,json:async()=>({version:'dev-fixture',commit:'abc123',os:'linux',arch:'amd64',data_schema:1,distribution:true})};}
+ }});
+ await h.settle();assert.equal(calls,0);
+ await h.click('settings-toggle');await h.click('settings-tab-updates');await h.settle();
+ assert.equal(calls,1);assert.match(h.$('update-version').textContent,/dev-fixture/);
+ assert.match(h.$('update-build').textContent,/abc123/);
+ assert.match(h.$('update-mode').textContent,/分发/);
+ assert.equal(h.$('chat-form').contains(h.$('update-version')),false);
+ assert.match(h.$('reload').textContent,/重载/);
+});
+
+test('更新页关闭后取消读取，迟到结果不覆盖下一次打开', async()=>{
+ let pending;let requestSignal;
+ const h=navigationHarness({respond:async(url,options)=>{
+  if(url==='/api/version'){requestSignal=options.signal;return await new Promise(resolve=>{pending=resolve;});}
+ }});
+ await h.settle();await h.click('settings-toggle');await h.click('settings-tab-updates');
+ await h.click('settings-tab-appearance');assert.equal(requestSignal.aborted,true);
+ pending({ok:true,json:async()=>({version:'late'})});await h.settle();
+ assert.doesNotMatch(h.$('update-version').textContent,/late/);
+});
