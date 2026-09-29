@@ -99,6 +99,8 @@ Luna 的通用行为指令位于 `internal/agent/prompts/core.md`，构建时嵌
 
 工作预设（preset）把工作方式、模型/思考偏好和可用能力、工具、技能选择组合起来。默认提供“通用助手”“开发协作”“资料研究”，由独立的 `presets` 能力管理；预设不授予权限，不安装或启用缺失能力，也不是独立的用户数据空间。
 
+- 点击输入区的模型摘要，再点“预设”选择；也可输入 `/preset research`、`/preset development` 或 `/preset --default`。首条消息前即可设置，不调用模型、不清空普通草稿。已绑定旧版本时，候选会提示可主动采用新版。
+- 从 `＋ → 管理预设` 或“设置 → 能力 → 工作预设”的面板入口，新建、复制、编辑工作方式及模型/思考偏好，选择能力、工具与技能；支持查看修订、归档、恢复和导出。目录停用时，快速入口仍可清除旧绑定。
 - 通过 `GET /api/presets` 查询目录；创建或修改使用 `POST /api/presets/save`，提交 `definition` 和当前 `expected_revision`。内置项只读，可用新的 ID 复制；并发修改使用旧版本号会返回 `409`，不覆盖后来保存的内容。
 - `POST /api/sessions/{id}/setup` 接受 `{"owner":"presets","id":"development"}`，把当时的完整版本复制到会话；之后修改目录不会静默修改已有会话。可传 `revision` 选择历史版本；`{"reset":true}` 清除会话预设。
 - 模型和思考档位按“会话显式选择 → 预设偏好 → 全局默认”继承。`reset_overrides:true` 可以在绑定时明确清除会话的模型/思考覆盖；默认保留。权限矩阵、Full access 和工作区不受影响。
@@ -294,14 +296,14 @@ run_timeout: 20m              # 每轮运行的最长时间
 | `GET` | `/api/provider` | 返回模型服务配置的界面视图：`active`（当前服务名，未选时为空）、按名称排序的 `providers[]`（各项含 `name`、`base_url`、`model`、`models`、`key_set`、`key_hint`）、`configured`（当前能否发起运行）、`missing`（仍缺少的配置，使用文件字段名 `provider` 或当前条目字段）及文件名。完整密钥不返回，只提供是否设置及末四位。没有“需要重启”字段，因为下一轮会直接读取该文件 |
 | `PUT` | `/api/provider` | `{"active":"...","providers":[{"name":"...","base_url":"...","model":"...","models":[...],"api_key":"...","clear_api_key":false}]}` 整体替换配置，请求中不再列出的服务会被移除。空 `api_key` 保留同名服务已有密钥；`"clear_api_key":true` 才会清除密钥。名称重复或 `active` 指向不存在的条目时返回 `400` 及原因，不写文件。属于变更请求，需来源精确匹配 |
 | `POST` | `/api/provider/models` | 查询某个接口支持的模型，返回 `{"models":[...],"problem":""}`；服务端错误写入 `problem`，不作为 HTTP 错误，便于页面在字段旁展示原因。`name` 指定正在编辑的服务，`base_url` / `api_key` 可使用表单尚未保存的值；省略项从同名已保存条目读取，无需重新输入密钥。此操作会使用当前安装实例的密钥发起外部请求，因此需来源精确匹配 |
-| `GET` | `/api/models` | 返回当前可选模型：`name`、`provider`（服务名），首项标记 `default`；同时返回会话将使用的模型及来源 `{"name":"...","origin":"session"\|"global"}`。读取当前模型服务配置，保存后立即反映。`?session=<id>` 指定会话，省略时只描述全局配置；会话不存在返回 `404`，标识格式错误返回 `400` |
+| `GET` | `/api/models` | 返回当前可选模型：`name`、`provider`（服务名），首项标记 `default`；同时返回会话将使用的模型及来源 `{"name":"...","origin":"session"\|"setup"\|"global"}`。读取当前模型服务配置，保存后立即反映。`?session=<id>` 指定会话，省略时只描述全局配置；会话不存在返回 `404`，标识格式错误返回 `400` |
 | `GET` | `/api/execution` | 返回当前有效 `mode`、保存的 `requested_mode`、`needs_confirmation` 与授权范围；可用 `?session=<id>` 查询会话。重启后保存的 Full access 偏好需要重新确认 |
 | `POST` | `/api/sessions/{id}/execution` | 选择 `sandbox` 或 `full_access`；后者必须带 `confirm_full_access:true` 并要求精确 Origin。授权仅在当前服务内存中生效，运行中拒绝更改，未确认的偏好不能启动运行 |
 | `GET` | `/api/reasoning` | 返回支持的档位 `levels` 与 `current`（`reasoning_effort`、`origin`）；`?session=<id>` 查询会话有效选择，省略时查询全局设置 |
-| `POST` | `/api/sessions/{id}/reasoning` | 接受 `{"reasoning_effort":"high"}` 或 `{"reset":true}`，两者互斥；空字符串表示不发送字段，重置表示继承全局。追加配置时保留模型和工作区，要求精确 Origin |
+| `POST` | `/api/sessions/{id}/reasoning` | 接受 `{"reasoning_effort":"high"}` 或 `{"reset":true}`，两者互斥；空字符串表示不发送字段，重置表示继承预设或全局。追加配置时保留模型和工作区，要求精确 Origin |
 | `GET` | `/api/skills` | 按发现顺序列出技能：`name`、`description`、`scope`、`enabled`，停用时含 `disabled_reason`。描述过长会截断并说明，不会静默截断；无技能时返回空列表 |
 | `POST` | `/api/skills/{name}/enable` · `/disable` | 启用或停用单个技能并返回新状态。偏好写入 `$XDG_CONFIG_HOME/luna/settings.yaml`，运行时列表随即更新，无需重新构建；技能清单每轮读取。未知名称返回 `404`，不会保存不存在技能的偏好；两者均为变更请求，需来源精确匹配 |
-| `POST` | `/api/sessions/{id}/model` | `{"model":"..."}` 指定会话后续运行使用的模型，或用 `{"reset":true}` 恢复跟随全局默认（不能同时提供）。以 `config` 记录追加到会话文件，重启后保留并随会话保存。模型不在配置中返回 `400`，会话不存在返回 `404`；需来源精确匹配。记录与现有会话配置合并，不会解除工作区绑定 |
+| `POST` | `/api/sessions/{id}/model` | `{"model":"..."}` 指定会话后续运行使用的模型，或用 `{"reset":true}` 恢复继承预设或全局默认（不能同时提供）。以 `config` 记录追加到会话文件，重启后保留并随会话保存。模型不在配置中返回 `400`，会话不存在返回 `404`；需来源精确匹配。记录与现有会话配置合并，不会解除工作区绑定 |
 | `GET` | `/api/workspaces` | 返回具名工作目录集合：`{"workspaces":[{"id":"...","name":"...","dirs":["..."]}]}`；无工作区时返回空列表 |
 | `POST` | `/api/workspaces` | `{"name":"...","dirs":["..."]}` 创建并返回工作区。`name` 可省略，默认使用首个目录的基本名称；目录必须为绝对路径，按原顺序去重，至少保留一个。名称重复返回 `409`，其他参数错误返回 `400` 及原因 |
 | `POST` | `/api/sessions/{id}/workspace` | `{"workspace":"<id>"}` 绑定工作区，`{"workspace":""}` 解除绑定，恢复会话初始状态。与现有配置合并，不丢失模型选择；工作区或会话不存在返回 `404`，需来源精确匹配 |
@@ -361,7 +363,7 @@ go vet ./...
 go build -o .runtime/luna ./cmd/luna
 node --check web/app.js
 node --check web/runtime-widgets.js
-node --test web/app.test.cjs web/runtime-widgets.test.cjs
+node --test web/app.test.cjs web/runtime-widgets.test.cjs internal/plugins/presets/panel.test.mjs
 ```
 
 此前的界面重做通过 JavaScript 语法检查与 50 项 Node 测试。隔离 Chromium 使用确定性接口夹具验证了会话切换与刷新恢复、记忆查看与撤回、轮询焦点保持、运行中禁用会话切换、草稿保留、抽屉键盘操作、窄屏缩放，以及当时新增的明暗主题与跟随系统、显式选择的持久化和存储失败回退、选中项与侧栏背景的区分、主要文字的自选对比度（均不低于 4.5:1）、1440px 与 390px 下没有元素越出视口，还有真实计数器插件在切换主题时保留挂载实例、停用时释放定时器。这不代表真实模型或 Go 服务的端到端验收。
