@@ -25,6 +25,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/fileread"
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
+	"github.com/Qaraku/luna-agent/internal/privatebackup"
 	"github.com/Qaraku/luna-agent/internal/runconfig"
 	"github.com/Qaraku/luna-agent/internal/store"
 	"github.com/Qaraku/luna-agent/internal/uiplugin"
@@ -52,6 +53,7 @@ type Sessions interface {
 }
 
 type Info struct {
+	DataPlan     *privatebackup.Plan
 	Distribution bool
 	BoundHost    string
 	Model        string
@@ -420,6 +422,18 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		st := s.state()
 		plugins := pluginsReady(st.Plugins)
 		send(w, 200, map[string]any{"ready": st.ModelConfigured && plugins, "model_configured": st.ModelConfigured, "plugin_active": plugins})
+	case "/api/backup-plan":
+		if r.Method != http.MethodGet {
+			method(w, http.MethodGet)
+			return
+		}
+		if s.info.DataPlan == nil {
+			fail(w, 503, fmt.Errorf("data plan is unavailable"))
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Disposition", `attachment; filename="luna-data-plan.json"`)
+		send(w, 200, s.info.DataPlan)
 	case "/api/version":
 		if r.Method != http.MethodGet {
 			method(w, http.MethodGet)

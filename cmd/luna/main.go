@@ -21,6 +21,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/agent"
 	"github.com/Qaraku/luna-agent/internal/command"
 	"github.com/Qaraku/luna-agent/internal/config"
+	"github.com/Qaraku/luna-agent/internal/datalifecycle"
 	"github.com/Qaraku/luna-agent/internal/fileread"
 	"github.com/Qaraku/luna-agent/internal/httpapi"
 	"github.com/Qaraku/luna-agent/internal/layout"
@@ -611,32 +612,6 @@ func run() error {
 		pinnedHome = value
 		log.Printf("luna: home: %s=%s holds the configuration, the sessions, the capability state and the cache", layout.HomeEnv, value)
 	}
-	configFile, err := userConfig(configFileFor(*configFlag, paths.Config))
-	if err != nil {
-		return err
-	}
-	// Settings are the other half of the user's configuration, and a different
-	// file for a different reason: config.yaml is theirs to edit, settings.yaml
-	// is Luna's to write. Turning a skill off is a choice, not a state change of
-	// the capability, so it is stored where the user's other choices are.
-	settingsPath := settingsFileFor(paths.Config)
-	userSettings, err := loadUserSettings(settingsPath)
-	if err != nil {
-		return err
-	}
-	// The provider file is Luna's own: the settings page writes it, and this is
-	// where the runner and the interface read it back. Every way this can go
-	// wrong — no file yet, a file an earlier version wrote, a file that cannot be
-	// parsed — is a starting state rather than a reason to exit: the settings page
-	// that repairs the last of them is served by this process, and a Luna that
-	// will not start is a Luna nobody can fix from the interface.
-	providerPath := providerFileFor(paths.Config)
-	// runtime is the same object the runner and the settings page are handed:
-	// one place reads the provider file, so the answer a run uses and the answer
-	// the interface shows cannot drift apart.
-	runtime := providerRuntime{path: providerPath, getenv: os.Getenv, userConfig: configFile}
-	cfg, providerNote := initialProvider(runtime, providerPath)
-	log.Printf("luna: %s", providerNote)
 	executable, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate executable: %w", err)
@@ -673,6 +648,42 @@ func run() error {
 			log.Printf("luna: %s", line)
 		}
 	}
+	dataPlan, err := makeDataPlan(paths, sessionsPath, statePath, configFileFor(*configFlag, paths.Config), skillDirs)
+	if err != nil {
+		return err
+	}
+	dataGuard, err := datalifecycle.Acquire(dataPlan.LockPaths())
+	if err != nil {
+		return err
+	}
+	defer dataGuard.Close()
+	configFile, err := userConfig(configFileFor(*configFlag, paths.Config))
+	if err != nil {
+		return err
+	}
+	// Settings are the other half of the user's configuration, and a different
+	// file for a different reason: config.yaml is theirs to edit, settings.yaml
+	// is Luna's to write. Turning a skill off is a choice, not a state change of
+	// the capability, so it is stored where the user's other choices are.
+	settingsPath := settingsFileFor(paths.Config)
+	userSettings, err := loadUserSettings(settingsPath)
+	if err != nil {
+		return err
+	}
+	// The provider file is Luna's own: the settings page writes it, and this is
+	// where the runner and the interface read it back. Every way this can go
+	// wrong — no file yet, a file an earlier version wrote, a file that cannot be
+	// parsed — is a starting state rather than a reason to exit: the settings page
+	// that repairs the last of them is served by this process, and a Luna that
+	// will not start is a Luna nobody can fix from the interface.
+	providerPath := providerFileFor(paths.Config)
+	// runtime is the same object the runner and the settings page are handed:
+	// one place reads the provider file, so the answer a run uses and the answer
+	// the interface shows cannot drift apart.
+	runtime := providerRuntime{path: providerPath, getenv: os.Getenv, userConfig: configFile}
+	cfg, providerNote := initialProvider(runtime, providerPath)
+	log.Printf("luna: %s", providerNote)
+
 	sessions, err := store.Open(sessionsPath)
 	if err != nil {
 		return fmt.Errorf("open session store: %w", err)
@@ -875,7 +886,7 @@ func run() error {
 	// capabilities are both written there, and the same value serves both seams
 	// the HTTP layer uses.
 	prefs := newUserPreferences(skillSet, settingsPath, userSettings)
-	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{Distribution: distribution, BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Missing: cfg.Missing, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(prefs), httpapi.WithCapabilityPreference(prefs), httpapi.WithWriteDirs(prefs), httpapi.WithWorkspaces(workspaceStore), httpapi.WithProvider(runtime), httpapi.WithConfigSource(runtime), httpapi.WithRunTimeout(runTimeout), httpapi.WithFallbackRoot(projectRoot(root, *readRoot)))
+	handler := httpapi.New(plugins, runner, sessions, httpapi.Info{DataPlan: &dataPlan, Distribution: distribution, BoundHost: bound, Model: cfg.Model, ProviderHost: cfg.ProviderHost, Missing: cfg.Missing, Models: models, ReasoningEffort: cfg.ReasoningEffort, MaxIterations: agent.MaxIterationsFor(cfg), WebDir: filepath.Join(root, "web"), UIPluginsDir: uiPluginsDir(root)}, httpapi.WithCapabilities(registry), httpapi.WithCommands(commands), httpapi.WithSkills(prefs), httpapi.WithCapabilityPreference(prefs), httpapi.WithWriteDirs(prefs), httpapi.WithWorkspaces(workspaceStore), httpapi.WithProvider(runtime), httpapi.WithConfigSource(runtime), httpapi.WithRunTimeout(runTimeout), httpapi.WithFallbackRoot(projectRoot(root, *readRoot)))
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 70 * time.Second, WriteTimeout: writeDeadlineFor(runTimeout), IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 	done := make(chan error, 1)
 	go func() {
@@ -903,6 +914,13 @@ func run() error {
 func main() {
 	if code, handled := terminal.NetworkHelper(os.Args); handled {
 		os.Exit(code)
+	}
+	if len(os.Args) > 1 && os.Args[1] == "data" {
+		if err := dataCommand(os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "luna:", err)
+			os.Exit(1)
+		}
+		return
 	}
 	if handled, err := maintenance.Handle(os.Args[1:], os.Stdout); handled {
 		if err != nil {
