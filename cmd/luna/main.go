@@ -686,8 +686,10 @@ func run() error {
 	if err := registry.Register(facts); err != nil {
 		return fmt.Errorf("register memory capability: %w", err)
 	}
-	if err := registry.Enable(memory.PluginID); err != nil {
-		return fmt.Errorf("enable memory capability: %w", err)
+	if userSettings.CapabilityEnabledByDefault(memory.PluginID, true) {
+		if err := registry.Enable(memory.PluginID); err != nil {
+			return fmt.Errorf("enable memory capability: %w", err)
+		}
 	}
 	if err := registerPresets(registry, statePath, userSettings.CapabilityEnabledByDefault(presets.PluginID, true)); err != nil {
 		return err

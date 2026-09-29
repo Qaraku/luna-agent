@@ -37,9 +37,11 @@
 package memory
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -94,6 +96,12 @@ type Fact struct {
 	Text          string    `json:"text"`
 	At            time.Time `json:"at"`
 	SourceSession string    `json:"source_session"`
+	ID            string    `json:"id,omitempty"`
+	Scope         string    `json:"scope,omitempty"`
+	WorkspaceID   string    `json:"workspace_id,omitempty"`
+	SourceRun     string    `json:"source_run,omitempty"`
+	Origin        string    `json:"origin,omitempty"`
+	Lineage       string    `json:"lineage,omitempty"`
 }
 
 // RetractRecord is the appended record of one retraction. It names its target by
@@ -104,6 +112,7 @@ type RetractRecord struct {
 	At         time.Time `json:"at"`
 	TargetAt   time.Time `json:"target_at"`
 	TargetText string    `json:"target_text"`
+	TargetRef  string    `json:"target_ref,omitempty"`
 }
 
 // Retracted is a fact that is no longer in effect, together with when it was
@@ -117,32 +126,45 @@ type Retracted struct {
 // Snapshot is the read model of the store: the facts still in effect, oldest
 // first, and the facts that have been retracted, in retraction order.
 type Snapshot struct {
-	Facts     []Fact      `json:"facts"`
-	Retracted []Retracted `json:"retracted"`
+	Facts     []Fact         `json:"facts"`
+	Retracted []Retracted    `json:"retracted"`
+	Changes   []MemoryChange `json:"changes,omitempty"`
 }
 
 // record is one decoded line. Facts and retractions share the file, so one
 // struct carries both shapes and the type field decides which one it is.
 type record struct {
-	Type          string    `json:"type"`
-	Text          string    `json:"text,omitempty"`
-	At            time.Time `json:"at"`
-	SourceSession string    `json:"source_session,omitempty"`
-	TargetAt      time.Time `json:"target_at,omitempty"`
-	TargetText    string    `json:"target_text,omitempty"`
+	Type          string        `json:"type"`
+	ID            string        `json:"id,omitempty"`
+	Scope         string        `json:"scope,omitempty"`
+	WorkspaceID   string        `json:"workspace_id,omitempty"`
+	SourceRun     string        `json:"source_run,omitempty"`
+	Origin        string        `json:"origin,omitempty"`
+	Lineage       string        `json:"lineage,omitempty"`
+	TargetRef     string        `json:"target_ref,omitempty"`
+	Change        *MemoryChange `json:"change,omitempty"`
+	Text          string        `json:"text,omitempty"`
+	At            time.Time     `json:"at"`
+	SourceSession string        `json:"source_session,omitempty"`
+	TargetAt      time.Time     `json:"target_at,omitempty"`
+	TargetText    string        `json:"target_text,omitempty"`
 }
 
 func factRecord(fact Fact) record {
-	return record{Type: TypeFact, Text: fact.Text, At: fact.At, SourceSession: fact.SourceSession}
+	return record{Type: TypeFact, Text: fact.Text, At: fact.At, SourceSession: fact.SourceSession, ID: fact.ID, Scope: fact.Scope, WorkspaceID: fact.WorkspaceID, SourceRun: fact.SourceRun, Origin: fact.Origin, Lineage: fact.Lineage}
 }
 
 func retractRecord(at time.Time, target Fact) record {
-	return record{Type: TypeRetract, At: at, TargetAt: target.At, TargetText: target.Text}
+	ref := ""
+	if target.ID != "" || target.Scope != "" {
+		ref = target.Ref()
+	}
+	return record{Type: TypeRetract, At: at, TargetAt: target.At, TargetText: target.Text, TargetRef: ref}
 }
 
 // factFor renders a fact record back into a Fact.
 func (r record) factFor() Fact {
-	return Fact{Type: TypeFact, Text: r.Text, At: r.At, SourceSession: r.SourceSession}
+	return Fact{Type: TypeFact, Text: r.Text, At: r.At, SourceSession: r.SourceSession, ID: r.ID, Scope: r.Scope, WorkspaceID: r.WorkspaceID, SourceRun: r.SourceRun, Origin: r.Origin, Lineage: r.Lineage}
 }
 
 // Store is an append-only, bounded JSONL fact file.
@@ -187,7 +209,7 @@ func (s *Store) Snapshot() (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	facts, retracted := fold(records)
-	return Snapshot{Facts: facts, Retracted: retracted}, nil
+	return Snapshot{Facts: facts, Retracted: retracted, Changes: collectChanges(records)}, nil
 }
 
 // Retract takes one fact out of the effective set by appending a retraction
@@ -242,6 +264,9 @@ func (s *Store) Remember(sourceSession, text string, at time.Time) (Fact, error)
 // again, but the cap is stated once, here, so the tool and the store cannot
 // drift apart.
 func ValidateText(text string) error {
+	if !utf8.ValidString(text) || strings.ContainsRune(text, 0) {
+		return errors.New("memory text must be valid UTF-8 without NUL bytes")
+	}
 	if strings.TrimSpace(text) == "" {
 		return ErrEmptyFact
 	}
@@ -254,12 +279,27 @@ func ValidateText(text string) error {
 // readRecords decodes the file. A missing file is an empty memory rather than a
 // failure, because the first run of a fresh checkout has no facts yet.
 func readRecords(path string) ([]record, bool, error) {
-	data, err := os.ReadFile(path)
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, false, nil
-		}
 		return nil, false, fmt.Errorf("memory: read memory file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, false, fmt.Errorf("%w: memory file must be regular", ErrCorrupt)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, false, fmt.Errorf("memory: read memory file: %w", err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, MaxMemoryHistoryBytes+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if len(data) > MaxMemoryHistoryBytes {
+		return nil, false, fmt.Errorf("%w: history exceeds size limit", ErrCorrupt)
 	}
 	return parseRecords(data)
 }
@@ -277,6 +317,8 @@ func parseRecords(data []byte) ([]record, bool, error) {
 	parts = parts[:len(parts)-1]
 	truncated := trailing != ""
 	records := make([]record, 0, len(parts))
+	seenChanges := map[string]bool{}
+	seenIDs := map[string]bool{}
 	for i, line := range parts {
 		if strings.TrimSpace(line) == "" {
 			continue
@@ -286,7 +328,20 @@ func parseRecords(data []byte) ([]record, bool, error) {
 			return nil, truncated, fmt.Errorf("%w: line %d: %v", ErrCorrupt, i+1, err)
 		}
 		switch rec.Type {
-		case TypeFact, TypeRetract:
+		case TypeChange:
+			if !validChange(rec.Change) || seenChanges[rec.Change.ID] || seenIDs[rec.Change.After.ID] {
+				return nil, truncated, ErrCorrupt
+			}
+			seenChanges[rec.Change.ID] = true
+			seenIDs[rec.Change.After.ID] = true
+		case TypeFact:
+			if !validFactScope(rec.factFor()) || (rec.ID != "" && (!memoryIDPattern.MatchString(rec.ID) || seenIDs[rec.ID])) {
+				return nil, truncated, ErrCorrupt
+			}
+			if rec.ID != "" {
+				seenIDs[rec.ID] = true
+			}
+		case TypeRetract:
 		default:
 			return nil, truncated, fmt.Errorf("%w: line %d: unknown record type %q", ErrCorrupt, i+1, rec.Type)
 		}
@@ -307,8 +362,19 @@ func fold(records []record) ([]Fact, []Retracted) {
 		switch rec.Type {
 		case TypeFact:
 			facts = append(facts, rec.factFor())
+		case TypeChange:
+			before := indexOfRef(facts, rec.Change.Before.Ref())
+			if before >= 0 {
+				facts = append(facts[:before], facts[before+1:]...)
+			}
+			if indexOfRef(facts, rec.Change.After.Ref()) < 0 {
+				facts = append(facts, rec.Change.After)
+			}
 		case TypeRetract:
 			idx := indexOfFact(facts, rec.TargetAt, rec.TargetText)
+			if rec.TargetRef != "" {
+				idx = indexOfRef(facts, rec.TargetRef)
+			}
 			if idx < 0 {
 				continue
 			}
@@ -364,6 +430,16 @@ func capFacts(facts []Fact) ([]Fact, int, error) {
 // effective facts, so a retraction and the fact it removed are compacted away
 // together and a rewrite can never resurrect one.
 func appendRecord(path string, records []record, truncated bool, rec record) error {
+	return appendRecordContext(context.Background(), path, records, truncated, rec)
+}
+
+func appendRecordContext(ctx context.Context, path string, records []record, truncated bool, rec record) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if handled, err := appendModernRecord(ctx, path, records, truncated, rec); handled {
+		return err
+	}
 	line, err := encodeRecord(rec)
 	if err != nil {
 		return err
@@ -459,9 +535,15 @@ func encodeRecord(rec record) ([]byte, error) {
 	var payload any
 	switch rec.Type {
 	case TypeFact:
-		payload = Fact{Type: TypeFact, Text: rec.Text, At: rec.At, SourceSession: rec.SourceSession}
+		payload = rec.factFor()
 	case TypeRetract:
-		payload = RetractRecord{Type: TypeRetract, At: rec.At, TargetAt: rec.TargetAt, TargetText: rec.TargetText}
+		payload = RetractRecord{Type: TypeRetract, At: rec.At, TargetAt: rec.TargetAt, TargetText: rec.TargetText, TargetRef: rec.TargetRef}
+	case TypeChange:
+		payload = struct {
+			Type   string        `json:"type"`
+			At     time.Time     `json:"at"`
+			Change *MemoryChange `json:"change"`
+		}{TypeChange, rec.At, rec.Change}
 	default:
 		return nil, fmt.Errorf("memory: unknown record type %q", rec.Type)
 	}

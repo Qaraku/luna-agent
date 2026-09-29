@@ -52,7 +52,7 @@ func TestTheInjectedBlockIsLabelledAndKeepsFactOrder(t *testing.T) {
 	}
 	// The label still says what the content is: facts about the user, recorded
 	// by luna_remember in earlier sessions.
-	for _, want := range []string{"facts about the user", "luna_remember", "earlier sessions"} {
+	for _, want := range []string{"Stored reference notes", "visible to this run"} {
 		if !strings.Contains(block.Text, want) {
 			t.Fatalf("the injected block is missing the label %q: %q", want, block.Text)
 		}
@@ -269,7 +269,7 @@ func TestAFactStoredByTheToolReachesTheNextContextRead(t *testing.T) {
 	if _, err := p.tool.Invoke(runCtx("session-1"), `{"text":"prefers short answers"}`); err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
-	if got := contextBlock(t, p).Text; !strings.Contains(got, "- prefers short answers\n") {
+	if got := contextBlock(t, p).Text; !strings.Contains(got, "- [global] prefers short answers\n") {
 		t.Fatalf("the fact written in this round is not injectable: %q", got)
 	}
 
@@ -278,7 +278,7 @@ func TestAFactStoredByTheToolReachesTheNextContextRead(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	got := contextBlock(t, restarted).Text
-	if !strings.Contains(got, factsBlockHeader) || !strings.Contains(got, "- prefers short answers\n") {
+	if !strings.Contains(got, factsBlockHeader) || !strings.Contains(got, "- [global] prefers short answers\n") {
 		t.Fatalf("the stored fact is not in the next read: %q", got)
 	}
 }

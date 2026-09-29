@@ -18,8 +18,7 @@ const (
 	RememberToolName = "luna_remember"
 
 	// RecallToolName is the model-visible name of the memory read tool. The
-	// pair is deliberate: the capability has one append and one list, and
-	// neither of them edits or removes anything.
+	// 读取与追加分开；纠错由独立的审批工具提供。
 	RecallToolName = "luna_recall"
 
 	// rememberConfirmation is the whole model-visible result of a memory write.
@@ -32,12 +31,12 @@ const (
 	// keep the two facts the model can act on: the write is append-only, and
 	// the user — not the model — is who removes a stored fact. It points at
 	// luna_recall for reading rather than telling the model the write is blind.
-	rememberDescription = "Store one durable fact about the user so a later session can use it. You can only append: this tool never edits or removes a stored fact, and luna_recall is how you see what is already stored. The user can see the stored facts and retract one in the dedicated Memory (记忆) panel, opened from the page header, so tell them where to remove it rather than refusing to store it."
+	rememberDescription = "Store one durable note. scope=global (default, for compatibility) is for personal preferences; scope=project is for knowledge about the current host-bound workspace. The model cannot choose another workspace id. Saving requires the current write policy and approval for the private memory scope. Use luna_recall first when unsure whether a note already exists. This tool only adds; use luna_memory_update for approved corrections and let the user retract entries in the Memory (记忆) panel opened from the page header."
 
 	// recallDescription is the tool's model-visible description. It states when
 	// to reach for it and what it will not do, because a listing tool the model
 	// could mistake for a write is worse than no listing tool at all.
-	recallDescription = "List the facts about the user that are in effect right now, each with the time it was recorded. Use it when you want to confirm what you already know about the user, or when you are unsure whether something was stored before; it only reads and never changes anything. A fact the user retracted is not in the list. The list is capped, and a list that stopped at the cap says how many of how many it returned and where it stopped. No stored fact at all is an ordinary answer, not an error. With no arguments, return the newest 50 facts at most, displayed oldest first. To find older facts, query is an optional case-insensitive literal substring of fact text, not a regex; it searches all effective facts before paging. offset skips that many newer matching facts (default 0), and limit sets the page size (1..50, default 50). Each page is still displayed oldest first. Use next_offset with the same query to read the next older page; when a default listing stops at 50, start the next page at offset 50. Each call reads the current facts, so new or retracted facts may shift offsets; this is not a frozen snapshot."
+	recallDescription = "List the facts about the user that are in effect right now, each with the time it was recorded. Use it when you want to confirm what you already know about the user, or when you are unsure whether something was stored before; it only reads and never changes anything. A fact the user retracted is not in the list. Default visibility is global notes plus the current project; scope may be current, global, project or all. all requires extra read-scope approval. Set include_refs=true to obtain immutable references for corrections. The list is capped, and a list that stopped at the cap says how many of how many it returned and where it stopped. No stored fact at all is an ordinary answer, not an error. With no arguments, return the newest 50 facts at most, displayed oldest first. To find older facts, query is an optional case-insensitive literal substring of fact text, not a regex; it searches all effective facts before paging. offset skips that many newer matching facts (default 0), and limit sets the page size (1..50, default 50). Each page is still displayed oldest first. Use next_offset with the same query to read the next older page; when a default listing stops at 50, start the next page at offset 50. Each call reads the current facts, so new or retracted facts may shift offsets; this is not a frozen snapshot."
 
 	// recallEmpty is the whole model-visible result of a recall over an empty
 	// store. An empty store is not a failure: it is a store that holds nothing
@@ -46,9 +45,8 @@ const (
 )
 
 // RememberTool is the plugin's luna_remember: the write half of the model's
-// reach into the store, and a write-only one. There is deliberately no parameter
-// that could read, list, edit or retract a fact — reading is RecallTool's job
-// and nothing the model can call changes or removes a stored fact.
+// reach into the store, and a write-only one. 这个工具只追加；读取与审批式纠错
+// 分别由 RecallTool 和 UpdateTool 负责，撤回仍是用户操作。
 //
 // It emits nothing. tool.started, tool.failed and tool.finished are the Kernel's
 // to emit for this round — the plugin's job is the arguments and the store.
@@ -64,14 +62,16 @@ func (t *RememberTool) Description() string { return rememberDescription }
 func (t *RememberTool) Schema() *jsonschema.Schema { return rememberSchema() }
 
 // rememberSchema is the exact public schema of the memory tool: one write-only
-// action with one parameter. additionalProperties is closed, so a parameter that
-// is not `text` is refused before any store is reached.
+// action with text and scope. additionalProperties is closed; models cannot
+// provide a workspace id, stored origin, or authority.
+type rememberArgs struct {
+	Text  string `json:"text" jsonschema_description:"One durable note, at most 500 characters"`
+	Scope string `json:"scope,omitempty" jsonschema:"enum=global,enum=project" jsonschema_description:"global personal preferences (default), or the current host-bound project; never another project id"`
+}
+
 func rememberSchema() *jsonschema.Schema {
-	type args struct {
-		Text string `json:"text" jsonschema_description:"One durable fact about the user, stated in a single sentence"`
-	}
 	r := jsonschema.Reflector{DoNotReference: true, AllowAdditionalProperties: false}
-	s := r.Reflect(args{})
+	s := r.Reflect(rememberArgs{})
 	s.Required = []string{"text"}
 	return s
 }
@@ -120,25 +120,33 @@ func decodeOne(arguments string, into any) error {
 // with an empty source session: no attribution is the honest answer, and a
 // fabricated id would be worse than none.
 func (t *RememberTool) Invoke(ctx context.Context, arguments string) (string, error) {
-	var in struct {
-		Text string `json:"text"`
-	}
+	var in rememberArgs
 	if err := decodeOne(arguments, &in); err != nil {
 		return "", err
 	}
 	if err := validateFactText(in.Text); err != nil {
 		return "", err
 	}
+	if err := plugin.CheckAccess(ctx, plugin.AccessWrite); err != nil {
+		return "", err
+	}
 	if t.store == nil {
 		return "", errors.New("memory is not configured on this host")
 	}
 	info, _ := plugin.Run(ctx)
-	if _, err := t.store.Remember(info.SessionID, in.Text, time.Now()); err != nil {
-		// A store that cannot be written is an infrastructure failure, not a
-		// refusal of this call: the model can do nothing about a full disk, and
-		// a run that silently lost a fact the model was told it stored would be
-		// lying. The marker makes the Kernel end the round.
-		return "", plugin.Unavailable(fmt.Errorf("store the fact: %w", err))
+	scope := normalizedScope(in.Scope)
+	workspace := ""
+	if scope == ScopeProject {
+		workspace = info.WorkspaceID
+	}
+	if !validFactScope(Fact{Scope: scope, WorkspaceID: workspace}) {
+		return "", fmt.Errorf("scope must be global or a bound project")
+	}
+	if err := memoryAccess(ctx, t.store, RememberToolName, plugin.AccessWrite, false, scope+":"+workspace, in.Text, arguments); err != nil {
+		return "", err
+	}
+	if _, err := t.store.RememberScoped(ctx, info.SessionID, info.RunID, in.Text, scope, workspace, "model"); err != nil {
+		return "", memoryToolError(fmt.Errorf("store the fact: %w", err))
 	}
 	return rememberConfirmation, nil
 }
@@ -202,7 +210,7 @@ func recallListing(facts []Fact) string {
 	for _, fact := range kept {
 		// One line per fact, and the recorded time exactly as stored (UTC), so
 		// the model can tell two similar facts apart by when they were written.
-		fmt.Fprintf(&b, "- %s (recorded %s)\n", singleLine(fact.Text), fact.At.UTC().Format(time.RFC3339Nano))
+		fmt.Fprintf(&b, "- %s (recorded %s)\n", singleLine(scopedFactText(fact)), fact.At.UTC().Format(time.RFC3339Nano))
 	}
 	return b.String()
 }
@@ -213,7 +221,7 @@ func recallListing(facts []Fact) string {
 // A store that cannot be read is an infrastructure failure, marked the same way
 // a failed write is: a listing that quietly reported an empty memory would tell
 // the model it remembers nothing, which is not what happened.
-func (t *RecallTool) Invoke(_ context.Context, arguments string) (string, error) {
+func (t *RecallTool) Invoke(ctx context.Context, arguments string) (string, error) {
 	options, err := parseRecallOptions(arguments)
 	if err != nil {
 		return "", err
@@ -221,9 +229,23 @@ func (t *RecallTool) Invoke(_ context.Context, arguments string) (string, error)
 	if t.store == nil {
 		return "", errors.New("memory is not configured on this host")
 	}
+	if err := plugin.CheckAccess(ctx, plugin.AccessRead); err != nil {
+		return "", err
+	}
+	if err := memoryAccess(ctx, t.store, RecallToolName, plugin.AccessRead, options.Scope == "all", options.Scope, "", arguments); err != nil {
+		return "", err
+	}
 	facts, err := t.store.Facts()
 	if err != nil {
 		return "", plugin.Unavailable(fmt.Errorf("read the stored facts: %w", err))
+	}
+	info, _ := plugin.Run(ctx)
+	facts, err = filterFacts(facts, options.Scope, info.WorkspaceID)
+	if err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	return recallPage(facts, options), nil
 }

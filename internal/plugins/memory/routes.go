@@ -17,19 +17,33 @@ type memoryFact struct {
 	Text          string    `json:"text"`
 	At            time.Time `json:"at"`
 	SourceSession string    `json:"source_session"`
+	Ref           string    `json:"ref"`
+	Lineage       string    `json:"lineage"`
+	Scope         string    `json:"scope"`
+	WorkspaceID   string    `json:"workspace_id,omitempty"`
+	SourceRun     string    `json:"source_run,omitempty"`
+	Origin        string    `json:"origin,omitempty"`
 }
 
 // memoryRetractedFact is a fact that is no longer in effect, with when it was
 // retracted.
 type memoryRetractedFact struct {
-	Text        string    `json:"text"`
-	At          time.Time `json:"at"`
-	RetractedAt time.Time `json:"retracted_at"`
+	Text          string    `json:"text"`
+	At            time.Time `json:"at"`
+	RetractedAt   time.Time `json:"retracted_at"`
+	Ref           string    `json:"ref"`
+	Lineage       string    `json:"lineage"`
+	Scope         string    `json:"scope"`
+	WorkspaceID   string    `json:"workspace_id,omitempty"`
+	SourceSession string    `json:"source_session,omitempty"`
+	Origin        string    `json:"origin,omitempty"`
 }
 
 type memoryView struct {
 	Facts     []memoryFact          `json:"facts"`
 	Retracted []memoryRetractedFact `json:"retracted"`
+	Changes   []memoryChangeView    `json:"changes"`
+	Scopes    []memoryScopeView     `json:"scopes"`
 }
 
 // factsRoute answers GET /api/memory with the user's view of their own store.
@@ -40,7 +54,7 @@ type factsRoute struct{ store *Store }
 func (r factsRoute) Method() string { return http.MethodGet }
 func (r factsRoute) Path() string   { return MemoryRoutePath }
 
-func (r factsRoute) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
+func (r factsRoute) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if r.store == nil {
 		fail(w, http.StatusInternalServerError, errors.New("memory is not configured"))
 		return
@@ -50,19 +64,16 @@ func (r factsRoute) ServeHTTP(w http.ResponseWriter, _ *http.Request) {
 		fail(w, http.StatusInternalServerError, err)
 		return
 	}
-	// Both lists are built empty rather than nil, so an empty memory is `[]` on
-	// the wire and never `null`.
-	view := memoryView{
-		Facts:     make([]memoryFact, 0, len(snapshot.Facts)),
-		Retracted: make([]memoryRetractedFact, 0, len(snapshot.Retracted)),
+	scope := req.URL.Query().Get("scope")
+	if scope == "" {
+		scope = "all"
 	}
-	for _, fact := range snapshot.Facts {
-		view.Facts = append(view.Facts, memoryFact{Text: fact.Text, At: fact.At, SourceSession: fact.SourceSession})
+	view, err := scopedMemoryView(snapshot, scope, req.URL.Query().Get("workspace"))
+	if err != nil {
+		fail(w, 400, err)
+		return
 	}
-	for _, gone := range snapshot.Retracted {
-		view.Retracted = append(view.Retracted, memoryRetractedFact{Text: gone.Fact.Text, At: gone.Fact.At, RetractedAt: gone.RetractedAt})
-	}
-	send(w, http.StatusOK, view)
+	send(w, 200, view)
 }
 
 // retractRoute answers POST /api/memory/retract. The fact is named by its text
@@ -80,10 +91,24 @@ func (r retractRoute) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	var in struct {
+		Ref  string `json:"ref"`
 		At   string `json:"at"`
 		Text string `json:"text"`
 	}
 	if !decode(w, req, &in) {
+		return
+	}
+	if in.Ref != "" {
+		if in.At != "" || in.Text != "" {
+			fail(w, 400, fmt.Errorf("provide ref or at and text, not both"))
+			return
+		}
+		gone, err := r.store.RetractRef(in.Ref)
+		if err != nil {
+			fail(w, memoryStatus(err), err)
+			return
+		}
+		send(w, 200, map[string]any{"retracted": retractedView(gone)})
 		return
 	}
 	at, err := time.Parse(time.RFC3339Nano, in.At)
@@ -100,11 +125,7 @@ func (r retractRoute) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		fail(w, memoryStatus(err), err)
 		return
 	}
-	send(w, http.StatusOK, map[string]any{"retracted": memoryRetractedFact{
-		Text:        gone.Fact.Text,
-		At:          gone.Fact.At,
-		RetractedAt: gone.RetractedAt,
-	}})
+	send(w, http.StatusOK, map[string]any{"retracted": retractedView(gone)})
 }
 
 // memoryStatus maps a store failure onto the HTTP status: retracting a fact that
@@ -112,6 +133,12 @@ func (r retractRoute) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // the server's.
 func memoryStatus(err error) int {
 	switch {
+	case errors.Is(err, ErrMemoryConflict):
+		return http.StatusConflict
+	case errors.Is(err, ErrMemoryCapacity):
+		return http.StatusConflict
+	case errors.Is(err, ErrEmptyFact), errors.Is(err, ErrFactTooLong):
+		return http.StatusBadRequest
 	case errors.Is(err, ErrUnknownFact):
 		return http.StatusNotFound
 	default:

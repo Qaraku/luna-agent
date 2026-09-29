@@ -67,3 +67,15 @@
 .memory-panel-empty, .memory-panel-status { margin: var(--luna-space-2) 0 0; font-size: var(--luna-font-meta); color: var(--luna-text-muted); }
 .memory-panel-group > .memory-panel-empty { margin: 0; }
 .memory-panel-status.failure { color: var(--luna-danger); }
+
+/* 范围与纠错仅在记忆面板内展开，不占 composer。 */
+.memory-management, .memory-add-form, .memory-edit-form { display: grid; gap: var(--luna-space-2); margin-bottom: var(--luna-space-4); min-width: 0; }
+.memory-scope-label { display: grid; gap: var(--luna-space-2); }
+.memory-scope-select, .memory-add-text, .memory-edit-text, .memory-export-text { width: 100%; min-width: 0; box-sizing: border-box; }
+.memory-add-text, .memory-edit-text, .memory-export-text { resize: vertical; }
+.memory-history-group, .memory-restore-box, .memory-export-box { margin-top: var(--luna-space-4); }
+.memory-history-row { padding: var(--luna-space-3); border: 1px solid var(--luna-border); border-radius: var(--luna-radius-md); margin-top: var(--luna-space-2); overflow-wrap: anywhere; }
+.memory-edit-before, .memory-restore-box { white-space: pre-wrap; overflow-wrap: anywhere; }
+.memory-edit-form[hidden], .memory-restore-box[hidden], .memory-history-group[hidden], .memory-export-box[hidden] { display: none; }
+
+.memory-panel-correct { flex: 0 0 auto; }

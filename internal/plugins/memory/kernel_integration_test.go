@@ -155,7 +155,7 @@ func TestRecallQueryThroughKernelAndSessionTranscript(t *testing.T) {
 				}
 				found = true
 				shape, err := tool.ParamsOneOf.ToJSONSchema()
-				if err != nil || shape.Properties.Len() != 3 || len(shape.Required) != 0 {
+				if err != nil || shape.Properties.Len() != 5 || len(shape.Required) != 0 {
 					t.Fatalf("model did not receive the optional query schema: %v, %v", shape, err)
 				}
 			}

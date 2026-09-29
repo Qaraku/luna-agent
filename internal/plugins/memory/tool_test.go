@@ -43,7 +43,7 @@ func blockedStore(t *testing.T) *Store {
 
 // runCtx carries the run identity the Kernel hands a tool call.
 func runCtx(sessionID string) context.Context {
-	return plugin.WithRun(context.Background(), plugin.RunInfo{RunID: "run-1", SessionID: sessionID})
+	return plugin.WithRun(context.Background(), plugin.RunInfo{RunID: "run-1", SessionID: sessionID, Approve: func(context.Context, plugin.AccessRequest) error { return nil }})
 }
 
 func TestRememberToolAppendsOneFactAndCarriesNoPluginIdentity(t *testing.T) {
@@ -133,15 +133,15 @@ func TestRememberSchemaIsStrictAndWriteOnly(t *testing.T) {
 		t.Fatalf("required mismatch: %s", encoded)
 	}
 	properties, ok := raw["properties"].(map[string]any)
-	if !ok || len(properties) != 1 {
-		t.Fatalf("the tool exposes more than one parameter: %s", encoded)
+	if !ok || len(properties) != 2 {
+		t.Fatalf("the tool must expose text and scope only: %s", encoded)
 	}
 	if _, ok := properties["text"]; !ok {
 		t.Fatalf("properties=%v", properties)
 	}
 	// The parameter description is part of the contract the model reads.
 	text, _ := properties["text"].(map[string]any)
-	if text["description"] != "One durable fact about the user, stated in a single sentence" {
+	if text["description"] != "One durable note, at most 500 characters" {
 		t.Fatalf("the text parameter description changed: %v", text["description"])
 	}
 	// No action switch: an action parameter is how a read or a delete would
@@ -228,7 +228,7 @@ func TestStoredFactsCarryNoPluginIdentity(t *testing.T) {
 // no attribution is honest, and a made-up id would not be.
 func TestRememberWithoutRunIdentityStoresAnEmptySource(t *testing.T) {
 	store := newRememberStore(t)
-	if _, err := NewRememberTool(store).Invoke(context.Background(), `{"text":"a fact"}`); err != nil {
+	if _, err := NewRememberTool(store).Invoke(plugin.WithRun(context.Background(), plugin.RunInfo{Approve: func(context.Context, plugin.AccessRequest) error { return nil }}), `{"text":"a fact"}`); err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
 	facts := mustRead(t, store)
@@ -340,7 +340,7 @@ func TestRecallSeesTheFactTheWriteToolJustStored(t *testing.T) {
 	if len(facts) != 1 {
 		t.Fatalf("facts=%+v", facts)
 	}
-	want := fmt.Sprintf("- prefers short answers (recorded %s)", facts[0].At.UTC().Format(time.RFC3339Nano))
+	want := fmt.Sprintf("- [global] prefers short answers (recorded %s)", facts[0].At.UTC().Format(time.RFC3339Nano))
 	if !strings.Contains(got, want) {
 		t.Fatalf("listing=%q, want it to carry %q", got, want)
 	}
@@ -466,8 +466,8 @@ func TestRecallAcceptsOptionalReadParametersAndWritesNothing(t *testing.T) {
 		t.Fatalf("the read schema is not a strict object: %s", encoded)
 	}
 	properties, ok := raw["properties"].(map[string]any)
-	if !ok || len(properties) != 3 {
-		t.Fatalf("expected only query, offset and limit: %s", encoded)
+	if !ok || len(properties) != 5 {
+		t.Fatalf("expected query, offset, limit, scope and include_refs: %s", encoded)
 	}
 	for name, wantType := range map[string]string{"query": "string", "offset": "integer", "limit": "integer"} {
 		field, ok := properties[name].(map[string]any)

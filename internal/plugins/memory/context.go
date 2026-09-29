@@ -33,7 +33,7 @@ func singleLine(text string) string {
 // disclaimer. That rule is the Kernel's now, applied uniformly to every
 // reference contribution, so the plugin states its own content and stops
 // restating host policy.
-const factsBlockHeader = "Existing facts about the user, recorded by luna_remember in earlier sessions."
+const factsBlockHeader = "Stored reference notes visible to this run."
 
 // factLine renders one fact as one labelled bullet line.
 func factLine(text string) string {
@@ -51,7 +51,7 @@ func factLine(text string) string {
 func selectFacts(facts []Fact) []Fact {
 	kept, size := 0, 0
 	for i := len(facts) - 1; i >= 0; i-- {
-		lineSize := len(factLine(facts[i].Text))
+		lineSize := len(factLine(scopedFactText(facts[i])))
 		if kept == MaxInjectFacts || size+lineSize > MaxInjectBytes {
 			break
 		}
@@ -81,7 +81,7 @@ func renderFactsBlock(facts []Fact) string {
 	b.WriteString(factsBlockHeader)
 	b.WriteString("\n")
 	for _, fact := range kept {
-		b.WriteString(factLine(fact.Text))
+		b.WriteString(factLine(scopedFactText(fact)))
 	}
 	return b.String()
 }
@@ -93,8 +93,16 @@ func renderFactsBlock(facts []Fact) string {
 // in a round reaches the next context read of the same round. A read failure is
 // returned as an error and fails the round: an agent that silently forgot
 // everything would answer as if the memory were empty.
-func (p *Plugin) Contexts(context.Context) ([]plugin.ContextBlock, error) {
+func (p *Plugin) Contexts(ctx context.Context) ([]plugin.ContextBlock, error) {
+	if plugin.AccessPolicyFor(ctx).Read != plugin.DecisionAllow {
+		return nil, nil
+	}
 	facts, err := p.store.Facts()
+	if err != nil {
+		return nil, err
+	}
+	info, _ := plugin.Run(ctx)
+	facts, err = filterFacts(facts, "current", info.WorkspaceID)
 	if err != nil {
 		return nil, err
 	}

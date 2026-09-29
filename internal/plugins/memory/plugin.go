@@ -104,9 +104,11 @@ func Descriptor() plugin.Descriptor {
 		Contributions: []plugin.Contribution{
 			{Kind: plugin.ContributionTool, ID: RememberToolName},
 			{Kind: plugin.ContributionTool, ID: RecallToolName},
+			{Kind: plugin.ContributionTool, ID: UpdateToolName},
 			{Kind: plugin.ContributionContext, ID: FactsContextID, BudgetBytes: FactsBudgetBytes},
 			{Kind: plugin.ContributionRoute, ID: MemoryRoutePath},
 			{Kind: plugin.ContributionRoute, ID: RetractRoutePath},
+			{Kind: plugin.ContributionRoute, ID: CorrectRoutePath}, {Kind: plugin.ContributionRoute, ID: RestoreRoutePath}, {Kind: plugin.ContributionRoute, ID: AddRoutePath}, {Kind: plugin.ContributionRoute, ID: ExportRoutePath},
 			{Kind: plugin.ContributionRoute, ID: PanelEntryPath},
 			{Kind: plugin.ContributionRoute, ID: PanelStylePath},
 			{Kind: plugin.ContributionPanel, ID: PanelID},
@@ -126,19 +128,19 @@ func Descriptor() plugin.Descriptor {
 // Descriptor implements plugin.Plugin.
 func (p *Plugin) Descriptor() plugin.Descriptor { return Descriptor() }
 
-// Tools returns the model-visible surface: luna_remember, append only, and
-// luna_recall, read only. Neither of them can edit or remove a stored fact.
+// Tools 提供追加、读取和受审批约束的纠错/恢复，不提供模型撤回工具。
 func (p *Plugin) Tools() []plugin.Tool {
-	return []plugin.Tool{p.tool, p.recall}
+	return []plugin.Tool{p.tool, p.recall, NewUpdateTool(p.store)}
 }
 
-// Routes returns the capability's HTTP entries: the user's two data routes plus
-// the panel's module and stylesheet. The Kernel owns the Host and Origin checks
+// Routes 返回记忆管理、导出和面板资源；宿主拥有 Host 与 Origin 检查。
+// The Kernel owns the Host and Origin checks
 // and the method matching; each route only serves its own method.
 func (p *Plugin) Routes() []plugin.Route {
 	return []plugin.Route{
 		factsRoute{store: p.store},
 		retractRoute{store: p.store},
+		memoryMutationRoute{p.store, "correct"}, memoryMutationRoute{p.store, "restore"}, memoryMutationRoute{p.store, "add"}, exportMemoryRoute{p.store},
 		panelRoute{},
 		panelStyleRoute{},
 	}

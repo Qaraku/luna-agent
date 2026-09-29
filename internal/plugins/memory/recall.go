@@ -11,24 +11,28 @@ import (
 // recallOptions 既声明公开参数，也保存本次调用的匹配器；匹配器不进入 schema，
 // 不缓存到工具或 Store。offset 从较新端计数，页内仍按文件顺序从旧到新排列。
 type recallOptions struct {
-	Query  string `json:"query,omitempty" jsonschema_description:"Optional case-insensitive literal substring of fact text, not a regex; empty means all effective facts"`
-	Offset int    `json:"offset,omitempty" jsonschema:"minimum=0" jsonschema_description:"Number of newer matching facts to skip, default 0; use next_offset to read older matches"`
-	Limit  int    `json:"limit,omitempty" jsonschema:"minimum=1,maximum=50" jsonschema_description:"Maximum facts on this page, 1..50, default 50"`
+	Scope       string `json:"scope,omitempty" jsonschema:"enum=current,enum=global,enum=project,enum=all" jsonschema_description:"Default current includes global and current-project notes; all requires extra read-scope approval"`
+	IncludeRefs bool   `json:"include_refs,omitempty" jsonschema_description:"Include immutable references for correction or restore"`
+	Query       string `json:"query,omitempty" jsonschema_description:"Optional case-insensitive literal substring of fact text, not a regex; empty means all effective facts"`
+	Offset      int    `json:"offset,omitempty" jsonschema:"minimum=0" jsonschema_description:"Number of newer matching facts to skip, default 0; use next_offset to read older matches"`
+	Limit       int    `json:"limit,omitempty" jsonschema:"minimum=1,maximum=50" jsonschema_description:"Maximum facts on this page, 1..50, default 50"`
 
 	pattern *regexp.Regexp
 }
 
 func parseRecallOptions(arguments string) (recallOptions, error) {
-	options := recallOptions{Limit: MaxRecallFacts}
+	options := recallOptions{Limit: MaxRecallFacts, Scope: "current"}
 	if strings.TrimSpace(arguments) == "" {
 		arguments = "{}"
 	}
 	// RawMessage 区分“未提供”和显式 null；保留历史上的根 null 默认调用，
 	// 但新增字段必须符合自己的类型，不能让 null 悄悄变成 0 或空串。
 	var raw struct {
-		Query  json.RawMessage `json:"query"`
-		Offset json.RawMessage `json:"offset"`
-		Limit  json.RawMessage `json:"limit"`
+		Query       json.RawMessage `json:"query"`
+		Scope       json.RawMessage `json:"scope"`
+		IncludeRefs json.RawMessage `json:"include_refs"`
+		Offset      json.RawMessage `json:"offset"`
+		Limit       json.RawMessage `json:"limit"`
 	}
 	if err := decodeOne(arguments, &raw); err != nil {
 		return options, err
@@ -37,7 +41,7 @@ func parseRecallOptions(arguments string) (recallOptions, error) {
 		name string
 		raw  json.RawMessage
 		into any
-	}{{"query", raw.Query, &options.Query}, {"offset", raw.Offset, &options.Offset}, {"limit", raw.Limit, &options.Limit}} {
+	}{{"scope", raw.Scope, &options.Scope}, {"include_refs", raw.IncludeRefs, &options.IncludeRefs}, {"query", raw.Query, &options.Query}, {"offset", raw.Offset, &options.Offset}, {"limit", raw.Limit, &options.Limit}} {
 		if len(field.raw) == 0 {
 			continue
 		}
@@ -47,6 +51,9 @@ func parseRecallOptions(arguments string) (recallOptions, error) {
 		if err := json.Unmarshal(field.raw, field.into); err != nil {
 			return options, fmt.Errorf("%s: %w", field.name, err)
 		}
+	}
+	if options.Scope != "current" && options.Scope != ScopeGlobal && options.Scope != ScopeProject && options.Scope != "all" {
+		return options, fmt.Errorf("invalid memory scope")
 	}
 	if options.Offset < 0 {
 		return options, fmt.Errorf("offset must be non-negative (got %d)", options.Offset)
@@ -66,7 +73,7 @@ func parseRecallOptions(arguments string) (recallOptions, error) {
 }
 
 func recallPage(facts []Fact, options recallOptions) string {
-	if options.Query == "" && options.Offset == 0 && options.Limit == MaxRecallFacts {
+	if options.Query == "" && options.Offset == 0 && options.Limit == MaxRecallFacts && !options.IncludeRefs {
 		return recallListing(facts)
 	}
 	matches := facts
@@ -98,7 +105,11 @@ func recallPage(facts []Fact, options recallOptions) string {
 		b.WriteString("no facts on this page: offset is at or beyond the matching facts\n")
 	}
 	for _, fact := range kept {
-		fmt.Fprintf(&b, "- %s (recorded %s)\n", singleLine(fact.Text), fact.At.UTC().Format(time.RFC3339Nano))
+		fmt.Fprintf(&b, "- %s (recorded %s)", singleLine(scopedFactText(fact)), fact.At.UTC().Format(time.RFC3339Nano))
+		if options.IncludeRefs {
+			fmt.Fprintf(&b, " ref=%s", fact.Ref())
+		}
+		b.WriteByte('\n')
 	}
 	if start > 0 {
 		fmt.Fprintf(&b, "page stopped at limit %d; keep the same query to continue\nnext_offset: %d\n", options.Limit, options.Offset+len(kept))

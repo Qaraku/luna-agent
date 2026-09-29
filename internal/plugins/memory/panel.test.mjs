@@ -21,6 +21,7 @@ function element(tag, created) {
     parentNode: null,
     removed: false,
   };
+  Object.defineProperty(node, 'textContent', { get() { return (node._text || '') + node.children.map(child => child.textContent || '').join(''); }, set(value) { node._text = String(value); node.children = []; } });
   node.append = (...nodes) => {
     for (const child of nodes) {
       child.parentNode = node;
@@ -28,6 +29,8 @@ function element(tag, created) {
     }
   };
   node.setAttribute = (name, value) => node.attributes.set(name, String(value));
+  node.getAttribute = name => node.attributes.get(name) ?? null;
+  node.focus = () => { globalThis.document.activeElement = node; };
   node.addEventListener = (type, handler) => node.listeners.push([type, handler]);
   node.remove = () => {
     node.removed = true;
@@ -36,6 +39,7 @@ function element(tag, created) {
     node.parentNode = null;
   };
   node.replaceChildren = (...nodes) => {
+    node._text = '';
     for (const child of node.children) child.parentNode = null;
     node.children = [];
     node.append(...nodes);
@@ -87,6 +91,7 @@ async function withDom(run, { respond } = {}) {
   };
   const timers = {
     queued: [],
+    network: [],
     flush() {
       const pending = timers.queued.splice(0, timers.queued.length);
       for (const timer of pending) timer.fn();
@@ -101,14 +106,15 @@ async function withDom(run, { respond } = {}) {
   globalThis.fetch = async (url, options) => respond
     ? respond(url, options)
     : { ok: true, status: 200, json: async () => ({ facts: [], retracted: [] }) };
-  globalThis.setTimeout = (fn) => {
+  globalThis.setTimeout = (fn, delay = 0) => {
     const timer = { fn };
-    timers.queued.push(timer);
+    (delay >= 10000 ? timers.network : timers.queued).push(timer);
     return timer;
   };
   globalThis.clearTimeout = (timer) => {
     const index = timers.queued.indexOf(timer);
     if (index >= 0) timers.queued.splice(index, 1);
+    const networkIndex = timers.network.indexOf(timer); if (networkIndex >= 0) timers.network.splice(networkIndex, 1);
   };
   try {
     return await run({ document, timers });
@@ -295,4 +301,29 @@ test('a retract failure stays in the status line', async () => {
     }
     return { ok: true, status: 200, json: async () => ({ facts: [FACT], retracted: [] }) };
   } });
+});
+
+
+test('Memory 范围选择请求对应项目，并能纠正条目而不伪造来源',async()=>{
+ const writes=[];const calls=[];let current={...FACT,ref:'id:a',lineage:'id:a',scope:'global',origin:'model'};
+ await withDom(async({document})=>{const module=await loadModule();const target=document.createElement('div');module.mount(target,{});await settle();
+  const correct=allByClass(target,'memory-panel-correct')[0];assert.ok(correct);click(correct);const editor=allByClass(target,'memory-edit-text')[0];editor.value='更新的偏好';const form=allByClass(target,'memory-edit-form')[0];for(const [type,fn]of form.listeners)if(type==='submit')fn({preventDefault(){}});await settle();await settle();
+  assert.equal(writes.length,1);assert.deepEqual(writes[0],{ref:'id:a',text:'更新的偏好',reason:'用户纠错'});
+  const select=allByClass(target,'memory-scope-select')[0];select.value='project:p';for(const [type,fn]of select.listeners)if(type==='change')fn();await settle();assert.ok(calls.includes('/api/memory?scope=project&workspace=p'));module.unmount(target);
+ },{respond:async(url,options)=>{calls.push(url);if(url==='/api/workspaces')return {ok:true,json:async()=>({workspaces:[{id:'p',name:'项目 P'}]})};if(url==='/api/memory/correct'){writes.push(JSON.parse(options.body));current={...current,text:'更新的偏好',ref:'id:b',origin:'user'};return {ok:true,json:async()=>({fact:current})}};return {ok:true,json:async()=>({facts:[current],retracted:[],changes:[],scopes:[{scope:'global',count:1},{scope:'project',workspace_id:'p',count:0}]})}}});
+});
+
+test('Memory 恢复使用历史引用及当前引用，先确认再提交',async()=>{
+ const before={...FACT,text:'旧内容',ref:'id:a',lineage:'id:a',scope:'global'};const after={...before,text:'新内容',ref:'id:b'};const writes=[];
+ await withDom(async({document})=>{const module=await loadModule();const target=document.createElement('div');module.mount(target,{});await settle();click(allByClass(target,'memory-history-restore')[0]);assert.equal(writes.length,0);click(allByClass(target,'memory-restore-confirm')[0]);await settle();assert.equal(writes.length,1);assert.equal(writes[0].ref,'id:a');assert.equal(writes[0].expected_ref,'id:b');module.unmount(target);},{respond:async(url,options)=>{if(url==='/api/workspaces')return {ok:true,json:async()=>({workspaces:[]})};if(url==='/api/memory/restore'){writes.push(JSON.parse(options.body));return {ok:true,json:async()=>({})}}return {ok:true,json:async()=>({facts:[after],retracted:[],changes:[{id:'change-one',action:'correct',before,after,origin:{kind:'user'}}]})}}});
+});
+
+
+test('Memory 纠错失败保留编辑内容和旧引用',async()=>{
+ const item={...FACT,ref:'id:a',lineage:'id:a',scope:'global'};
+ await withDom(async({document})=>{const module=await loadModule();const target=document.createElement('div');module.mount(target,{});await settle();click(allByClass(target,'memory-panel-correct')[0]);const text=allByClass(target,'memory-edit-text')[0];text.value='未保存纠错';const form=allByClass(target,'memory-edit-form')[0];for(const[type,fn]of form.listeners)if(type==='submit')fn({preventDefault(){}});await settle();assert.equal(form.hidden,false);assert.equal(text.value,'未保存纠错');assert.match(textOf(target,'memory-panel-status'),/stale reference/);module.unmount(target);},{respond:async url=>url==='/api/memory/correct'?{ok:false,status:409,json:async()=>({error:'stale reference'})}:url==='/api/workspaces'?{ok:true,json:async()=>({workspaces:[]})}:{ok:true,json:async()=>({facts:[item],retracted:[],changes:[]})}});
+});
+
+test('Memory 卸载取消数据请求，迟到结果不复活内容或定时器',async()=>{
+ let release,signal;await withDom(async({document,timers})=>{const module=await loadModule();const target=document.createElement('div');module.mount(target,{});await settle();module.unmount(target);assert.equal(signal.aborted,true);release();await settle();assert.equal(target.children.length,0);assert.equal(document.head.children.length,0);assert.equal(timers.network.length,0);},{respond:async(url,options)=>{if(url==='/api/workspaces')return {ok:true,json:async()=>({workspaces:[]})};signal=options.signal;await new Promise(resolve=>release=resolve);return {ok:true,json:async()=>({facts:[FACT],retracted:[]})}}});
 });

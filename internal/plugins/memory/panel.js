@@ -1,27 +1,6 @@
-// The Memory panel, as the capability's own browser module.
-//
-// The host owns the panel itself — the header entry, the overlay, the title and
-// the close control — and hands this module a container to mount into. What the
-// panel *says* belongs here: the hint line, the rows, the retract call and the
-// wording around all of it. That is what makes disabling the capability take the
-// panel's content away with the route it talks to, instead of leaving a host
-// panel that renders nothing.
-//
-// The panel is a product surface, not a lifecycle log: mounting, unmounting and
-// how many requests went out are things the module knows and the user does not
-// need. It has two layers instead of one flat list. The facts in effect are the
-// surface: each one carries its text, where it came from, when it was recorded,
-// and the one action that changes anything — retracting it, kept visually
-// secondary because it is the exception, not the point of the row. Retracted
-// facts are the archive behind that surface: one summary line by default, the
-// entries only when asked for, because a store's internal shape is not what the
-// reader opened the panel to see.
-//
-// It uses the same mount(target, api) / unmount(target) contract as every other
-// browser module, and the host's own classes for the shared look; its layout
-// rules come from the capability's own stylesheet route, so the host
-// stylesheet has no memory-specific rules and disabling the capability takes
-// the panel's look away with its content.
+// Memory 能力拥有的用户管理面板：范围、来源、纠错与恢复。
+// 宿主只负责容器与生命周期；所有文本通过 DOM 文本接口渲染。
+// 请求在切换范围或卸载时取消，编辑失败不丢弃输入。
 
 const FACTS_URL = '/api/memory';
 const RETRACT_URL = '/api/memory/retract';
@@ -60,7 +39,7 @@ export function mount(target, api) {
 
   const hint = document.createElement('p');
   hint.className = 'memory-panel-hint';
-  hint.textContent = '这些是 Luna 会在之后的对话里用到的事实。撤回会把一条移出生效集合，记录仍留在本地文件里；要让它重新生效，只能由模型再记录一次。';
+  hint.textContent = '这里是你的记忆管理视图。模型只会读取全局与当前项目的记忆，并受权限和上下文预算限制；纠错与恢复会保留历史，不改变原条目的范围。';
 
   // 生效中：当前真的会进入对话的那些事实，每条都能就地撤回。这是面板的主体。
   const activeHeading = document.createElement('h3');
@@ -100,6 +79,7 @@ export function mount(target, api) {
   target.append(hint, activeGroup, goneGroup, status);
 
   const state = {
+    target, live: true, scopeValue: 'all', renderedScope: 'all', stale: false, loading: false, changes: [], scopes: [], workspaceNames: new Map(), editing: null, workspaceController: null, workspaceTimer: null,
     link,
     activeHeading,
     activeList,
@@ -117,7 +97,10 @@ export function mount(target, api) {
     controller: null,
   };
   states.set(target, state);
+  const management = buildMemoryManagement(state);
+  target.replaceChildren(hint, management, state.editForm, state.restoreBox, activeGroup, goneGroup, state.historyGroup, state.exportBox, status);
   draw(state);
+  loadMemoryWorkspaces(state);
 
   // 展开与收起只改这一段的可访问状态和可见性：不重画条目，也就不发请求，
   // 点开已撤回不会让面板闪一下。
@@ -133,6 +116,10 @@ export function unmount(target) {
   const state = states.get(target);
   if (!state) return;
   states.delete(target);
+  state.live = false;
+  state.workspaceController?.abort();
+  clearTimeout(state.workspaceTimer);
+  clearTimeout(state.requestTimer);
   if (state.controller) state.controller.abort();
   if (state.pending) clearTimeout(state.pending);
   // The stylesheet travels with the module, so it leaves with it; the host still
@@ -141,29 +128,33 @@ export function unmount(target) {
   target.replaceChildren();
 }
 
-function load(state) {
-  if (state.controller) state.controller.abort();
-  state.controller = new AbortController();
-  const signal = state.controller.signal;
-  return fetch(FACTS_URL, { headers: { accept: 'application/json' }, signal })
-    .then((response) => response.json().then((payload) => ({ response, payload })))
-    .then(({ response, payload }) => {
-      if (!response.ok) throw new Error(errorText(payload) || `读取失败（${response.status}）`);
-      state.facts = Array.isArray(payload.facts) ? payload.facts : [];
-      state.retracted = Array.isArray(payload.retracted) ? payload.retracted : [];
-      draw(state);
-    })
-    .catch((error) => {
-      if (error && error.name === 'AbortError') return;
-      setStatus(state, errorMessage(error), 'failure');
-    });
+function memoryURL(state, path = FACTS_URL) {
+  if (state.scopeValue === 'all') return path;
+  if (state.scopeValue === 'global') return path + '?scope=global';
+  return path + '?scope=project&workspace=' + encodeURIComponent(state.scopeValue.slice(8));
+}
+async function load(state) {
+  if (!state.live || state.busy) return;
+  state.controller?.abort(); clearTimeout(state.requestTimer); const controller = new AbortController(); state.controller = controller;
+  state.loading = true; state.stale = state.scopeValue !== state.renderedScope; const scope = state.scopeValue;
+  const timer = setTimeout(() => controller.abort(), 15000); state.requestTimer = timer; draw(state);
+  try {
+    const response = await fetch(memoryURL(state), { headers: { accept: 'application/json' }, signal: controller.signal }); const payload = await response.json();
+    if (!state.live || controller !== state.controller || controller.signal.aborted) return;
+    if (!response.ok) throw new Error(errorText(payload) || '读取失败（' + response.status + '）');
+    state.facts = Array.isArray(payload.facts) ? payload.facts : []; state.retracted = Array.isArray(payload.retracted) ? payload.retracted : [];
+    state.changes = Array.isArray(payload.changes) ? payload.changes : []; state.scopes = Array.isArray(payload.scopes) ? payload.scopes : [];
+    state.renderedScope = scope; state.stale = false; setStatus(state, '', '');
+  } catch (error) { if (state.live && controller === state.controller) setStatus(state, controller.signal.aborted ? '读取超时，请重试。' : errorMessage(error) + (state.stale ? '；仍显示上一次范围，暂不能修改。' : ''), 'failure'); }
+  finally { clearTimeout(timer); if (state.live && controller === state.controller) { state.controller = null; state.loading = false; draw(state); } }
 }
 
 function draw(state) {
+  if (!state.live) return;
   // 生效中
   state.activeList.replaceChildren();
   state.facts.forEach((fact, index) => state.activeList.append(factNode(state, fact, index)));
-  state.activeHeading.textContent = `Luna 记得的 · ${state.facts.length} 条`;
+  state.activeHeading.textContent = `生效中 · ${state.facts.length} 条`;
   state.activeEmpty.hidden = state.facts.length > 0;
   state.activeEmpty.textContent =
     state.retracted.length > 0
@@ -172,10 +163,11 @@ function draw(state) {
 
   // 已撤回：一行摘要加一组默认收起的条目，展开状态由 state.goneOpen 决定。
   state.goneList.replaceChildren();
-  state.retracted.forEach((entry) => state.goneList.append(retractedNode(entry)));
+  state.retracted.forEach((entry) => state.goneList.append(retractedNode(state, entry)));
   state.goneGroup.hidden = state.retracted.length === 0;
   state.goneToggle.textContent = `已撤回 · ${state.retracted.length} 条`;
   syncGone(state);
+  drawMemoryManagement(state);
 }
 
 // syncGone is the whole of the collapse behaviour: the button says whether the
@@ -198,24 +190,27 @@ function factNode(state, fact, index) {
   const meta = document.createElement('p');
   meta.className = 'memory-panel-meta';
   meta.textContent = joinMeta([
+    scopeLabel(state, fact),
+    fact.origin === 'user' ? '用户记录或修订' : fact.origin === 'model' ? '模型记录' : '',
     textOf(fact.source_session) ? `来自会话 ${textOf(fact.source_session)}` : '',
+    textOf(fact.source_run) ? '运行 ' + textOf(fact.source_run) : '',
     `记录于 ${whenOf(fact.at)}`,
   ]);
 
-  // 这一条能做什么：只有生效中的记忆有可点的动作；已撤回的没有。按钮和来源、
-  // 时间同处一行，读起来是这张卡片的脚注而不是主体。
+  // 操作与来源作为次级信息；撤回只影响生效状态，纠错保留历史。
   const button = document.createElement('button');
   button.type = 'button';
   button.className = 'memory-panel-retract luna-button';
   button.textContent = '撤回';
   // 每行的按钮文字都一样，读屏时它们会变成一串"撤回"；标签把这条事实带上。
   button.setAttribute('aria-label', `撤回这条记忆${labelOf(fact.text)}`);
-  button.disabled = state.busy;
+  button.disabled = state.busy || state.loading || state.stale;
   button.addEventListener('click', () => retract(state, index));
 
   const foot = document.createElement('div');
   foot.className = 'memory-panel-foot';
   foot.append(meta, button);
+  if (fact.ref) foot.append(memoryButton('纠错', 'memory-panel-correct', () => editMemory(state, fact), state));
   item.append(foot);
 
   return item;
@@ -224,7 +219,7 @@ function factNode(state, fact, index) {
 // A retracted entry carries the fact and when it was retracted, and nothing
 // else: /api/memory does not name a source session for one. What is not on the
 // wire is not shown, so the line says what actually happened to it.
-function retractedNode(entry) {
+function retractedNode(state, entry) {
   const item = document.createElement('li');
   item.className = 'memory-panel-item memory-panel-item-retracted';
 
@@ -235,40 +230,30 @@ function retractedNode(entry) {
 
   const meta = document.createElement('p');
   meta.className = 'memory-panel-meta';
-  meta.textContent = joinMeta([`记录于 ${whenOf(entry.at)}`, `撤回于 ${whenOf(entry.retracted_at)}`]);
+  meta.textContent = joinMeta([scopeLabel(state, entry), `记录于 ${whenOf(entry.at)}`, `撤回于 ${whenOf(entry.retracted_at)}`]);
   item.append(meta);
+  if (entry.ref) item.append(memoryButton('恢复此内容', 'memory-history-restore', () => confirmMemoryRestore(state, entry), state));
 
   return item;
 }
 
 function retract(state, index) {
-  const fact = state.facts[index];
-  if (!fact || state.busy) return;
-  state.busy = true;
-  draw(state);
-  setStatus(state, '正在撤回…', '');
-  fetch(RETRACT_URL, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json' },
-    body: JSON.stringify({ at: fact.at, text: fact.text }),
-  })
-    .then((response) => response.json().then((payload) => ({ response, payload })).catch(() => ({ response, payload: {} })))
-    .then(({ response, payload }) => {
-      state.busy = false;
-      if (!response.ok) {
-        setStatus(state, errorText(payload) || `撤回失败（${response.status}）`, 'failure');
-        draw(state);
-        return;
-      }
-      // 成功的证据是这条事实真的移到了「已撤回」，不再另写一条状态文案。
-      setStatus(state, '', '');
-      load(state);
-    })
-    .catch((error) => {
-      state.busy = false;
-      setStatus(state, errorMessage(error), 'failure');
-      draw(state);
-    });
+  const fact = state.facts[index]; if (!fact || state.busy || state.loading || state.stale) return;
+  mutateMemory(state, RETRACT_URL, fact.ref ? { ref: fact.ref } : { at: fact.at, text: fact.text }, '正在撤回…');
+}
+async function mutateMemory(state, path, body, message = '正在保存…') {
+  if (!state.live || state.busy || state.loading || state.stale) return;
+  state.controller?.abort(); clearTimeout(state.requestTimer); const controller = new AbortController(); state.controller = controller; state.busy = true;
+  const timer = setTimeout(() => controller.abort(), 15000); state.requestTimer = timer; draw(state); setStatus(state, message, '');
+  try {
+    const response = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, signal: controller.signal, body: JSON.stringify(body) });
+    const payload = await response.json().catch(() => ({})); if (!state.live || controller !== state.controller) return;
+    if (!response.ok) throw new Error(errorText(payload) || '保存失败（' + response.status + '）');
+    state.editing = null; state.editForm.hidden = true; state.restoreBox.hidden = true;
+    if (path === '/api/memory/add') state.addText.value = '';
+    state.busy = false; setStatus(state, '', ''); await load(state); if (state.live) (path === '/api/memory/add' ? state.addText : state.scopeSelect).focus();
+  } catch (error) { if (state.live && controller === state.controller) setStatus(state, controller.signal.aborted ? '操作超时，可能已保存；请刷新确认。' : errorMessage(error), 'failure'); }
+  finally { clearTimeout(timer); if (state.live) { state.busy = false; if (controller === state.controller) state.controller = null; draw(state); } }
 }
 
 // setStatus carries exactly one thing at a time. A failure stays until the next
@@ -276,6 +261,7 @@ function retract(state, index) {
 // takes itself away, and cannot push a failure out, because the timer that
 // would clear the line is dropped when someone else writes to it.
 function setStatus(state, text, className) {
+  if (!state.live) return;
   if (state.pending !== null) {
     clearTimeout(state.pending);
     state.pending = null;
@@ -317,4 +303,53 @@ function errorText(payload) {
 
 function errorMessage(error) {
   return error && typeof error.message === 'string' ? error.message : '读取失败';
+}
+
+function memoryNode(tag, className = '', text = '') { const node = document.createElement(tag); node.className = className; if (text) node.textContent = text; return node; }
+function memoryButton(text, className, callback, state) { const button = memoryNode('button', className + ' luna-button', text); button.type = 'button'; button.disabled = state.busy || state.loading || state.stale; button.addEventListener('click', callback); return button; }
+function scopeLabel(state, fact) { if (!fact.scope) return ''; return fact.scope === 'global' ? '全局' : '项目：' + (state.workspaceNames.get(fact.workspace_id) || fact.workspace_id); }
+function buildMemoryManagement(state) {
+  const area = memoryNode('section', 'memory-management');
+  const label = memoryNode('label', 'memory-scope-label', '查看范围'); const select = memoryNode('select', 'memory-scope-select luna-input'); select.setAttribute('aria-label', '记忆范围'); select.value = 'all'; state.scopeSelect = select;
+  label.append(select); area.append(label, memoryButton('刷新', 'memory-refresh', () => load(state), state), memoryButton('导出当前范围', 'memory-export', () => exportMemory(state), state));
+  select.addEventListener('change', () => { if (state.busy || state.editing) return; state.scopeValue = select.value; load(state); });
+  const add = memoryNode('form', 'memory-add-form'); const text = memoryNode('textarea', 'memory-add-text luna-input'); text.rows = 2; text.maxLength = 500; text.value = ''; text.setAttribute('aria-label', '新记忆内容'); text.placeholder = '添加一条长期有效的偏好或项目知识'; state.addText = text;
+  const addButton = memoryNode('button', 'memory-add-button luna-button'); addButton.type = 'submit'; state.addButton = addButton; add.append(text, addButton); area.append(add);
+  add.addEventListener('submit', event => { event.preventDefault(); const project = state.scopeValue.startsWith('project:'); mutateMemory(state, '/api/memory/add', { text: text.value, scope: project ? 'project' : 'global', ...(project ? { workspace_id: state.scopeValue.slice(8) } : {}) }); });
+  const editor = memoryNode('form', 'memory-edit-form'); editor.hidden = true; state.editForm = editor;
+  state.editBefore = memoryNode('p', 'memory-edit-before'); state.editText = memoryNode('textarea', 'memory-edit-text luna-input'); state.editText.rows = 3; state.editText.maxLength = 500; state.editText.setAttribute('aria-label', '纠正后的记忆内容');
+  const save = memoryNode('button', 'memory-edit-save luna-button', '保存纠错（保留原文）'); save.type = 'submit';
+  editor.append(state.editBefore, state.editText, save, memoryButton('取消', 'memory-edit-cancel', () => { state.editing = null; editor.hidden = true; drawMemoryManagement(state); }, state));
+  editor.addEventListener('submit', event => { event.preventDefault(); if (state.editing) mutateMemory(state, '/api/memory/correct', { ref: state.editing.ref, text: state.editText.value, reason: '用户纠错' }); });
+  state.restoreBox = memoryNode('div', 'memory-restore-box'); state.restoreBox.hidden = true;
+  state.historyGroup = memoryNode('details', 'memory-history-group'); state.historyGroup.hidden = true;
+  state.exportBox = memoryNode('section', 'memory-export-box'); state.exportBox.hidden = true;
+  return area;
+}
+function drawMemoryManagement(state) {
+  if (!state.scopeSelect || !state.live) return;
+  const options = new Map([['all', '全部记忆（用户视图）'], ['global', '全局偏好']]);
+  for (const [id, name] of state.workspaceNames) options.set('project:' + id, '项目：' + name);
+  for (const item of state.scopes) if (item.scope === 'project' && !options.has('project:' + item.workspace_id)) options.set('project:' + item.workspace_id, '项目：' + item.workspace_id);
+  if (!options.has(state.scopeValue)) options.set(state.scopeValue, state.scopeValue);
+  const key = JSON.stringify([...options]); if (key !== state.scopeOptionsKey) { state.scopeOptionsKey = key; state.scopeSelect.replaceChildren(); for (const [value, label] of options) { const option = memoryNode('option', '', label); option.value = value; state.scopeSelect.append(option); } state.scopeSelect.value = state.scopeValue; }
+  state.scopeSelect.disabled = state.busy || Boolean(state.editing); state.addButton.disabled = state.busy || state.loading || state.stale; state.addButton.textContent = state.scopeValue.startsWith('project:') ? '添加项目记忆' : '添加全局记忆'; state.editForm.inert = state.busy || state.loading;
+  state.historyGroup.replaceChildren(memoryNode('summary', '', '纠错与恢复历史 · ' + state.changes.length)); state.historyGroup.hidden = state.changes.length === 0;
+  for (const change of state.changes) { const before = change.before || {}, after = change.after || {}; const row = memoryNode('div', 'memory-history-row'); row.append(memoryNode('p', 'memory-panel-meta', joinMeta([scopeLabel(state, after), change.origin?.kind === 'model' ? '模型修订' : '用户修订', before.source_session ? '原来源会话 ' + before.source_session : '', change.origin?.session_id ? '修订会话 ' + change.origin.session_id : '', whenOf(after.at)])), memoryNode('p', '', '原内容：' + textOf(before.text)), memoryNode('p', '', '新内容：' + textOf(after.text))); if (change.origin?.reason) row.append(memoryNode('p', 'memory-panel-meta', change.origin.reason)); if (before.ref) row.append(memoryButton('恢复原内容', 'memory-history-restore', () => confirmMemoryRestore(state, before), state)); state.historyGroup.append(row); }
+}
+function editMemory(state, fact) { if (state.busy || state.loading || state.stale) return; state.editing = { ...fact }; state.editBefore.textContent = joinMeta([scopeLabel(state, fact), '原内容：' + textOf(fact.text)]); state.editText.value = textOf(fact.text); state.editForm.hidden = false; state.restoreBox.hidden = true; drawMemoryManagement(state); state.editText.focus(); }
+function confirmMemoryRestore(state, source) {
+  if (state.busy || state.loading || state.stale) return;
+  const current = state.facts.find(fact => fact.lineage === source.lineage); if (current?.ref === source.ref) { setStatus(state, '这已经是当前生效内容。', ''); return; }
+  state.restoreBox.replaceChildren(memoryNode('p', '', '恢复为：' + textOf(source.text)), memoryButton('确认恢复（生成新记录）', 'memory-restore-confirm', () => mutateMemory(state, '/api/memory/restore', { ref: source.ref, expected_ref: current?.ref || '', reason: '用户恢复历史内容' }), state), memoryButton('取消', 'memory-restore-cancel', () => { state.restoreBox.hidden = true; }, state)); state.restoreBox.hidden = false;
+}
+async function loadMemoryWorkspaces(state) {
+  const controller = new AbortController(); state.workspaceController = controller; state.workspaceTimer = setTimeout(() => controller.abort(), 15000);
+  try { const response = await fetch('/api/workspaces', { signal: controller.signal }); if (!response.ok) return; const payload = await response.json(); if (!state.live || controller.signal.aborted) return; state.workspaceNames = new Map((payload.workspaces || []).map(item => [item.id, item.name || item.id])); drawMemoryManagement(state); }
+  catch (_) { /* 项目名称不可用时仍显示已有项目标识，不影响记忆内容。 */ }
+  finally { clearTimeout(state.workspaceTimer); }
+}
+async function exportMemory(state) {
+  if (state.busy || state.loading || state.stale) return;
+  state.exportBox.replaceChildren(memoryNode('p', 'memory-panel-meta', '导出内容包含私人记忆，分享前请自行检查。')); const data = { scope: state.scopeValue, facts: state.facts, retracted: state.retracted, changes: state.changes }; const text = memoryNode('textarea', 'memory-export-text luna-input'); text.rows = 12; text.readOnly = true; text.value = JSON.stringify(data, null, 2); text.setAttribute('aria-label', '当前记忆范围导出'); state.exportBox.append(text); state.exportBox.hidden = false;
 }
