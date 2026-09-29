@@ -89,14 +89,14 @@ func (f *fixture) breakSettings(t *testing.T) {
 // call runs the tool in a run whose working directory is this fixture's.
 func (f *fixture) call(t *testing.T, arguments string) (string, error) {
 	t.Helper()
-	return f.tool.Invoke(plugin.WithRoots(context.Background(), []string{f.root}), arguments)
+	return f.tool.Invoke(plugin.WithRoots(allowedWriteContext(), []string{f.root}), arguments)
 }
 
 // callIn runs the tool in a run whose working directories are exactly these; an
 // empty (but non-nil) list is a run with no working directory at all.
 func (f *fixture) callIn(t *testing.T, roots []string, arguments string) (string, error) {
 	t.Helper()
-	return f.tool.Invoke(plugin.WithRoots(context.Background(), roots), arguments)
+	return f.tool.Invoke(plugin.WithRoots(allowedWriteContext(), roots), arguments)
 }
 
 // write puts a file under the working directory, creating its directory, and
@@ -893,4 +893,9 @@ func TestASettingsFileThatIsNotConfiguredRefusesAndSaysWhere(t *testing.T) {
 	if !strings.Contains(err.Error(), "no directory has been allowed") || !strings.Contains(err.Error(), "setting") {
 		t.Fatalf("refusal=%q, want it to point at the settings page", err)
 	}
+}
+
+func allowedWriteContext() context.Context {
+	p := plugin.AccessPolicy{Read: plugin.DecisionAllow, Write: plugin.DecisionAllow, Network: plugin.DecisionDeny, Exec: plugin.DecisionDeny}
+	return plugin.WithRun(context.Background(), plugin.RunInfo{Permissions: &p})
 }

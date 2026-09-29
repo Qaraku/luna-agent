@@ -90,7 +90,7 @@ func decodeOne(arguments string, into any) error {
 // failure of the round: the model supplied the name and the path and can correct
 // both. Nothing is ever truncated — a skill whose file is over the limit, or one
 // that is not text, is refused with the reason instead.
-func (t *SkillViewTool) Invoke(_ context.Context, arguments string) (string, error) {
+func (t *SkillViewTool) Invoke(ctx context.Context, arguments string) (string, error) {
 	var in struct {
 		Name string `json:"name"`
 		Path string `json:"path"`
@@ -101,6 +101,9 @@ func (t *SkillViewTool) Invoke(_ context.Context, arguments string) (string, err
 	name := strings.TrimSpace(in.Name)
 	if name == "" {
 		return "", errors.New("name is required")
+	}
+	if err := plugin.CheckAccess(ctx, plugin.AccessRead); err != nil {
+		return "", err
 	}
 	// A skill the user turned off is refused by name, not reported as never
 	// discovered: "there is no such skill" would be a false statement about
@@ -128,6 +131,9 @@ func (t *SkillViewTool) Invoke(_ context.Context, arguments string) (string, err
 	// Reading is fileread's job too: the size cap after the bytes were actually
 	// read, the NUL check and the regular-file check live in one place, and a
 	// growth between validation and read is caught there rather than here.
+	if err := plugin.RequireAccess(ctx, plugin.AccessRequest{Tool: t.Name(), Summary: "read an installed skill file", Target: resolved, ReadRoots: []string{dir}, Permissions: []plugin.AccessKind{plugin.AccessRead}, ParametersDigest: plugin.AccessDigest(arguments)}); err != nil {
+		return "", err
+	}
 	text, err := fileread.Read(resolved, t.limit)
 	if err != nil {
 		return "", err

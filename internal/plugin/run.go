@@ -10,6 +10,14 @@ import "context"
 type RunInfo struct {
 	RunID     string
 	SessionID string
+	// ExecutionMode 来自宿主授权快照，不接受模型参数或未经核准的持久化字段。
+	ExecutionMode ExecutionMode
+	// Permissions 与 Approve 只来自宿主运行快照，不从工具参数或会话文件直接恢复。
+	Permissions *AccessPolicy
+	// AutomaticWriteDirs 是宿主在准入时读取的自动写入范围，不由模型参数设置。
+	AutomaticWriteDirs []string
+	WriteScopeError    string
+	Approve            ApprovalFunc
 }
 
 type runInfoKey struct{}

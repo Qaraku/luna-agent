@@ -66,7 +66,14 @@ type RunRequest struct {
 	SessionID string
 	Message   string
 	Model     string
-	Sink      Sink
+	// ReasoningEffort 为 nil 时继承全局，指向空字符串时明确不发送思考字段。
+	ReasoningEffort    *string
+	ExecutionMode      plugin.ExecutionMode
+	Permissions        *plugin.AccessPolicy
+	AutomaticWriteDirs []string
+	WriteScopeError    string
+	Approve            plugin.ApprovalFunc
+	Sink               Sink
 	// Roots are the directories this run works in — the directories of the
 	// workspace its session is bound to — in the order the file tools try them.
 	// They are resolved by the caller, from the session's own configuration,
@@ -199,17 +206,11 @@ type AssistantReasoning struct {
 	Text string `json:"text"`
 }
 
-// UsageUpdated reports what one model call cost, when the provider reports it at
-// all. Nothing in the runtime depends on it: a provider that stays silent simply
-// produces no such event, and tokens the runtime was not told about are never
-// estimated.
+// UsageUpdated 是本轮累计快照；客户端按 run_id 替换，不能把事件再次相加。
 type UsageUpdated struct {
-	RunID           string `json:"run_id"`
-	InputTokens     int    `json:"input_tokens"`
-	OutputTokens    int    `json:"output_tokens"`
-	TotalTokens     int    `json:"total_tokens"`
-	CachedTokens    int    `json:"cached_tokens,omitempty"`
-	ReasoningTokens int    `json:"reasoning_tokens,omitempty"`
+	RunID string `json:"run_id"`
+	Scope string `json:"scope"`
+	store.Usage
 }
 
 const (
@@ -312,31 +313,6 @@ func callDurationMS(startedAt time.Time) int64 { return time.Since(startedAt).Mi
 func stopCall(ctx context.Context, name string, reason error, out pluginhost.Output, startedAt time.Time) (string, error) {
 	emit(ctx, Event{Type: "tool.failed", Data: ToolFailed{RunID: runID(ctx), Name: name, Error: reason.Error(), DurationMS: callDurationMS(startedAt), Generation: out.Generation, Version: out.Version, PluginPID: out.PluginPID}})
 	return "", reason
-}
-
-// emitUsage forwards a usage block one model call reported. Providers differ:
-// the OpenAI-compatible path asks for it with StreamOptions.IncludeUsage, and a
-// provider that reports nothing produces no event rather than zeros.
-func emitUsage(ctx context.Context, runID string, usage *schema.TokenUsage) {
-	if usage == nil {
-		return
-	}
-	emit(ctx, Event{Type: "usage.updated", Data: UsageUpdated{
-		RunID:           runID,
-		InputTokens:     usage.PromptTokens,
-		OutputTokens:    usage.CompletionTokens,
-		TotalTokens:     usage.TotalTokens,
-		CachedTokens:    usage.PromptTokenDetails.CachedTokens,
-		ReasoningTokens: usage.CompletionTokensDetails.ReasoningTokens,
-	}})
-}
-
-// emitMessageUsage is emitUsage for a call that arrived whole.
-func emitMessageUsage(ctx context.Context, runID string, message *schema.Message) {
-	if message == nil || message.ResponseMeta == nil {
-		return
-	}
-	emitUsage(ctx, runID, message.ResponseMeta.Usage)
 }
 
 // FileTools is the host-side file capability the core's plugin-backed file tools
@@ -489,6 +465,12 @@ func (t *ReadFileTool) InvokableRun(ctx context.Context, arguments string, _ ...
 	}
 	// The requested path is passed through unchanged: the host resolves and
 	// validates it against the read root before any plugin sees it.
+	if err := plugin.RequireAccess(ctx, plugin.AccessRequest{Tool: ReadFileToolName, Summary: "read project files", Target: in.Path, ReadRoots: roots(ctx), Permissions: []plugin.AccessKind{plugin.AccessRead}, ParametersDigest: plugin.AccessDigest(arguments)}); err != nil {
+		if stopped := ctx.Err(); stopped != nil {
+			return stopCall(ctx, ReadFileToolName, stopped, pluginhost.Output{}, startedAt)
+		}
+		return refuse(ctx, ReadFileToolName, pluginhost.Output{}, err, startedAt)
+	}
 	out, err := t.reader.ReadFile(ctx, pluginhost.ReadRequest{Path: in.Path, Roots: roots(ctx), StartLine: in.StartLine, MaxLines: in.MaxLines})
 	if err != nil {
 		if stopped := ctx.Err(); stopped != nil {
@@ -574,6 +556,12 @@ func (t *ListDirTool) InvokableRun(ctx context.Context, arguments string, _ ...t
 	}
 	// As with a read, the requested path is passed through unchanged: the host
 	// resolves and validates it against the read root before any plugin sees it.
+	if err := plugin.RequireAccess(ctx, plugin.AccessRequest{Tool: ListDirToolName, Summary: "read project files", Target: in.Path, ReadRoots: roots(ctx), Permissions: []plugin.AccessKind{plugin.AccessRead}, ParametersDigest: plugin.AccessDigest(arguments)}); err != nil {
+		if stopped := ctx.Err(); stopped != nil {
+			return stopCall(ctx, ListDirToolName, stopped, pluginhost.Output{}, startedAt)
+		}
+		return refuse(ctx, ListDirToolName, pluginhost.Output{}, err, startedAt)
+	}
 	out, err := t.lister.ListDir(ctx, pluginhost.ListRequest{Path: in.Path, Depth: depth, Roots: roots(ctx)})
 	if err != nil {
 		if stopped := ctx.Err(); stopped != nil {
@@ -665,6 +653,12 @@ func (t *SearchFilesTool) InvokableRun(ctx context.Context, arguments string, _ 
 	// unknown mode is refused by the host by name, so the wrapper does not
 	// substitute the default for it here — a call that asked for a mode the
 	// search does not have is answered as a refusal, never as a literal search.
+	if err := plugin.RequireAccess(ctx, plugin.AccessRequest{Tool: SearchFilesToolName, Summary: "read project files", Target: in.Path, ReadRoots: roots(ctx), Permissions: []plugin.AccessKind{plugin.AccessRead}, ParametersDigest: plugin.AccessDigest(arguments)}); err != nil {
+		if stopped := ctx.Err(); stopped != nil {
+			return stopCall(ctx, SearchFilesToolName, stopped, pluginhost.Output{}, startedAt)
+		}
+		return refuse(ctx, SearchFilesToolName, pluginhost.Output{}, err, startedAt)
+	}
 	out, err := t.searcher.SearchFiles(ctx, pluginhost.SearchRequest{Path: in.Path, Query: in.Query, Mode: in.Mode, Roots: roots(ctx)})
 	if err != nil {
 		if stopped := ctx.Err(); stopped != nil {
@@ -741,6 +735,12 @@ func (t *FindFilesTool) InvokableRun(ctx context.Context, arguments string, _ ..
 	// passed through unchanged: the host resolves and validates it against the
 	// roots of this run before any plugin sees it, and the pattern is validated
 	// there too.
+	if err := plugin.RequireAccess(ctx, plugin.AccessRequest{Tool: FindFilesToolName, Summary: "read project files", Target: in.Path, ReadRoots: roots(ctx), Permissions: []plugin.AccessKind{plugin.AccessRead}, ParametersDigest: plugin.AccessDigest(arguments)}); err != nil {
+		if stopped := ctx.Err(); stopped != nil {
+			return stopCall(ctx, FindFilesToolName, stopped, pluginhost.Output{}, startedAt)
+		}
+		return refuse(ctx, FindFilesToolName, pluginhost.Output{}, err, startedAt)
+	}
 	out, err := t.finder.FindFiles(ctx, pluginhost.FindRequest{Path: in.Path, Pattern: in.Pattern, Roots: roots(ctx)})
 	if err != nil {
 		if stopped := ctx.Err(); stopped != nil {
@@ -798,6 +798,8 @@ type Runner struct {
 	files    FileTools
 	// cfg is the model list a run may be sent to, its default first.
 	cfg config.Config
+	// baseConfig 保留无 ProviderSource 时的全局值，不能被某会话覆盖污染。
+	baseConfig config.Config
 	// source is where the current provider is read from, when one was supplied.
 	// With it, a provider saved while this process runs is used by the next run
 	// without a restart; without it, cfg is what the runner was built with and
@@ -858,16 +860,17 @@ func WithProviderSource(src ProviderSource) Option { return func(r *Runner) { r.
 // configSignature is everything about a configuration that the built agent and
 // its clients depend on. It exists so "the provider changed" is one comparison
 // instead of a list of fields at every call site, and so a change that does not
-// matter (a reasoning level, say — which is read per request, not baked into the
-// client) does not throw away a working agent.
+// matter does not throw away a working agent. 思考档位在客户端构造时固定，
+// 因而也必须纳入签名，否则会话切换档位只会改变界面而不改变请求。
 type configSignature struct {
-	provider      string
-	baseURL       string
-	apiKey        string
-	model         string
-	models        []string
-	maxIterations int
-	runTimeout    time.Duration
+	provider        string
+	baseURL         string
+	apiKey          string
+	model           string
+	reasoningEffort string
+	models          []string
+	maxIterations   int
+	runTimeout      time.Duration
 }
 
 // signatureOf reduces a configuration to the parts a built agent and its clients
@@ -881,11 +884,11 @@ func signatureOf(cfg config.Config) configSignature {
 			provider = entry.Provider
 		}
 	}
-	return configSignature{provider: provider, baseURL: cfg.BaseURL, apiKey: cfg.APIKey, model: cfg.Model, models: models, maxIterations: cfg.MaxIterations, runTimeout: cfg.RunTimeout}
+	return configSignature{provider: provider, baseURL: cfg.BaseURL, apiKey: cfg.APIKey, model: cfg.Model, reasoningEffort: cfg.ReasoningEffort, models: models, maxIterations: cfg.MaxIterations, runTimeout: cfg.RunTimeout}
 }
 
 func (s configSignature) same(other configSignature) bool {
-	return s.provider == other.provider && s.baseURL == other.baseURL && s.apiKey == other.apiKey && s.model == other.model &&
+	return s.provider == other.provider && s.baseURL == other.baseURL && s.apiKey == other.apiKey && s.model == other.model && s.reasoningEffort == other.reasoningEffort &&
 		s.maxIterations == other.maxIterations && s.runTimeout == other.runTimeout && slices.Equal(s.models, other.models)
 }
 
@@ -956,6 +959,7 @@ func NewRunner(ctx context.Context, m model.ToolCallingChatModel, invoker Invoke
 	if r.maxIterations <= 0 {
 		r.maxIterations = DefaultMaxIterations
 	}
+	r.baseConfig = r.cfg
 	if err := r.build(m, r.defaultModelName()); err != nil {
 		return nil, err
 	}
@@ -1132,24 +1136,33 @@ func (r *Runner) currentRevision() uint64 {
 // An unknown model name is reported here, which fails the run. It is not
 // silently replaced by the default: the user would be answered by a model they
 // did not choose, and nothing in the answer says so.
-func (r *Runner) agentForRun(name string) (*adk.Runner, error) {
+func (r *Runner) agentForRun(name string, reasoning *string) (*adk.Runner, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	cfg := r.baseConfig
 	if r.source != nil {
-		cfg, err := r.source.Current()
+		var err error
+		cfg, err = r.source.Current()
 		if err != nil {
 			return nil, fmt.Errorf("read the configured provider: %w", err)
 		}
 		if len(cfg.Missing) > 0 {
 			return nil, missingProviderError(cfg.Missing)
 		}
-		// Adopting only on a real change keeps a working agent: rebuilding on
-		// every run would throw away the client cache and the built tool set for
-		// nothing, and the configuration is re-read on every run regardless.
-		if !r.built || !signatureOf(cfg).same(r.sig) {
-			if err := r.adopt(cfg); err != nil {
-				return nil, err
-			}
+	}
+	if reasoning != nil {
+		selected, err := config.ParseReasoningEffort(*reasoning)
+		if err != nil {
+			return nil, err
+		}
+		cfg.ReasoningEffort = selected
+	}
+	if r.clientFor == nil && reasoning != nil {
+		return nil, errors.New("this runner cannot change reasoning without a client factory")
+	}
+	if r.clientFor != nil && (!r.built || !signatureOf(cfg).same(r.sig)) {
+		if err := r.adopt(cfg); err != nil {
+			return nil, err
 		}
 	}
 	m, resolved, err := r.modelForRun(name)
@@ -1312,11 +1325,11 @@ func (r *Runner) appendMessage(req RunRequest, role, text string, at time.Time) 
 	return nil
 }
 
-func (r *Runner) appendRun(req RunRequest, startedAt time.Time, status string) error {
+func (r *Runner) appendRun(req RunRequest, startedAt time.Time, status string, usage *store.Usage) error {
 	if r.transcript == nil || req.SessionID == "" {
 		return nil
 	}
-	if err := r.transcript.AppendRun(req.SessionID, store.RunRecord{RunID: req.RunID, StartedAt: startedAt, EndedAt: time.Now(), Status: status}); err != nil {
+	if err := r.transcript.AppendRun(req.SessionID, store.RunRecord{RunID: req.RunID, StartedAt: startedAt, EndedAt: time.Now(), Status: status, Usage: usage}); err != nil {
 		return fmt.Errorf("persist run record: %w", err)
 	}
 	return nil
@@ -1324,14 +1337,22 @@ func (r *Runner) appendRun(req RunRequest, startedAt time.Time, status string) e
 
 func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err error) {
 	startedAt := time.Now()
+	usage := &runUsage{}
 	recorder := newRecorder(req.Sink, r.transcript, req.SessionID, req.RunID)
 	// The run identity travels in the context so a capability's tools can
 	// attribute what they store without being handed the session themselves.
-	ctx := plugin.WithRun(WithRoots(WithRun(parent, req.RunID, recorder), req.Roots), plugin.RunInfo{RunID: req.RunID, SessionID: req.SessionID})
+	permissions := plugin.DefaultAccessPolicy()
+	if req.Permissions != nil {
+		permissions = *req.Permissions
+	}
+	if !permissions.Valid() {
+		return "", fmt.Errorf("invalid run permission policy")
+	}
+	ctx := plugin.WithRun(WithRoots(WithRun(parent, req.RunID, recorder), req.Roots), plugin.RunInfo{RunID: req.RunID, SessionID: req.SessionID, ExecutionMode: req.ExecutionMode, Permissions: &permissions, AutomaticWriteDirs: append([]string{}, req.AutomaticWriteDirs...), WriteScopeError: req.WriteScopeError, Approve: req.Approve})
 	emit(ctx, Event{Type: "run.started", Data: RunStarted{RunID: req.RunID, SessionID: req.SessionID}})
 	defer func() {
 		status := runStatus(err)
-		if appendErr := r.appendRun(req, startedAt, status); appendErr != nil && err == nil {
+		if appendErr := r.appendRun(req, startedAt, status, usage.emit(ctx, req.RunID, err == nil)); appendErr != nil && err == nil {
 			// The run itself succeeded but its transcript entry did not: the
 			// run is reported as failed rather than as a success that cannot
 			// survive a restart.
@@ -1352,7 +1373,7 @@ func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err
 	// The agent is resolved once per run: a capability toggled or a model chosen
 	// since the last run is built into this one, and this run keeps the agent it
 	// started with even if either changes again while it is in flight.
-	agentRunner, err := r.agentForRun(req.Model)
+	agentRunner, err := r.agentForRun(req.Model, req.ReasoningEffort)
 	if err != nil {
 		return "", err
 	}
@@ -1382,6 +1403,7 @@ func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err
 			continue
 		}
 		if mv.IsStreaming {
+			usage.begin()
 			// There is deliberately no model.started event here. The stream
 			// handle is not a reliable ordering point: Eino hands the model
 			// stream to two consumers through Copy(2) — this loop and the
@@ -1429,16 +1451,21 @@ func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err
 				if chunk.ReasoningContent != "" {
 					emit(ctx, Event{Type: "assistant.reasoning", Data: AssistantReasoning{Text: chunk.ReasoningContent}})
 				}
-				if usage := chunk.ResponseMeta; usage != nil {
-					emitUsage(ctx, req.RunID, usage.Usage)
+				if meta := chunk.ResponseMeta; meta != nil {
+					usage.observe(meta.Usage)
 				}
 			}
 			sr.Close()
+			usage.finish(ctx, req.RunID)
 			if !hasToolCalls {
 				b.WriteString(turn.String())
 			}
 		} else if mv.Message != nil {
-			emitMessageUsage(ctx, req.RunID, mv.Message)
+			usage.begin()
+			if mv.Message.ResponseMeta != nil {
+				usage.observe(mv.Message.ResponseMeta.Usage)
+			}
+			usage.finish(ctx, req.RunID)
 			if mv.Message.ReasoningContent != "" {
 				emit(ctx, Event{Type: "assistant.reasoning", Data: AssistantReasoning{Text: mv.Message.ReasoningContent}})
 			}

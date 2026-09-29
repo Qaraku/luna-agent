@@ -31,8 +31,8 @@ type Plugin struct{ tool *WriteTool }
 // New binds the capability to the settings file the user's own choices live in.
 // settingsPath is a host path, resolved by the composition root; an empty one is
 // not an error here, because it means the same thing the file's absence means —
-// no directory has been allowed, so nothing may be written — and that answer
-// comes from the tool itself, in the words a model can act on.
+// no automatic directory has been configured; project writes require one-time
+// scope approval. Formal runs use the host-provided directory snapshot.
 func New(settingsPath string) *Plugin { return &Plugin{tool: NewWriteTool(settingsPath)} }
 
 // Descriptor declares exactly what this capability exposes. The registry checks

@@ -14,7 +14,7 @@ import (
 // — with the grant the descriptor is honest and accepted, without it the same descriptor
 // is refused.
 func TestTheExecDescriptorRegistersWithTheGrant(t *testing.T) {
-	registry := plugin.NewRegistry(plugin.PermissionProcessExec)
+	registry := plugin.NewRegistry(plugin.PermissionProcessExec, plugin.PermissionFilesystemWrite, plugin.PermissionNetworkFetch)
 	if err := registry.Register(terminal.New()); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -25,10 +25,10 @@ func TestTheExecDescriptorRegistersWithTheGrant(t *testing.T) {
 	if entry.State != plugin.StateRegistered || entry.Err != nil {
 		t.Fatalf("entry = %+v", entry)
 	}
-	if len(entry.Descriptor.Permissions) != 1 || entry.Descriptor.Permissions[0].Kind != plugin.PermissionProcessExec {
+	if len(entry.Descriptor.Permissions) != 3 || entry.Descriptor.Permissions[0].Kind != plugin.PermissionProcessExec {
 		t.Fatalf("permissions = %+v", entry.Descriptor.Permissions)
 	}
-	if grants := registry.Grants(); len(grants) != 1 || grants[0] != plugin.PermissionProcessExec {
+	if grants := registry.Grants(); len(grants) != 3 {
 		t.Fatalf("grants = %v", grants)
 	}
 }
@@ -49,5 +49,24 @@ func TestTheExecDescriptorIsRejectedWithoutTheGrant(t *testing.T) {
 	}
 	if entries := registry.Entries(); len(entries) != 0 {
 		t.Fatalf("Entries = %d, want 0", len(entries))
+	}
+}
+
+func TestTerminalRequiresEveryDeclaredMachinePermission(t *testing.T) {
+	all := []plugin.PermissionKind{plugin.PermissionProcessExec, plugin.PermissionFilesystemWrite, plugin.PermissionNetworkFetch}
+	for _, missing := range all {
+		var grants []plugin.PermissionKind
+		for _, kind := range all {
+			if kind != missing {
+				grants = append(grants, kind)
+			}
+		}
+		reg := plugin.NewRegistry(grants...)
+		if err := reg.Register(terminal.New()); err == nil || !strings.Contains(err.Error(), string(missing)) {
+			t.Fatalf("missing %s: %v", missing, err)
+		}
+		if len(reg.Entries()) != 0 {
+			t.Fatal("partial capability registered")
+		}
 	}
 }

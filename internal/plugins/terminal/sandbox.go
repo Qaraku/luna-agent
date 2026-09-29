@@ -1,6 +1,7 @@
 package terminal
 
 import (
+	"github.com/Qaraku/luna-agent/internal/netbridge"
 	"io"
 	"os"
 	"os/exec"
@@ -15,12 +16,24 @@ const sandboxScratchBytes = 512 << 20
 // child-pid 并不代表挂载已完成，不能拿 Bubblewrap 的进程状态替代这个确认。
 const sandboxBootstrap = "printf 'luna-sandbox-ready\\n' >&3 || exit 125; exec 3>&- 4>&-; exec /bin/sh -c \"$1\""
 
+type sandboxAccess struct {
+	Read       bool
+	WriteRoots []string
+	Network    bool
+	Dial       netbridge.DialFunc
+}
+
 type isolatedCommand struct {
+	networkFile                      *os.File
+	stopNetwork                      func()
 	cmd                              *exec.Cmd
 	readyReader, readyWriter, filter *os.File
 }
 
 func (s *isolatedCommand) closeParentFiles() {
+	if s.networkFile != nil {
+		s.networkFile.Close()
+	}
 	if s.readyWriter != nil {
 		_ = s.readyWriter.Close()
 	}
@@ -30,6 +43,9 @@ func (s *isolatedCommand) closeParentFiles() {
 }
 func (s *isolatedCommand) close() {
 	s.closeParentFiles()
+	if s.stopNetwork != nil {
+		s.stopNetwork()
+	}
 	if s.readyReader != nil {
 		_ = s.readyReader.Close()
 	}

@@ -203,7 +203,7 @@ func TestTheProductRulesRefuseLoopbackBeforeAnyRequestIsMade(t *testing.T) {
 
 	tool := NewFetchTool()
 	for _, target := range []string{server.URL + "/page", "http://localhost:1/page", "http://10.0.0.1/page", "http://[::1]:1/page"} {
-		got, err := tool.Invoke(context.Background(), args(t, map[string]any{"url": target}))
+		got, err := tool.Invoke(allowedFetchContext(context.Background()), args(t, map[string]any{"url": target}))
 		refused(t, got, err, "only public addresses")
 	}
 	if touched {
@@ -228,9 +228,8 @@ func TestTheDialCheckStepsAsideWhenTheRequestGoesThroughAProxy(t *testing.T) {
 		t.Fatalf("parse the proxy address: %v", err)
 	}
 
-	// 192.0.2.10 is TEST-NET-1: public as far as this tool's policy is concerned, and it is
-	// never dialled by this process — the proxy is the one that connects.
-	const target = "http://192.0.2.10/page"
+	// 目标使用公共 IP 的字面量；测试代理直接应答，不拨号到该地址。
+	const target = "http://8.8.8.8/page"
 	rules := fetchRules{
 		addresses: publicAddresses,
 		// The dial layer judges loopback, and the proxy is on loopback: this is the
@@ -241,7 +240,7 @@ func TestTheDialCheckStepsAsideWhenTheRequestGoesThroughAProxy(t *testing.T) {
 	}
 	tool := newFetchTool(newClient(rules), rules)
 
-	got, err := tool.Invoke(context.Background(), args(t, map[string]any{"url": target}))
+	got, err := tool.Invoke(allowedFetchContext(context.Background()), args(t, map[string]any{"url": target}))
 	if err != nil {
 		t.Fatalf("a fetch through a proxy was refused: %v", err)
 	}
@@ -272,7 +271,7 @@ func TestTheDialCheckRefusesALoopbackTargetWhenThereIsNoProxy(t *testing.T) {
 		timeout:   testFetchTimeout,
 	}
 	tool := newFetchTool(newClient(rules), rules)
-	got, err := tool.Invoke(context.Background(), args(t, map[string]any{"url": server.URL + "/page"}))
+	got, err := tool.Invoke(allowedFetchContext(context.Background()), args(t, map[string]any{"url": server.URL + "/page"}))
 	refused(t, got, err, "loopback", "only public addresses")
 }
 
@@ -298,7 +297,7 @@ func TestTheDialCheckCatchesANameThatResolvesToLoopback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("split the server address: %v", err)
 	}
-	got, err := tool.Invoke(context.Background(), args(t, map[string]any{"url": "http://localhost:" + port + "/page"}))
+	got, err := tool.Invoke(allowedFetchContext(context.Background()), args(t, map[string]any{"url": "http://localhost:" + port + "/page"}))
 	refused(t, got, err, "loopback", "only public addresses")
 }
 
@@ -320,7 +319,7 @@ func TestFetchReturnsTheContextErrorWhenTheRunIsCancelled(t *testing.T) {
 		time.Sleep(150 * time.Millisecond)
 		cancel()
 	}()
-	_, err := tool.Invoke(ctx, args(t, map[string]any{"url": server.URL}))
+	_, err := tool.Invoke(allowedFetchContext(ctx), args(t, map[string]any{"url": server.URL}))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}

@@ -3,9 +3,12 @@
 package terminal
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/Qaraku/luna-agent/internal/netbridge"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -66,12 +69,38 @@ func sandboxRoots(roots []string) ([]string, error) {
 }
 
 func prepareSandbox(executable string, roots []string, cwd, command string) (*isolatedCommand, error) {
-	mounted, err := sandboxRoots(roots)
+	return prepareSandboxWithAccess(context.Background(), executable, roots, cwd, command, sandboxAccess{Read: true})
+}
+
+func prepareSandboxWithAccess(ctx context.Context, executable string, roots []string, cwd, command string, access sandboxAccess) (*isolatedCommand, error) {
+	var mounted []string
+	var err error
+	if access.Read {
+		mounted, err = sandboxRoots(roots)
+	}
 	if err != nil {
 		return nil, err
 	}
 	if executable == "" {
 		executable = sandboxExecutable
+	}
+	var writable []string
+	for _, root := range access.WriteRoots {
+		resolved, err := fileread.ResolveDirInRoots([]string{root}, ".")
+		if err != nil {
+			return nil, err
+		}
+		contained := false
+		for _, base := range mounted {
+			if fileread.Within(base, resolved.Path) {
+				contained = true
+				break
+			}
+		}
+		if !contained {
+			return nil, fmt.Errorf("writable mount must remain inside this command's readable project roots")
+		}
+		writable = append(writable, resolved.Path)
 	}
 	filter, err := sandboxFilter()
 	if err != nil {
@@ -82,6 +111,7 @@ func prepareSandbox(executable string, roots []string, cwd, command string) (*is
 		filter.Close()
 		return nil, plugin.Unavailable(fmt.Errorf("prepare terminal isolation status: %w", err))
 	}
+	isolation := &isolatedCommand{readyReader: readyR, readyWriter: readyW, filter: filter}
 	args := []string{
 		"--unshare-all", "--unshare-user", "--disable-userns", "--cap-drop", "ALL",
 		"--new-session", "--die-with-parent", "--clearenv",
@@ -93,16 +123,49 @@ func prepareSandbox(executable string, roots []string, cwd, command string) (*is
 			args = append(args, "--ro-bind", path, path)
 		}
 	}
-	args = append(args, "--proc", "/proc", "--dev", "/dev", "--size", fmt.Sprint(sandboxScratchBytes), "--tmpfs", "/tmp", "--dir", "/tmp/home")
+	args = append(args, "--proc", "/proc", "--dev", "/dev", "--size", fmt.Sprint(sandboxScratchBytes), "--tmpfs", "/tmp", "--dir", "/tmp/home", "--dir", "/tmp/work")
 	for _, path := range mounted {
 		args = append(args, "--ro-bind", path, path)
 	}
-	args = append(args, "--remount-ro", "/proc", "--remount-ro", "/dev", "--remount-ro", "/", "--seccomp", "4", "--chdir", cwd, "--", "/bin/sh", "-c", sandboxBootstrap, "luna-sandbox", command)
+	for _, path := range writable {
+		args = append(args, "--bind", path, path)
+	}
+	bootstrap := sandboxBootstrap
+	extra := []*os.File{readyW, filter}
+	if access.Network {
+		helper, err := os.Executable()
+		if err != nil {
+			isolation.close()
+			return nil, plugin.Unavailable(fmt.Errorf("network helper is unavailable"))
+		}
+		helper, err = filepath.EvalSymlinks(helper)
+		if err != nil {
+			isolation.close()
+			return nil, plugin.Unavailable(fmt.Errorf("network helper is unavailable"))
+		}
+		file, stop, err := startNetworkBridge(ctx, access.Dial)
+		if err != nil {
+			isolation.close()
+			return nil, plugin.Unavailable(err)
+		}
+		isolation.networkFile = file
+		isolation.stopNetwork = stop
+		extra = append(extra, file)
+		args = append(args, "--ro-bind", helper, "/.luna-network-helper")
+		for _, path := range []string{"/etc/ssl/certs", "/etc/ssl/cert.pem", "/etc/pki/tls/certs"} {
+			if _, err := os.Stat(path); err == nil {
+				args = append(args, "--ro-bind", path, path)
+			}
+		}
+		bootstrap = "exec 4>&-; exec /.luna-network-helper --luna-network-helper \"$1\""
+	}
+	args = append(args, "--remount-ro", "/proc", "--remount-ro", "/dev", "--remount-ro", "/", "--seccomp", "4", "--chdir", cwd, "--", "/bin/sh", "-c", bootstrap, "luna-sandbox", command)
 	cmd := exec.Command(executable, args...)
 	cmd.Dir = "/"
 	cmd.Env = commandEnv()
-	cmd.ExtraFiles = []*os.File{readyW, filter}
-	return &isolatedCommand{cmd: cmd, readyReader: readyR, readyWriter: readyW, filter: filter}, nil
+	cmd.ExtraFiles = extra
+	isolation.cmd = cmd
+	return isolation, nil
 }
 
 // 网络 namespace 不阻断通过已挂载路径连接宿主 Unix socket，因此拒绝 AF_UNIX
@@ -143,4 +206,23 @@ func sandboxFilter() (*os.File, error) {
 		return nil, err
 	}
 	return file, nil
+}
+
+func startNetworkBridge(parent context.Context, dial netbridge.DialFunc) (*os.File, func(), error) {
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create isolated network channel: %w", err)
+	}
+	hostFile := os.NewFile(uintptr(pair[0]), "network-host")
+	childFile := os.NewFile(uintptr(pair[1]), "network-child")
+	wire, err := net.FileConn(hostFile)
+	hostFile.Close()
+	if err != nil {
+		childFile.Close()
+		return nil, nil, err
+	}
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() { netbridge.Serve(ctx, wire, dial); close(done) }()
+	return childFile, func() { cancel(); wire.Close(); <-done }, nil
 }

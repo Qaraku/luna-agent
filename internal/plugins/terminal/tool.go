@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Qaraku/luna-agent/internal/netbridge"
 	"io"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -35,13 +37,16 @@ const (
 
 // runDescription 是模型可见的工具描述：说清它跑什么、在哪里跑、边界是什么、什么时候用。
 // 与 internal/plugins/memory/tool.go 的描述同一种语言与口气。
-const runDescription = "Run one shell command using sh -c inside Linux Bubblewrap isolation and report its exit code, duration, cwd, stdout and stderr. Use it for computation, inspecting a project, or tests that fit these boundaries. The directories this session works in are mounted read-only: this tool cannot modify host files, even in allowed write directories; use luna_write_file for authorized text changes. cwd is relative to those working directories, as with the file tools, and defaults to the first available directory. System runtime files are read-only, HOME is private, and only the private /tmp is writable (512 MiB, discarded after the call). The minimal environment is PATH, HOME and TMPDIR; host profiles, credentials and user caches are not inherited. Host networking, host processes and pathname Unix sockets are inaccessible; commands that need those resources will fail. Temporary results are not copied back. timeout_s defaults to 30 seconds, at most 120; stopping the command terminates its sandbox, including descendants. Output is capped across stdout and stderr and reports withheld bytes. If Bubblewrap or the required isolation cannot start, the tool is unavailable: it never falls back to an unrestricted shell. This is not a virtual machine or protection against kernel vulnerabilities or all resource exhaustion."
+const runDescription = "Run one shell command using sh -c under the effective session policy. In sandbox mode, default read=true mounts projects read-only; write=true requests writable write_dirs (relative project directories; defaults to cwd), and network=true requests a private HTTP(S)/CONNECT proxy to public addresses. These flags request permissions, never grant them: denied dimensions refuse, ask pauses for approval before execution. Direct host networking, private/local addresses, pathname Unix sockets and UDP are unavailable. Set read=false and omit cwd to run in private scratch without project mounts. In full_access mode, explicitly authorized by the user, commands run as the host user without filesystem/network isolation; request flags do not narrow that mode. No parameter enables full access and isolation failure never falls back. The minimal environment includes PATH/HOME/TMPDIR, plus private proxy URLs only when network was approved; no model credentials are inherited. Reports exit code, duration, cwd, stdout and stderr. timeout_s starts after approval, defaults to 30 seconds and is capped at 120; output is limited to 32 KiB, stdin is closed. Cancellation terminates the sandbox; native full-access descendants may escape process-group cleanup."
 
 // RunTool 是 luna_run：模型在本次运行的工作目录里执行一条命令的唯一入口。
 //
 // 它不持有跨调用共享的状态，工作目录与超时都来自每次调用；它也不解释路径，cwd 交给
 // fileread 的边界检查。
-type RunTool struct{ sandboxPath string }
+type RunTool struct {
+	sandboxPath string
+	networkDial netbridge.DialFunc
+}
 
 // NewRunTool 建这个工具。
 func NewRunTool() *RunTool { return &RunTool{sandboxPath: sandboxExecutable} }
@@ -54,48 +59,131 @@ func (t *RunTool) Schema() *jsonschema.Schema { return runSchema() }
 
 // runSchema 是工具的公开 schema：一条必填的命令，加两个可选参数。additionalProperties
 // 关闭，所以未声明的参数在触及任何进程之前就被拒绝。
+type commandRequest struct {
+	Command   string   `json:"command" jsonschema_description:"The exact shell command to run; no interactive stdin"`
+	Cwd       string   `json:"cwd,omitempty" jsonschema_description:"Relative project directory; omit when read=false to use private scratch"`
+	TimeoutS  int      `json:"timeout_s,omitempty" jsonschema_description:"Execution budget after approval, default 30 seconds, maximum 120"`
+	Read      *bool    `json:"read,omitempty" jsonschema_description:"Mount project directories read-only by default; false runs in private scratch without project mounts"`
+	Write     bool     `json:"write,omitempty" jsonschema_description:"Request write access to write_dirs or cwd; requires policy permission and any necessary one-time approval"`
+	WriteDirs []string `json:"write_dirs,omitempty" jsonschema_description:"Relative project directories requested writable; default is cwd, maximum 16; requires write=true"`
+	Network   bool     `json:"network,omitempty" jsonschema_description:"Request public HTTP(S)/CONNECT access through a private proxy; no host or private-network access, no direct sockets or UDP"`
+}
+
 func runSchema() *jsonschema.Schema {
-	type args struct {
-		Command  string `json:"command" jsonschema_description:"The one command to run, passed to sh -c inside isolation; a pipeline or a redirection is part of it"`
-		Cwd      string `json:"cwd,omitempty" jsonschema_description:"Where to run it, as a path relative to one of the directories this session works in. Optional: the first of those directories is the default"`
-		TimeoutS int    `json:"timeout_s,omitempty" jsonschema_description:"How many seconds the command may run, 30 by default and 120 at most"`
-	}
 	r := jsonschema.Reflector{DoNotReference: true, AllowAdditionalProperties: false}
-	s := r.Reflect(args{})
+	s := r.Reflect(commandRequest{})
 	s.Required = []string{"command"}
 	return s
 }
 
-// Invoke 执行命令。除了插件侧无法服务这次调用（例如 sh 起不来）的情况，其余失败都是
-// 这次调用的拒绝：模型给错了参数，可以自己纠正，因此不带 plugin.ErrUnavailable 标记。
 func (t *RunTool) Invoke(ctx context.Context, arguments string) (string, error) {
-	var in struct {
-		Command  string `json:"command"`
-		Cwd      string `json:"cwd"`
-		TimeoutS int    `json:"timeout_s"`
-	}
+	var in commandRequest
 	if err := decodeOne(arguments, &in); err != nil {
 		return "", fmt.Errorf("the call is not a single JSON object with the declared parameters: %w", err)
 	}
 	if strings.TrimSpace(in.Command) == "" {
 		return "", errors.New("command is required")
 	}
-	roots := plugin.Roots(ctx)
-	if len(roots) == 0 {
-		// A run with no working directory is a session that names no workspace. The fix
-		// belongs to the user, so the refusal says which control it is instead of only
-		// stating that there is nowhere to run.
-		return "", errors.New("this run works in no directory, so there is nowhere to run a command: this session is not bound to a workspace, and the user binds one on the settings page under 工作区")
+	if len(in.Command) > 16384 {
+		return "", errors.New("command must not exceed 16384 bytes")
 	}
-	dir, err := resolveDir(roots, in.Cwd)
+	mode, err := plugin.ExecutionFor(ctx)
 	if err != nil {
-		return "", err
+		return "", plugin.Unavailable(err)
 	}
+	roots := plugin.Roots(ctx)
 	timeout, err := resolveTimeout(in.TimeoutS)
 	if err != nil {
 		return "", err
 	}
-	return t.run(ctx, roots, dir, in.Command, timeout)
+	if mode == plugin.ExecutionFullAccess {
+		dir, err := resolveHostDir(roots, in.Cwd)
+		if err != nil {
+			return "", err
+		}
+		return t.runNative(ctx, dir, in.Command, timeout)
+	}
+	read := in.Read == nil || *in.Read
+	if in.Write && !read {
+		return "", errors.New("a writable project mount also permits reading; request read=true or use private scratch without write")
+	}
+	if len(in.WriteDirs) > 16 || (!in.Write && len(in.WriteDirs) > 0) {
+		return "", errors.New("write_dirs requires write=true and at most 16 directories")
+	}
+	preflight := []plugin.AccessKind{plugin.AccessExec}
+	if read {
+		preflight = append(preflight, plugin.AccessRead)
+	}
+	if in.Write {
+		preflight = append(preflight, plugin.AccessWrite)
+	}
+	if in.Network {
+		preflight = append(preflight, plugin.AccessNetwork)
+	}
+	if err := plugin.CheckAccess(ctx, preflight...); err != nil {
+		return "", err
+	}
+	access := sandboxAccess{Read: read, Network: in.Network, Dial: t.networkDial}
+	dir := "/tmp/work"
+	if read {
+		if len(roots) == 0 {
+			return "", errors.New("this run works in no directory, so there is nowhere to run a command: bind a workspace on the settings page under 工作区")
+		}
+		dir, err = resolveDir(roots, in.Cwd)
+		if err != nil {
+			return "", err
+		}
+	} else if in.Cwd != "" {
+		return "", errors.New("omit cwd when read=false; the command runs in private /tmp/work")
+	}
+	required := []plugin.AccessKind{plugin.AccessExec}
+	if read {
+		required = append(required, plugin.AccessRead)
+	}
+	operation := plugin.AccessRequest{Tool: RunToolName, Summary: "run one shell command with the requested scope", Command: in.Command, Cwd: dir, Permissions: required, ParametersDigest: plugin.AccessDigest(arguments)}
+	if read {
+		operation.ReadRoots = append([]string(nil), roots...)
+	}
+	if in.Write {
+		info, _ := plugin.Run(ctx)
+		if info.WriteScopeError != "" {
+			return "", errors.New(info.WriteScopeError)
+		}
+		if len(in.WriteDirs) == 0 {
+			access.WriteRoots = []string{dir}
+		} else {
+			for _, value := range in.WriteDirs {
+				resolved, err := fileread.ResolveDirInRoots(roots, value)
+				if err != nil {
+					return "", err
+				}
+				access.WriteRoots = append(access.WriteRoots, resolved.Path)
+			}
+		}
+		operation.WriteRoots = append([]string(nil), access.WriteRoots...)
+		operation.Permissions = append(operation.Permissions, plugin.AccessWrite)
+		// 范围只由核准目录与宿主快照决定，不分析命令字符串。
+		for _, writeRoot := range access.WriteRoots {
+			automatic := false
+			for _, allowed := range info.AutomaticWriteDirs {
+				real, err := filepath.EvalSymlinks(allowed)
+				if err == nil && fileread.Within(real, writeRoot) {
+					automatic = true
+					break
+				}
+			}
+			if !automatic {
+				operation.ScopeApproval = true
+			}
+		}
+	}
+	if in.Network {
+		operation.Permissions = append(operation.Permissions, plugin.AccessNetwork)
+	}
+	if err := plugin.RequireAccess(ctx, operation); err != nil {
+		return "", err
+	}
+	return t.runWithAccess(ctx, roots, dir, in.Command, timeout, access)
 }
 
 // resolveDir 定下命令的工作目录。给了 cwd 就交给 fileread 的多 root 边界检查——与文件
@@ -145,10 +233,13 @@ func resolveTimeout(requested int) (time.Duration, error) {
 // 结束的三种方式分工明确：命令自己跑完，报退出码；超过 timeout 被停掉，报“被停止了”
 // （仍然是结果，不是错误）；ctx 被取消，报 ctx 的错误，由内核当作结束整轮而不是拒绝。
 func (t *RunTool) run(ctx context.Context, roots []string, dir, command string, timeout time.Duration) (string, error) {
+	return t.runWithAccess(ctx, roots, dir, command, timeout, sandboxAccess{Read: true})
+}
+func (t *RunTool) runWithAccess(ctx context.Context, roots []string, dir, command string, timeout time.Duration, access sandboxAccess) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	sandbox, err := prepareSandbox(t.sandboxPath, roots, dir, command)
+	sandbox, err := prepareSandboxWithAccess(ctx, t.sandboxPath, roots, dir, command, access)
 	if err != nil {
 		return "", err
 	}
@@ -209,8 +300,12 @@ func (t *RunTool) run(ctx context.Context, roots []string, dir, command string, 
 // render 组装模型可见的结果：退出码、耗时、实际工作目录、两路带标签的输出，以及任何
 // 截断与停止的说明。它只报告已经发生的事，不把被杀掉的过程描述成正常结束。
 func (t *RunTool) render(cmd *exec.Cmd, dir string, elapsed, timeout time.Duration, timedOut bool, capture *outputCapture) string {
+	return renderResult(exitCode(cmd), dir, elapsed, timeout, timedOut, capture)
+}
+
+func renderResult(code int, dir string, elapsed, timeout time.Duration, timedOut bool, capture *outputCapture) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "exit code %d after %s in %s\n", exitCode(cmd), shortDuration(elapsed), dir)
+	fmt.Fprintf(&b, "exit code %d after %s in %s\n", code, shortDuration(elapsed), dir)
 	if timedOut {
 		fmt.Fprintf(&b, "(the command was stopped: it was still running after the %s timeout, so it and its whole process group were killed)\n",
 			shortDuration(timeout))
@@ -298,6 +393,8 @@ func (w captureWriter) Write(p []byte) (int, error) {
 // 什么”与“这一路不存在”对模型是两件不同的事。触到上限的一路要说清被截在哪里、还有
 // 多少没有给出。
 func (c *outputCapture) render(b *strings.Builder) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	for stream, name := range [2]string{"stdout", "stderr"} {
 		fmt.Fprintf(b, "%s:\n", name)
 		text := c.kept[stream]

@@ -40,6 +40,8 @@ func (s *Server) requiresOrigin(method, path string) bool {
 	switch path {
 	case "/api/reload", "/api/runs":
 		return true
+	case "/api/sessions":
+		return !isReadMethod(method)
 	case providerPath:
 		// Saving a provider writes the file a run calls through, so it is a
 		// mutation in the same way starting a run is. A read method to this
@@ -56,6 +58,9 @@ func (s *Server) requiresOrigin(method, path string) bool {
 		// method to this path is a wrong-method request and is answered 405.
 		return !isReadMethod(method)
 	}
+	if _, ok := approvalPath(path); ok {
+		return !isReadMethod(method)
+	}
 	if _, ok := cancelRunPath(path); ok {
 		// Stopping the active run is a kernel mutation in the same way starting
 		// one is, so it carries the same Origin requirement as POST /api/runs.
@@ -70,6 +75,12 @@ func (s *Server) requiresOrigin(method, path string) bool {
 		// Turning a skill off writes to the user's own settings file, so it is
 		// a mutation in the same way starting a run is. A read method to this
 		// path is a wrong-method request and is answered 405.
+		return !isReadMethod(method)
+	}
+	if _, ok := sessionExecutionPath(path); ok {
+		return !isReadMethod(method)
+	}
+	if _, ok := sessionReasoningPath(path); ok {
 		return !isReadMethod(method)
 	}
 	if _, ok := sessionModelPath(path); ok {

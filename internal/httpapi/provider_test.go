@@ -507,7 +507,7 @@ func TestTheInterfaceFollowsAProviderSavedWhileItRuns(t *testing.T) {
 	for _, option := range model.Options {
 		values = append(values, option.Value)
 	}
-	if strings.Join(values, ",") != "after,after-extra" {
+	if strings.Join(values, ",") != "after,after-extra,--default" {
 		t.Fatalf("options = %v, want the models of the provider now in use", values)
 	}
 

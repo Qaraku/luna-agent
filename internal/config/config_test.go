@@ -135,8 +135,8 @@ func TestLoadSendsNoReasoningEffortByDefault(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsALevelTheAPIDoesNotDefine(t *testing.T) {
-	for _, level := range []string{"ultra", "xhigh", "max"} {
+func TestLoadRejectsUnknownReasoningLevel(t *testing.T) {
+	for _, level := range []string{"ultra", "maximum", "unlimited"} {
 		_, err := Load(effortEnv(level), nil, providerValues())
 		if err == nil {
 			t.Fatalf("%q was accepted", level)
@@ -355,6 +355,20 @@ func TestRunBudgetsThatCannotBeUsedAreRefused(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.mentions) {
 				t.Fatalf("error %q does not name %q", err, tc.mentions)
+			}
+		})
+	}
+}
+
+func TestLoadSupportsExtendedReasoningLevels(t *testing.T) {
+	for _, level := range []string{"xhigh", "max"} {
+		t.Run(level, func(t *testing.T) {
+			cfg, err := Load(effortEnv(level), nil, providerValues())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.ReasoningEffort != level {
+				t.Fatalf("effort = %q, want %q", cfg.ReasoningEffort, level)
 			}
 		})
 	}

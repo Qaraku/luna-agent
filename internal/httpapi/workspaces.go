@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/Qaraku/luna-agent/internal/store"
 	"github.com/Qaraku/luna-agent/internal/workspace"
@@ -169,35 +168,25 @@ func (s *Server) setSessionWorkspace(w http.ResponseWriter, r *http.Request, id 
 	if !decode(w, r, &in) {
 		return
 	}
-	session, err := s.sessions.Read(id)
-	if err != nil {
-		fail(w, sessionStatus(err), err)
-		return
-	}
 	target := strings.TrimSpace(in.Workspace)
 	var view *workspaceView
-	if target != "" {
-		if s.workspaces == nil {
-			fail(w, 500, fmt.Errorf("no workspace store is configured"))
-			return
+	status, err := s.updateSessionConfig(id, func(next *store.ConfigRecord) (int, error) {
+		if target != "" {
+			if s.workspaces == nil {
+				return http.StatusInternalServerError, fmt.Errorf("no workspace store is configured")
+			}
+			found, ok := s.workspaces.Get(target)
+			if !ok {
+				return http.StatusNotFound, fmt.Errorf("unknown workspace %q", target)
+			}
+			rendered := workspaceViewOf(found)
+			view = &rendered
 		}
-		found, ok := s.workspaces.Get(target)
-		if !ok {
-			fail(w, 404, fmt.Errorf("unknown workspace %q", target))
-			return
-		}
-		rendered := workspaceViewOf(found)
-		view = &rendered
-	}
-	record := store.ConfigRecord{Type: store.TypeConfig, Workspace: target, At: time.Now()}
-	if current := session.Config; current != nil {
-		// The model choice is carried over, never re-derived here: this request
-		// is about the workspace, and the model it happens to use is whatever
-		// the session's newest config record already said.
-		record.Model = current.Model
-	}
-	if err := s.sessions.AppendConfig(id, record); err != nil {
-		fail(w, sessionStatus(err), err)
+		next.Workspace = target
+		return http.StatusOK, nil
+	})
+	if err != nil {
+		fail(w, status, err)
 		return
 	}
 	if view != nil {

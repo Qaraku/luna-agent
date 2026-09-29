@@ -692,7 +692,7 @@ func toolsOf(registry *plugin.Registry) []string {
 // 打开时才启用。没有 process.exec 授权的注册表连注册都不接受——内置不是特权。
 func TestTheTerminalCapabilityIsOffUntilTheSettingsSaySo(t *testing.T) {
 	t.Run("a capability nobody asked for is not running", func(t *testing.T) {
-		registry := plugin.NewRegistry(plugin.PermissionStateWrite, plugin.PermissionProcessExec)
+		registry := plugin.NewRegistry(plugin.PermissionStateWrite, plugin.PermissionProcessExec, plugin.PermissionFilesystemWrite, plugin.PermissionNetworkFetch)
 		if err := registerTerminal(registry, false); err != nil {
 			t.Fatal(err)
 		}
@@ -708,7 +708,7 @@ func TestTheTerminalCapabilityIsOffUntilTheSettingsSaySo(t *testing.T) {
 		}
 	})
 	t.Run("the user's choice turns it on", func(t *testing.T) {
-		registry := plugin.NewRegistry(plugin.PermissionStateWrite, plugin.PermissionProcessExec)
+		registry := plugin.NewRegistry(plugin.PermissionStateWrite, plugin.PermissionProcessExec, plugin.PermissionFilesystemWrite, plugin.PermissionNetworkFetch)
 		if err := registerTerminal(registry, true); err != nil {
 			t.Fatal(err)
 		}

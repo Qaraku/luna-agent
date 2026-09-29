@@ -310,12 +310,12 @@ func TestSessionEndpointsRejectUnknownMethodsAndIDs(t *testing.T) {
 		{"malformed id", http.MethodGet, "/api/sessions/UPPER1234567890", 400},
 		{"traversal id", http.MethodGet, "/api/sessions/..%2F..%2Fetc%2Fpasswd", 400},
 		{"trailing slash", http.MethodGet, "/api/sessions/", 404},
-		{"list rejects post", http.MethodPost, "/api/sessions", 405},
+		{"list rejects delete", http.MethodDelete, "/api/sessions", 405},
 		{"read rejects post", http.MethodPost, "/api/sessions/" + id, 405},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			w := request(t, h, tc.method, tc.path, "", tc.method == http.MethodPost)
+			w := request(t, h, tc.method, tc.path, "", tc.method != http.MethodGet)
 			if w.Code != tc.want {
 				t.Fatalf("status=%d want=%d body=%s", w.Code, tc.want, w.Body.String())
 			}

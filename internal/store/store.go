@@ -100,6 +100,8 @@ type SessionRecord struct {
 	ID        string    `json:"id"`
 	CreatedAt time.Time `json:"created_at"`
 	Title     string    `json:"title"`
+	// AutoTitle 仅为新建空会话启用，读取时取第一条用户消息，不改写 header。
+	AutoTitle bool `json:"auto_title,omitempty"`
 }
 
 // MessageRecord is one persisted conversation message.
@@ -133,6 +135,7 @@ type RunRecord struct {
 	StartedAt time.Time `json:"started_at"`
 	EndedAt   time.Time `json:"ended_at"`
 	Status    string    `json:"status"`
+	Usage     *Usage    `json:"usage,omitempty"`
 }
 
 // ConfigRecord is one statement of which model the session's next run should
@@ -155,8 +158,13 @@ type ConfigRecord struct {
 	// Workspace is the id of the workspace the session works in, or empty when
 	// the session is not bound to one. It is an id and not a name, so renaming
 	// a workspace does not detach every session that points at it.
-	Workspace string    `json:"workspace,omitempty"`
-	At        time.Time `json:"at"`
+	Workspace string `json:"workspace,omitempty"`
+	// nil 为继承；指向空字符串为明确不发送，不能与 none 档位混同。
+	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
+	// ExecutionMode 仅保存偏好，不能作为执行授权凭证。
+	ExecutionMode string            `json:"execution_mode,omitempty"`
+	Permissions   *PermissionRecord `json:"permissions,omitempty"`
+	At            time.Time         `json:"at"`
 }
 
 // Record is one decoded line. Exactly one of the five pointers is set, matching
@@ -281,7 +289,7 @@ func ValidateID(id string) error {
 // unguessable: it comes from the system random source, not from a counter or a
 // clock, and a collision is retried rather than overwritten.
 func (s *Store) Create(title string) (string, error) {
-	record := SessionRecord{Type: TypeSession, CreatedAt: time.Now(), Title: TitleText(title)}
+	record := SessionRecord{Type: TypeSession, CreatedAt: time.Now(), Title: TitleText(title), AutoTitle: strings.TrimSpace(title) == ""}
 	for attempt := 0; attempt < 4; attempt++ {
 		id, err := newID()
 		if err != nil {
@@ -477,13 +485,19 @@ func (s *Store) readFile(path, id string, keepRecords bool, visit func(Record)) 
 		session.Records = []Record{}
 	}
 	headerSeen := false
+	autoTitle := false
 	// 上限取开始读取时的长度，不追逐并发追加；内容与 metadata 来自同一个
 	// 已打开文件，不再重新按路径打开。上限内的未结束片段仍按残行处理。
 	truncated, err := scanRecords(io.LimitReader(file, info.Size()), path, func(record Record) {
 		if record.Session != nil && !headerSeen {
 			session.CreatedAt = record.Session.CreatedAt
 			session.Title = record.Session.Title
+			autoTitle = record.Session.AutoTitle && session.Title == ""
 			headerSeen = true
+		}
+		if autoTitle && record.Message != nil && record.Message.Role == RoleUser {
+			session.Title = TitleText(record.Message.Text)
+			autoTitle = false
 		}
 		if at := record.Time(); !at.IsZero() {
 			session.UpdatedAt = at
@@ -511,23 +525,28 @@ func (s *Store) readFile(path, id string, keepRecords bool, visit func(Record)) 
 
 // line is the superset of the frozen record fields used for decoding.
 type line struct {
-	Type      string    `json:"type"`
-	ID        string    `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	Title     string    `json:"title"`
-	RunID     string    `json:"run_id"`
-	Role      string    `json:"role"`
-	Text      string    `json:"text"`
-	At        time.Time `json:"at"`
-	Name      string    `json:"name"`
-	Arguments string    `json:"arguments"`
-	Result    string    `json:"result"`
-	Error     string    `json:"error"`
-	StartedAt time.Time `json:"started_at"`
-	EndedAt   time.Time `json:"ended_at"`
-	Status    string    `json:"status"`
-	Model     string    `json:"model"`
-	Workspace string    `json:"workspace"`
+	Type            string            `json:"type"`
+	ID              string            `json:"id"`
+	CreatedAt       time.Time         `json:"created_at"`
+	Title           string            `json:"title"`
+	RunID           string            `json:"run_id"`
+	Role            string            `json:"role"`
+	Text            string            `json:"text"`
+	At              time.Time         `json:"at"`
+	Name            string            `json:"name"`
+	Arguments       string            `json:"arguments"`
+	Result          string            `json:"result"`
+	Error           string            `json:"error"`
+	StartedAt       time.Time         `json:"started_at"`
+	EndedAt         time.Time         `json:"ended_at"`
+	Status          string            `json:"status"`
+	Model           string            `json:"model"`
+	Workspace       string            `json:"workspace"`
+	ReasoningEffort *string           `json:"reasoning_effort"`
+	AutoTitle       bool              `json:"auto_title"`
+	ExecutionMode   string            `json:"execution_mode"`
+	Permissions     *PermissionRecord `json:"permissions"`
+	Usage           *Usage            `json:"usage"`
 }
 
 // decodeLine decodes one record. Unknown fields are ignored rather than
@@ -540,15 +559,15 @@ func decodeLine(data []byte) (Record, error) {
 	}
 	switch raw.Type {
 	case TypeSession:
-		return Record{Type: TypeSession, Session: &SessionRecord{Type: raw.Type, ID: raw.ID, CreatedAt: raw.CreatedAt, Title: raw.Title}}, nil
+		return Record{Type: TypeSession, Session: &SessionRecord{Type: raw.Type, ID: raw.ID, CreatedAt: raw.CreatedAt, Title: raw.Title, AutoTitle: raw.AutoTitle}}, nil
 	case TypeMessage:
 		return Record{Type: TypeMessage, Message: &MessageRecord{Type: raw.Type, RunID: raw.RunID, Role: raw.Role, Text: raw.Text, At: raw.At}}, nil
 	case TypeToolCall:
 		return Record{Type: TypeToolCall, ToolCall: &ToolCallRecord{Type: raw.Type, RunID: raw.RunID, Name: raw.Name, Arguments: raw.Arguments, Result: raw.Result, Error: raw.Error, At: raw.At}}, nil
 	case TypeRun:
-		return Record{Type: TypeRun, Run: &RunRecord{Type: raw.Type, RunID: raw.RunID, StartedAt: raw.StartedAt, EndedAt: raw.EndedAt, Status: raw.Status}}, nil
+		return Record{Type: TypeRun, Run: &RunRecord{Type: raw.Type, RunID: raw.RunID, StartedAt: raw.StartedAt, EndedAt: raw.EndedAt, Status: raw.Status, Usage: raw.Usage}}, nil
 	case TypeConfig:
-		return Record{Type: TypeConfig, Config: &ConfigRecord{Type: raw.Type, Model: raw.Model, Workspace: raw.Workspace, At: raw.At}}, nil
+		return Record{Type: TypeConfig, Config: &ConfigRecord{Type: raw.Type, Model: raw.Model, Workspace: raw.Workspace, ReasoningEffort: raw.ReasoningEffort, ExecutionMode: raw.ExecutionMode, Permissions: raw.Permissions, At: raw.At}}, nil
 	}
 	return Record{}, fmt.Errorf("unknown record type %q", raw.Type)
 }

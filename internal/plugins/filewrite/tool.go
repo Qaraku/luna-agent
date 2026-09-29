@@ -52,7 +52,7 @@ const (
 	// the four things the model can act on: content is the whole text rather than
 	// a patch, create_only exists, the result carries a diff, and a refusal
 	// writes nothing while naming its own reason.
-	writeDescription = "Create a text file, or replace one, inside a directory the user has allowed Luna to write in. `path` is relative to one of this run's working directories; `content` is the file's whole new text — it replaces what the file holds rather than patching it — and an empty `content` makes an empty file. Set `create_only` when the file must not already exist. The result says whether the file was created or overwritten and shows a diff of the change, so you can tell the user what changed; an overwrite that would change nothing writes nothing. A call is refused, leaving everything on disk as it was, when the path leaves this run's working directories, when the directory is not one the user allowed, when the content or the file being replaced is not text or is over the size limit, or when the file cannot be written — each refusal states its own reason, and the reason is what you pass on to the user."
+	writeDescription = "Create or replace one project text file under the effective read/write policy. ask pauses for one-time approval; deny refuses before reading or writing. Outside the automatic write-directory scope, a separate one-time scope approval is required, and the path must still remain inside this run's project directories. `path` is relative to one of this run's working directories; `content` is the file's whole new text — it replaces what the file holds rather than patching it — and an empty `content` makes an empty file. Set `create_only` when the file must not already exist. The result says whether the file was created or overwritten and shows a diff of the change, so you can tell the user what changed; an overwrite that would change nothing writes nothing. A call is refused, leaving everything on disk as it was, when the path leaves this run's working directories, when a required approval is refused, when the content or the file being replaced is not text or is over the size limit, or when the file cannot be written — each refusal states its own reason, and the reason is what you pass on to the user."
 )
 
 // WriteTool is the capability's luna_write_file: the model's only way to change
@@ -165,6 +165,9 @@ func (t *WriteTool) Invoke(ctx context.Context, arguments string) (string, error
 		return "", errors.New("content is required: send the file's whole new text (an empty string is allowed and makes an empty file)")
 	}
 	content := *in.Content
+	if err := plugin.CheckAccess(ctx, plugin.AccessRead, plugin.AccessWrite); err != nil {
+		return "", err
+	}
 
 	roots := plugin.Roots(ctx)
 	if len(roots) == 0 {
@@ -179,8 +182,18 @@ func (t *WriteTool) Invoke(ctx context.Context, arguments string) (string, error
 		// of this path would have been refused with.
 		return "", err
 	}
-	if err := t.allowed(target.Path, in.Path); err != nil {
-		return "", err
+	info, _ := plugin.Run(ctx)
+	if info.WriteScopeError != "" {
+		return "", errors.New(info.WriteScopeError)
+	}
+	var scopeErr error
+	if info.AutomaticWriteDirs != nil {
+		scopeErr = allowedInDirs(target.Path, in.Path, info.AutomaticWriteDirs)
+	} else {
+		scopeErr = t.allowed(target.Path, in.Path)
+	}
+	if scopeErr != nil && !errors.Is(scopeErr, errOutsideWriteScope) {
+		return "", scopeErr
 	}
 	if strings.ContainsRune(content, 0) {
 		return "", errors.New("content contains a NUL byte, so it is not text; this tool writes text files, and nothing was written")
@@ -189,6 +202,26 @@ func (t *WriteTool) Invoke(ctx context.Context, arguments string) (string, error
 		return "", fmt.Errorf("content is %d bytes, over the %d-byte limit this tool writes; nothing was written", len(content), MaxContentBytes)
 	}
 
+	preview := content
+	if len(preview) > 4096 {
+		preview = preview[:4096] + "\n[preview truncated; full content is bound by digest]"
+	}
+	if err := plugin.RequireAccess(ctx, plugin.AccessRequest{Tool: WriteToolName, Summary: fmt.Sprintf("write %d bytes to one project file", len(content)), Target: target.Path, Preview: preview, ReadRoots: roots, WriteRoots: []string{target.Path}, Permissions: []plugin.AccessKind{plugin.AccessRead, plugin.AccessWrite}, ScopeApproval: scopeErr != nil, ParametersDigest: plugin.AccessDigest(arguments)}); err != nil {
+		if errors.Is(err, plugin.ErrApprovalRequired) && scopeErr != nil {
+			return "", fmt.Errorf("%w: %v", err, scopeErr)
+		}
+		return "", err
+	}
+	checked, err := fileread.ResolveWriteInRoots(roots, in.Path)
+	if err != nil {
+		return "", err
+	}
+	if checked.Path != target.Path {
+		return "", fmt.Errorf("write target changed while awaiting approval; request again")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	current, exists, mode, err := existingText(target.Path, in.Path)
 	if err != nil {
 		return "", err
@@ -201,6 +234,9 @@ func (t *WriteTool) Invoke(ctx context.Context, arguments string) (string, error
 		// file with the same bytes and moved its modification time, which is a
 		// change the user did not ask for and the model would have to explain.
 		return fmt.Sprintf("%s already has exactly this content; nothing was written", in.Path), nil
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	if err := atomicfile.WriteFile(target.Path, []byte(content), mode); err != nil {
 		return "", fmt.Errorf("write %q: %w", in.Path, err)
@@ -231,6 +267,8 @@ func (t *WriteTool) Invoke(ctx context.Context, arguments string) (string, error
 // The comparison itself is fileread.Within, the same rule the read and write
 // boundaries are decided by, so a grant and a resolution can never disagree
 // about where a directory ends.
+var errOutsideWriteScope = errors.New("path is outside automatic write scope")
+
 func (t *WriteTool) allowed(resolved, requested string) error {
 	file, _, err := settings.Load(t.settingsPath)
 	if err != nil {
@@ -240,9 +278,12 @@ func (t *WriteTool) allowed(resolved, requested string) error {
 		// one who can fix the file.
 		return fmt.Errorf("read the directories allowed to be written: %w", err)
 	}
-	dirs := file.WriteDirs()
+	return allowedInDirs(resolved, requested, file.WriteDirs())
+}
+
+func allowedInDirs(resolved, requested string, dirs []string) error {
 	if len(dirs) == 0 {
-		return fmt.Errorf("%q is not inside a directory Luna may write in: no directory has been allowed yet, so nothing was written. The user allows one in %s.", requested, allowHint)
+		return fmt.Errorf("%w: %q is not inside a directory Luna may write in: no directory has been allowed yet, so nothing was written. The user allows one in %s.", errOutsideWriteScope, requested, allowHint)
 	}
 	for _, dir := range dirs {
 		real, err := filepath.EvalSymlinks(dir)
@@ -253,7 +294,7 @@ func (t *WriteTool) allowed(resolved, requested string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("%q is not inside a directory the user allowed Luna to write in; nothing was written. The user allows one in %s.", requested, allowHint)
+	return fmt.Errorf("%w: %q is not inside a directory the user allowed Luna to write in; nothing was written. The user allows one in %s.", errOutsideWriteScope, requested, allowHint)
 }
 
 // existingText reads the file a call is about to replace and answers the three

@@ -53,7 +53,7 @@ func permissiveTool(timeout time.Duration) *FetchTool {
 // call runs the tool the way the kernel does: one arguments string, one result.
 func (f *fixture) call(t *testing.T, arguments string) (string, error) {
 	t.Helper()
-	return f.tool.Invoke(context.Background(), arguments)
+	return f.tool.Invoke(allowedFetchContext(context.Background()), arguments)
 }
 
 // fetch runs the tool against a path on the fixture's server.
@@ -528,7 +528,7 @@ func TestFetchRefusesAnAddressThatIsNotHttpOrHttps(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := tool.Invoke(context.Background(), args(t, map[string]any{"url": tc.url}))
+			got, err := tool.Invoke(allowedFetchContext(context.Background()), args(t, map[string]any{"url": tc.url}))
 			refused(t, got, err, tc.want...)
 		})
 	}
@@ -542,7 +542,7 @@ func TestFetchRefusesAnEmptyOrMissingUrl(t *testing.T) {
 		`{"url":"   "}`,
 		`{}`,
 	} {
-		got, err := tool.Invoke(context.Background(), arguments)
+		got, err := tool.Invoke(allowedFetchContext(context.Background()), arguments)
 		refused(t, got, err, "url is required")
 	}
 }
@@ -727,4 +727,10 @@ func TestTheToolsAreBoundToThePluginDescriptor(t *testing.T) {
 	if p.Descriptor().ID != Descriptor().ID {
 		t.Fatal("the plugin's descriptor and the package's Descriptor() disagree")
 	}
+}
+
+func allowedFetchContext(ctx context.Context) context.Context {
+	p := plugin.DefaultAccessPolicy()
+	p.Network = plugin.DecisionAllow
+	return plugin.WithRun(ctx, plugin.RunInfo{Permissions: &p})
 }

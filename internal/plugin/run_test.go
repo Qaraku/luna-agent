@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"reflect"
 	"testing"
 )
 
@@ -21,7 +22,7 @@ func TestRunWithoutInfoReturnsZero(t *testing.T) {
 	if ok {
 		t.Fatalf("Run claimed info on a bare context: %+v", got)
 	}
-	if got != (RunInfo{}) {
+	if !reflect.DeepEqual(got, RunInfo{}) {
 		t.Fatalf("Run = %+v, want the zero value", got)
 	}
 }

@@ -32,7 +32,7 @@ type WriteDirPreference interface {
 // WithWriteDirs supplies the store the write-directory preference lives in. A
 // server built without one reports that no write directories can be read or
 // edited, rather than answering with an empty list: an empty list is a real
-// choice ("write nowhere"), and a page that could not tell it apart from "nothing
+// choice ("no automatic write scope"), and a page that could not tell it apart from "nothing
 // is wired up" would show the user a decision they never made.
 func WithWriteDirs(pref WriteDirPreference) Option { return func(s *Server) { s.writeDirs = pref } }
 

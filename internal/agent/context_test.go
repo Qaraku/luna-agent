@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Qaraku/luna-agent/internal/plugin"
 	"strings"
 	"sync"
 	"testing"
@@ -168,7 +169,7 @@ func TestModelInputIsSystemPromptPlusHistoryPlusTheNewMessage(t *testing.T) {
 		t.Fatalf("model input=%v, want system + two history messages + this turn", contents(input))
 	}
 	wantRoles := []schema.RoleType{schema.System, schema.User, schema.Assistant, schema.User}
-	wantText := []string{instruction, "first question", "first answer", "third question"}
+	wantText := []string{instruction + runtimePermissionInstruction(plugin.WithRun(context.Background(), plugin.RunInfo{})), "first question", "first answer", "third question"}
 	for i := range wantRoles {
 		if input[i].Role != wantRoles[i] || input[i].Content != wantText[i] {
 			t.Fatalf("input[%d]=%s/%q, want %s/%q", i, input[i].Role, input[i].Content, wantRoles[i], wantText[i])

@@ -25,7 +25,8 @@ const kernelRefusalPrefix = "the tool refused this call: "
 
 // runCtx 造一个带着本次运行工作目录的 ctx，与宿主调用工具时放进去的东西一致。
 func runCtx(roots ...string) context.Context {
-	return plugin.WithRoots(context.Background(), roots)
+	p := plugin.AccessPolicy{Read: plugin.DecisionAllow, Write: plugin.DecisionDeny, Network: plugin.DecisionDeny, Exec: plugin.DecisionAllow}
+	return plugin.WithRoots(plugin.WithRun(context.Background(), plugin.RunInfo{Permissions: &p}), roots)
 }
 
 // args 把一次调用的参数编码成模型会送过来的 JSON。
@@ -317,12 +318,12 @@ func TestRunToolSchemaAndDescriptionShape(t *testing.T) {
 	if !ok {
 		t.Fatalf("properties = %v", raw["properties"])
 	}
-	for _, name := range []string{"command", "cwd", "timeout_s"} {
+	for _, name := range []string{"command", "cwd", "timeout_s", "read", "write", "write_dirs", "network"} {
 		if _, ok := properties[name]; !ok {
 			t.Fatalf("schema has no %q parameter: %s", name, encoded)
 		}
 	}
-	if len(properties) != 3 {
+	if len(properties) != 7 {
 		t.Fatalf("the tool exposes an undeclared parameter: %s", encoded)
 	}
 
@@ -333,7 +334,7 @@ func TestRunToolSchemaAndDescriptionShape(t *testing.T) {
 		"stdout",
 		"stderr",
 		"timeout_s",
-		"directories this session works in",
+		"relative project directories",
 		"minimal environment",
 		"cap",
 	} {
@@ -343,9 +344,9 @@ func TestRunToolSchemaAndDescriptionShape(t *testing.T) {
 	}
 }
 
-// The descriptor is the capability's whole declaration: one tool, the exec permission,
+// The descriptor declares one tool, its execution context, the exec permission,
 // and no claim on anything the capability does not provide.
-func TestTheDescriptorDeclaresOneToolAndTheExecPermission(t *testing.T) {
+func TestTheDescriptorDeclaresOneToolAndItsRequiredPermissions(t *testing.T) {
 	d := Descriptor()
 	if d.ID != PluginID || PluginID != "terminal" {
 		t.Fatalf("id = %q", d.ID)
@@ -359,10 +360,10 @@ func TestTheDescriptorDeclaresOneToolAndTheExecPermission(t *testing.T) {
 	if len(d.Claims) != 0 {
 		t.Fatalf("the terminal capability must claim nothing: %+v", d.Claims)
 	}
-	if len(d.Contributions) != 1 || d.Contributions[0].Kind != plugin.ContributionTool || d.Contributions[0].ID != RunToolName {
+	if len(d.Contributions) != 2 || d.Contributions[0].Kind != plugin.ContributionTool || d.Contributions[0].ID != RunToolName {
 		t.Fatalf("contributions = %+v", d.Contributions)
 	}
-	if len(d.Permissions) != 1 || d.Permissions[0].Kind != plugin.PermissionProcessExec || d.Permissions[0].Detail != "" {
+	if len(d.Permissions) != 3 || d.Permissions[0].Kind != plugin.PermissionProcessExec || d.Permissions[1].Kind != plugin.PermissionFilesystemWrite || d.Permissions[2].Kind != plugin.PermissionNetworkFetch {
 		t.Fatalf("permissions = %+v", d.Permissions)
 	}
 }

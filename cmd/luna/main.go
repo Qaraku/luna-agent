@@ -733,8 +733,8 @@ func run() error {
 	}
 	// The capability that writes files is the other one the user decides about. It
 	// asks for fs.write, and it reads the directories it may write in from the
-	// settings file on every call, so a directory allowed in the settings page takes
-	// effect on the model's next call rather than at the next start-up.
+	// settings file through the run-admission snapshot; changing automatic scopes
+	// affects the next run without granting broader session permissions.
 	if err := registerFileWrite(registry, settingsPath, userSettings.CapabilityEnabled(filewrite.PluginID)); err != nil {
 		return err
 	}
@@ -829,6 +829,9 @@ func run() error {
 }
 
 func main() {
+	if code, handled := terminal.NetworkHelper(os.Args); handled {
+		os.Exit(code)
+	}
 	if err := run(); err != nil {
 		log.Printf("luna: %v", err)
 		os.Exit(1)

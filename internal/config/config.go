@@ -50,11 +50,9 @@ type Config struct {
 // choice about how a run is made, not about where it is sent.
 const ReasoningEffortEnv = "LUNA_REASONING_EFFORT"
 
-// ReasoningEffortLevels are the accepted levels, and they are the levels the
-// chat-completions API defines for reasoning_effort. A level that sounds stronger
-// but is not a value the API defines (max, ultra, xhigh) is not accepted: sending
-// it would come back as a rejected request, not as more thinking.
-var ReasoningEffortLevels = []string{"minimal", "low", "medium", "high", "none"}
+// ReasoningEffortLevels 是 Luna 接受并原样传递的档位；各提供方/模型的支持范围
+// 可以不同。服务拒绝某档位时报告真实错误，不静默降档或映射成另一个值。
+var ReasoningEffortLevels = []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 
 // ParseReasoningEffort accepts the declared levels and the empty value, and
 // reports anything else with the list of what would have worked.

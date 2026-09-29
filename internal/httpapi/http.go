@@ -235,6 +235,8 @@ type Server struct {
 	provider ProviderConfig
 	// providerWriteMu 保护保留密钥所需的读—合并—写事务，不锁住只读请求或 HTTP 写回。
 	providerWriteMu sync.Mutex
+	// sessionConfigMu 串行化会话配置的读—合并—追加，不占用运行准入锁或 HTTP 写回。
+	sessionConfigMu sync.Mutex
 	// configSource is what a run started right now would use, when the
 	// composition root supplied one: the interface asks it instead of reporting
 	// what this process started with.
@@ -246,13 +248,19 @@ type Server struct {
 	workspaces WorkspaceStore
 	// commands is the table the composer's slash commands come from. It is
 	// served to the browser rather than duplicated there.
-	commands  *command.Table
-	info      Info
-	started   time.Time
-	runMu     sync.Mutex
-	busy      bool
-	runID     string
-	sessionID string
+	commands *command.Table
+	info     Info
+	started  time.Time
+	runMu    sync.Mutex
+	// executionGrants 只由可信控制入口修改，与准入共用 runMu；不从文件恢复。
+	executionGrants  map[string]bool
+	permissionGrants map[string]plugin.AccessPolicy
+	// pendingApprovals 与准入/取消共用 runMu，决定身份与消费是一个临界区。
+	pendingApprovals map[string]*pendingApproval
+	activeExecution  *executionView
+	busy             bool
+	runID            string
+	sessionID        string
 	// cancelRun ends the active run's context with a cause, which is what makes
 	// a run stoppable from outside. It is set and cleared inside the same
 	// critical section as the run slot itself: a busy flag without a handle
@@ -430,11 +438,32 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.reload(w, r)
 	case "/api/sessions":
+		switch r.Method {
+		case http.MethodGet:
+			s.listSessions(w)
+		case http.MethodPost:
+			s.createSession(w, r)
+		default:
+			method(w, "GET, POST")
+		}
+	case "/api/approvals":
 		if r.Method != http.MethodGet {
 			method(w, http.MethodGet)
 			return
 		}
-		s.listSessions(w)
+		s.listApprovals(w, r)
+	case "/api/execution":
+		if r.Method != http.MethodGet {
+			method(w, http.MethodGet)
+			return
+		}
+		s.getExecution(w, r)
+	case "/api/reasoning":
+		if r.Method != http.MethodGet {
+			method(w, http.MethodGet)
+			return
+		}
+		s.sendReasoning(w, r)
 	case "/api/ui-plugins":
 		if r.Method != http.MethodGet {
 			method(w, http.MethodGet)
@@ -493,6 +522,14 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.static(w, r)
 	default:
+		if id, ok := approvalPath(r.URL.Path); ok {
+			if r.Method != http.MethodPost {
+				method(w, http.MethodPost)
+				return
+			}
+			s.decideApproval(w, r, id)
+			return
+		}
 		if id, ok := cancelRunPath(r.URL.Path); ok {
 			if r.Method != http.MethodPost {
 				method(w, http.MethodPost)
@@ -515,6 +552,22 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.setSkillState(w, name, action)
+			return
+		}
+		if id, ok := sessionExecutionPath(r.URL.Path); ok {
+			if r.Method != http.MethodPost {
+				method(w, http.MethodPost)
+				return
+			}
+			s.setExecution(w, r, id)
+			return
+		}
+		if id, ok := sessionReasoningPath(r.URL.Path); ok {
+			if r.Method != http.MethodPost {
+				method(w, http.MethodPost)
+				return
+			}
+			s.setSessionReasoning(w, r, id)
 			return
 		}
 		if id, ok := sessionModelPath(r.URL.Path); ok {
@@ -820,6 +873,7 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	// before admission, so an unknown id costs the caller a 4xx and not the
 	// single-run slot.
 	runModel := ""
+	var runReasoning *string
 	var runRoots []string
 	if in.SessionID != "" {
 		session, err := s.sessions.Read(in.SessionID)
@@ -831,6 +885,7 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 		// configuration's default, which the runner resolves.
 		if session.Config != nil {
 			runModel = session.Config.Model
+			runReasoning = session.Config.ReasoningEffort
 		}
 		// A session bound to a workspace reads inside that workspace's
 		// directories. A binding that no longer names a workspace fails the run
@@ -874,6 +929,25 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 		fail(w, 409, fmt.Errorf("another run is active"))
 		return
 	}
+	// 有效授权在准入锁内重新读取，不能拿撤销之前的快照开始新运行。
+	execution, err := s.executionViewLocked(in.SessionID)
+	if err != nil {
+		s.runMu.Unlock()
+		fail(w, sessionStatus(err), err)
+		return
+	}
+	if execution.NeedsConfirmation || execution.Problem != "" {
+		s.runMu.Unlock()
+		fail(w, 409, fmt.Errorf("execution permission needs user confirmation in this service process; confirm Full access or select sandbox"))
+		return
+	}
+	runRoots = append([]string(nil), execution.Scopes.ProjectDirs...)
+	if execution.config != nil {
+		runModel = execution.config.Model
+		runReasoning = execution.config.ReasoningEffort
+	}
+	automaticWriteDirs := append([]string{}, execution.Scopes.AutomaticWriteDirs...)
+	writeScopeError := execution.Scopes.WriteProblem
 	id := newRunID()
 	s.busy = true
 	s.runID = id
@@ -887,6 +961,7 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 			s.sessionID = ""
 			s.runID = ""
 			s.cancelRun = nil
+			s.activeExecution = nil
 		}
 		s.runMu.Unlock()
 	}
@@ -904,6 +979,7 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	}
 	s.runMu.Lock()
 	s.sessionID = sessionID
+	s.activeExecution = &execution
 	s.runMu.Unlock()
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -918,7 +994,11 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	sink := &streamSink{ctx: runCtx, events: make(chan agent.Event, streamSinkCapacity)}
 	result := make(chan runResult, 1)
 	go func() {
-		answer, err := s.runner.Run(runCtx, agent.RunRequest{RunID: id, SessionID: sessionID, Message: in.Message, Model: runModel, Roots: runRoots, Sink: sink})
+		policy := execution.Permissions
+		approve := func(ctx context.Context, operation plugin.AccessRequest) error {
+			return s.awaitApproval(ctx, id, sessionID, operation, sink)
+		}
+		answer, err := s.runner.Run(runCtx, agent.RunRequest{RunID: id, SessionID: sessionID, Message: in.Message, Model: runModel, ReasoningEffort: runReasoning, ExecutionMode: execution.Mode, Permissions: &policy, AutomaticWriteDirs: automaticWriteDirs, WriteScopeError: writeScopeError, Approve: approve, Roots: runRoots, Sink: sink})
 		close(sink.events)
 		result <- runResult{answer, err}
 	}()

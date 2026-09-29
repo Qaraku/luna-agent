@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Qaraku/luna-agent/internal/plugin"
 	jsonschema "github.com/eino-contrib/jsonschema"
 )
 
@@ -76,6 +77,9 @@ func (t *FetchTool) Invoke(ctx context.Context, arguments string) (string, error
 	}
 	target, err := parseTarget(in.URL)
 	if err != nil {
+		return "", err
+	}
+	if err := plugin.RequireAccess(ctx, plugin.AccessRequest{Tool: t.Name(), Summary: "fetch a public HTTP(S) resource", Target: target.String(), Permissions: []plugin.AccessKind{plugin.AccessNetwork}, ParametersDigest: plugin.AccessDigest(arguments)}); err != nil {
 		return "", err
 	}
 	// 一次抓取的那点时间从地址检查就开始算：解析主机名也可能慢，把它放在预算之外等于

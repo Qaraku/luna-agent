@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"fmt"
+	"github.com/Qaraku/luna-agent/internal/netpolicy"
 	"net"
 	"net/http"
 	"net/url"
@@ -90,32 +91,7 @@ func publicAddresses(ip net.IP) error {
 // 装在 v6 里，在有相应路由的网络上照样回到本机或局域网，而 IsLoopback、IsPrivate 都覆盖
 // 不到它们。IPv4 与 IPv6 走同一份判断，写成 IPv6 的 IPv4 地址（::ffff:127.0.0.1）由
 // net.IP 自己折算，不会漏。
-func blockedAddress(ip net.IP) string {
-	switch {
-	case ip.IsUnspecified():
-		return "the unspecified address"
-	case ip.IsLoopback():
-		return "a loopback address"
-	case ip.IsPrivate():
-		return "a private address"
-	case ip.IsLinkLocalUnicast():
-		return "a link-local address"
-	case ip.IsLinkLocalMulticast() || ip.IsMulticast():
-		return "a multicast address"
-	case sixToFourPrefix.Contains(ip):
-		return "a 6to4 address, which carries another address inside it"
-	case nat64Prefix.Contains(ip):
-		return "a NAT64 address, which carries another address inside it"
-	}
-	return ""
-}
-
-// sixToFourPrefix 是 6to4 的 2002::/16，nat64Prefix 是 NAT64 的知名前缀 64:ff9b::/96。
-// 两者都能把一个内网 IPv4 地址包在 v6 地址里。
-var (
-	sixToFourPrefix = net.IPNet{IP: net.ParseIP("2002::"), Mask: net.CIDRMask(16, 128)}
-	nat64Prefix     = net.IPNet{IP: net.ParseIP("64:ff9b::"), Mask: net.CIDRMask(96, 128)}
-)
+func blockedAddress(ip net.IP) string { return netpolicy.BlockedReason(ip) }
 
 // checkHost 是请求前的那层检查：主机名是 IP 字面量就直接判，否则解析之后逐个地址判，
 // 只要有一个地址不允许就拒绝整次抓取。解析失败、解析不出地址也拒绝——一个名字此刻指不到

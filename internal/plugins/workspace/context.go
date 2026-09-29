@@ -220,8 +220,14 @@ func (p *Plugin) sessionWorkspace(ctx context.Context) (Target, bool) {
 // carries no leading blank line: the Kernel is what decides where a contribution
 // lands and what kind of block it is.
 func (p *Plugin) Contexts(ctx context.Context) ([]plugin.ContextBlock, error) {
+	readPolicy := plugin.AccessPolicyFor(ctx).Read
+	loadRules := readPolicy == plugin.DecisionAllow
+	notice := "\nProject rule files are not automatically included under the current read policy. Follow the kernel policy; ask-mode reads require an explicit file operation and user approval.\n"
 	if target, ok := p.sessionWorkspace(ctx); ok {
 		identity := renderWorkspace(target)
+		if !loadRules {
+			identity += notice
+		}
 		if len(identity) > ProjectBudgetBytes {
 			return nil, fmt.Errorf("the workspace identity block is %d bytes, over the %d-byte budget it declares", len(identity), ProjectBudgetBytes)
 		}
@@ -230,6 +236,9 @@ func (p *Plugin) Contexts(ctx context.Context) ([]plugin.ContextBlock, error) {
 			Kind: plugin.ContextReference,
 			Text: identity,
 		}}
+		if !loadRules {
+			return blocks, nil
+		}
 		rules, ok, err := p.workspaceRulesBlock(target)
 		if err != nil {
 			return nil, err
@@ -244,6 +253,10 @@ func (p *Plugin) Contexts(ctx context.Context) ([]plugin.ContextBlock, error) {
 		Kind: plugin.ContextReference,
 		Text: p.Render(),
 	}}
+	if !loadRules {
+		blocks[0].Text += notice
+		return blocks, nil
+	}
 	if rules, ok := p.rulesBlock(); ok {
 		blocks = append(blocks, rules)
 	}
