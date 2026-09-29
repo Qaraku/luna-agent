@@ -1600,3 +1600,20 @@ body {
     top: 12px; bottom: 12px; height: auto; max-height: calc(100dvh - 24px);
   }
 }
+
+/* 会话整理：低频动作折叠在侧栏，不增加 composer 高度。 */
+.session-filters { display: grid; gap: var(--luna-space-2); margin-bottom: var(--luna-space-3); min-width: 0; }
+.session-filters .luna-input { width: 100%; min-width: 0; box-sizing: border-box; }
+.session-row-line { display: flex; align-items: center; min-width: 0; }
+.session-row-line .session-row { min-width: 0; flex: 1; }
+.session-menu-toggle { flex: 0 0 auto; }
+.session-row-menu, .session-rename-form { display: flex; flex-wrap: wrap; gap: var(--luna-space-2); padding: var(--luna-space-2); }
+.session-row-menu[hidden], .session-rename-form[hidden] { display: none; }
+.session-rename-input { width: 100%; min-width: 0; box-sizing: border-box; }
+.session-row-error { color: var(--luna-danger); font-size: var(--luna-font-meta); overflow-wrap: anywhere; }
+.session-pagination { display: flex; align-items: center; flex-wrap: wrap; gap: var(--luna-space-2); margin-top: var(--luna-space-3); font-size: var(--luna-font-meta); }
+.session-pagination[hidden] { display: none; }
+.session-archive-banner { display: flex; align-items: center; flex-wrap: wrap; gap: var(--luna-space-3); padding: var(--luna-space-3); margin-bottom: var(--luna-space-4); border: 1px solid var(--luna-border); border-radius: var(--luna-radius-md); color: var(--luna-text-muted); }
+.session-archive-banner[hidden] { display: none; }
+.run-configuration { color: var(--luna-text-muted); font-size: var(--luna-font-meta); }
+.run-configuration pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24rem; overflow: auto; }

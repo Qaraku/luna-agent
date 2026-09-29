@@ -466,7 +466,7 @@ test('session navigation closes after selection and survives breakpoint changes'
   assert.match(h.$('conversation').textContent, /已保存的消息/);
   h.$('message').value = '保留草稿';
   await h.click('session-toggle');
-  h.$('session-list').querySelectorAll('button')[1].click();
+  h.$('session-list').querySelectorAll('.session-row')[1].click();
   await h.settle();
   assert.equal(h.location.hash, '#session=bbbbbbbb');
   assert.equal(h.$('session-sidebar').hidden, true, '选中会话后回到对话');
@@ -490,7 +490,9 @@ test('session navigation closes after selection and survives breakpoint changes'
   await h.click('session-new');
   assert.equal(h.$('session-sidebar').hidden, true);
   assert.equal(h.location.hash, '');
-  assert.equal(h.$('message').value, '保留草稿');
+  assert.equal(h.$('message').value, '', '新会话不带入别的会话草稿');
+  h.location.hash = '#session=aaaaaaaa'; await h.settle();
+  assert.equal(h.$('message').value, '保留草稿', '回到原会话仍保留它自己的草稿');
 });
 
 test('the shell reserves desktop space for the sidebar and contains it when narrow', () => {
@@ -588,7 +590,7 @@ test('visible sessions refresh without diagnostics or replacing the focused acti
   await h.settle();
   assert.equal(h.$('session-sidebar').hidden, false);
   assert.equal(h.$('runtime-drawer').hidden, true);
-  const buttons = h.$('session-list').querySelectorAll('button');
+  const buttons = h.$('session-list').querySelectorAll('.session-row');
   buttons[1].focus();
   const before = h.calls.filter(({ url }) => url === '/api/sessions').length;
   h.data.sessions.sessions[1].title = '标题更新';
@@ -597,7 +599,7 @@ test('visible sessions refresh without diagnostics or replacing the focused acti
   assert.equal(h.calls.filter(({ url }) => url === '/api/sessions').length, before + 1);
   assert.equal(h.document.activeElement, buttons[1], '列表更新仍保留原来的会话按钮');
   assert.match(buttons[1].textContent, /标题更新/);
-  assert.equal(h.$('session-list').querySelectorAll('button')[0], buttons[1]);
+  assert.equal(h.$('session-list').querySelectorAll('.session-row')[0], buttons[1]);
   await h.poll();
   assert.equal(h.document.activeElement, buttons[1], '无变更的轮询不重建按钮');
   await h.resize(true);
@@ -688,11 +690,11 @@ test('navigation preserves running and switching guards without discarding draft
     }
   } });
   await h.settle();
-  h.$('session-list').querySelectorAll('button')[1].click();
+  h.$('session-list').querySelectorAll('.session-row')[1].click();
   await h.settle();
   assert.equal(h.$('send').disabled, true);
   assert.equal(h.$('session-new').disabled, true);
-  assert.ok(h.$('session-list').querySelectorAll('button').every((button) => button.disabled));
+  assert.ok(h.$('session-list').querySelectorAll('.session-row').every((button) => button.disabled));
   await h.click('session-new');
   assert.equal(h.location.hash, '#session=bbbbbbbb');
   finishRead();
@@ -703,7 +705,7 @@ test('navigation preserves running and switching guards without discarding draft
   h.$('chat-form').emit('submit');
   await h.settle();
   assert.equal(h.$('session-new').disabled, true);
-  assert.ok(h.$('session-list').querySelectorAll('button').every((button) => button.disabled));
+  assert.ok(h.$('session-list').querySelectorAll('.session-row').every((button) => button.disabled));
   h.location.hash = '#session=aaaaaaaa';
   await h.settle();
   assert.equal(h.location.hash, '#session=bbbbbbbb', '运行中更改 hash 会恢复原会话');
@@ -811,7 +813,8 @@ test('the loading state and the session notices live in the conversation area, n
   // 那不是契约的一部分。契约是侧栏永远只承载"列表读到/读不到"，其余一概不写。
   const allowed = new Set([
     'setSessionStatus(\'\')',
-    'setSessionStatus(`无法读取会话列表：${error.message}`, \'failure\')'
+    'setSessionStatus(`无法读取会话列表：${error.message}`, \'failure\')',
+    "setSessionStatus(controller.signal.aborted ? '会话列表读取超时，请重试。' : '无法读取会话列表：' + error.message, 'failure')"
   ]);
   for (const write of writes) {
     assert.ok(allowed.has(write), `侧栏只允许“列表读到/读不到”两种写入，出现了：${write}`);
@@ -4795,4 +4798,54 @@ test('个人技能管理从现有设置页打开能力面板，不调用模型',
 
 test('学习技能在列表中标明受管理修订，不冒充外部用户目录',()=>{
  const {skillRows}=require('./app.js');const rows=skillRows({skills:[{name:'learned',scope:'user',description:'Method',enabled:true,managed:true,revision:'abcdef1234567890'}]});assert.match(rows[0].scopeLabel,/个人技能/);assert.match(rows[0].scopeLabel,/abcdef123456/);
+});
+
+
+function organizedSessionHarness({hash='#session=aaaaaaaa',failMetadata=false}={}){
+ const data=new Map([['aaaaaaaa',{id:'aaaaaaaa',title:'Alpha',archived:false,workspace:'project-a'}],['bbbbbbbb',{id:'bbbbbbbb',title:'Beta',archived:false,workspace:'project-b'}]]);
+ const json=(payload,ok=true)=>({ok,status:ok?200:409,json:async()=>payload});
+ const h=navigationHarness({hash,respond:async(url,options={})=>{
+  const parsed=new URL(url,'http://localhost');
+  if(parsed.pathname==='/api/sessions'&&options.method!=='POST'){
+   const q=parsed.searchParams;const mode=q.get('archived')||'exclude';let rows=[...data.values()].filter(row=>mode==='include'||(mode==='only'?row.archived:!row.archived));if(q.get('q'))rows=rows.filter(row=>row.title.toLowerCase().includes(q.get('q').toLowerCase()));if(q.get('workspace'))rows=rows.filter(row=>q.get('workspace')==='unbound'?!row.workspace:row.workspace===q.get('workspace'));const offset=Number(q.get('offset')||0);return json({sessions:rows.slice(offset,offset+100),total:rows.length,offset,limit:100,next_offset:offset+100<rows.length?offset+100:null,workspace_options:[{id:'project-a',name:'项目 A'},{id:'project-b',name:'项目 B'}]});
+  }
+  const change=parsed.pathname.match(/^\/api\/sessions\/([^/]+)\/metadata$/);if(change){if(failMetadata)return json({error:'metadata conflict'},false);const row=data.get(change[1]);Object.assign(row,JSON.parse(options.body));return json({...row,records:[]});}
+  const detail=parsed.pathname.match(/^\/api\/sessions\/([^/]+)$/);if(detail){const row=data.get(detail[1]);return json({...row,workspace:row?.workspace?{id:row.workspace,name:row.workspace,dirs:[]}:null,records:[]});}
+ }});h.server=data;h.row=id=>[...h.$('session-list').children].find(item=>item.dataset.sessionId===id);h.choose=async id=>{h.row(id).querySelector('.session-row').click();await h.settle();};return h;
+}
+
+test('会话重命名保留草稿，归档可恢复且归档后不能误发送',async()=>{
+ const h=organizedSessionHarness();await h.settle();h.$('message').value='保留草稿';const row=h.row('aaaaaaaa');assert.ok(row);
+ row.querySelector('.session-menu-toggle').click();row.querySelector('.session-rename-action').click();row.querySelector('.session-rename-input').value='新的 Alpha';row.querySelector('.session-rename-form').emit('submit');await h.settle();assert.equal(h.server.get('aaaaaaaa').title,'新的 Alpha');assert.equal(h.$('message').value,'保留草稿');assert.match(h.$('conversation-title').textContent,/新的 Alpha/);
+ h.row('aaaaaaaa').querySelector('.session-archive-action').click();await h.settle();assert.equal(h.server.get('aaaaaaaa').archived,true);assert.equal(h.$('session-archive-banner').hidden,false);assert.equal(h.$('send').disabled,true);assert.equal(h.$('message').value,'保留草稿');
+ await h.click('session-restore');assert.equal(h.server.get('aaaaaaaa').archived,false);assert.equal(h.$('session-archive-banner').hidden,true);
+});
+
+test('会话筛选查询服务端，失败保留正在编辑的标题',async()=>{
+ const h=organizedSessionHarness({failMetadata:true});await h.settle();const row=h.row('aaaaaaaa');row.querySelector('.session-rename-action').click();row.querySelector('.session-rename-input').value='未保存标题';row.querySelector('.session-rename-form').emit('submit');await h.settle();assert.equal(row.querySelector('.session-rename-input').value,'未保存标题');assert.match(row.querySelector('.session-row-error').textContent,/metadata conflict/);assert.equal(h.server.get('aaaaaaaa').title,'Alpha');
+ h.$('session-search').value='Beta';h.$('session-search').emit('input');await h.settle();assert.equal(h.$('session-list').children.length,1);assert.ok(h.row('bbbbbbbb'));h.$('session-filter-workspace').value='project-a';h.$('session-filter-workspace').emit('change');await h.settle();assert.equal(h.$('session-list').children.length,0);assert.match(h.$('sessions-empty').textContent,/匹配/);
+});
+
+test('不同会话的未发送草稿不会互相覆盖或被发送',async()=>{
+ const h=organizedSessionHarness();await h.settle();h.$('message').value='A 的草稿';await h.choose('bbbbbbbb');assert.equal(h.$('message').value,'');h.$('message').value='B 的草稿';await h.choose('aaaaaaaa');assert.equal(h.$('message').value,'A 的草稿');await h.choose('bbbbbbbb');assert.equal(h.$('message').value,'B 的草稿');assert.equal(h.calls.some(x=>x.url==='/api/runs'),false);
+});
+
+test('历史回放显示当轮配置版本，不把它作为当前授权',async()=>{
+ const configuration={model:'old-model',selection:{owner:'presets',id:'research',revision:'preset-old'},tools:['luna_read_file'],resource_revisions:{skills:{learned:'skill-old'}}};
+ const h=navigationHarness({hash:'#session=aaaaaaaa',respond:async url=>url==='/api/sessions/aaaaaaaa'?{ok:true,json:async()=>({id:'aaaaaaaa',title:'历史',records:[{type:'message',role:'user',text:'hi'},{type:'message',role:'assistant',text:'answer'},{type:'run',status:'ok',configuration}]})}:undefined});await h.settle();const detail=h.$('conversation').querySelector('.run-configuration');assert.ok(detail);assert.match(detail.textContent,/old-model/);assert.match(detail.textContent,/skill-old/);assert.match(detail.textContent,/不代表当前授权/);assert.equal(Boolean(detail.open),false);
+});
+
+
+test('会话分页展示剩余数量并用 offset 读取下一页',async()=>{
+ const h=organizedSessionHarness();await h.settle();for(let i=0;i<103;i++){const id='c'+String(i).padStart(7,'0');h.server.set(id,{id,title:'Session '+i,archived:false,workspace:''});}
+ await h.poll();assert.equal(h.$('session-list').children.length,100);assert.equal(h.$('session-pagination').hidden,false);assert.match(h.$('session-page-label').textContent,/105/);await h.click('session-page-next');assert.equal(h.$('session-list').children.length,5);assert.ok(h.calls.some(x=>x.url.includes('offset=100')));await h.click('session-page-prev');assert.equal(h.$('session-list').children.length,100);
+});
+
+test('会话筛选取消旧请求，迟到结果不能覆盖新查询',async()=>{
+ let release;const h=navigationHarness({respond:async url=>{if(url.includes('/api/sessions?q=Alpha')){await new Promise(resolve=>release=resolve);return {ok:true,json:async()=>({sessions:[{id:'aaaaaaaa',title:'stale Alpha'}]})}}if(url.includes('/api/sessions?q=Beta'))return {ok:true,json:async()=>({sessions:[{id:'bbbbbbbb',title:'Beta'}]})};}});
+ await h.settle();h.$('session-search').value='Alpha';h.$('session-search').emit('input');await h.settle();h.$('session-search').value='Beta';h.$('session-search').emit('input');await h.settle();const stale=h.calls.find(x=>x.url.includes('q=Alpha'));assert.equal(stale.options.signal.aborted,true);release();await h.settle();assert.match(h.$('session-list').textContent,/Beta/);assert.doesNotMatch(h.$('session-list').textContent,/stale Alpha/);
+});
+
+test('已有未发送新会话草稿时再次新建，为旧草稿分配身份但不发送内容',async()=>{
+ const h=sessionControlHarness();await h.settle();h.$('message').value='尚未发送的想法';await h.click('session-new');await h.settle();assert.equal(h.server.created,true);assert.equal(h.$('message').value,'');assert.equal(h.calls.some(x=>x.url==='/api/runs'),false);h.location.hash='#session=cccccccc';await h.settle();assert.equal(h.$('message').value,'尚未发送的想法');
 });

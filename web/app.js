@@ -821,7 +821,9 @@ function sessionRows(payload, currentID, now = Date.now()) {
       title: sessionTitle(record.title),
       time: relativeTime(record.updated_at, now),
       runs: runCountLabel(record.run_count),
-      current: record.id === currentID
+      current: record.id === currentID,
+      ...(record.archived === true ? { archived: true } : {}),
+      ...(typeof record.workspace === 'string' && record.workspace ? { workspace: record.workspace } : {})
     });
   }
   return rows;
@@ -906,6 +908,7 @@ function replaySession(detail) {
       const failed = status !== '' && status !== 'ok';
       if (open) {
         open.status = status;
+        if (record.configuration && typeof record.configuration === 'object') open.configuration = record.configuration;
         const reported = usageSnapshot(record.usage);
         if (reported) open.usage = reported;
         open.failed = failed;
@@ -1597,6 +1600,16 @@ if (typeof document !== 'undefined') {
   let switching = false;
   let sessionsPayload = null;
   let currentSessionID = '';
+  let sessionArchived = false;
+  const sessionDrafts = new Map();
+  const sessionMetadataPending = new Set();
+  let sessionListRequest = null;
+  let sessionListRevision = 0;
+  let sessionPageOffset = 0;
+  let sessionNextOffset = null;
+  let sessionPageSize = 100;
+  let sessionWorkspaceOptionsKey = '';
+  let sessionFilterTimer = null;
   const approvalCards = new Map();
   let approvalRevision = 0;
   let lastCompletedRunID = '';
@@ -2326,6 +2339,10 @@ if (typeof document !== 'undefined') {
       adoptSession(data.session_id);
       return;
     }
+    if (type === 'run.configuration') {
+      if (currentTurn && !currentTurn.configurationNode) { currentTurn.configurationNode = runConfigurationNode(data); currentTurn.timeline.insertBefore(currentTurn.configurationNode, stepAnchor(currentTurn)); }
+      return;
+    }
     // 一条新的真实事件覆盖上一次取消失败留下的那句话。
     if (liveRun) liveRun.notice = '';
     if (type === 'assistant.delta') {
@@ -2448,18 +2465,21 @@ if (typeof document !== 'undefined') {
     if (running || switching) return;
     if(remoteBusy()){setConversationStatus('已有运行进行中，请先停止它或等待完成。',true);return;}
     if (!executionReady()) { setConversationStatus('请先读取执行权限，或在权限面板中确认 Full access / 切回隔离。', true); return; }
+    if (sessionArchived) { setConversationStatus('请先恢复已归档会话。', true); return; }
     const message = rawMessage.trim();
     if (!message) return;
     let admitted = false;
     addUserTurn(message);
     currentTurn = addAssistantTurn(message);
     input.value = '';
+    captureSessionDraft();
     resizeInput();
     beginRun();
     try {
       await streamRun(message, () => { admitted = true; });
     } catch (error) {
-      if (!admitted) input.value = message;
+      if (!admitted && !input.value) input.value = rawMessage;
+      captureSessionDraft();
       resizeInput();
       if (!currentTurn || !currentTurn.terminal) showRunFailure(error.message);
     } finally {
@@ -2470,7 +2490,7 @@ if (typeof document !== 'undefined') {
       input.focus();
       updateState();
       // The run changed the session's title, time and run count.
-      updateSessions();
+      updateSessions(true);
     }
   }
 
@@ -2961,12 +2981,12 @@ if (typeof document !== 'undefined') {
     if (!response.ok) throw new Error(await errorMessage(response));
     const session = await response.json();
     if (!isSessionID(session.id)) throw new Error('服务端没有返回有效的会话标识');
-    currentSessionID = session.id;
+    bindSessionDraft(session.id);
     syncCapabilityWidgets(capabilityWidgets(lastRuntimeState?.capabilities));
     resetExecutionState();
     history.replaceState(null, '', location.pathname + location.search + sessionHash(session.id));
     rerenderSessions();
-    await updateSessions();
+    await updateSessions(true);
     return session.id;
   }
 
@@ -4935,54 +4955,124 @@ if (typeof document !== 'undefined') {
     }
   }
 
+  function captureSessionDraft() {
+    if (input.value) sessionDrafts.set(currentSessionID, input.value);
+    else sessionDrafts.delete(currentSessionID);
+  }
+  function restoreSessionDraft() { input.value = sessionDrafts.get(currentSessionID) || ''; resizeInput(); }
+  function bindSessionDraft(id) {
+    captureSessionDraft();
+    if (!currentSessionID) { const draft = sessionDrafts.get(''); sessionDrafts.delete(''); if (draft) sessionDrafts.set(id, draft); }
+    currentSessionID = id;
+  }
+  input.addEventListener('input', captureSessionDraft);
+
   function sessionRowNode(row) {
-    const item = make('li');
-    const button = make('button', 'session-row');
-    button.type = 'button';
+    const item = make('li', 'session-item'); item.sessionRow = row; item.dataset.sessionId = row.id;
+    const line = make('div', 'session-row-line');
+    const button = make('button', 'session-row'); button.type = 'button';
     button.append(make('span', 'session-title'), make('span', 'session-meta'));
-    button.addEventListener('click', () => switchSession(row.id));
-    item.append(button);
-    return item;
+    button.addEventListener('click', () => switchSession(item.sessionRow.id));
+    const toggle = make('button', 'session-menu-toggle icon-button', '⋯'); toggle.type = 'button'; toggle.setAttribute('aria-label', '会话操作'); toggle.setAttribute('aria-expanded', 'false');
+    const menu = make('div', 'session-row-menu'); menu.id = 'session-menu-' + row.id; menu.hidden = true; toggle.setAttribute('aria-controls', menu.id);
+    const rename = make('button', 'session-rename-action luna-button', '重命名'); rename.type = 'button';
+    const archive = make('button', 'session-archive-action luna-button'); archive.type = 'button';
+    const editor = make('form', 'session-rename-form'); editor.hidden = true;
+    const title = make('input', 'session-rename-input luna-input'); title.maxLength = 80; title.required = true; title.setAttribute('aria-label', '会话标题');
+    const save = make('button', 'luna-button', '保存'); save.type = 'submit';
+    const cancel = make('button', 'luna-button', '取消'); cancel.type = 'button'; cancel.addEventListener('click', () => { editor.hidden = true; toggle.focus(); });
+    editor.append(title, save, cancel);
+    toggle.addEventListener('click', () => { const open = menu.hidden; closeSessionMenus(); menu.hidden = !open; toggle.setAttribute('aria-expanded', String(open)); if (open) rename.focus(); });
+    rename.addEventListener('click', () => { menu.hidden = true; toggle.setAttribute('aria-expanded', 'false'); title.value = item.sessionRow.title; editor.hidden = false; title.focus(); });
+    archive.addEventListener('click', () => { menu.hidden = true; toggle.setAttribute('aria-expanded', 'false'); saveSessionMetadata(item.sessionRow.id, { archived: !item.sessionRow.archived }); });
+    editor.addEventListener('submit', async event => { event.preventDefault(); if (await saveSessionMetadata(item.sessionRow.id, { title: title.value })) editor.hidden = true; });
+    menu.append(rename, archive); line.append(button, toggle);
+    const error = make('p', 'session-row-error'); error.hidden = true; error.setAttribute('role', 'status');
+    item.append(line, menu, editor, error); return item;
   }
-
   function updateSessionRow(item, row) {
-    const button = item.querySelector('button');
+    item.sessionRow = row; item.dataset.sessionId = row.id;
+    const button = item.querySelector('.session-row');
     button.classList.toggle('is-current', row.current);
-    if (row.current) button.setAttribute('aria-current', 'true');
-    else button.removeAttribute('aria-current');
+    if (row.current) button.setAttribute('aria-current', 'true'); else button.removeAttribute('aria-current');
     item.querySelector('.session-title').textContent = row.title;
-    const meta = item.querySelector('.session-meta');
-    meta.textContent = row.time === '—' ? '' : row.time;
-    button.setAttribute('title', `${row.title}\n#${row.id} · ${row.runs}`);
+    const meta = item.querySelector('.session-meta'); meta.textContent = [row.archived ? '已归档' : '', row.time === '—' ? '' : row.time].filter(Boolean).join(' · ');
+    button.setAttribute('title', row.title + '\n#' + row.id + ' · ' + row.runs);
+    const pending = sessionMetadataPending.has(row.id);
     button.disabled = running || switching;
+    item.querySelector('.session-menu-toggle').disabled = pending || switching;
+    item.querySelector('.session-rename-action').disabled = pending;
+    const archive = item.querySelector('.session-archive-action'); archive.textContent = row.archived ? '恢复' : '归档'; archive.disabled = pending || (row.current && Boolean(running || remoteRunID()));
+    item.querySelector('.session-rename-form').inert = pending;
   }
+  function closeSessionMenus(restoreFocus = false) { for (const item of sessionList.children) { const menu = item.querySelector('.session-row-menu'); const toggle = item.querySelector('.session-menu-toggle'); if (restoreFocus && !menu.hidden && menu.contains(document.activeElement)) toggle.focus(); menu.hidden = true; toggle.setAttribute('aria-expanded', 'false'); } }
+  document.addEventListener('keydown', event => { if (event.key === 'Escape') closeSessionMenus(true); });
+  document.addEventListener('click', event => { if (!sessionList.contains(event.target)) closeSessionMenus(); });
 
-  function renderSessions(payload) {
-    sessionsPayload = payload;
-    const rows = sessionRows(payload, currentSessionID);
-    const current = rows.find((row) => row.current);
-    if (current) setConversationTitle(current.title);
-    reconcileList(sessionList, rows, (row) => row.id, sessionRowNode, updateSessionRow, sessionNew);
-    $('sessions-empty').hidden = rows.length > 0;
-  }
-
-  function rerenderSessions() {
-    if (sessionsPayload === null) return;
-    renderSessions(sessionsPayload);
-  }
-
-  async function updateSessions() {
+  async function saveSessionMetadata(id, body) {
+    if (sessionMetadataPending.has(id)) return false;
+    sessionMetadataPending.add(id); rerenderSessions();
+    const controller = new AbortController(); const deadline = setTimeout(() => controller.abort(), 15000);
+    const item = [...sessionList.children].find(node => node.dataset.sessionId === id); const errorNode = item?.querySelector('.session-row-error');
+    if (errorNode) { errorNode.hidden = true; errorNode.textContent = ''; }
     try {
-      const response = await fetch('/api/sessions', { cache: 'no-store' });
+      const response = await fetch('/api/sessions/' + encodeURIComponent(id) + '/metadata', { method: 'POST', signal: controller.signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       if (!response.ok) throw new Error(await errorMessage(response));
-      renderSessions(await response.json());
-      // 读到了：上一次的列表故障不再挂着。
-      setSessionStatus('');
+      const detail = await response.json();
+      if (id === currentSessionID) { sessionArchived = detail.archived === true; setConversationTitle(detail.title); setSessionControls(); }
+      await updateSessions(true); return true;
     } catch (error) {
-      // 只有这一列自身的故障写在这里：主体是导航，报错的对象就是它。
-      setSessionStatus(`无法读取会话列表：${error.message}`, 'failure');
-    }
+      const message = controller.signal.aborted ? '更新超时，可能已保存；请刷新后确认。' : error.message;
+      if (errorNode) { errorNode.textContent = message; errorNode.hidden = false; }
+      if (id === currentSessionID) setConversationStatus('会话更新失败：' + message, true); return false;
+    } finally { clearTimeout(deadline); sessionMetadataPending.delete(id); setSessionControls(); }
   }
+  $('session-restore').addEventListener('click', () => { if (currentSessionID) saveSessionMetadata(currentSessionID, { archived: false }); });
+
+  function renderSessionWorkspaceOptions(payload) {
+    const select = $('session-filter-workspace'); const value = select.value;
+    const entries = new Map([['', '全部项目'], ['unbound', '未绑定项目']]);
+    for (const workspace of payload.workspace_options || []) if (workspace?.id) entries.set(workspace.id, workspace.name || workspace.id);
+    for (const row of payload.sessions || []) if (row.workspace && !entries.has(row.workspace)) entries.set(row.workspace, '项目 ' + row.workspace);
+    if (value && !entries.has(value)) entries.set(value, '项目 ' + value);
+    const key = JSON.stringify([...entries]); if (key === sessionWorkspaceOptionsKey) return; sessionWorkspaceOptionsKey = key;
+    select.replaceChildren(); for (const [id, title] of entries) { const option = make('option', '', title); option.value = id; select.append(option); } select.value = value;
+  }
+  function renderSessions(payload) {
+    sessionsPayload = payload; const rows = sessionRows(payload, currentSessionID); const current = rows.find(row => row.current);
+    if (current) setConversationTitle(current.title);
+    reconcileList(sessionList, rows, row => row.id, sessionRowNode, updateSessionRow, sessionNew);
+    renderSessionWorkspaceOptions(payload);
+    const total = Number.isSafeInteger(payload.total) ? payload.total : rows.length;
+    sessionPageSize = Number.isSafeInteger(payload.limit) ? payload.limit : 100;
+    sessionNextOffset = Number.isSafeInteger(payload.next_offset) ? payload.next_offset : null;
+    $('session-pagination').hidden = total <= sessionPageSize && !sessionPageOffset;
+    $('session-page-prev').disabled = sessionPageOffset === 0; $('session-page-next').disabled = sessionNextOffset === null;
+    $('session-page-label').textContent = rows.length ? (sessionPageOffset + 1) + '–' + (sessionPageOffset + rows.length) + ' / ' + total : '0 / ' + total;
+    $('sessions-empty').hidden = rows.length > 0;
+    $('sessions-empty').textContent = $('session-search').value || $('session-filter-workspace').value || ($('session-filter-archive').value && $('session-filter-archive').value !== 'exclude') ? '没有匹配的会话。' : '还没有历史会话。';
+  }
+  function rerenderSessions() { if (sessionsPayload !== null) renderSessions(sessionsPayload); }
+  function sessionListURL() {
+    const parts = []; const query = $('session-search').value.trim(); const workspace = $('session-filter-workspace').value; const archived = $('session-filter-archive').value;
+    if (query) parts.push('q=' + encodeURIComponent(query)); if (workspace) parts.push('workspace=' + encodeURIComponent(workspace)); if (archived && archived !== 'exclude') parts.push('archived=' + encodeURIComponent(archived)); if (sessionPageOffset) parts.push('offset=' + sessionPageOffset);
+    return '/api/sessions' + (parts.length ? '?' + parts.join('&') : '');
+  }
+  async function updateSessions(force = false) {
+    const url = sessionListURL(); if (!force && sessionListRequest?.url === url) return;
+    sessionListRequest?.controller.abort(); const controller = new AbortController(); const revision = ++sessionListRevision;
+    sessionListRequest = { url, controller }; const deadline = setTimeout(() => controller.abort(), 15000);
+    try {
+      const response = await fetch(url, { cache: 'no-store', signal: controller.signal }); if (!response.ok) throw new Error(await errorMessage(response)); const payload = await response.json();
+      if (revision !== sessionListRevision || controller.signal.aborted) return; renderSessions(payload); setSessionStatus('');
+    } catch (error) { if (revision === sessionListRevision) setSessionStatus(controller.signal.aborted ? '会话列表读取超时，请重试。' : '无法读取会话列表：' + error.message, 'failure'); }
+    finally { clearTimeout(deadline); if (sessionListRequest?.controller === controller) sessionListRequest = null; }
+  }
+  function sessionFilterChanged() { sessionPageOffset = 0; updateSessions(); }
+  $('session-search').addEventListener('input', () => { clearTimeout(sessionFilterTimer); sessionFilterTimer = setTimeout(sessionFilterChanged, 200); });
+  $('session-filter-workspace').addEventListener('change', sessionFilterChanged); $('session-filter-archive').addEventListener('change', sessionFilterChanged);
+  $('session-page-prev').addEventListener('click', () => { sessionPageOffset = Math.max(0, sessionPageOffset - sessionPageSize); updateSessions(); });
+  $('session-page-next').addEventListener('click', () => { if (sessionNextOffset !== null) { sessionPageOffset = sessionNextOffset; updateSessions(); } });
 
   // A single place decides whether the composer and the session controls accept
   // input: a run and a replay in flight both block the controls that would mix
@@ -5007,7 +5097,11 @@ if (typeof document !== 'undefined') {
     const cancelling=Boolean(running&&liveRun?.cancelling)||Boolean(remote&&remoteCancelID===remote);
     const action=cancelling?'cancelling':running||remote?'cancel':'send';
     if(send.dataset.action!==action)setSendAction(action);
-    send.disabled=switching||cancelling||(!running&&!remote&&(!executionReady()||remoteBusy()));
+    send.disabled=switching||cancelling||(!running&&!remote&&(sessionArchived||!executionReady()||remoteBusy()));
+    input.readOnly = sessionArchived;
+    $('session-archive-banner').hidden = !sessionArchived;
+    $('session-restore').disabled = switching || sessionMetadataPending.has(currentSessionID);
+    if (sessionArchived && !running && !remote) send.title = '先恢复会话再发送';
     if(!running&&!remote&&remoteBusy())send.title='另一个会话正在运行';
     sessionNew.disabled = running || switching;
     rerenderSessions();
@@ -5075,8 +5169,17 @@ if (typeof document !== 'undefined') {
     });
   }
 
+  function runConfigurationNode(configuration) {
+    const detail = make('details', 'run-configuration');
+    detail.append(make('summary', '', '本轮配置（不代表当前授权）'));
+    const selection = configuration.selection;
+    const receipt = { model: configuration.model, reasoning_effort: configuration.reasoning_effort, workspace_id: configuration.workspace_id, preset: selection ? { owner: selection.owner, id: selection.id, revision: selection.revision } : undefined, capabilities: configuration.capabilities, tools: configuration.tools, resources: configuration.resources, resource_revisions: configuration.resource_revisions };
+    detail.append(make('pre', '', JSON.stringify(receipt, null, 2))); return detail;
+  }
+
   function assistantReplayNode(record) {
     const node = assistantTurnNode();
+    if (record.configuration) node.timeline.insertBefore(runConfigurationNode(record.configuration), node.body);
     for (const tool of record.tools) node.timeline.insertBefore(toolRowNode(tool).card, node.body);
     if (record.tools.length || record.usage) {
       // 回放出来的调用也排在同一条时间线里：它同样是"过程"，不是回答。
@@ -5101,6 +5204,7 @@ if (typeof document !== 'undefined') {
   }
 
   function renderReplayedSession(detail) {
+    sessionArchived = detail?.archived === true;
     const usage = usageFromRecords(detail?.records);
     sessionUsageByRun = usage.runs;
     usageRunID = usage.latest;
@@ -5135,8 +5239,11 @@ if (typeof document !== 'undefined') {
   // 等待期间的表现发生在主区：一段占位骨架 + aria-busy。侧栏只做导航，这里既不
   // 写"正在恢复会话…"，也不在成功时补一句"已恢复"。
   async function loadSession(id) {
+    captureSessionDraft();
     clearApprovals();
     currentSessionID = id;
+    sessionArchived = false;
+    restoreSessionDraft();
     resetCapabilityWidgets();
     resetExecutionState();
     modelListRevision += 1;
@@ -5177,7 +5284,10 @@ if (typeof document !== 'undefined') {
   // dropSession leaves the URL with no session in it and the area empty, which
   // is the truth after a new session is started or a stored one is gone.
   function dropSession() {
+    captureSessionDraft();
     currentSessionID = '';
+    sessionArchived = false;
+    restoreSessionDraft();
     resetExecutionState();
     sessionModelChoice = sessionReasoningChoice = sessionSetupChoice = null;
     sessionSetupProblem = '';
@@ -5190,8 +5300,14 @@ if (typeof document !== 'undefined') {
     rerenderSessions();
   }
 
-  function newSession() {
+  async function newSession() {
     if (running || switching) return;
+    if (!currentSessionID && input.value.trim()) {
+      switching = true; setSessionControls();
+      try { await ensureSession(); captureSessionDraft(); }
+      catch (error) { setConversationStatus('保留草稿失败：' + error.message, true); return; }
+      finally { switching = false; setSessionControls(); }
+    }
     if (activePanel === panels.sessions) closeDrawer();
     dropSession();
     setConversationStatus('新会话：可以先选择模型、思考档位和工作区。');
@@ -5210,7 +5326,7 @@ if (typeof document !== 'undefined') {
   // run.started, so the hash names the session the answer belongs to.
   function adoptSession(id) {
     if (!isSessionID(id) || id === currentSessionID) return;
-    currentSessionID = id;
+    bindSessionDraft(id);
     syncCapabilityWidgets(capabilityWidgets(lastRuntimeState?.capabilities));
     resetExecutionState();
     location.hash = sessionHash(id);

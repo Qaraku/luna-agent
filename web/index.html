@@ -42,6 +42,7 @@
             <h2 id="empty-title">有什么想一起看看？</h2>
             <p>从一个问题、一段文字，或一个想法开始。</p>
           </section>
+          <div id="session-archive-banner" class="session-archive-banner" hidden><span>这个会话已归档，恢复后才能继续发送。</span><button id="session-restore" class="luna-button" type="button">恢复会话</button></div>
           <div id="session-notices" class="session-notices" hidden></div>
           <!-- 会话切换时的加载占位：它出现在用户正在看的主区，不在侧栏。
                它与真实内容在同一帧里换手，所以不会把外壳挤动。 -->
@@ -117,7 +118,13 @@
         <span>新建会话</span>
       </button>
       <h2 id="sessions-title" class="sidebar-heading">会话</h2>
+      <div class="session-filters">
+        <label class="sr-only" for="session-search">搜索会话标题</label><input id="session-search" class="luna-input" type="search" maxlength="256" placeholder="搜索会话标题">
+        <label class="sr-only" for="session-filter-workspace">按项目筛选</label><select id="session-filter-workspace" class="luna-input"><option value="">全部项目</option><option value="unbound">未绑定项目</option></select>
+        <label class="sr-only" for="session-filter-archive">会话归档状态</label><select id="session-filter-archive" class="luna-input"><option value="exclude">活动会话</option><option value="only">已归档</option><option value="include">全部会话</option></select>
+      </div>
       <ul id="session-list" class="session-list"></ul>
+      <div id="session-pagination" class="session-pagination" hidden><button id="session-page-prev" class="luna-button" type="button">上一页</button><span id="session-page-label"></span><button id="session-page-next" class="luna-button" type="button">下一页</button></div>
       <p id="sessions-empty" class="session-empty" hidden>还没有历史会话。</p>
       <p id="session-status" class="session-status" role="status"></p>
     </div>
