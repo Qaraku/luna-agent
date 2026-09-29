@@ -114,7 +114,7 @@ Luna 的通用行为指令位于 `internal/agent/prompts/core.md`，构建时嵌
 
 - 使用名为 `luna` 的 Eino `ChatModelAgent`，自动选择工具；模型调用默认最多 64 轮（`max_iterations`），同一模型轮次中的多个工具调用按顺序执行。
 - 支持兼容 OpenAI 的模型服务接口。接口地址、密钥和模型由设置页写入 `provider.yaml`；运行预算与思考档位从环境变量及 `$XDG_CONFIG_HOME/luna/config.yaml` 读取，文件中的有效值优先，未设置的部分由环境变量补充。
-- 共提供十三种模型可见工具。五种核心包装器由独立子进程提供，支持按工具重建当前源码；另外八种由能力贡献，其中 JSON 工具也使用独立子进程。JSON 工具、终端、文件写入、网页读取和模型运行组件默认停用，需用户在设置中启用；权限边界见下文。
+- 共提供十四种模型可见工具。五种核心包装器由独立子进程提供，支持按工具重建当前源码；另外九种由能力贡献，其中 JSON 工具也使用独立子进程。JSON 工具、终端、文件写入、网页读取和模型运行组件默认停用，需用户在设置中启用；权限边界见下文。
 
   | 工具 | 部署 | 当前行为 |
   |---|---|---|
@@ -126,6 +126,7 @@ Luna 的通用行为指令位于 `internal/agent/prompts/core.md`，构建时嵌
   | `luna_remember` | 记忆能力 | 追加一条事实 |
   | `luna_recall` | 记忆能力 | 列出或按字面量检索生效事实，支持有界分页 |
   | `luna_skill_view` | 技能能力 | 按需读取技能正文或技能目录内文件 |
+  | `luna_skill_manage` | 技能能力 | 预览、保存和恢复个人技能修订，模型写入前审批 |
   | `luna_run` | 终端能力 | 按会话权限和本次请求挂载可读/可写范围，通过隔离代理联网；Full access 需单独确认 |
   | `luna_write_file` | 文件写入能力 | 在授权目录内创建或替换文本文件，并返回修改差异 |
   | `luna_web_fetch` | 网页读取能力 | 获取公网 HTTP(S) 网页的可读文本，说明触及的上限 |
@@ -192,6 +193,19 @@ Luna 的通用行为指令位于 `internal/agent/prompts/core.md`，构建时嵌
 - **能力**承载用户可感知的产品功能，内核只负责运行机制。每个能力声明贡献的工具、上下文块、HTTP 路由和浏览器面板，以及资源占用声明（路由前缀、面板标识、状态命名空间）和所需权限。其生命周期状态为 `registered` / `enabled` / `disabled` / `failed`。注册时拒绝重复占用的名称、未在描述中声明的接口和未经内核授权的权限。`GET /api/state` 通过 `capabilities[]` 返回所有已注册能力的 `id`、`title`、`deployment`、`state`、`contributions`、`claims`、`permissions`、`panels`，不包含能力存储的数据。`POST /api/plugins/{id}/enable|disable` 切换状态；停用会一起移除工具、上下文、路由和面板，**不删除数据**，清理数据必须单独明确操作；不允许的状态转换返回 `409`。记忆、工作区和技能等能力均按这一机制装配，内置只是部署选择，不代表额外特权。停用后，其工具从下一轮的模型工具集中移除；装配清单变化时会重建智能体。
 
 <a id="quick-start"></a>
+
+### 个人技能学习
+
+在对话中可以教 Luna 一次可复用的方法，例如：“把刚才确认过的流程整理成技能，先展示差异，保存前询问我。”模型使用 `luna_skill_manage` 的 `preview` / `save` 操作；不会自动把整段聊天或未经证实的成功记录存进技能。
+
+- 从“设置 → 技能 → 管理个人技能”打开能力自己的面板。支持新建、复制、编辑、查看差异、确认保存、启停、查看来源、恢复旧修订和导出标准文件。编辑失败保留草稿，预览后内容改变必须重新预览。
+- 个人技能库位于能力状态根的 `skill-library/`。每个版本包含标准同名技能目录与 `SKILL.md`；可附带最多 8 个 `references/*.md` 文本文件。正文最多 32 KiB、定义合计最多 128 KiB，最多 64 个技能、每个 32 个修订；超限拒绝，不删除旧历史。
+- 保存记录来源类型、会话、运行、原因、父修订和内容校验值。模型不能自行指定来源身份。恢复会生成新修订，不改写旧版本；外部修改破坏校验时明确报错，不冒充原修订。
+- 模型读取遵守 `read` 策略；保存遵守 `write` 策略，并对个人库目录要求单次范围审批，即使项目文件写入已允许。明确拒绝先于目录探测；拒绝、取消或并发修订冲突不会发布待保存内容。另行确认的 Full access 仍是宿主权限例外。
+- 受管理技能的名字与版本在运行开始时冻结，清单与正文使用同一修订。新内容仅在后续运行中、且该技能已启用并被选中时生效。停用整个 Skills 能力会同时移除读取、管理工具、路由与面板，不删除个人库。
+- 已安装的外部技能目录不被学习流程原地覆盖。需要改编时保存为新的个人技能名称，再在预设中选择；程序更新不应替换这个独立目录。导出只包含技能定义文件，但分享前仍须检查正文是否包含私人内容。
+
+`luna_skill_manage` 还支持有界 `list`、`read` 与 `restore`。查询整个管理库是用户面板的功能，模型查询仍受本轮技能选择限制。普通文件读取工具仍然只读，不因为技能学习而获得写入能力。
 
 ## 快速开始
 
@@ -301,7 +315,9 @@ run_timeout: 20m              # 每轮运行的最长时间
 | `POST` | `/api/sessions/{id}/execution` | 选择 `sandbox` 或 `full_access`；后者必须带 `confirm_full_access:true` 并要求精确 Origin。授权仅在当前服务内存中生效，运行中拒绝更改，未确认的偏好不能启动运行 |
 | `GET` | `/api/reasoning` | 返回支持的档位 `levels` 与 `current`（`reasoning_effort`、`origin`）；`?session=<id>` 查询会话有效选择，省略时查询全局设置 |
 | `POST` | `/api/sessions/{id}/reasoning` | 接受 `{"reasoning_effort":"high"}` 或 `{"reset":true}`，两者互斥；空字符串表示不发送字段，重置表示继承预设或全局。追加配置时保留模型和工作区，要求精确 Origin |
-| `GET` | `/api/skills` | 按发现顺序列出技能：`name`、`description`、`scope`、`enabled`，停用时含 `disabled_reason`。描述过长会截断并说明，不会静默截断；无技能时返回空列表 |
+| `GET` | `/api/skill-library` · `/detail` · `/history` · `/export` | Skills 能力提供的个人库目录、`?name=...&revision=...` 的定义、历史与标准文件导出；子路径均位于 `/api/skill-library/` 下 |
+| `POST` | `/api/skill-library/preview` · `/save` · `/restore` | 预览不写入；保存和恢复要求当前 `expected_revision`，来源由服务端记录为用户操作，要求精确 Origin |
+| `GET` | `/api/skills` | 按发现顺序列出技能：`name`、`description`、`scope`、`enabled`，停用时含 `disabled_reason`；个人库技能另含 `managed` 和 `revision`。目录不可读返回错误，不伪装空列表。描述过长会截断并说明，不会静默截断；无技能时返回空列表 |
 | `POST` | `/api/skills/{name}/enable` · `/disable` | 启用或停用单个技能并返回新状态。偏好写入 `$XDG_CONFIG_HOME/luna/settings.yaml`，运行时列表随即更新，无需重新构建；技能清单每轮读取。未知名称返回 `404`，不会保存不存在技能的偏好；两者均为变更请求，需来源精确匹配 |
 | `POST` | `/api/sessions/{id}/model` | `{"model":"..."}` 指定会话后续运行使用的模型，或用 `{"reset":true}` 恢复继承预设或全局默认（不能同时提供）。以 `config` 记录追加到会话文件，重启后保留并随会话保存。模型不在配置中返回 `400`，会话不存在返回 `404`；需来源精确匹配。记录与现有会话配置合并，不会解除工作区绑定 |
 | `GET` | `/api/workspaces` | 返回具名工作目录集合：`{"workspaces":[{"id":"...","name":"...","dirs":["..."]}]}`；无工作区时返回空列表 |
@@ -363,7 +379,7 @@ go vet ./...
 go build -o .runtime/luna ./cmd/luna
 node --check web/app.js
 node --check web/runtime-widgets.js
-node --test web/app.test.cjs web/runtime-widgets.test.cjs internal/plugins/presets/panel.test.mjs
+node --test web/app.test.cjs web/runtime-widgets.test.cjs internal/plugins/presets/panel.test.mjs internal/plugins/skills/library_panel.test.mjs
 ```
 
 此前的界面重做通过 JavaScript 语法检查与 50 项 Node 测试。隔离 Chromium 使用确定性接口夹具验证了会话切换与刷新恢复、记忆查看与撤回、轮询焦点保持、运行中禁用会话切换、草稿保留、抽屉键盘操作、窄屏缩放，以及当时新增的明暗主题与跟随系统、显式选择的持久化和存储失败回退、选中项与侧栏背景的区分、主要文字的自选对比度（均不低于 4.5:1）、1440px 与 390px 下没有元素越出视口，还有真实计数器插件在切换主题时保留挂载实例、停用时释放定时器。这不代表真实模型或 Go 服务的端到端验收。

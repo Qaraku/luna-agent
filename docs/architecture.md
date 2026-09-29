@@ -170,7 +170,7 @@ Workspace 是官方内置能力（`internal/plugins/workspace`），和 Memory �
 
 ### 能力：Skills
 
-Skills 是**程序性知识**：做某类事的方式。它由内置的 `skills` 能力承载，贡献面很窄——**一条上下文加一个工具**，不注册路由、不注册面板、不认领状态命名空间、不声明权限（它只读自己被发现的那些目录）。
+Skills 是**程序性知识**：做某类事的方式。正式应用使用管理型 `skills` 能力：贡献技能清单、`luna_skill_view` 与 `luna_skill_manage`、个人技能库路由和面板，认领独立 `skill-library` 状态命名空间并声明 `state.write`。嵌入方仍可用只读构造，此时没有管理工具或持久化贡献。
 
 - **一个 skill 是一个目录**：`<root>/<name>/SKILL.md`，frontmatter 是 YAML。`name` 必须等于目录名（否则清单上写的位置与磁盘上的位置会对不上），`description` 必填且不超过 1024 字符（与 Claude Code / Codex 一致）。**未知字段忽略**：skill 是第三方内容，多一个来自更新工具的字段不该让它变成不可用。
 - **发现期只读 frontmatter**：一个 skill 在清单里只占一行（名字 + 描述 + 来源）。这是渐进披露的第一级，也是"装一柜子 skill 不会把提示词填满"的原因。
@@ -182,6 +182,16 @@ Skills 是**程序性知识**：做某类事的方式。它由内置的 `skills`
 
 - **停用写的是 `settings.yaml`，而清单与工具读的是同一份选择**：写文件在前、改运行态在后。顺序反过来（先改运行态、写文件失败）会留下"运行中显示已停用、文件里还写着启用"，下次重启就悄悄把它打开——那是最难查的一类不一致。名字没被发现过时不写任何东西（`404`），因为一个为不存在的目录积累名字的设置文件，没人能把它读成"用户意图"。
 - **停用不重建 agent**：清单是每次运行现读的，工具每次调用现读，所以下一次运行就生效，不需要重启也不需要重载。这与"工具集只在构造时固定"不同——那个是能力**贡献了什么**的问题（见能力模型一节），这里是同一份贡献**当前包含什么**的问题。
+
+#### 个人技能修订与审批
+
+`Library` 先在 `skill-library/entries/<revision>/<name>/` 写入标准文件，再向 `<name>.jsonl` 追加修订元数据以发布；旧目录不就地修改。元数据记录内容哈希、父版本、来源和序号，冲突用 `expected_revision` 拒绝。损坏完整行、残缺尾部或正文校验不符都明确失败。普通外部来源目录不参与写入；与其同名的学习请求须换新名称，不能覆盖已安装来源。
+
+模型预览只读，不保存候选。保存先检查明确拒绝，再按读取策略读取当前版本和差异；私人库写入使用已有 `RequireAccess`、参数摘要和单次范围审批。审批不持有库写锁；批准后重新检查当前父版本与取消状态，再发布，避免等待期间的修改被旧批准覆盖。来源会话与运行从宿主上下文取得，模型参数和用户 API 都不能伪造。用户面板直接提交属于明确用户操作，但仍做版本与内容校验。
+
+`RunResourceRevisionProvider` 以一次读取提供名字和不可变版本，宿主冻结为 `RunInfo.ResourceRevisions` 与运行回执的 `resource_revisions`。受管理技能的清单描述、目录和正文校验都按此版本读取；普通外部目录没有伪造的版本号。技能目录错误通过 `SkillCatalog.Skills() (..., error)` 传到 HTTP 与运行装配，不当成空目录。
+
+管理面板通过 `/api/skill-library/panel.js` 与 `panel.css` 挂载，正文只进文本 DOM。新建/编辑必须先预览差异；后续修改使旧预览失效；恢复先展示差异，再写入新的修订。请求有 15 秒上限，面板关闭会取消请求，迟到结果不重新挂载。启停复用既有用户偏好事务，目录读取在写偏好前完成，写入后只更新内存选择，避免第二次读取失败造成真假状态不一致。
 
 ### 能力：Terminal
 
@@ -242,7 +252,7 @@ Full access 仍是单独明确确认的高级模式：直接使用宿主 `/bin/s
 
 ### 插件进程
 
-模型可见的工具来自两处：五个由插件支撑的包装器，由核心按插件宿主的白名单注册、各自作为独立进程运行、各有自己的输入 schema；以及启用中能力贡献的工具——`luna_remember` 与 `luna_recall`（Memory）、`luna_skill_view`（Skills）、`luna_run`（Terminal）、`luna_write_file`（文件写入）、`luna_web_fetch`（联网）。后三个能力**默认关闭**：只有用户在设置里打开它之后，它的工具才进入工具集；打开之后它的可达范围仍由设置决定（命令能在哪些目录里跑、文件能写进哪些目录），联网的可达范围则由能力自己判定（只走公开地址的文本响应）。
+模型可见的工具来自两处：五个由插件支撑的包装器，由核心按插件宿主的白名单注册、各自作为独立进程运行、各有自己的输入 schema；以及启用中能力贡献的工具——`luna_remember` 与 `luna_recall`（Memory）、`luna_skill_view` 与 `luna_skill_manage`（Skills）、`luna_run`（Terminal）、`luna_write_file`（文件写入）、`luna_web_fetch`（联网）。后三个能力**默认关闭**：只有用户在设置里打开它之后，它的工具才进入工具集；打开之后它的可达范围仍由设置决定（命令能在哪些目录里跑、文件能写进哪些目录），联网的可达范围则由能力自己判定（只走公开地址的文本响应）。
 
 `luna_text_transform`:
 
@@ -529,7 +539,7 @@ Widget 声明可附带同能力提供的 GET `Source`。宿主按当前会话请
 - `POST /api/provider/models` 由服务端带着某个 provider 的密钥去问 `<base_url>/models`，返回 `{"models":[…],"problem":""}`；失败时接口自己的话（含状态码、不含密钥）进 `problem` 而不是变成一个 HTTP 错误，因为界面要把它显示在导致它的那个输入框旁边。请求里可以带 `name`（正在编辑哪个 provider）与 `base_url`/`api_key`（表单刚敲的值），缺的部分回退到同名 provider 已存的值，所以填了一半的表单也能测。它要求精确 Origin：这是一次花掉这个安装密钥的外呼。
 - `GET /api/models` 返回 `{"models":[{"name":…,"provider":…,"default":…}],"current":{"name":…,"origin":"session"|"global"}}`：可用的模型（第一项是默认）、这个会话会用的那个、以及这个选择来自哪里。**它跟着 provider 文件走**：刚保存的 provider 就是它现在报的东西。`?session=<id>` 指名会话，不带它就只描述运行中的配置。未知会话是 `404`，格式错误是 `400`。**来源字段是必需的**：用户切过会话之后回到这里，必须能分辨看到的是自己的选择还是配置的默认值。
 - `POST /api/sessions/{id}/model` 接受 `{"model":"…"}` 或 `{"reset":true}`（互斥，后者清除会话绑定并恢复跟随全局），把这条会话后续运行使用的模型**追加**成一条 `config` 记录。配置里没有的模型名是 `400`（错误里列出可用的名字），未知会话是 `404`，空名与未识别字段是 `400`。这是一次变更，因此与启动一次运行一样要求精确 Origin。**运行时的模型名不合法不会静默回退**：那会让用户以为切换成功，而每次实际问的仍是另一个模型。
-- `GET /api/skills` 按发现顺序列出每个 skill 的 `name`、`description`、`scope`、`enabled`，以及停用时非空的 `disabled_reason`。描述过长会**截断并说明**，不静默截。没有发现任何 skill 时是空列表。
+- `GET /api/skills` 按发现顺序列出每个 skill 的 `name`、`description`、`scope`、`enabled`，以及停用时非空的 `disabled_reason`。受管理技能另带 `managed`、`revision`。描述过长会**截断并说明**，不静默截。没有发现任何 skill 时是空列表；目录读取失败是错误响应，不是空目录。
 - `POST /api/skills/{name}/enable` 与 `/disable` 改一个 skill 的启停并返回它的新状态：**先写 `settings.yaml`、再改运行态**（顺序理由见"能力：Skills"一节），下一次运行即生效、不需要重建。没发现过的名字是 `404`，且什么都不写。两者都是变更，要求精确 Origin。
 - `GET /api/workspaces` 返回 `{"workspaces":[{"id":…,"name":…,"dirs":[…]}]}`；没有 workspace 时是空列表。
 - `POST /api/workspaces` 接受 `{"name":"…","dirs":["…"]}` 并返回新建的那个：`name` 可省（取第一个目录的基名），目录必须是绝对路径、按顺序去重、至少一个——**一个不包含任何目录的 workspace 不是边界**；重名是 `409`，其余问题 `400` 并给出原因。它是一次变更，要求精确 Origin。
@@ -562,7 +572,7 @@ data: <JSON payload>
 - `run.configuration` —— 带预设的运行在模型调用前报告冻结的 `selection`、模型/思考档位、能力、工具和资源集合；仅是运行状态，不授予权限，不含凭据。
 - `assistant.delta` —— `{"text":"..."}`；文本边产生边发出，包含含工具调用的回合里的文本。哪些文本是答案由终止事件划界，不由这个事件本身声明。
 - `assistant.reasoning` —— `{"text":"..."}`；provider 自愿暴露的推理内容的**流式增量**。它是运行内容而不是回答：**不进入最终答案**，不写入 transcript，也不参与答案对齐。provider 不报告推理时（取决于 provider 与是否 thinking 模式）这个事件根本不出现——运行期不会推断、不会伪造、也不为它留占位。响应只展示这一路真实到达的内容。
-- `tool.started` —— `{"run_id":"...","name":"...","arguments":...}`，其中 `name` 是当前可用的模型可见工具名之一：由子进程支撑的 `luna_text_transform`、`luna_read_file`、`luna_list_dir`、`luna_search_files` 与 `luna_find_files`，以及启用中能力贡献的工具（`luna_remember` / `luna_recall` / `luna_skill_view` / `luna_run` / `luna_write_file` / `luna_web_fetch`）
+- `tool.started` —— `{"run_id":"...","name":"...","arguments":...}`，其中 `name` 是当前可用的模型可见工具名之一：由子进程支撑的 `luna_text_transform`、`luna_read_file`、`luna_list_dir`、`luna_search_files` 与 `luna_find_files`，以及启用中能力贡献的工具（`luna_remember` / `luna_recall` / `luna_skill_view` / `luna_skill_manage` / `luna_run` / `luna_write_file` / `luna_web_fetch`）
 - `tool.finished` —— `{"run_id":"...","name":"...","result":"...","duration_ms":N,"generation":N,"version":"...","plugin_pid":N}`，用于服务了该调用的子进程工具；对于内置能力贡献的调用（例如 `luna_remember`），这三个身份字段在 JSON 中缺席，而不是被发成 0，因为没有进程服务它
 - `tool.failed` —— 运行/工具身份、一个错误和 `duration_ms`；当有子进程服务了这次尝试时带有 generation/版本/PID，没有时省略。工具就调用本身作出的**拒绝**——被拒绝的路径（读取与列举共用同一套边界检查）、单次读取大小上限、二进制内容、格式错误的参数——同样作为调用结果交给模型，因此运行继续，模型可以向用户解释原因。只有**基础设施**故障才结束整轮：没有活跃插件、终止了插件的 RPC 超时或取消、插件进程已经消失，或内置能力用 `plugin.ErrUnavailable` 标记了“这次调用我服务不了”。插件宿主用哨兵错误标记前者（`pluginhost.ErrUnknownTool`、`ErrNoActivePlugin`、`ErrRPCTimeout`、`ErrRPCCanceled`、`ErrPluginGone`），因此包装器按标记分类，而不是匹配报错文字；插件内部抛出的拒绝以纯文本穿越 `net/rpc`，因此永远不属于其中之一。被拒绝的调用仍然带着错误写入它的 `tool_call` 记录，因此失败的调用在重启后依然存在。运行被停止而中断的调用不是拒绝：它以同样的身份关闭，错误就是停止原因，并且**结束整轮**——模型不会被告知工具拒绝了一个它从未拒绝的调用。
 - `usage.updated` —— `{"run_id":"...","input_tokens":N,"output_tokens":N,"total_tokens":N,"cached_tokens":N?,"reasoning_tokens":N?}`；只在 provider 报告用量时出现。运行期不依赖它，也不会估算它没被告知的 token 数。
