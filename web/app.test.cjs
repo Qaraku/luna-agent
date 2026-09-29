@@ -4736,7 +4736,7 @@ function presetControlHarness({hash='',server={created:false,selection:null},fai
  const entries=[{owner:'presets',id:'general',title:'通用助手',revision:'one',capabilities:null},{owner:'presets',id:'research',title:'资料研究',revision:'two',capabilities:['web']}];
  const h=navigationHarness({hash,respond:async(url,options)=>{
   if(url==='/api/commands')return json({commands:[{name:'preset',summary:'预设',args:'text',busy:'reject'}]});
-  if(url==='/api/presets')return failCatalog?json({error:'catalog disabled'},false):json({presets:entries});
+  if(url==='/api/setups')return failCatalog?json({error:'catalog disabled'},false):json({presets:entries});
   if(url.startsWith('/api/setup'))return json({selection:url.includes('session=cccccccc')?server.selection:null,unavailable_capabilities:server.selection?.id==='research'?['web']:[]});
   if(url==='/api/sessions'&&options?.method==='POST'){server.created=true;return json({id:'cccccccc',title:'',records:[]});}
   if(url==='/api/sessions/cccccccc/setup'){
@@ -4781,8 +4781,8 @@ test('预设管理入口使用能力面板，关闭后卸载模块',async()=>{
 });
 
 test('切换会话取消未完成的预设候选请求，迟到结果不重新打开菜单',async()=>{
- let release;const h=navigationHarness({hash:'#session=aaaaaaaa',respond:async(url)=>{if(url==='/api/presets'){await new Promise(resolve=>release=resolve);return {ok:true,json:async()=>({presets:[{id:'stale',title:'旧会话'}]})};}}});
- await h.settle();await h.click('session-preset');await h.click('session-new');const call=h.calls.find(item=>item.url==='/api/presets');assert.equal(call.options.signal.aborted,true);release();await h.settle();assert.equal(h.$('command-menu').hidden,true);assert.doesNotMatch(h.$('session-preset').textContent,/旧会话/);
+ let release;const h=navigationHarness({hash:'#session=aaaaaaaa',respond:async(url)=>{if(url==='/api/setups'){await new Promise(resolve=>release=resolve);return {ok:true,json:async()=>({presets:[{id:'stale',title:'旧会话'}]})};}}});
+ await h.settle();await h.click('session-preset');await h.click('session-new');const call=h.calls.find(item=>item.url==='/api/setups');assert.equal(call.options.signal.aborted,true);release();await h.settle();assert.equal(h.$('command-menu').hidden,true);assert.doesNotMatch(h.$('session-preset').textContent,/旧会话/);
 });
 
 
@@ -4848,4 +4848,13 @@ test('会话筛选取消旧请求，迟到结果不能覆盖新查询',async()=>
 
 test('已有未发送新会话草稿时再次新建，为旧草稿分配身份但不发送内容',async()=>{
  const h=sessionControlHarness();await h.settle();h.$('message').value='尚未发送的想法';await h.click('session-new');await h.settle();assert.equal(h.server.created,true);assert.equal(h.$('message').value,'');assert.equal(h.calls.some(x=>x.url==='/api/runs'),false);h.location.hash='#session=cccccccc';await h.settle();assert.equal(h.$('message').value,'尚未发送的想法');
+});
+
+
+test('插件包管理入口使用能力面板，不把安装当成模型调用',async()=>{
+ let mounted=0;const h=navigationHarness({panelModules:{'/api/packages/panel.js':{mount(){mounted++},unmount(){}}},respond:async url=>url==='/api/state'?{ok:true,json:async()=>({model:'one',busy:false,capabilities:[{id:'packages',title:'插件包管理',state:'enabled',panels:[{id:'packages',title:'插件包管理',entry:'/api/packages/panel.js'}]}]})}:undefined});await h.settle();await h.click('settings-toggle');await h.click('settings-tab-capabilities');await h.click('package-manage');await h.settle();assert.equal(mounted,1);assert.equal(h.$('capability-panel-packages').hidden,false);assert.equal(h.calls.some(x=>x.url==='/api/runs'),false);
+});
+
+test('包预设选择保留真实能力来源，不误写到内置预设目录',async()=>{
+ let selected;const h=navigationHarness({hash:'#session=aaaaaaaa',respond:async(url,options)=>{if(url==='/api/setups')return {ok:true,json:async()=>({presets:[{owner:'pkg-study',id:'pkg_study__research',title:'研究',revision:'r',source_title:'Study'}]})};if(url==='/api/sessions/aaaaaaaa/setup'){selected=JSON.parse(options.body);return {ok:true,json:async()=>({selection:{...selected,title:'研究'}})}}}});await h.settle();await h.click('session-preset');const row=[...h.$('command-menu').children].find(node=>node.textContent.includes('pkg-study:pkg_study__research'));assert.ok(row);row.emit('mousedown');await h.settle();assert.deepEqual(selected,{owner:'pkg-study',id:'pkg_study__research'});
 });

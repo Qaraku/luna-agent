@@ -636,7 +636,7 @@ function skillRows(payload) {
       descriptionText: skillDescriptionText(description) || '没有写描述。',
       descriptionMissing: description === '',
       scope: capabilityPanelText(skill.scope),
-      scopeLabel: skill.managed === true ? '个人技能 · ' + capabilityPanelText(skill.revision).slice(0, 12) : skillScopeLabel(skill.scope),
+      scopeLabel: skill.managed === true ? '个人技能 · ' + capabilityPanelText(skill.revision).slice(0, 12) : skill.scope === 'package' ? '插件包 · ' + capabilityPanelText(skill.revision).slice(0, 12) : skillScopeLabel(skill.scope),
       reported,
       enabled,
       stateLabel: reported ? (enabled ? '已启用' : '已停用') : '状态未报',
@@ -3084,13 +3084,13 @@ if (typeof document !== 'undefined') {
     presetPickerController = controller;
     const deadline = setTimeout(() => controller.abort(), 15000);
     try {
-      const response = await fetch('/api/presets', { cache: 'no-store', signal: controller.signal });
+      const response = await fetch('/api/setups', { cache: 'no-store', signal: controller.signal });
       if (!response.ok) throw new Error(await errorMessage(response));
       const payload = await response.json();
       if (revision !== controlPickerRevision || id !== currentSessionID || running || switching) return;
       const options = (Array.isArray(payload.presets) ? payload.presets : []).map(preset => ({
-        value: preset.id,
-        summary: [preset.title, preset.id === sessionSetupChoice?.id && sessionSetupChoice?.owner === 'presets' ? preset.revision === sessionSetupChoice.revision ? '当前版本' : '会话仍使用旧版本；点击采用新版' : '', preset.builtin ? '内置' : '自定义'].filter(Boolean).join(' · ')
+        value: preset.owner && preset.owner !== 'presets' ? preset.owner + ':' + preset.id : preset.id,
+        summary: [preset.title, preset.id === sessionSetupChoice?.id && sessionSetupChoice?.owner === (preset.owner || 'presets') ? preset.revision === sessionSetupChoice.revision ? '当前版本' : '会话仍使用旧版本；点击采用新版' : '', preset.source_title || (preset.builtin ? '内置' : '自定义')].filter(Boolean).join(' · ')
       }));
       options.push({ value: '--default', summary: '清除预设，保留其他会话设置' });
       const items = commandCandidates([{ name: 'preset', args: 'options', options }], '/preset ').items;
@@ -3167,6 +3167,11 @@ if (typeof document !== 'undefined') {
     else { openComposerSettings('capabilities'); setConversationStatus('请先启用工作预设能力。'); }
   });
   $('composer-project-change').addEventListener('click', () => openComposerSettings('workspace'));
+  $('package-manage').addEventListener('click', () => {
+    const record = capabilityPanelNodes.get('packages');
+    if (record) openDrawer(record.panel);
+    else setConversationStatus('请先启用插件包管理能力。', true);
+  });
   $('skill-manage').addEventListener('click', () => {
     const record = capabilityPanelNodes.get('skill-library');
     if (record) openDrawer(record.panel);
