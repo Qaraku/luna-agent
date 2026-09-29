@@ -29,6 +29,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/plugins/filewrite"
 	"github.com/Qaraku/luna-agent/internal/plugins/jsonformat"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
+	"github.com/Qaraku/luna-agent/internal/plugins/runtimewidgets"
 	skillsplugin "github.com/Qaraku/luna-agent/internal/plugins/skills"
 	"github.com/Qaraku/luna-agent/internal/plugins/terminal"
 	"github.com/Qaraku/luna-agent/internal/plugins/web"
@@ -540,6 +541,18 @@ func registerFileWrite(registry *plugin.Registry, settingsPath string, enabled b
 // is its own business: the capability refuses anything that is not a public http(s)
 // text response, so turning it on does not hand the model a way into this machine or
 // into the local network.
+func registerRuntimeWidgets(registry *plugin.Registry, enabled bool) error {
+	if err := registry.Register(runtimewidgets.New()); err != nil {
+		return fmt.Errorf("register runtime widgets: %w", err)
+	}
+	if enabled {
+		if err := registry.Enable(runtimewidgets.PluginID); err != nil {
+			return fmt.Errorf("enable runtime widgets: %w", err)
+		}
+	}
+	return nil
+}
+
 func registerWeb(registry *plugin.Registry, enabled bool) error {
 	if err := registry.Register(web.New()); err != nil {
 		return fmt.Errorf("register web capability: %w", err)
@@ -742,6 +755,9 @@ func run() error {
 	// asks for net.fetch, and what it can reach is decided by the capability: only
 	// public addresses, only text, with every cap reported instead of hidden.
 	if err := registerWeb(registry, userSettings.CapabilityEnabled(web.PluginID)); err != nil {
+		return err
+	}
+	if err := registerRuntimeWidgets(registry, userSettings.CapabilityEnabled(runtimewidgets.PluginID)); err != nil {
 		return err
 	}
 	listener, err := httpapi.Listen(*addr)

@@ -1,0 +1,5 @@
+.runtime-generated p { margin: 0 0 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.runtime-generated progress { width: 100%; accent-color: var(--luna-accent); }
+.runtime-generated dl { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap: 6px 12px; margin: 0; }
+.runtime-generated dt { color: var(--luna-text-muted); }
+.runtime-generated dd { margin: 0; overflow-wrap: anywhere; }

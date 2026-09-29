@@ -889,3 +889,25 @@ func TestWriteDeadlineSitsAboveTheRunBudget(t *testing.T) {
 		}
 	}
 }
+
+func TestRuntimeWidgetsRegisterWithoutPrivilegeAndRespectEnableChoice(t *testing.T) {
+	registry := plugin.NewRegistry()
+	if err := registerRuntimeWidgets(registry, false); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(toolsOf(registry), "luna_runtime_widget") {
+		t.Fatal("disabled runtime capability exposed its tool")
+	}
+	if err := registry.Enable("runtime-widgets"); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(toolsOf(registry), "luna_runtime_widget") {
+		t.Fatal("runtime widget tool not assembled")
+	}
+	if err := registry.Disable("runtime-widgets"); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(toolsOf(registry), "luna_runtime_widget") {
+		t.Fatal("disabled runtime capability still exposed its tool")
+	}
+}

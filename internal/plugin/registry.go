@@ -161,10 +161,10 @@ func (r *Registry) Register(p Plugin) error {
 }
 
 // exposedGlobally 报告这类贡献的 ID 是不是全局名字。工具名给模型看，路由路径给浏览器
-// 打，面板 id 给宿主渲染，三者都必须唯一；上下文贡献的 ID 只是插件内部的名字。
+// 打，面板和 widget id 给宿主渲染，均须唯一；上下文贡献的 ID 只是插件内部的名字。
 func exposedGlobally(kind ContributionKind) bool {
 	switch kind {
-	case ContributionTool, ContributionRoute, ContributionPanel:
+	case ContributionTool, ContributionRoute, ContributionPanel, ContributionWidget:
 		return true
 	default:
 		return false
@@ -296,7 +296,7 @@ func validateContributions(d Descriptor) error {
 	seen := make(map[contribKey]bool, len(d.Contributions))
 	for _, c := range d.Contributions {
 		switch c.Kind {
-		case ContributionTool, ContributionContext, ContributionRoute, ContributionPanel:
+		case ContributionTool, ContributionContext, ContributionRoute, ContributionPanel, ContributionWidget:
 		default:
 			return fmt.Errorf("plugin %q declares unknown contribution kind %q", d.ID, c.Kind)
 		}
@@ -316,7 +316,7 @@ func validateContributions(d Descriptor) error {
 func validateClaims(d Descriptor) error {
 	for _, c := range d.Claims {
 		switch c.Kind {
-		case ClaimRoutePrefix, ClaimPanel, ClaimStateNamespace:
+		case ClaimRoutePrefix, ClaimPanel, ClaimWidget, ClaimStateNamespace:
 		default:
 			return fmt.Errorf("plugin %q declares unknown claim kind %q", d.ID, c.Kind)
 		}
@@ -457,7 +457,7 @@ func checkConsistency(p Plugin, d Descriptor) error {
 		return fmt.Errorf("plugin %q declares panel contributions but does not implement PanelProvider", d.ID)
 	}
 
-	return nil
+	return validateWidgets(p, d)
 }
 
 // requireExposed 断言静态贡献项声明了就一定暴露。工具、路由与面板的接口返回值在

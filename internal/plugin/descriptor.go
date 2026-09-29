@@ -28,6 +28,7 @@ const (
 	ContributionContext ContributionKind = "context"
 	ContributionRoute   ContributionKind = "route"
 	ContributionPanel   ContributionKind = "panel"
+	ContributionWidget  ContributionKind = "widget"
 )
 
 // DefaultContributionBudget 是 Contribution.BudgetBytes 为 0 时 Kernel 采用的
@@ -53,6 +54,8 @@ const (
 	ClaimRoutePrefix ClaimKind = "route-prefix"
 	// ClaimPanel 是面板 id。
 	ClaimPanel ClaimKind = "panel"
+	// ClaimWidget 是运行时组件的全局标识。
+	ClaimWidget ClaimKind = "widget"
 	// ClaimStateNamespace 是状态目录名，不含分隔符。
 	ClaimStateNamespace ClaimKind = "state-namespace"
 )

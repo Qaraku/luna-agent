@@ -148,6 +148,7 @@ type capabilityView struct {
 	Claims        []claimView        `json:"claims"`
 	Permissions   []permissionView   `json:"permissions"`
 	Panels        []panelView        `json:"panels"`
+	Widgets       []widgetView       `json:"widgets"`
 	Error         string             `json:"error,omitempty"`
 }
 
@@ -158,6 +159,13 @@ type panelView struct {
 	ID    string `json:"id"`
 	Title string `json:"title"`
 	Entry string `json:"entry"`
+}
+
+type widgetView struct {
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	Entry  string `json:"entry"`
+	Source string `json:"source,omitempty"`
 }
 
 type contributionView struct {
@@ -213,6 +221,15 @@ func capabilityViewOf(entry plugin.Entry) capabilityView {
 			view.Panels = append(view.Panels, panelView{ID: panel.ID, Title: panel.Title, Entry: panel.Entry})
 		}
 	}
+	view.Widgets = make([]widgetView, 0)
+	if entry.State == plugin.StateEnabled {
+		if provider, ok := entry.Plugin.(plugin.WidgetProvider); ok {
+			for _, widget := range provider.Widgets() {
+				view.Widgets = append(view.Widgets, widgetView{ID: widget.ID, Title: widget.Title, Entry: widget.Entry, Source: widget.Source})
+			}
+		}
+	}
+
 	if entry.Err != nil {
 		view.Error = entry.Err.Error()
 	}

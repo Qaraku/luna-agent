@@ -515,7 +515,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.run(w, r)
-	case "/", "/app.js", "/style.css", "/theme.js":
+	case "/", "/app.js", "/style.css", "/theme.js", "/runtime-widgets.js":
 		if r.Method != http.MethodGet {
 			method(w, http.MethodGet)
 			return
