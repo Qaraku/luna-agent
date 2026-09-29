@@ -561,8 +561,13 @@ func registerWeb(registry *plugin.Registry, enabled bool) error {
 	return nil
 }
 
+// listenAddressFlag 共用实际启动与参数测试的注册入口，不在测试中复制默认值。
+func listenAddressFlag(flags *flag.FlagSet) *string {
+	return flags.String("addr", "127.0.0.1:3210", "literal loopback listen address (use port 0 for an ephemeral port)")
+}
+
 func run() error {
-	addr := flag.String("addr", "127.0.0.1:0", "literal loopback listen address")
+	addr := listenAddressFlag(flag.CommandLine)
 	rootFlag := flag.String("root", "", "repository root holding web/ and plugins/ (default: auto-detect)")
 	readRoot := flag.String("read-root", "", "directory the file tools (luna_read_file, luna_list_dir, luna_search_files, luna_find_files) are bounded to, and the directory a run works in when its session names no workspace (default: the resolved root)")
 	readLimit := flag.Int("read-limit", 0, "single-read cap in bytes for luna_read_file (default: 262144)")
