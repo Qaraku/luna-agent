@@ -12,14 +12,14 @@ import (
 type tool struct{}
 
 func (tool) Metadata() (pluginprotocol.Metadata, error) {
-	return pluginprotocol.Metadata{Version: "v1", PID: os.Getpid(), Protocol: 1}, nil
+	return pluginprotocol.Metadata{Version: "2.0.0", PID: os.Getpid(), Protocol: 1}, nil
 }
 func (tool) Invoke(in pluginprotocol.Input) (string, error) {
 	if in.DelayMS < 0 || in.DelayMS > pluginprotocol.MaxDelayMS {
 		return "", fmt.Errorf("delay_ms must be 0..%d", pluginprotocol.MaxDelayMS)
 	}
 	time.Sleep(time.Duration(in.DelayMS) * time.Millisecond)
-	return strings.TrimSpace(in.Text), nil
+	return "Luna · " + strings.ToUpper(strings.TrimSpace(in.Text)), nil
 }
 func main() {
 	plugin.Serve(&plugin.ServeConfig{HandshakeConfig: pluginprotocol.Handshake, Plugins: map[string]plugin.Plugin{"tool": &pluginprotocol.ToolPlugin{Impl: tool{}}}})

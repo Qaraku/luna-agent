@@ -171,13 +171,13 @@ func exposedGlobally(kind ContributionKind) bool {
 	}
 }
 
-// Enable 按生命周期状态机启用一个 builtin 插件。
+// Enable 按生命周期状态机启用一个内置或子进程能力。
 func (r *Registry) Enable(id string) error { return r.apply(id, EventEnable) }
 
-// Disable 按生命周期状态机停用一个 builtin 插件。
+// Disable 按生命周期状态机停用一个内置或子进程能力。
 func (r *Registry) Disable(id string) error { return r.apply(id, EventDisable) }
 
-// apply 是 Enable/Disable 的共同实现：非 builtin 形态与“已处于目标状态”都报错，
+// apply 是 Enable/Disable 的共同实现：未接入宿主能力生命周期的部署形态与“已处于目标状态”都报错，
 // 不静默成功；迁移被拒时记录原因并把插件标记为 failed。
 func (r *Registry) apply(id string, e Event) error {
 	r.mu.Lock()
@@ -188,8 +188,8 @@ func (r *Registry) apply(id string, e Event) error {
 		return fmt.Errorf("plugin %q is not registered", id)
 	}
 	entry := &r.entries[i]
-	if entry.Descriptor.Deployment != DeploymentBuiltin {
-		return fmt.Errorf("plugin %q is a %s plugin: this registry can only enable or disable builtin plugins",
+	if entry.Descriptor.Deployment != DeploymentBuiltin && entry.Descriptor.Deployment != DeploymentProcess {
+		return fmt.Errorf("plugin %q is a %s plugin: this registry can only enable or disable builtin or process plugins",
 			id, entry.Descriptor.Deployment)
 	}
 	if e == EventEnable && entry.State == StateEnabled {

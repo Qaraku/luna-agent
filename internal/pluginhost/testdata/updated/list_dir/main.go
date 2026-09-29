@@ -20,7 +20,7 @@ import (
 type tool struct{}
 
 func (tool) Metadata() (pluginprotocol.Metadata, error) {
-	return pluginprotocol.Metadata{Version: "v2", PID: os.Getpid(), Protocol: 1}, nil
+	return pluginprotocol.Metadata{Version: "2.0.0", PID: os.Getpid(), Protocol: 1}, nil
 }
 func (tool) Invoke(in pluginprotocol.Input) (string, error) {
 	if in.DelayMS < 0 || in.DelayMS > pluginprotocol.MaxDelayMS {

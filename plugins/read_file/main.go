@@ -1,5 +1,4 @@
-// Command v1 is the file-read plugin candidate: it returns the text of the
-// path the host validated.
+// 此工具从宿主校验过的输入执行操作，源码可独立重载，无需重启 Luna。
 //
 // It never interprets a path. Path arrives absolute and already checked
 // against the read root by the host, and MaxBytes carries the host's cap. Even
@@ -11,7 +10,7 @@
 // the documented shape of a read here: with neither set the whole file is
 // returned on the whole-file terms, and with either set one bounded window of
 // it comes back with the lines it covers and the lines it left stated. A
-// candidate that ignored them would be a candidate that answers a different
+// implementation that ignored them would be a implementation that answers a different
 // question than the one the model asked.
 package main
 
@@ -28,7 +27,7 @@ import (
 type tool struct{}
 
 func (tool) Metadata() (pluginprotocol.Metadata, error) {
-	return pluginprotocol.Metadata{Version: "v1", PID: os.Getpid(), Protocol: 1}, nil
+	return pluginprotocol.Metadata{Version: "1.0.0", PID: os.Getpid(), Protocol: 1}, nil
 }
 func (tool) Invoke(in pluginprotocol.Input) (string, error) {
 	if in.DelayMS < 0 || in.DelayMS > pluginprotocol.MaxDelayMS {

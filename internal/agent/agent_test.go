@@ -482,7 +482,7 @@ func TestFakeModelEinoEndToEndMapsAppEvents(t *testing.T) {
 		}
 	}
 	finished := sink.events[2].Data.(ToolFinished)
-	if finished.Result != "hello" || finished.Generation != 1 || finished.Version != "v1" || finished.PluginPID <= 0 {
+	if finished.Result != "hello" || finished.Generation != 1 || finished.Version != h.State().Active(pluginhost.ToolTextTransform).Version || finished.PluginPID != h.State().Active(pluginhost.ToolTextTransform).PluginPID {
 		t.Fatalf("tool event=%+v", finished)
 	}
 }
@@ -1186,10 +1186,10 @@ func TestFakeModelReadsAFileThroughEinoEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(finished.Result, string(onDisk)) {
-		t.Fatalf("finished.Result differs from the file on disk=%+v", finished)
+		t.Fatalf("file result mismatch: got %d bytes, want %d bytes", len(finished.Result), len(onDisk))
 	}
-	if finished.Generation != 1 || finished.Version != "v1" || finished.PluginPID <= 0 {
-		t.Fatalf("finished identity=%+v", finished)
+	if finished.Generation != 1 || finished.Version != h.State().Active(pluginhost.ToolReadFile).Version || finished.PluginPID != h.State().Active(pluginhost.ToolReadFile).PluginPID {
+		t.Fatalf("finished identity: generation=%d version=%q pid=%d", finished.Generation, finished.Version, finished.PluginPID)
 	}
 }
 
@@ -1287,8 +1287,8 @@ func TestFakeModelListsTheReadRootThroughEinoEndToEnd(t *testing.T) {
 	if finished.Name != ListDirToolName {
 		t.Fatalf("finished=%+v", finished)
 	}
-	if finished.Generation != 1 || finished.Version != "v1" || finished.PluginPID <= 0 {
-		t.Fatalf("finished identity=%+v", finished)
+	if finished.Generation != 1 || finished.Version != h.State().Active(pluginhost.ToolListDir).Version || finished.PluginPID != h.State().Active(pluginhost.ToolListDir).PluginPID {
+		t.Fatalf("finished identity: generation=%d version=%q pid=%d", finished.Generation, finished.Version, finished.PluginPID)
 	}
 	if m.toolResult != finished.Result {
 		t.Fatalf("the model did not receive the listing the tool produced: model=%q tool=%q", m.toolResult, finished.Result)

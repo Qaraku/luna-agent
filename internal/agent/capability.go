@@ -68,13 +68,13 @@ func (t contributedTool) InvokableRun(ctx context.Context, arguments string, _ .
 		}
 		return refuseCapability(ctx, t.tool.Name(), err, startedAt)
 	}
-	// No generation, version or plugin process id: those belong to the process
-	// deployment form, and this call had none.
+	// 通用 Tool 原语只返回文本，不提供进程身份；实现可能使用子进程，
+	// 这里不能编造代次或 PID。实际进程可由宿主状态和能力自己的接口报告。
 	emit(ctx, Event{Type: "tool.finished", Data: ToolFinished{RunID: runID(ctx), Name: t.tool.Name(), Result: result, DurationMS: callDurationMS(startedAt)}})
 	return result, nil
 }
 
-// refuseCapability is refuse for tools that are not served by a plugin process.
+// refuseCapability classifies failures from capability-contributed tools.
 // A capability that says it cannot serve the call ends the round, because the
 // model cannot act on a broken store; everything else is the call's own result
 // and the round continues.

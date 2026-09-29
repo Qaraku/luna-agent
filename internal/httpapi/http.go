@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,10 +88,11 @@ type LifecycleEvent struct {
 	Message string    `json:"message"`
 }
 type State struct {
-	HostPID      int       `json:"host_pid"`
-	StartedAt    time.Time `json:"started_at"`
-	Model        string    `json:"model"`
-	ProviderHost string    `json:"provider_host"`
+	ReloadableTools []string  `json:"reloadable_tools"`
+	HostPID         int       `json:"host_pid"`
+	StartedAt       time.Time `json:"started_at"`
+	Model           string    `json:"model"`
+	ProviderHost    string    `json:"provider_host"`
 	// ReasoningEffort is empty when no level was chosen, which is not the same as
 	// "medium": nothing was sent, so the provider's own default is what applied.
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
@@ -373,7 +375,7 @@ func (s *Server) state() State {
 			maxIterations = agent.MaxIterationsFor(cfg)
 		}
 	}
-	return State{HostPID: os.Getpid(), StartedAt: s.started, Model: model, ProviderHost: providerHost, ReasoningEffort: effort, MaxIterations: maxIterations, RunTimeoutMS: s.runTimeout.Milliseconds(), ModelConfigured: model != "" && providerHost != "" && len(missing) == 0, ModelConnected: s.connected.Load(), Plugins: ps.Plugins, Busy: busy, CurrentRunID: id, CurrentSessionID: sessionID, Events: events, Capabilities: capabilityViews(s.capabilities), ProviderMissing: missing, ProviderProblem: problem, Demo: true}
+	return State{ReloadableTools: reloadableToolNames(ps), HostPID: os.Getpid(), StartedAt: s.started, Model: model, ProviderHost: providerHost, ReasoningEffort: effort, MaxIterations: maxIterations, RunTimeoutMS: s.runTimeout.Milliseconds(), ModelConfigured: model != "" && providerHost != "" && len(missing) == 0, ModelConnected: s.connected.Load(), Plugins: ps.Plugins, Busy: busy, CurrentRunID: id, CurrentSessionID: sessionID, Events: events, Capabilities: capabilityViews(s.capabilities), ProviderMissing: missing, ProviderProblem: problem, Demo: true}
 }
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -706,37 +708,51 @@ func method(w http.ResponseWriter, allow string) {
 	fail(w, 405, fmt.Errorf("method must be %s", allow))
 }
 
-// candidateSentence renders the allowlist's candidates the way the refusal has always
-// read ("v1, v2 or broken"), so the message follows the table instead of keeping a
-// second copy of the names.
-func candidateSentence(names []string) string {
-	switch len(names) {
-	case 0:
-		return "one of the allowlisted candidates"
-	case 1:
-		return names[0]
-	default:
-		return strings.Join(names[:len(names)-1], ", ") + " or " + names[len(names)-1]
+// reloadableToolNames 来自当前宿主注册表，不依赖插件是否已有健康进程。
+// 旧嵌入方未提供 Tools 时可从其状态记录派生；不会构造路径。
+func reloadableToolNames(state pluginhost.State) []string {
+	names := append([]string{}, state.Tools...)
+	if state.Tools != nil {
+		return names
 	}
+	for _, record := range state.Plugins {
+		if record.Tool != "" && !slices.Contains(names, record.Tool) {
+			names = append(names, record.Tool)
+		}
+	}
+	return names
 }
 
 func (s *Server) reload(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		Candidate string `json:"candidate"`
+	var in *struct {
+		Tool string `json:"tool"`
 	}
 	if !decode(w, r, &in) {
 		return
 	}
-	if !pluginhost.CandidateAllowed(in.Candidate) {
-		fail(w, 400, fmt.Errorf("candidate must be %s", candidateSentence(pluginhost.CandidateNames())))
+	if in == nil {
+		fail(w, 400, fmt.Errorf("reload requires a JSON object"))
 		return
 	}
-	if err := s.plugins.Reload(r.Context(), in.Candidate); err != nil {
-		s.addEvent("reload_failed", in.Candidate+" rejected; active unchanged")
-		fail(w, 409, err)
+	names := reloadableToolNames(s.plugins.State())
+	if in.Tool != "" && !slices.Contains(names, in.Tool) {
+		fail(w, 400, fmt.Errorf("tool must name a registered tool: %s", strings.Join(names, ", ")))
 		return
 	}
-	s.addEvent("reloaded", in.Candidate+" activated")
+	label := in.Tool
+	if label == "" {
+		label = "all registered tools"
+	}
+	if err := s.plugins.Reload(r.Context(), in.Tool); err != nil {
+		s.addEvent("reload_failed", label+" rejected; active unchanged")
+		status := http.StatusConflict
+		if errors.Is(err, pluginhost.ErrUnknownTool) {
+			status = http.StatusBadRequest
+		}
+		fail(w, status, err)
+		return
+	}
+	s.addEvent("reloaded", label+" rebuilt")
 	send(w, 200, s.state())
 }
 func newRunID() string {

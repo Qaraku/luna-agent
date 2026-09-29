@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,9 +21,7 @@ import (
 	"github.com/hashicorp/go-plugin"
 )
 
-// Model-visible tool names. The core registers exactly the tools in Allowlist,
-// and neither the browser nor the model can name anything else: a tool name and
-// a candidate name only ever come from these tables.
+// 模型可见的默认工具名。运行时只能选择已登记的工具，不能提供源码或可执行路径。
 const (
 	ToolTextTransform = "luna_text_transform"
 	ToolReadFile      = "luna_read_file"
@@ -30,60 +30,24 @@ const (
 	ToolFindFiles     = "luna_find_files"
 )
 
-// ToolSpec is one allowlisted tool: its model-visible name, the directory under
-// plugins/ that holds its candidates, and the candidate versions this core may
-// compile and run. Candidate names keep the v1/v2/broken style, so the shape of
-// a replacement is identical for every tool.
+// ToolSpec 是可信装配方登记的工具及其 plugins/ 内源码目录，不接受浏览器构建路径。
 type ToolSpec struct {
-	Tool       string
-	Dir        string
-	Candidates []string
+	Tool string
+	Dir  string
+	// Lazy 的可选进程在第一次调用或显式重载时启动，不阻塞其他能力启动。
+	Lazy bool
 }
 
-// allows reports whether candidate belongs to this tool's allowlist.
-func (s ToolSpec) allows(candidate string) bool {
-	for _, allowed := range s.Candidates {
-		if allowed == candidate {
-			return true
-		}
-	}
-	return false
-}
-
-// Allowlist is the complete set of tool plugins the core may run. A candidate
-// build path is derived from it, never from a request.
+// Allowlist 是根应用的默认工具注册清单；版本由每个插件报告，不是宿主的选择枚举。
 var Allowlist = []ToolSpec{
-	{Tool: ToolTextTransform, Dir: "text_transform", Candidates: []string{"v1", "v2", "broken"}},
-	{Tool: ToolReadFile, Dir: "read_file", Candidates: []string{"v1", "v2", "broken"}},
-	{Tool: ToolListDir, Dir: "list_dir", Candidates: []string{"v1", "v2", "broken"}},
-	{Tool: ToolSearchFiles, Dir: "search_files", Candidates: []string{"v1", "v2", "broken"}},
-	{Tool: ToolFindFiles, Dir: "find_files", Candidates: []string{"v1", "v2", "broken"}},
+	{Tool: ToolTextTransform, Dir: "text_transform"},
+	{Tool: ToolReadFile, Dir: "read_file"},
+	{Tool: ToolListDir, Dir: "list_dir"},
+	{Tool: ToolSearchFiles, Dir: "search_files"},
+	{Tool: ToolFindFiles, Dir: "find_files"},
 }
 
-// CandidateNames returns the candidate versions the allowlist accepts, in the order
-// the table declares them. Every allowlisted tool declares the same set, so naming one
-// candidate names them all: callers that have to say what is allowed read it from here
-// instead of keeping a second copy of the names.
-func CandidateNames() []string {
-	if len(Allowlist) == 0 {
-		return nil
-	}
-	names := make([]string, len(Allowlist[0].Candidates))
-	copy(names, Allowlist[0].Candidates)
-	return names
-}
-
-// CandidateAllowed reports whether candidate is one every allowlisted tool accepts, so
-// a caller can only ever name a candidate the table itself contains. The HTTP guard and
-// Reload both decide with this function.
-func CandidateAllowed(candidate string) bool {
-	for _, spec := range Allowlist {
-		if !spec.allows(candidate) {
-			return false
-		}
-	}
-	return true
-}
+var toolNamePattern = regexp.MustCompile("^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
 
 // Infrastructure failures mean the tool never ran because its owned plugin
 // could not serve the call. They end the run, unlike a refusal the tool makes
@@ -118,7 +82,6 @@ type Record struct {
 	Generation uint64 `json:"generation"`
 	Version    string `json:"version"`
 	PluginPID  int    `json:"plugin_pid"`
-	Candidate  string `json:"candidate"`
 	Status     string `json:"status"`
 	Inflight   int    `json:"inflight"`
 }
@@ -128,6 +91,7 @@ type Event struct {
 	Message string    `json:"message"`
 }
 type State struct {
+	Tools   []string `json:"tools"`
 	Plugins []Record `json:"plugins"`
 	Events  []Event  `json:"events"`
 }
@@ -144,6 +108,8 @@ func (s State) Active(tool string) *Record {
 }
 
 type Options struct {
+	// Tools 可由可信装配方提供；nil 使用默认清单。每项在启动前验证并复制。
+	Tools        []ToolSpec
 	BuildTimeout time.Duration
 	StartTimeout time.Duration
 	RPCTimeout   time.Duration
@@ -385,20 +351,41 @@ func (h *Host) resolveReadRoot() error {
 	return nil
 }
 
-// New starts every allowlisted tool on the default candidate v1. A failure
-// leaves nothing running, because a host that could not start its whole tool
-// set must not be returned as usable.
+// New 启动已登记的真实源码实现。任一启动失败会清理已启动进程，不返回半可用宿主。
 func New(ctx context.Context, root string, opts Options) (*Host, error) {
-	h := &Host{root: root, opts: opts, next: 1}
+	absolute, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return nil, err
+	}
+	h := &Host{root: resolved, opts: opts, next: 1}
 	h.withDefaults()
 	if err := h.resolveReadRoot(); err != nil {
 		return nil, err
 	}
-	for _, spec := range Allowlist {
+	specs := opts.Tools
+	if specs == nil {
+		specs = Allowlist
+	}
+	seen := map[string]bool{}
+	for _, spec := range specs {
+		if !toolNamePattern.MatchString(spec.Tool) || seen[spec.Tool] {
+			return nil, fmt.Errorf("invalid or duplicate registered tool %q", spec.Tool)
+		}
+		seen[spec.Tool] = true
+		if _, err := fileread.ResolveDir(filepath.Join(h.root, "plugins"), spec.Dir); err != nil && !(spec.Lazy && errors.Is(err, fileread.ErrNotFound)) {
+			return nil, fmt.Errorf("source for %s: %w", spec.Tool, err)
+		}
 		h.tools = append(h.tools, &toolRuntime{spec: spec})
 	}
 	for _, rt := range h.tools {
-		g, err := h.start(ctx, rt, "v1")
+		if rt.spec.Lazy {
+			continue
+		}
+		g, err := h.start(ctx, rt)
 		if err != nil {
 			h.Close()
 			return nil, err
@@ -433,9 +420,14 @@ func watchStartup(ctx context.Context, kill func()) func() {
 	}()
 	return func() { once.Do(func() { close(done) }); <-exited }
 }
-func (h *Host) start(parent context.Context, rt *toolRuntime, candidate string) (*generation, error) {
-	if !rt.spec.allows(candidate) {
-		return nil, fmt.Errorf("unknown candidate")
+func (h *Host) start(parent context.Context, rt *toolRuntime) (*generation, error) {
+	source, err := fileread.ResolveDir(filepath.Join(h.root, "plugins"), rt.spec.Dir)
+	if err != nil {
+		return nil, fmt.Errorf("source for %s: %w", rt.spec.Tool, err)
+	}
+	relative, err := filepath.Rel(h.root, source)
+	if err != nil {
+		return nil, err
 	}
 	buildCtx, buildCancel := context.WithTimeout(parent, h.opts.BuildTimeout)
 	defer buildCancel()
@@ -443,7 +435,7 @@ func (h *Host) start(parent context.Context, rt *toolRuntime, candidate string) 
 	if err := os.MkdirAll(runtimeDir, 0700); err != nil {
 		return nil, err
 	}
-	f, err := os.CreateTemp(runtimeDir, "plugin-"+rt.spec.Dir+"-"+candidate+"-")
+	f, err := os.CreateTemp(runtimeDir, "plugin-"+rt.spec.Tool+"-")
 	if err != nil {
 		return nil, err
 	}
@@ -455,7 +447,7 @@ func (h *Host) start(parent context.Context, rt *toolRuntime, candidate string) 
 			_ = os.Remove(path)
 		}
 	}()
-	dir := "./plugins/" + rt.spec.Dir + "/" + candidate
+	dir := "./" + filepath.ToSlash(relative)
 	cmd := exec.CommandContext(buildCtx, "go", "build", "-o", path, dir)
 	cmd.Dir = h.root
 	cmd.Env = minimalEnv()
@@ -485,7 +477,7 @@ func (h *Host) start(parent context.Context, rt *toolRuntime, candidate string) 
 		return nil, fmt.Errorf("invalid tool interface")
 	}
 	meta, err := pt.Metadata()
-	if err != nil || meta.Version != candidate || meta.Protocol != 1 || proc.Process == nil || meta.PID != proc.Process.Pid {
+	if err != nil || strings.TrimSpace(meta.Version) == "" || len(meta.Version) > 128 || strings.ContainsAny(meta.Version, "\r\n\x00") || meta.Protocol != 1 || proc.Process == nil || meta.PID != proc.Process.Pid {
 		client.Kill()
 		return nil, fmt.Errorf("invalid plugin metadata for %s", dir)
 	}
@@ -495,7 +487,7 @@ func (h *Host) start(parent context.Context, rt *toolRuntime, candidate string) 
 		return nil, fmt.Errorf("startup deadline: %w", err)
 	}
 	ok = true
-	return &generation{rt: rt, record: Record{Tool: rt.spec.Tool, Version: meta.Version, PluginPID: meta.PID, Candidate: candidate}, client: client, tool: pt, path: path}, nil
+	return &generation{rt: rt, record: Record{Tool: rt.spec.Tool, Version: meta.Version, PluginPID: meta.PID}, client: client, tool: pt, path: path}, nil
 }
 func (h *Host) event(kind, msg string) {
 	h.events = append(h.events, Event{Time: time.Now(), Type: kind, Message: msg})
@@ -514,8 +506,9 @@ func (h *Host) runtime(tool string) *toolRuntime {
 func (h *Host) State() State {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	s := State{Plugins: []Record{}, Events: append([]Event{}, h.events...)}
+	s := State{Tools: []string{}, Plugins: []Record{}, Events: append([]Event{}, h.events...)}
 	for _, rt := range h.tools {
+		s.Tools = append(s.Tools, rt.spec.Tool)
 		if rt.active != nil {
 			s.Plugins = append(s.Plugins, rt.active.record)
 		}
@@ -524,6 +517,29 @@ func (h *Host) State() State {
 		}
 	}
 	return s
+}
+
+// InvokeText 为能力提供不带文件路径的文本 RPC。工具身份来自可信能力实现，
+// Text/Mode 只是数据，不参与构建命令；文件工具仍必须走自己的宿主路径校验。
+func (h *Host) InvokeText(ctx context.Context, name, text, mode string) (Output, error) {
+	if len(text) > 16384 || len(mode) > 32 {
+		return Output{}, fmt.Errorf("text max 16384 bytes; mode max 32 bytes")
+	}
+	h.mu.Lock()
+	lazy := false
+	for _, rt := range h.tools {
+		if rt.spec.Tool == name {
+			lazy = rt.spec.Lazy && rt.active == nil
+			break
+		}
+	}
+	h.mu.Unlock()
+	if lazy {
+		if err := h.Reload(ctx, name); err != nil {
+			return Output{}, fmt.Errorf("%w: %v", ErrNoActivePlugin, err)
+		}
+	}
+	return h.invoke(ctx, name, Input{Text: text, Mode: mode})
 }
 
 // Invoke calls the text-transform tool.
@@ -544,7 +560,7 @@ func (h *Host) Invoke(ctx context.Context, in Input) (Output, error) {
 // fileread.ResolveRange, which applies the same normalization, containment and
 // symbolic-link checks as fileread.Resolve but does not refuse a file over the
 // read limit — reading a part of such a file is exactly what a range is for.
-// The limit still bounds the bytes that come back, and the candidate states
+// The limit still bounds the bytes that come back, and the implementation states
 // what it left unread.
 func (h *Host) ReadFile(ctx context.Context, req ReadRequest) (Output, error) {
 	if len(req.Path) > 4096 {
@@ -752,20 +768,9 @@ func pluginGone(g *generation, err error) bool {
 	return errors.Is(err, rpc.ErrShutdown) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
-// allowedCandidate reports whether every allowlisted tool has this candidate,
-// so one reload can publish a consistent set. It is the table's decision, not this
-// host's: the runtimes here were built from that same table.
-func (h *Host) allowedCandidate(candidate string) bool {
-	return CandidateAllowed(candidate)
-}
-
-// Reload builds and validates candidate for every allowlisted tool and then
-// publishes them as one generation, or changes nothing. A candidate that fails
-// on any tool leaves the previous generation of every tool serving.
-func (h *Host) Reload(ctx context.Context, candidate string) error {
-	if !h.allowedCandidate(candidate) {
-		return fmt.Errorf("unknown candidate")
-	}
+// Reload 重建单个已登记工具，target 为空时重建全部；只有全部验证通过才发布。
+// 请求只选择注册身份，不参与构建路径。版本号可不变，同版本重建也产生新代次。
+func (h *Host) Reload(ctx context.Context, target string) error {
 	if !h.reloadMu.TryLock() {
 		return fmt.Errorf("reload already in progress")
 	}
@@ -775,18 +780,35 @@ func (h *Host) Reload(ctx context.Context, candidate string) error {
 		h.mu.Unlock()
 		return fmt.Errorf("plugin host closed")
 	}
-	h.event("build_started", candidate)
+	var selected []*toolRuntime
+	for _, rt := range h.tools {
+		if target == "" || rt.spec.Tool == target {
+			selected = append(selected, rt)
+		}
+	}
+	if len(selected) == 0 {
+		h.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrUnknownTool, target)
+	}
+	label := target
+	if label == "" {
+		label = "all registered tools"
+	}
+	h.event("build_started", label)
 	h.mu.Unlock()
 	var started []*generation
-	for _, rt := range h.tools {
-		g, err := h.start(ctx, rt, candidate)
+	cleanup := func() {
+		for _, g := range started {
+			g.client.Kill()
+			_ = os.Remove(g.path)
+		}
+	}
+	for _, rt := range selected {
+		g, err := h.start(ctx, rt)
 		if err != nil {
-			for _, x := range started {
-				x.client.Kill()
-				_ = os.Remove(x.path)
-			}
+			cleanup()
 			h.mu.Lock()
-			h.event("reload_failed", candidate+" rejected; active unchanged")
+			h.event("reload_failed", label+" rejected; active unchanged")
 			h.mu.Unlock()
 			return err
 		}
@@ -795,15 +817,12 @@ func (h *Host) Reload(ctx context.Context, candidate string) error {
 	h.mu.Lock()
 	if h.closed || ctx.Err() != nil {
 		h.mu.Unlock()
-		for _, g := range started {
-			g.client.Kill()
-			_ = os.Remove(g.path)
-		}
+		cleanup()
 		return fmt.Errorf("reload expired before publish")
 	}
 	h.next++
 	var draining []*generation
-	for i, rt := range h.tools {
+	for i, rt := range selected {
 		g := started[i]
 		g.record.Generation = h.next
 		g.record.Status = "active"

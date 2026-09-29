@@ -1,5 +1,4 @@
-// Command v1 is the search plugin candidate: it looks for one query in the file
-// or directory the host validated.
+// 此工具从宿主校验过的输入执行操作，源码可独立重载，无需重启 Luna。
 //
 // It never interprets a path. Path arrives absolute and already checked against
 // the read root by the host, and Query plus MaxMatches/MaxLineBytes/MaxFiles/
@@ -24,7 +23,7 @@ import (
 type tool struct{}
 
 func (tool) Metadata() (pluginprotocol.Metadata, error) {
-	return pluginprotocol.Metadata{Version: "v1", PID: os.Getpid(), Protocol: 1}, nil
+	return pluginprotocol.Metadata{Version: "1.0.0", PID: os.Getpid(), Protocol: 1}, nil
 }
 func (tool) Invoke(in pluginprotocol.Input) (string, error) {
 	if in.DelayMS < 0 || in.DelayMS > pluginprotocol.MaxDelayMS {

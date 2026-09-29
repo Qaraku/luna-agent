@@ -45,7 +45,7 @@ func (f fakeRunner) Run(_ context.Context, req agent.RunRequest) (string, error)
 func pluginState(tools ...string) pluginhost.State {
 	state := pluginhost.State{Plugins: []pluginhost.Record{}}
 	for i, tool := range tools {
-		state.Plugins = append(state.Plugins, pluginhost.Record{Tool: tool, Generation: 1, Version: "v1", Candidate: "v1", PluginPID: 123 + i, Status: "active"})
+		state.Plugins = append(state.Plugins, pluginhost.Record{Tool: tool, Generation: 1, Version: "1.0.0", PluginPID: 123 + i, Status: "active"})
 	}
 	return state
 }
@@ -595,8 +595,8 @@ func TestHTTPGuardsAndStrictBodies(t *testing.T) {
 		{"null origin", http.MethodPost, "/api/runs", `{"message":"x"}`, false, "", 403},
 		{"foreign origin", http.MethodPost, "/api/runs", `{"message":"x"}`, true, "foreign", 403},
 		{"bad host", http.MethodGet, "/api/state", "", false, "bad", 403},
-		{"unknown field", http.MethodPost, "/api/reload", `{"candidate":"v1","path":"/tmp/x"}`, true, "", 400},
-		{"unknown candidate", http.MethodPost, "/api/reload", `{"candidate":"other"}`, true, "", 400},
+		{"unknown field", http.MethodPost, "/api/reload", `{"tool":"luna_read_file","path":"/tmp/x"}`, true, "", 400},
+		{"unknown tool", http.MethodPost, "/api/reload", `{"tool":"other"}`, true, "", 400},
 		{"oversize", http.MethodPost, "/api/runs", `{"message":"` + strings.Repeat("x", 33000) + `"}`, true, "", 413},
 	}
 	for _, tc := range cases {
@@ -747,39 +747,20 @@ func TestListenRejectsNonLiteralLoopback(t *testing.T) {
 	l.Close()
 }
 
-// The candidate names once lived in two places: a literal inside the reload guard and
-// the allowlist table. This pins the accepted and refused sets, so collapsing them into
-// one source cannot quietly change which names a request may name.
-func TestReloadAcceptsExactlyTheAllowlistedCandidates(t *testing.T) {
+// 重载只选择已注册工具，保留空对象的全量重载；路径与旧演示参数均被拒绝。
+func TestReloadAcceptsExactlyRegisteredTools(t *testing.T) {
 	h := testHandler(t, fakeRunner{})
-	// Near misses of the allowlisted names as well as names that are not candidates at all.
-	probes := []string{"v1", "v2", "broken", "", "V1", "v1 ", " v1", "v1\n", "vn", "v3",
-		"broken2", "v1,v2", "v1/v2", "../v1", "other", "v2.0"}
-	allowed := map[string]bool{}
-	for _, name := range pluginhost.CandidateNames() {
-		allowed[name] = true
-	}
-	if !allowed["v1"] || !allowed["v2"] || !allowed["broken"] {
-		t.Fatalf("allowlist candidates = %v", pluginhost.CandidateNames())
-	}
-	for _, candidate := range probes {
-		body, err := json.Marshal(map[string]string{"candidate": candidate})
-		if err != nil {
-			t.Fatal(err)
-		}
-		w := request(t, h, http.MethodPost, "/api/reload", string(body), true)
-		want := http.StatusBadRequest
-		if allowed[candidate] {
-			want = http.StatusOK
-		}
-		if w.Code != want {
-			t.Fatalf("candidate %q got %d, want %d（接受的候选只能来自 Allowlist）", candidate, w.Code, want)
+	for _, spec := range pluginhost.Allowlist {
+		w := controlsRequest(t, h, "/api/reload", map[string]string{"tool": spec.Tool})
+		if w.Code != 200 {
+			t.Fatalf("tool %s: %d %s", spec.Tool, w.Code, w.Body)
 		}
 	}
-	// 拒绝的理由也要跟着表走：未知候选是 400（名字不对），不是 Reload 之后的 409。
-	w := request(t, h, http.MethodPost, "/api/reload", `{"candidate":"other"}`, true)
-	if !strings.Contains(w.Body.String(), "candidate must be v1, v2 or broken") {
-		t.Fatalf("refusal should name the allowlist's candidates: %s", w.Body.String())
+	for _, target := range []string{"v1", "v2", "broken", "../read_file", "/bin/sh", "other", " luna_read_file"} {
+		w := controlsRequest(t, h, "/api/reload", map[string]string{"tool": target})
+		if w.Code != 400 {
+			t.Fatalf("target %q accepted: %d", target, w.Code)
+		}
 	}
 }
 

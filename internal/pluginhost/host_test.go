@@ -87,7 +87,7 @@ func TestEveryAllowlistedToolStartsInItsOwnProcess(t *testing.T) {
 		if record == nil {
 			t.Fatalf("%s has no active generation: %+v", spec.Tool, state.Plugins)
 		}
-		if record.Version != "v1" || record.Generation != 1 || record.Candidate != "v1" {
+		if record.Version != "1.0.0" || record.Generation != 1 {
 			t.Fatalf("%s: %+v", spec.Tool, record)
 		}
 		if record.PluginPID <= 0 || record.PluginPID == os.Getpid() {
@@ -98,24 +98,7 @@ func TestEveryAllowlistedToolStartsInItsOwnProcess(t *testing.T) {
 		}
 		seen[record.PluginPID] = spec.Tool
 	}
-	// The allowlist itself stays inside the v1/v2/broken vocabulary, and every
-	// candidate has a real build directory: a reload can never reach a path that
-	// was not compiled from root source.
-	vocabulary := map[string]bool{"v1": true, "v2": true, "broken": true}
-	for _, spec := range Allowlist {
-		if len(spec.Candidates) == 0 {
-			t.Fatalf("%s has no candidates", spec.Tool)
-		}
-		for _, candidate := range spec.Candidates {
-			if !vocabulary[candidate] {
-				t.Fatalf("%s candidate %q is outside the v1/v2/broken vocabulary", spec.Tool, candidate)
-			}
-			dir := filepath.Join(testRoot(t), "plugins", spec.Dir, candidate)
-			if info, err := os.Stat(dir); err != nil || !info.IsDir() {
-				t.Fatalf("%s candidate %q has no plugin directory at %s: %v", spec.Tool, candidate, dir, err)
-			}
-		}
-	}
+
 }
 
 func TestRealSubprocessReplacementPinsInflightAndRollsBack(t *testing.T) {
@@ -127,17 +110,17 @@ func TestRealSubprocessReplacementPinsInflightAndRollsBack(t *testing.T) {
 	// pinning. This test is about pinning a call to the generation that started
 	// it, not about how long a build takes; reloading to v2 and back leaves the
 	// host in the state the rest of the test expects.
-	if err := h.Reload(context.Background(), "v2"); err != nil {
+	if err := reloadFixture(t, h, "updated"); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.Reload(context.Background(), "v1"); err != nil {
+	if err := reloadFixture(t, h, "baseline"); err != nil {
 		t.Fatal(err)
 	}
 	first := *active(t, h, ToolTextTransform)
-	if first.Version != "v1" || first.PluginPID == os.Getpid() {
+	if first.Version != "1.0.0" || first.PluginPID == os.Getpid() {
 		t.Fatalf("bad v1 state: %+v", first)
 	}
-	if reader := active(t, h, ToolReadFile); reader.Version != "v1" {
+	if reader := active(t, h, ToolReadFile); reader.Version != "1.0.0" {
 		t.Fatalf("bad reader state: %+v", reader)
 	}
 
@@ -156,12 +139,12 @@ func TestRealSubprocessReplacementPinsInflightAndRollsBack(t *testing.T) {
 	}()
 	waitFor(t, func() bool { a := h.State().Active(ToolTextTransform); return a != nil && a.Inflight == 1 })
 	reloadStarted := time.Now()
-	if err := h.Reload(context.Background(), "v2"); err != nil {
+	if err := reloadFixture(t, h, "updated"); err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("timed reload took %v (in-flight window is %dms)", time.Since(reloadStarted), inFlightMS)
 	second := *active(t, h, ToolTextTransform)
-	if second.Version != "v2" || second.Generation == first.Generation || second.PluginPID == first.PluginPID {
+	if second.Version != "2.0.0" || second.Generation == first.Generation || second.PluginPID == first.PluginPID {
 		t.Fatalf("bad replacement: %+v", second)
 	}
 	// The pinned transform generation is retained; the reader's old generation
@@ -170,7 +153,7 @@ func TestRealSubprocessReplacementPinsInflightAndRollsBack(t *testing.T) {
 	if len(h.State().Plugins) != len(Allowlist)+1 {
 		t.Fatalf("old generation not retained exactly once: %+v", h.State().Plugins)
 	}
-	if reader := active(t, h, ToolReadFile); reader.Version != "v2" || reader.Generation != second.Generation {
+	if reader := active(t, h, ToolReadFile); reader.Version != "2.0.0" || reader.Generation != second.Generation {
 		t.Fatalf("reader was not replaced with the same generation: %+v", reader)
 	}
 	out2, err := h.Invoke(context.Background(), Input{Text: " hello ", DelayMS: 0})
@@ -193,7 +176,7 @@ func TestRealSubprocessReplacementPinsInflightAndRollsBack(t *testing.T) {
 	for _, spec := range Allowlist {
 		before[spec.Tool] = *active(t, h, spec.Tool)
 	}
-	if err := h.Reload(context.Background(), "broken"); err == nil {
+	if err := reloadFixture(t, h, "reject-handshake"); err == nil {
 		t.Fatal("broken candidate accepted")
 	}
 	for _, tool := range []string{ToolTextTransform, ToolReadFile} {
@@ -207,7 +190,7 @@ func TestRealSubprocessReplacementPinsInflightAndRollsBack(t *testing.T) {
 func TestSameVersionReloadCreatesNewProcessAndCleansOld(t *testing.T) {
 	h := testHost(t, Options{})
 	old := *active(t, h, ToolTextTransform)
-	if err := h.Reload(context.Background(), "v1"); err != nil {
+	if err := reloadFixture(t, h, "baseline"); err != nil {
 		t.Fatal(err)
 	}
 	cur := active(t, h, ToolTextTransform)
@@ -236,14 +219,14 @@ func TestInvokeTimeoutTerminatesOnlyTheOwnedPlugin(t *testing.T) {
 	}
 }
 
-func TestRejectsUnknownCandidate(t *testing.T) {
+func TestRejectsUnknownReloadTarget(t *testing.T) {
 	h := testHost(t, Options{})
-	for _, candidate := range []string{"../../bin/sh", "read_file/v1", "/plugins/v1", "v3", ""} {
+	for _, candidate := range []string{"../../bin/sh", "read_file/v1", "/plugins/v1", "v3", " luna_read_file"} {
 		if err := h.Reload(context.Background(), candidate); err == nil {
 			t.Fatalf("unknown candidate %q accepted", candidate)
 		}
 	}
-	if got := active(t, h, ToolTextTransform); got.Version != "v1" {
+	if got := active(t, h, ToolTextTransform); got.Version != "1.0.0" {
 		t.Fatalf("rejected candidates changed the active tool: %+v", got)
 	}
 }
@@ -315,14 +298,14 @@ func TestReadFileReturnsExactContentAndSurvivesReplacement(t *testing.T) {
 	if out.Result != "line one\r\nline two\n" {
 		t.Fatalf("v1 must return content verbatim, got %q", out.Result)
 	}
-	if out.Version != "v1" || out.Generation != 1 || out.PluginPID <= 0 {
+	if out.Version != "1.0.0" || out.Generation != 1 || out.PluginPID <= 0 {
 		t.Fatalf("metadata lost: %+v", out)
 	}
 	if transformer := active(t, h, ToolTextTransform); transformer.PluginPID == out.PluginPID {
 		t.Fatal("reader and transformer share one process")
 	}
 
-	if err := h.Reload(context.Background(), "v2"); err != nil {
+	if err := reloadFixture(t, h, "updated"); err != nil {
 		t.Fatal(err)
 	}
 	replaced, err := h.ReadFile(context.Background(), ReadRequest{Path: "notes.txt"})
@@ -483,7 +466,7 @@ func TestSearchFilesCarriesTheModeAcrossThePluginBoundary(t *testing.T) {
 // the call as though it had not been given at all, and every other test here runs v1, so this
 // switches to v2 and asks again. What is being checked is the argument, not the rendering: v2
 // renders sizes in exact bytes and trims indentation on purpose.
-func TestTheNewArgumentsReachTheV2CandidateToo(t *testing.T) {
+func TestUpdatedImplementationReceivesTheSameArguments(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "sub", "deep"), 0o755); err != nil {
 		t.Fatal(err)
@@ -492,7 +475,7 @@ func TestTheNewArgumentsReachTheV2CandidateToo(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := testHost(t, Options{ReadRoot: root, ReadLimit: 4096})
-	if err := h.Reload(context.Background(), "v2"); err != nil {
+	if err := reloadFixture(t, h, "updated"); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
@@ -788,7 +771,7 @@ func TestFindFilesWalksTheRootAndRefusesOnTheHostSide(t *testing.T) {
 	if !strings.Contains(out.Result, "symbolic link") {
 		t.Fatalf("the result does not say a link was left alone:\n%s", out.Result)
 	}
-	if out.Version != "v1" || out.Generation == 0 || out.PluginPID <= 0 {
+	if out.Version != "1.0.0" || out.Generation == 0 || out.PluginPID <= 0 {
 		t.Fatalf("metadata lost: %+v", out)
 	}
 
@@ -879,7 +862,7 @@ func TestFindFilesSurvivesReplacementAndV2ChangesOnlyTheSizes(t *testing.T) {
 	if !strings.Contains(before.Result, "2.0 KiB") {
 		t.Fatalf("v1 must render a human-readable size:\n%s", before.Result)
 	}
-	if err := h.Reload(context.Background(), "v2"); err != nil {
+	if err := reloadFixture(t, h, "updated"); err != nil {
 		t.Fatal(err)
 	}
 	after, err := h.FindFiles(context.Background(), FindRequest{Path: ".", Pattern: "large.go"})
@@ -922,11 +905,11 @@ func TestReadFilePinsInflightCallAndDrainsOnReload(t *testing.T) {
 	}()
 	waitFor(t, func() bool { a := h.State().Active(ToolReadFile); return a != nil && a.Inflight == 1 })
 
-	if err := h.Reload(context.Background(), "v2"); err != nil {
+	if err := reloadFixture(t, h, "updated"); err != nil {
 		t.Fatal(err)
 	}
 	current := active(t, h, ToolReadFile)
-	if current.Version != "v2" || current.PluginPID == before.PluginPID || current.Generation == before.Generation {
+	if current.Version != "2.0.0" || current.PluginPID == before.PluginPID || current.Generation == before.Generation {
 		t.Fatalf("reader not replaced: before=%+v after=%+v", before, current)
 	}
 	// The pinned reader generation drains only after its call returns.

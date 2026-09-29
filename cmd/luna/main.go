@@ -27,6 +27,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
 	"github.com/Qaraku/luna-agent/internal/plugins/filewrite"
+	"github.com/Qaraku/luna-agent/internal/plugins/jsonformat"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
 	skillsplugin "github.com/Qaraku/luna-agent/internal/plugins/skills"
 	"github.com/Qaraku/luna-agent/internal/plugins/terminal"
@@ -751,11 +752,22 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	plugins, err := pluginhost.New(ctx, root, pluginhost.Options{ReadRoot: projectRoot(root, *readRoot), ReadLimit: *readLimit})
+	toolSources := append([]pluginhost.ToolSpec{}, pluginhost.Allowlist...)
+	toolSources = append(toolSources, jsonformat.Source())
+	plugins, err := pluginhost.New(ctx, root, pluginhost.Options{Tools: toolSources, ReadRoot: projectRoot(root, *readRoot), ReadLimit: *readLimit})
 	if err != nil {
 		return fmt.Errorf("start plugin host: %w", err)
 	}
 	defer plugins.Close()
+	jsonUtility := jsonformat.New(plugins)
+	if err := registry.Register(jsonUtility); err != nil {
+		return fmt.Errorf("register JSON capability: %w", err)
+	}
+	if userSettings.CapabilityEnabled(jsonformat.PluginID) {
+		if err := registry.Enable(jsonformat.PluginID); err != nil {
+			return fmt.Errorf("enable JSON capability: %w", err)
+		}
+	}
 	// The store is both sides of the conversation: history is read from it and
 	// the transcript of every run is appended to it. Capabilities are assembled
 	// from the registry, which is what makes them capabilities rather than core.

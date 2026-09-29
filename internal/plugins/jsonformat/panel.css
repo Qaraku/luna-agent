@@ -1,0 +1,5 @@
+.json-format-panel { display: grid; gap: 12px; min-width: 0; }
+.json-format-panel label { display: grid; gap: 6px; color: var(--luna-text-muted); font-size: var(--luna-font-ui); }
+.json-format-panel textarea { box-sizing: border-box; width: 100%; min-width: 0; resize: vertical; padding: 10px; border: 1px solid var(--luna-border); border-radius: var(--luna-radius-sm); background: var(--luna-raised); color: var(--luna-text); font: 13px/1.5 var(--luna-font-mono); }
+.json-format-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.json-format-status { overflow-wrap: anywhere; font-size: var(--luna-font-meta); }
