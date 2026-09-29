@@ -8,3 +8,8 @@
 
 # Local-only multi-agent coordination state (handoff, backlog, heartbeat).
 /.hermes/
+
+# Persistent cooperative data locks and format markers; never commit private lifecycle state.
+.luna-data-*.lock
+.luna-data-format.json
+.luna-restore-pending
