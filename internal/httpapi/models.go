@@ -137,8 +137,8 @@ func (s *Server) sendModels(w http.ResponseWriter, r *http.Request) {
 		// A session that chose a model keeps that choice even if the
 		// configuration has changed since: saying otherwise would report a
 		// model the next run is not going to use.
-		if session.Config != nil && session.Config.Model != "" {
-			current = currentModel{Name: session.Config.Model, Origin: originSession}
+		if name, origin := selectedModel(session.Config); name != "" {
+			current = currentModel{Name: name, Origin: origin}
 		}
 	}
 	send(w, 200, modelsResponse{Models: views, Current: current})
@@ -183,6 +183,11 @@ func (s *Server) setSessionModel(w http.ResponseWriter, r *http.Request, id stri
 	}
 	status, err := s.updateSessionConfig(id, func(next *store.ConfigRecord) (int, error) {
 		next.Model = name
+		if in.Reset {
+			if inherited, inheritedOrigin := selectedModel(next); inherited != "" {
+				selected, origin = inherited, inheritedOrigin
+			}
+		}
 		return http.StatusOK, nil
 	})
 	if err != nil {

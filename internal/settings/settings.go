@@ -81,6 +81,8 @@ type Capabilities struct {
 	// only place that says so — which is why the key is written only when there
 	// is something to say.
 	Enabled []string `yaml:"enabled,omitempty"`
+	// Disabled 记录显式停用，也适用于默认启用的能力；冲突时停用优先。
+	Disabled []string `yaml:"disabled,omitempty"`
 }
 
 // Skills is what the user decided about the skills installed on this machine.
@@ -155,13 +157,22 @@ func (f Settings) EnabledCapabilities() []string { return f.normalized().Capabil
 // capability the product does not run on its own is off unless its id is in the
 // list, so a name that is not there is the ordinary state and not a missing
 // entry — which is why this answers a question rather than returning the list.
-func (f Settings) CapabilityEnabled(id string) bool {
-	for _, name := range f.EnabledCapabilities() {
+func (f Settings) CapabilityEnabled(id string) bool { return f.CapabilityEnabledByDefault(id, false) }
+
+func (f Settings) CapabilityEnabledByDefault(id string, fallback bool) bool {
+	id = strings.TrimSpace(id)
+	current := f.normalized()
+	for _, name := range current.Capabilities.Disabled {
+		if name == id {
+			return false
+		}
+	}
+	for _, name := range current.Capabilities.Enabled {
 		if name == id {
 			return true
 		}
 	}
-	return false
+	return fallback
 }
 
 // WithSkillDisabled returns these settings with one skill turned off or on.
@@ -181,7 +192,7 @@ func (f Settings) WithSkillDisabled(name string, disabled bool) Settings {
 func (f Settings) WithCapabilityEnabled(id string, enabled bool) Settings {
 	current := f.normalized()
 	kept := withName(current.Capabilities.Enabled, id, enabled)
-	current.Capabilities = Capabilities{Enabled: kept}
+	current.Capabilities = Capabilities{Enabled: kept, Disabled: withName(current.Capabilities.Disabled, id, !enabled)}
 	return current
 }
 
@@ -271,7 +282,7 @@ func cleanPath(path string) string {
 func (f Settings) normalized() Settings {
 	return Settings{
 		Skills:       Skills{Disabled: normalizeNames(f.Skills.Disabled)},
-		Capabilities: Capabilities{Enabled: normalizeNames(f.Capabilities.Enabled)},
+		Capabilities: Capabilities{Enabled: normalizeNames(f.Capabilities.Enabled), Disabled: normalizeNames(f.Capabilities.Disabled)},
 		Write:        Write{Dirs: normalizePaths(f.Write.Dirs)},
 	}
 }

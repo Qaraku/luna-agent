@@ -29,8 +29,8 @@ func (s *Server) reasoningNow(id string) (currentReasoning, error) {
 		if err != nil {
 			return currentReasoning{}, err
 		}
-		if session.Config != nil && session.Config.ReasoningEffort != nil {
-			current = currentReasoning{Effort: *session.Config.ReasoningEffort, Origin: originSession}
+		if effort, origin := selectedReasoning(session.Config); effort != nil {
+			current = currentReasoning{Effort: *effort, Origin: origin}
 		}
 	}
 	return current, nil
@@ -78,7 +78,13 @@ func (s *Server) setSessionReasoning(w http.ResponseWriter, r *http.Request, id 
 	if choice != nil {
 		current = currentReasoning{Effort: *choice, Origin: originSession}
 	}
-	status, err := s.updateSessionConfig(id, func(next *store.ConfigRecord) (int, error) { next.ReasoningEffort = choice; return http.StatusOK, nil })
+	status, err := s.updateSessionConfig(id, func(next *store.ConfigRecord) (int, error) {
+		next.ReasoningEffort = choice
+		if inherited, origin := selectedReasoning(next); inherited != nil {
+			current = currentReasoning{Effort: *inherited, Origin: origin}
+		}
+		return http.StatusOK, nil
+	})
 	if err != nil {
 		fail(w, status, err)
 		return

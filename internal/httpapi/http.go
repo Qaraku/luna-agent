@@ -24,6 +24,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/fileread"
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
+	"github.com/Qaraku/luna-agent/internal/runconfig"
 	"github.com/Qaraku/luna-agent/internal/store"
 	"github.com/Qaraku/luna-agent/internal/uiplugin"
 )
@@ -256,11 +257,12 @@ type Server struct {
 	executionGrants  map[string]bool
 	permissionGrants map[string]plugin.AccessPolicy
 	// pendingApprovals 与准入/取消共用 runMu，决定身份与消费是一个临界区。
-	pendingApprovals map[string]*pendingApproval
-	activeExecution  *executionView
-	busy             bool
-	runID            string
-	sessionID        string
+	pendingApprovals    map[string]*pendingApproval
+	activeExecution     *executionView
+	activeConfiguration *runconfig.Snapshot
+	busy                bool
+	runID               string
+	sessionID           string
 	// cancelRun ends the active run's context with a cause, which is what makes
 	// a run stoppable from outside. It is set and cleared inside the same
 	// critical section as the run slot itself: a busy flag without a handle
@@ -458,6 +460,12 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.getExecution(w, r)
+	case "/api/setup":
+		if r.Method != http.MethodGet {
+			method(w, http.MethodGet)
+			return
+		}
+		s.getSetup(w, r)
 	case "/api/reasoning":
 		if r.Method != http.MethodGet {
 			method(w, http.MethodGet)
@@ -552,6 +560,14 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.setSkillState(w, name, action)
+			return
+		}
+		if id, ok := sessionSetupPath(r.URL.Path); ok {
+			if r.Method != http.MethodPost {
+				method(w, http.MethodPost)
+				return
+			}
+			s.setSessionSetup(w, r, id)
 			return
 		}
 		if id, ok := sessionExecutionPath(r.URL.Path); ok {
@@ -874,6 +890,7 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	// single-run slot.
 	runModel := ""
 	var runReasoning *string
+	var runSetup *runconfig.Selection
 	var runRoots []string
 	if in.SessionID != "" {
 		session, err := s.sessions.Read(in.SessionID)
@@ -943,8 +960,14 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 	}
 	runRoots = append([]string(nil), execution.Scopes.ProjectDirs...)
 	if execution.config != nil {
-		runModel = execution.config.Model
-		runReasoning = execution.config.ReasoningEffort
+		runModel, _ = selectedModel(execution.config)
+		runReasoning, _ = selectedReasoning(execution.config)
+	}
+	runSetup, err = s.setupForRun(execution.config)
+	if err != nil {
+		s.runMu.Unlock()
+		fail(w, 409, err)
+		return
 	}
 	automaticWriteDirs := append([]string{}, execution.Scopes.AutomaticWriteDirs...)
 	writeScopeError := execution.Scopes.WriteProblem
@@ -962,6 +985,7 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 			s.runID = ""
 			s.cancelRun = nil
 			s.activeExecution = nil
+			s.activeConfiguration = nil
 		}
 		s.runMu.Unlock()
 	}
@@ -998,7 +1022,14 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 		approve := func(ctx context.Context, operation plugin.AccessRequest) error {
 			return s.awaitApproval(ctx, id, sessionID, operation, sink)
 		}
-		answer, err := s.runner.Run(runCtx, agent.RunRequest{RunID: id, SessionID: sessionID, Message: in.Message, Model: runModel, ReasoningEffort: runReasoning, ExecutionMode: execution.Mode, Permissions: &policy, AutomaticWriteDirs: automaticWriteDirs, WriteScopeError: writeScopeError, Approve: approve, Roots: runRoots, Sink: sink})
+		configured := func(snapshot *runconfig.Snapshot) {
+			s.runMu.Lock()
+			defer s.runMu.Unlock()
+			if s.runID == id {
+				s.activeConfiguration = snapshot.Clone()
+			}
+		}
+		answer, err := s.runner.Run(runCtx, agent.RunRequest{Configured: configured, RunID: id, SessionID: sessionID, Message: in.Message, Model: runModel, ReasoningEffort: runReasoning, Setup: runSetup, ExecutionMode: execution.Mode, Permissions: &policy, AutomaticWriteDirs: automaticWriteDirs, WriteScopeError: writeScopeError, Approve: approve, Roots: runRoots, Sink: sink})
 		close(sink.events)
 		result <- runResult{answer, err}
 	}()

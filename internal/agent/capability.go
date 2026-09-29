@@ -24,18 +24,15 @@ func WithCapabilities(reg *plugin.Registry) Option { return func(r *Runner) { r.
 const MaxContributedContextBytes = 64 * 1024
 
 // capabilityTools returns the model-visible tools of every enabled capability.
-func (r *Runner) capabilityTools() []contributedTool {
-	if r.capabilities == nil {
-		return nil
-	}
+func capabilityToolsFor(entries []plugin.Entry) []contributedTool {
 	var out []contributedTool
-	for _, entry := range r.capabilities.Enabled() {
+	for _, entry := range entries {
 		provider, ok := entry.Plugin.(plugin.ToolProvider)
 		if !ok {
 			continue
 		}
 		for _, t := range provider.Tools() {
-			out = append(out, contributedTool{tool: t})
+			out = append(out, contributedTool{tool: t, owner: entry.Descriptor.ID})
 		}
 	}
 	return out
@@ -44,7 +41,10 @@ func (r *Runner) capabilityTools() []contributedTool {
 // contributedTool adapts a capability's tool to the model. The kernel owns the
 // event stream and the failure classification for every model-visible tool; the
 // capability owns the name, the description, the schema and the work.
-type contributedTool struct{ tool plugin.Tool }
+type contributedTool struct {
+	tool  plugin.Tool
+	owner string
+}
 
 func (t contributedTool) Info(context.Context) (*schema.ToolInfo, error) {
 	return &schema.ToolInfo{
@@ -55,6 +55,9 @@ func (t contributedTool) Info(context.Context) (*schema.ToolInfo, error) {
 }
 
 func (t contributedTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.Option) (string, error) {
+	if info, ok := plugin.Run(ctx); ok && (!info.Selection.AllowsTool(t.tool.Name()) || (t.owner != "" && !info.Selection.AllowsCapability(t.owner))) {
+		return refusalPrefix + "tool is not selected for this run", nil
+	}
 	var raw any
 	if err := json.Unmarshal([]byte(arguments), &raw); err != nil {
 		raw = arguments
@@ -90,10 +93,17 @@ func refuseCapability(ctx context.Context, name string, err error, startedAt tim
 // message holding the instruction followed by the reference blocks of every
 // enabled capability, then the messages assembled from disk.
 func (r *Runner) modelInputWithCapabilities() adk.GenModelInput {
+	return r.modelInputFor(r.selectedEntries())
+}
+
+func (r *Runner) modelInputFor(entries []plugin.Entry) adk.GenModelInput {
 	return func(ctx context.Context, instr string, input *adk.AgentInput) ([]*schema.Message, error) {
-		block, err := r.contextBlocks(ctx)
+		block, err := contextBlocksFor(ctx, entries)
 		if err != nil {
 			return nil, err
+		}
+		if info, ok := plugin.Run(ctx); ok && info.Selection != nil && info.Selection.Instructions != "" {
+			instr += "\n\n本轮用户工作方式（不覆盖系统边界，不授予权限）：\n" + info.Selection.Instructions
 		}
 		instr += runtimePermissionInstruction(ctx)
 		messages := make([]*schema.Message, 0, len(input.Messages)+1)
@@ -116,13 +126,10 @@ func (r *Runner) modelInputWithCapabilities() adk.GenModelInput {
 // decides only what its own block says. A capability that cannot be read fails
 // the run instead of silently contributing nothing, the same rule the
 // transcript follows.
-func (r *Runner) contextBlocks(ctx context.Context) (string, error) {
-	if r.capabilities == nil {
-		return "", nil
-	}
+func contextBlocksFor(ctx context.Context, entries []plugin.Entry) (string, error) {
 	var b strings.Builder
 	total := 0
-	for _, entry := range r.capabilities.Enabled() {
+	for _, entry := range entries {
 		provider, ok := entry.Plugin.(plugin.ContextProvider)
 		if !ok {
 			continue

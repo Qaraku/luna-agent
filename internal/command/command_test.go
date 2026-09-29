@@ -142,3 +142,17 @@ func TestAZeroTableAnswers(t *testing.T) {
 		t.Fatalf("SortedNames() = %v", got)
 	}
 }
+
+func TestPresetCommandChangesOnlySessionSetup(t *testing.T) {
+	table, err := New(Builtins()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd, ok := table.Lookup("preset")
+	if !ok {
+		t.Fatal("preset command is missing")
+	}
+	if cmd.Args != ArgText || cmd.Busy != BusyReject {
+		t.Fatalf("command=%+v", cmd)
+	}
+}

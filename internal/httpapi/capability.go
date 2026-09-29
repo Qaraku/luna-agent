@@ -77,6 +77,9 @@ func (s *Server) requiresOrigin(method, path string) bool {
 		// path is a wrong-method request and is answered 405.
 		return !isReadMethod(method)
 	}
+	if _, ok := sessionSetupPath(path); ok {
+		return !isReadMethod(method)
+	}
 	if _, ok := sessionExecutionPath(path); ok {
 		return !isReadMethod(method)
 	}

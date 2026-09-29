@@ -36,6 +36,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Qaraku/luna-agent/internal/runconfig"
 )
 
 // Record types. The first four are frozen by the S2a spec; TypeConfig was added
@@ -130,12 +132,13 @@ type ToolCallRecord struct {
 // RunRecord is written once per run, after the run ends, so a crash mid-run
 // leaves the run unrecorded rather than half-recorded.
 type RunRecord struct {
-	Type      string    `json:"type"`
-	RunID     string    `json:"run_id"`
-	StartedAt time.Time `json:"started_at"`
-	EndedAt   time.Time `json:"ended_at"`
-	Status    string    `json:"status"`
-	Usage     *Usage    `json:"usage,omitempty"`
+	Type          string              `json:"type"`
+	RunID         string              `json:"run_id"`
+	StartedAt     time.Time           `json:"started_at"`
+	EndedAt       time.Time           `json:"ended_at"`
+	Status        string              `json:"status"`
+	Usage         *Usage              `json:"usage,omitempty"`
+	Configuration *runconfig.Snapshot `json:"configuration,omitempty"`
 }
 
 // ConfigRecord is one statement of which model the session's next run should
@@ -161,6 +164,8 @@ type ConfigRecord struct {
 	Workspace string `json:"workspace,omitempty"`
 	// nil 为继承；指向空字符串为明确不发送，不能与 none 档位混同。
 	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
+	// Setup 是选择时复制的内容版本，不是授权；后续资源更新不会静默改写它。
+	Setup *runconfig.Selection `json:"setup,omitempty"`
 	// ExecutionMode 仅保存偏好，不能作为执行授权凭证。
 	ExecutionMode string            `json:"execution_mode,omitempty"`
 	Permissions   *PermissionRecord `json:"permissions,omitempty"`
@@ -525,28 +530,30 @@ func (s *Store) readFile(path, id string, keepRecords bool, visit func(Record)) 
 
 // line is the superset of the frozen record fields used for decoding.
 type line struct {
-	Type            string            `json:"type"`
-	ID              string            `json:"id"`
-	CreatedAt       time.Time         `json:"created_at"`
-	Title           string            `json:"title"`
-	RunID           string            `json:"run_id"`
-	Role            string            `json:"role"`
-	Text            string            `json:"text"`
-	At              time.Time         `json:"at"`
-	Name            string            `json:"name"`
-	Arguments       string            `json:"arguments"`
-	Result          string            `json:"result"`
-	Error           string            `json:"error"`
-	StartedAt       time.Time         `json:"started_at"`
-	EndedAt         time.Time         `json:"ended_at"`
-	Status          string            `json:"status"`
-	Model           string            `json:"model"`
-	Workspace       string            `json:"workspace"`
-	ReasoningEffort *string           `json:"reasoning_effort"`
-	AutoTitle       bool              `json:"auto_title"`
-	ExecutionMode   string            `json:"execution_mode"`
-	Permissions     *PermissionRecord `json:"permissions"`
-	Usage           *Usage            `json:"usage"`
+	Type            string               `json:"type"`
+	ID              string               `json:"id"`
+	CreatedAt       time.Time            `json:"created_at"`
+	Title           string               `json:"title"`
+	RunID           string               `json:"run_id"`
+	Role            string               `json:"role"`
+	Text            string               `json:"text"`
+	At              time.Time            `json:"at"`
+	Name            string               `json:"name"`
+	Arguments       string               `json:"arguments"`
+	Result          string               `json:"result"`
+	Error           string               `json:"error"`
+	StartedAt       time.Time            `json:"started_at"`
+	EndedAt         time.Time            `json:"ended_at"`
+	Status          string               `json:"status"`
+	Model           string               `json:"model"`
+	Workspace       string               `json:"workspace"`
+	ReasoningEffort *string              `json:"reasoning_effort"`
+	AutoTitle       bool                 `json:"auto_title"`
+	ExecutionMode   string               `json:"execution_mode"`
+	Permissions     *PermissionRecord    `json:"permissions"`
+	Usage           *Usage               `json:"usage"`
+	Setup           *runconfig.Selection `json:"setup"`
+	Configuration   *runconfig.Snapshot  `json:"configuration"`
 }
 
 // decodeLine decodes one record. Unknown fields are ignored rather than
@@ -565,9 +572,9 @@ func decodeLine(data []byte) (Record, error) {
 	case TypeToolCall:
 		return Record{Type: TypeToolCall, ToolCall: &ToolCallRecord{Type: raw.Type, RunID: raw.RunID, Name: raw.Name, Arguments: raw.Arguments, Result: raw.Result, Error: raw.Error, At: raw.At}}, nil
 	case TypeRun:
-		return Record{Type: TypeRun, Run: &RunRecord{Type: raw.Type, RunID: raw.RunID, StartedAt: raw.StartedAt, EndedAt: raw.EndedAt, Status: raw.Status, Usage: raw.Usage}}, nil
+		return Record{Type: TypeRun, Run: &RunRecord{Type: raw.Type, RunID: raw.RunID, StartedAt: raw.StartedAt, EndedAt: raw.EndedAt, Status: raw.Status, Usage: raw.Usage, Configuration: raw.Configuration}}, nil
 	case TypeConfig:
-		return Record{Type: TypeConfig, Config: &ConfigRecord{Type: raw.Type, Model: raw.Model, Workspace: raw.Workspace, ReasoningEffort: raw.ReasoningEffort, ExecutionMode: raw.ExecutionMode, Permissions: raw.Permissions, At: raw.At}}, nil
+		return Record{Type: TypeConfig, Config: &ConfigRecord{Type: raw.Type, Model: raw.Model, Workspace: raw.Workspace, ReasoningEffort: raw.ReasoningEffort, ExecutionMode: raw.ExecutionMode, Permissions: raw.Permissions, Setup: raw.Setup, At: raw.At}}, nil
 	}
 	return Record{}, fmt.Errorf("unknown record type %q", raw.Type)
 }

@@ -12,6 +12,7 @@ func Builtins() []Command {
 	return []Command{
 		ReasoningCommand(config.ReasoningEffortLevels),
 		PermissionsCommand(),
+		SetupCommand(),
 		{
 			Name:     "help",
 			Summary:  "列出 Luna 知道的命令。",
@@ -42,7 +43,7 @@ func ModelCommand(models []string) Command {
 	for _, name := range models {
 		options = append(options, Option{Value: name})
 	}
-	options = append(options, Option{Value: "--default", Summary: "恢复跟随全局默认模型"})
+	options = append(options, Option{Value: "--default", Summary: "恢复继承预设或全局模型"})
 	return Command{
 		Name:     "model",
 		Summary:  "查看或切换这个会话使用的模型。",
@@ -56,7 +57,7 @@ func ModelCommand(models []string) Command {
 
 // ReasoningCommand 由服务端声明选项，界面不另写一套档位；none 不等于不发送。
 func ReasoningCommand(levels []string) Command {
-	options := []Option{{Value: "--default", Summary: "恢复跟随全局设置"}, {Value: "--off", Summary: "不发送 reasoning_effort 字段"}}
+	options := []Option{{Value: "--default", Summary: "恢复继承预设或全局设置"}, {Value: "--off", Summary: "不发送 reasoning_effort 字段"}}
 	for _, level := range levels {
 		options = append(options, Option{Value: level})
 	}
@@ -72,4 +73,9 @@ func PermissionsCommand() Command {
 		}
 	}
 	return Command{Name: "permissions", Summary: "查看或逐项修改会话权限。", Usage: "/permissions [read|write|network|exec=allow|ask|deny | --default]", Category: "权限", Args: ArgOptions, Options: options, Busy: BusyAllow}
+}
+
+// SetupCommand 是宿主的会话配置操作；清除选择不依赖原配置能力仍处于启用状态。
+func SetupCommand() Command {
+	return Command{Name: "preset", Summary: "查看或切换这个会话的工作预设，不授予额外权限。", Usage: "/preset [预设ID | 来源:预设ID | --default]", Category: "会话", Args: ArgText, Busy: BusyReject}
 }

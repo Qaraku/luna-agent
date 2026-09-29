@@ -109,6 +109,9 @@ func (t *SkillViewTool) Invoke(ctx context.Context, arguments string) (string, e
 	// discovered: "there is no such skill" would be a false statement about
 	// this installation, and the model would have no way to tell that the
 	// procedure it wants is on disk but out of service.
+	if !plugin.ResourceSelected(ctx, PluginID, name) {
+		return "", fmt.Errorf("the skill %q is not selected for this run", name)
+	}
 	if t.state.off(name) {
 		return "", fmt.Errorf("the skill %q is turned off in the user's settings; it is not read while it is off", name)
 	}

@@ -15,6 +15,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/fileread"
 	"github.com/Qaraku/luna-agent/internal/plugin"
 	"github.com/Qaraku/luna-agent/internal/pluginhost"
+	"github.com/Qaraku/luna-agent/internal/runconfig"
 	"github.com/Qaraku/luna-agent/internal/store"
 	"github.com/cloudwego/eino-ext/components/model/openai"
 	"github.com/cloudwego/eino/adk"
@@ -60,6 +61,10 @@ type RunRequest struct {
 	Message   string
 	Model     string
 	// ReasoningEffort 为 nil 时继承全局，指向空字符串时明确不发送思考字段。
+	Setup         *runconfig.Selection
+	configuration *runconfig.Snapshot
+	// Configured 是宿主的只读观察入口，不能改变本轮配置。
+	Configured         func(*runconfig.Snapshot)
 	ReasoningEffort    *string
 	ExecutionMode      plugin.ExecutionMode
 	Permissions        *plugin.AccessPolicy
@@ -823,7 +828,11 @@ type Runner struct {
 	builtModel string
 	// builtRevision is the capability list's revision at build time, or zero
 	// when the runner was built without a list.
-	builtRevision uint64
+	builtRevision  uint64
+	selection      *runconfig.Selection
+	builtSelection string
+	builtEntries   []plugin.Entry
+	builtTools     []string
 	// maxIterations is how many model turns one run may take before the agent
 	// stops it as a runaway loop. It is resolved when the agent is built, so a
 	// run and the error that explains it agree on the number.
@@ -1032,16 +1041,33 @@ func (r *Runner) build(m model.ToolCallingChatModel, modelName string) error {
 	if finder, ok := r.files.(FileFinder); ok {
 		tools = append(tools, NewFindFilesTool(finder))
 	}
-	for _, contributed := range r.capabilityTools() {
+	entries := r.selectedEntries()
+	for _, contributed := range capabilityToolsFor(entries) {
 		tools = append(tools, contributed)
 	}
-	a, err := adk.NewChatModelAgent(r.buildCtx, &adk.ChatModelAgentConfig{Name: "luna", Description: "Personal Luna assistant", Instruction: instruction, GenModelInput: r.modelInputWithCapabilities(), Model: m, ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: tools, ExecuteSequentially: true}}, MaxIterations: r.maxIterations})
+	selectedTools := make([]tool.BaseTool, 0, len(tools))
+	names := make([]string, 0, len(tools))
+	for _, item := range tools {
+		info, err := item.Info(r.buildCtx)
+		if err != nil {
+			return err
+		}
+		if r.selection.AllowsTool(info.Name) {
+			selectedTools = append(selectedTools, item)
+			names = append(names, info.Name)
+		}
+	}
+	tools = selectedTools
+	a, err := adk.NewChatModelAgent(r.buildCtx, &adk.ChatModelAgentConfig{Name: "luna", Description: "Personal Luna assistant", Instruction: instruction, GenModelInput: r.modelInputFor(entries), Model: m, ToolsConfig: adk.ToolsConfig{ToolsNodeConfig: compose.ToolsNodeConfig{Tools: tools, ExecuteSequentially: true}}, MaxIterations: r.maxIterations})
 	if err != nil {
 		return err
 	}
 	r.runner = adk.NewRunner(r.buildCtx, adk.RunnerConfig{Agent: a, EnableStreaming: true})
 	r.builtRevision = r.currentRevision()
 	r.builtModel = modelName
+	r.builtEntries = entries
+	r.builtTools = names
+	r.builtSelection = selectionSignature(r.selection)
 	return nil
 }
 
@@ -1129,9 +1155,14 @@ func (r *Runner) currentRevision() uint64 {
 // An unknown model name is reported here, which fails the run. It is not
 // silently replaced by the default: the user would be answered by a model they
 // did not choose, and nothing in the answer says so.
-func (r *Runner) agentForRun(name string, reasoning *string) (*adk.Runner, error) {
+func (r *Runner) agentForRun(name string, reasoning *string, selection *runconfig.Selection) (*preparedAgent, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.selection = selection.Clone()
+	if err := r.selection.Validate(); err != nil {
+		return nil, err
+	}
+	selectionChanged := selectionSignature(r.selection) != r.builtSelection
 	cfg := r.baseConfig
 	if r.source != nil {
 		var err error
@@ -1163,12 +1194,12 @@ func (r *Runner) agentForRun(name string, reasoning *string) (*adk.Runner, error
 		return nil, err
 	}
 	revisionChanged := r.capabilities != nil && r.capabilities.Revision() != r.builtRevision
-	if revisionChanged || resolved != r.builtModel {
+	if revisionChanged || resolved != r.builtModel || selectionChanged {
 		if err := r.build(m, resolved); err != nil {
 			return nil, fmt.Errorf("rebuild the agent after a capability or model change: %w", err)
 		}
 	}
-	return r.runner, nil
+	return &preparedAgent{runner: r.runner, entries: append([]plugin.Entry{}, r.builtEntries...), snapshot: &runconfig.Snapshot{Selection: r.selection.Clone(), Model: resolved, ReasoningEffort: cfg.ReasoningEffort, Capabilities: entryNames(r.builtEntries), Tools: append([]string{}, r.builtTools...)}}, nil
 }
 
 // openAIChatConfig is the client configuration for one model of the active
@@ -1322,7 +1353,7 @@ func (r *Runner) appendRun(req RunRequest, startedAt time.Time, status string, u
 	if r.transcript == nil || req.SessionID == "" {
 		return nil
 	}
-	if err := r.transcript.AppendRun(req.SessionID, store.RunRecord{RunID: req.RunID, StartedAt: startedAt, EndedAt: time.Now(), Status: status, Usage: usage}); err != nil {
+	if err := r.transcript.AppendRun(req.SessionID, store.RunRecord{RunID: req.RunID, StartedAt: startedAt, EndedAt: time.Now(), Status: status, Usage: usage, Configuration: req.configuration}); err != nil {
 		return fmt.Errorf("persist run record: %w", err)
 	}
 	return nil
@@ -1330,6 +1361,18 @@ func (r *Runner) appendRun(req RunRequest, startedAt time.Time, status string, u
 
 func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err error) {
 	startedAt := time.Now()
+	req.Setup = req.Setup.Clone()
+	if err := req.Setup.Validate(); err != nil {
+		return "", err
+	}
+	if req.Setup != nil {
+		if req.Model == "" {
+			req.Model = req.Setup.Model
+		}
+		if req.ReasoningEffort == nil {
+			req.ReasoningEffort = req.Setup.ReasoningEffort
+		}
+	}
 	usage := &runUsage{}
 	recorder := newRecorder(req.Sink, r.transcript, req.SessionID, req.RunID)
 	// The run identity travels in the context so a capability's tools can
@@ -1341,7 +1384,7 @@ func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err
 	if !permissions.Valid() {
 		return "", fmt.Errorf("invalid run permission policy")
 	}
-	ctx := plugin.WithRun(WithRoots(WithRun(parent, req.RunID, recorder), req.Roots), plugin.RunInfo{RunID: req.RunID, SessionID: req.SessionID, ExecutionMode: req.ExecutionMode, Permissions: &permissions, AutomaticWriteDirs: append([]string{}, req.AutomaticWriteDirs...), WriteScopeError: req.WriteScopeError, Approve: req.Approve})
+	ctx := plugin.WithRun(WithRoots(WithRun(parent, req.RunID, recorder), req.Roots), plugin.RunInfo{RunID: req.RunID, SessionID: req.SessionID, Selection: req.Setup, ExecutionMode: req.ExecutionMode, Permissions: &permissions, AutomaticWriteDirs: append([]string{}, req.AutomaticWriteDirs...), WriteScopeError: req.WriteScopeError, Approve: req.Approve})
 	emit(ctx, Event{Type: "run.started", Data: RunStarted{RunID: req.RunID, SessionID: req.SessionID}})
 	defer func() {
 		status := runStatus(err)
@@ -1366,11 +1409,22 @@ func (r *Runner) Run(parent context.Context, req RunRequest) (answer string, err
 	// The agent is resolved once per run: a capability toggled or a model chosen
 	// since the last run is built into this one, and this run keeps the agent it
 	// started with even if either changes again while it is in flight.
-	agentRunner, err := r.agentForRun(req.Model, req.ReasoningEffort)
+	prepared, err := r.agentForRun(req.Model, req.ReasoningEffort, req.Setup)
 	if err != nil {
 		return "", err
 	}
-	iter := agentRunner.Run(ctx, input)
+	req.configuration = prepared.snapshot
+	ctx, err = prepared.freezeResources(ctx)
+	if err != nil {
+		return "", err
+	}
+	if req.Configured != nil {
+		req.Configured(req.configuration.Clone())
+	}
+	if req.Setup != nil {
+		emit(ctx, Event{Type: "run.configuration", Data: req.configuration.Clone()})
+	}
+	iter := prepared.runner.Run(ctx, input)
 	var b strings.Builder
 	for {
 		ev, ok := iter.Next()

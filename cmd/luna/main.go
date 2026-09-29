@@ -29,6 +29,7 @@ import (
 	"github.com/Qaraku/luna-agent/internal/plugins/filewrite"
 	"github.com/Qaraku/luna-agent/internal/plugins/jsonformat"
 	"github.com/Qaraku/luna-agent/internal/plugins/memory"
+	"github.com/Qaraku/luna-agent/internal/plugins/presets"
 	"github.com/Qaraku/luna-agent/internal/plugins/runtimewidgets"
 	skillsplugin "github.com/Qaraku/luna-agent/internal/plugins/skills"
 	"github.com/Qaraku/luna-agent/internal/plugins/terminal"
@@ -686,6 +687,9 @@ func run() error {
 	}
 	if err := registry.Enable(memory.PluginID); err != nil {
 		return fmt.Errorf("enable memory capability: %w", err)
+	}
+	if err := registerPresets(registry, statePath, userSettings.CapabilityEnabledByDefault(presets.PluginID, true)); err != nil {
+		return err
 	}
 	// The Workspace capability names the project this session is working in and
 	// states that project's rules. It is built from the same directory the file

@@ -180,8 +180,14 @@ func (p *Plugin) Tools() []plugin.Tool { return []plugin.Tool{p.tool} }
 // An empty manifest is no block at all rather than a header with nothing under
 // it: telling the model there are skills, and then naming none, would be a
 // statement about this installation that is not true.
-func (p *Plugin) Contexts(context.Context) ([]plugin.ContextBlock, error) {
-	text, _ := skills.List(p.state.on(p.found), ListBudgetBytes)
+func (p *Plugin) Contexts(ctx context.Context) ([]plugin.ContextBlock, error) {
+	selected := make([]skills.Skill, 0)
+	for _, skill := range p.state.on(p.found) {
+		if plugin.ResourceSelected(ctx, PluginID, skill.Name) {
+			selected = append(selected, skill)
+		}
+	}
+	text, _ := skills.List(selected, ListBudgetBytes)
 	if text == "" {
 		return nil, nil
 	}
@@ -197,3 +203,12 @@ var (
 	_ plugin.ToolProvider    = (*Plugin)(nil)
 	_ plugin.ContextProvider = (*Plugin)(nil)
 )
+
+// RunResources 只提供名字；宿主负责冻结本轮选择，正文仍按需读取。
+func (p *Plugin) RunResources(context.Context) ([]string, error) {
+	names := make([]string, 0)
+	for _, skill := range p.state.on(p.found) {
+		names = append(names, skill.Name)
+	}
+	return names, nil
+}

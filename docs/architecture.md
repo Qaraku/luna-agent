@@ -113,6 +113,18 @@ providers:
 
 会话读取共用 `internal/store/scan.go` 的逐行校验路径，`store.go` 决定保留哪些记录：`Read` 保留完整回放，`List` 仅聚合摘要和最后的配置，`Messages` 仅保留消息。三者都校验未选中的记录，不能为了省内存忽略损坏的工具调用。扫描使用同一个已打开文件的内容与 metadata，以开始读取时的长度限制本次扫描，不追逐后续追加；这不是冻结文件内容的快照。长行缓冲可以增长并重用，不引入 Scanner 默认的 64 KiB 上限。额外缓冲由最大单行决定；完整回放和消息返回值仍占用对应输出所需内存，扫描时间仍随日志字节数增长。
 
+### 运行选择与工作预设
+
+`internal/runconfig.Selection` 是内核可理解的通用运行选择：来源/版本、指令、模型偏好、能力与工具名字、按能力命名空间划分的资源名字。它没有权限字段；列表的 `nil` 与显式空列表分别表示继承和不选择。选择有内容、条目和总字节上限，进入运行前深拷贝与校验。
+
+`internal/plugins/presets` 拥有预设定义、修订存储与 `/api/presets*` 路由，认领自己的状态目录并声明 `state.write`。宿主通过 `plugin.SetupProvider` 解析一次配置，再使用 `POST /api/sessions/{id}/setup` 的事务把快照追加到 `config.setup`；后续目录修改不替换已有绑定。内置项只读，自定义项用父修订号做并发检查，归档/恢复也只是追加记录。状态读写使用 Go 1.24 的 `os.Root`，拒绝越界及非普通修订文件，完整行损坏或残缺尾部不会被覆盖成新历史。
+
+运行器按选择过滤实际模型工具和能力上下文，并以选择内容参与 agent 构造缓存键。能力可通过 `RunResourceProvider` 提供资源名，宿主在本轮开始时做交集并冻结；Skills 的清单与读取工具均检查该集合，运行中后来启用的技能不会扩张旧快照。用户明确停用技能仍可拒绝后续读取。资源选择不是执行授权，四维权限与审批继续独立强制。
+
+实际模型、思考档位、能力、工具和资源集合写入运行记录的 `configuration`；其中的预设指令是用户选择的资料，不是完整模型请求或授权。宿主的只读配置观察回调用深拷贝更新活动快照，`GET /api/setup` 不把之后的目录或实例状态冒充正在运行的一轮。带预设的运行另发出 `run.configuration` 事件，终止事件规则不变。
+
+`settings.CapabilityEnabledByDefault` 在显式停用列表、显式启用列表、产品默认值之间按此顺序选择；默认关闭的执行类能力仍默认关闭。旧偏好格式兼容读入，新增 `capabilities.disabled` 后降级旧程序需要先恢复兼容的配置备份。
+
 ### 能力：Memory
 
 Memory 是官方内置能力（`internal/plugins/memory`），不再属于内核业务：`fact`、`remember`、`retract`、注入块的渲染、存储上限、接口形状与面板文案都由它自己决定与测试。它贡献四类能力——两个工具（追加 `luna_remember` 与检索 `luna_recall`）、一个上下文块、四条路由（`GET /api/memory`、`POST /api/memory/retract`，以及面板自己的两个资产：`GET /api/memory/panel.js` 与 `GET /api/memory/panel.css`）与一个浏览器面板——外加一个状态命名空间 `.runtime`。面板的样式表走它自己的路由而不是注入 `<style>`：服务的 CSP 是 `default-src 'self'` 且没有 `style-src 'unsafe-inline'`，注入的样式表会被浏览器拒绝。模块用自己 URL 推导样式表地址，卸载时把 `<link>` 一并摘掉。
@@ -545,6 +557,7 @@ data: <JSON payload>
 事件类型和载荷由应用自有：
 
 - `run.started` —— `{"run_id":"...","session_id":"..."}`；运行被准入到的会话，当本次请求没有提供会话时由本请求创建。下面的终止事件规则不变。
+- `run.configuration` —— 带预设的运行在模型调用前报告冻结的 `selection`、模型/思考档位、能力、工具和资源集合；仅是运行状态，不授予权限，不含凭据。
 - `assistant.delta` —— `{"text":"..."}`；文本边产生边发出，包含含工具调用的回合里的文本。哪些文本是答案由终止事件划界，不由这个事件本身声明。
 - `assistant.reasoning` —— `{"text":"..."}`；provider 自愿暴露的推理内容的**流式增量**。它是运行内容而不是回答：**不进入最终答案**，不写入 transcript，也不参与答案对齐。provider 不报告推理时（取决于 provider 与是否 thinking 模式）这个事件根本不出现——运行期不会推断、不会伪造、也不为它留占位。响应只展示这一路真实到达的内容。
 - `tool.started` —— `{"run_id":"...","name":"...","arguments":...}`，其中 `name` 是当前可用的模型可见工具名之一：由子进程支撑的 `luna_text_transform`、`luna_read_file`、`luna_list_dir`、`luna_search_files` 与 `luna_find_files`，以及启用中能力贡献的工具（`luna_remember` / `luna_recall` / `luna_skill_view` / `luna_run` / `luna_write_file` / `luna_web_fetch`）
