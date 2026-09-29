@@ -17,6 +17,7 @@ const sandboxScratchBytes = 512 << 20
 const sandboxBootstrap = "printf 'luna-sandbox-ready\\n' >&3 || exit 125; exec 3>&- 4>&-; exec /bin/sh -c \"$1\""
 
 type sandboxAccess struct {
+	Readonly   []ReadOnlyMount
 	Read       bool
 	WriteRoots []string
 	Network    bool

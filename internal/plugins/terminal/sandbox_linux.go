@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 
 	"github.com/Qaraku/luna-agent/internal/fileread"
@@ -84,6 +85,19 @@ func prepareSandboxWithAccess(ctx context.Context, executable string, roots []st
 	if executable == "" {
 		executable = sandboxExecutable
 	}
+	readonly := []ReadOnlyMount{}
+	targets := map[string]bool{}
+	for _, mount := range access.Readonly {
+		if !regexp.MustCompile(`^/run/luna/[a-z][a-z0-9-]{0,31}$`).MatchString(mount.Target) || targets[mount.Target] {
+			return nil, fmt.Errorf("invalid or duplicate trusted resource mount target")
+		}
+		targets[mount.Target] = true
+		paths, err := sandboxRoots([]string{mount.Source})
+		if err != nil {
+			return nil, err
+		}
+		readonly = append(readonly, ReadOnlyMount{Source: paths[0], Target: mount.Target})
+	}
 	var writable []string
 	for _, root := range access.WriteRoots {
 		resolved, err := fileread.ResolveDirInRoots([]string{root}, ".")
@@ -129,6 +143,15 @@ func prepareSandboxWithAccess(ctx context.Context, executable string, roots []st
 	}
 	for _, path := range writable {
 		args = append(args, "--bind", path, path)
+	}
+	for _, mount := range readonly {
+		args = append(args, "--ro-bind", mount.Source, mount.Target)
+		for _, base := range mounted {
+			if fileread.Within(base, mount.Source) {
+				args = append(args, "--ro-bind", mount.Source, mount.Source)
+				break
+			}
+		}
 	}
 	bootstrap := sandboxBootstrap
 	extra := []*os.File{readyW, filter}
