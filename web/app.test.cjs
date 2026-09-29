@@ -4894,3 +4894,8 @@ test('备份入口只下载位置计划，提示停机和私人归档，不暴�
  assert.match(h.$('backup-privacy').textContent,/不加密/);
  assert.equal(h.$('chat-form').contains(link),false);
 });
+
+
+test('自我开发说明只指向独立副本和候选，不提供自动覆盖运行实例按钮',()=>{
+ const html=source('index.html');assert.match(html,/id="self-development-guidance"/);assert.match(html,/luna dev create/);assert.match(html,/luna dev export/);assert.match(html,/luna dev inspect/);assert.match(html,/只把 source[/]/);assert.match(html,/独立的 LUNA_HOME/);assert.doesNotMatch(html,/id="dev-auto-apply"/);
+});

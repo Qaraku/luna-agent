@@ -242,6 +242,15 @@
 luna data inspect -archive /私有目录/backup.tar.gz
 luna data restore -archive /私有目录/backup.tar.gz -dest /绝对路径/新数据目录 -include-private</pre>
             <p class="luna-muted">恢复只写入新目录，不覆盖旧资料、不启动程序。恢复完成后使用新目录作为 LUNA_HOME；额外技能目录按命令返回的 extra_skills 加回。项目代码不在备份中，工作区路径可能需要调整。</p>
+            <details id="self-development-guidance" class="technical-detail">
+              <summary>让 Luna 参与改进自己</summary>
+              <p class="luna-muted">从完整本地提交建立独立副本，只把 source/ 绑定为工作区；基线与来源记录留在外面。写入和命令仍需原有权限，试运行使用独立的 LUNA_HOME，不触碰日常数据或正在运行的实例。</p>
+              <pre>luna dev create -repo /源码仓库 -commit 完整提交 -dest /独立开发目录
+luna dev status -workspace /独立开发目录
+luna dev export -workspace /独立开发目录 -dest /新候选目录
+luna dev inspect -bundle /新候选目录</pre>
+              <p class="luna-muted">新增文件按 status 列表逐个用 -include 加入；生成文件和常见私人文件不会导出。命令只产生候选补丁，由你在可信干净副本审阅、检查和采用，不自动应用到原仓库、提交原仓库或重启。</p>
+            </details>
             <h3>主程序手动更新</h3>
             <p class="luna-muted">只从可信来源获取程序包。在本地终端安装到一个新目录，核对版本，备份私人数据后，由你停止旧实例并启动新版本。不会静默下载、重启或替换正在运行的程序。</p>
             <pre class="technical-detail">luna release install -archive /绝对路径/luna.tar.gz -dest /绝对路径/新安装目录
