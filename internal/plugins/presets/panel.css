@@ -1,0 +1,13 @@
+/* 能力自有样式，只使用宿主主题变量。 */
+.preset-list, .preset-editor, .preset-history { display: grid; gap: var(--luna-space-3); min-width: 0; }
+.preset-row { border: 1px solid var(--luna-border); border-radius: var(--luna-radius-md); padding: var(--luna-space-3); min-width: 0; }
+.preset-row h3 { margin: 0; font-size: var(--luna-font-ui); }
+.preset-actions { display: flex; flex-wrap: wrap; gap: var(--luna-space-2); }
+.preset-field { display: grid; gap: var(--luna-space-2); min-width: 0; }
+.preset-field .luna-input, .preset-export { width: 100%; min-width: 0; box-sizing: border-box; }
+.preset-field textarea, .preset-export { resize: vertical; min-height: 8rem; }
+.preset-resource-group { display: grid; gap: var(--luna-space-2); border: 1px solid var(--luna-border); min-width: 0; }
+.preset-check { display: flex; align-items: flex-start; gap: var(--luna-space-2); overflow-wrap: anywhere; }
+.preset-editor, .preset-history { margin-top: var(--luna-space-4); }
+.preset-definition { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 24rem; overflow: auto; }
+.preset-editor[hidden], .preset-history[hidden] { display: none; }

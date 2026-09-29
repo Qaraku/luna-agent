@@ -2,6 +2,7 @@
 package presets
 
 import (
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,12 @@ import (
 
 const Prefix = "/api/presets"
 
+//go:embed panel.js
+var panelModule []byte
+
+//go:embed panel.css
+var panelStyle []byte
+
 type Plugin struct{ store *Store }
 
 func New(stateDir string) (*Plugin, error) {
@@ -25,9 +32,11 @@ func New(stateDir string) (*Plugin, error) {
 }
 func Descriptor() plugin.Descriptor {
 	d := plugin.Descriptor{ID: PluginID, Title: "工作预设", Deployment: plugin.DeploymentBuiltin, Claims: []plugin.Claim{{Kind: plugin.ClaimStateNamespace, ID: "presets"}, {Kind: plugin.ClaimRoutePrefix, ID: Prefix}}, Permissions: []plugin.Permission{{Kind: plugin.PermissionStateWrite}}}
-	for _, path := range []string{Prefix, Prefix + "/save", Prefix + "/archive", Prefix + "/restore", Prefix + "/history", Prefix + "/export"} {
+	for _, path := range []string{Prefix, Prefix + "/save", Prefix + "/archive", Prefix + "/restore", Prefix + "/history", Prefix + "/export", Prefix + "/panel.js", Prefix + "/panel.css"} {
 		d.Contributions = append(d.Contributions, plugin.Contribution{Kind: plugin.ContributionRoute, ID: path})
 	}
+	d.Contributions = append(d.Contributions, plugin.Contribution{Kind: plugin.ContributionPanel, ID: PluginID})
+	d.Claims = append(d.Claims, plugin.Claim{Kind: plugin.ClaimPanel, ID: PluginID})
 	return d
 }
 func (*Plugin) Descriptor() plugin.Descriptor { return Descriptor() }
@@ -38,9 +47,15 @@ func (p *Plugin) ResolveSetup(id, rev string) (*runconfig.Selection, error) {
 	}
 	return e.Selection.Clone(), nil
 }
+func (*Plugin) Panels() []plugin.Panel {
+	return []plugin.Panel{{ID: PluginID, Title: "工作预设", Entry: Prefix + "/panel.js"}}
+}
+
 func (p *Plugin) Routes() []plugin.Route {
 	return []plugin.Route{
 		route{http.MethodGet, Prefix, p.list}, route{http.MethodPost, Prefix + "/save", p.save}, route{http.MethodPost, Prefix + "/archive", p.archive}, route{http.MethodPost, Prefix + "/restore", p.restore}, route{http.MethodGet, Prefix + "/history", p.history}, route{http.MethodGet, Prefix + "/export", p.export},
+		route{http.MethodGet, Prefix + "/panel.js", asset("text/javascript; charset=utf-8", panelModule)},
+		route{http.MethodGet, Prefix + "/panel.css", asset("text/css; charset=utf-8", panelStyle)},
 	}
 }
 
@@ -150,10 +165,25 @@ func (p *Plugin) history(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]any{"revisions": entries})
 }
 func (p *Plugin) export(w http.ResponseWriter, r *http.Request) {
-	e, err := p.store.Lookup(r.URL.Query().Get("id"), r.URL.Query().Get("revision"))
+	history, err := p.store.History(r.URL.Query().Get("id"))
 	if err != nil {
 		problem(w, err)
 		return
 	}
-	respond(w, 200, e.Selection)
+	revision := r.URL.Query().Get("revision")
+	for i := len(history) - 1; i >= 0; i-- {
+		entry := history[i]
+		if revision == "" || entry.Revision == revision {
+			respond(w, 200, entry.Selection)
+			return
+		}
+	}
+	problem(w, ErrNotFound)
+}
+
+func asset(contentType string, body []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", contentType)
+		_, _ = w.Write(body)
+	}
 }

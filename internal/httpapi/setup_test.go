@@ -166,3 +166,22 @@ func TestDisabledSetupOwnerCannotBeAppliedOrRun(t *testing.T) {
 		t.Fatalf("cannot remove disabled setup: %d %s", w.Code, w.Body)
 	}
 }
+
+func TestArchivedPresetCanStillExportItsDefinition(t *testing.T) {
+	h, _, _, _, _ := setupHandler(t)
+	e := saveTestPreset(t, h, "portable method", "")
+	if w := controlsRequest(t, h, "/api/presets/archive", map[string]any{"id": e.ID, "expected_revision": e.Revision}); w.Code != 200 {
+		t.Fatal(w.Body)
+	}
+	w := request(t, h, http.MethodGet, "/api/presets/export?id="+e.ID, "", false)
+	if w.Code != 200 {
+		t.Fatalf("export=%d %s", w.Code, w.Body)
+	}
+	var exported map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &exported); err != nil {
+		t.Fatal(err)
+	}
+	if exported["instructions"] != "portable method" || exported["permissions"] != nil || exported["sessions"] != nil || exported["builtin"] != nil {
+		t.Fatalf("unexpected export: %v", exported)
+	}
+}
