@@ -4786,3 +4786,13 @@ test('切换会话取消未完成的预设候选请求，迟到结果不重新�
 test('预设目录停用后仍可从快速入口清除旧绑定',async()=>{
  const server={created:true,selection:{owner:'presets',id:'research',title:'资料研究',revision:'old'}};const h=presetControlHarness({hash:'#session=cccccccc',server,failCatalog:true});await h.settle();await h.click('session-preset');await h.pick('--default');assert.equal(server.selection,null);assert.match(h.$('session-preset').textContent,/未选择/);
 });
+
+
+test('个人技能管理从现有设置页打开能力面板，不调用模型',async()=>{
+ let mounts=0;const h=navigationHarness({panelModules:{'/api/skill-library/panel.js':{mount(){mounts++},unmount(){}}},respond:async url=>url==='/api/state'?{ok:true,json:async()=>({model:'one',busy:false,capabilities:[{id:'skills',title:'技能',state:'enabled',panels:[{id:'skill-library',title:'个人技能库',entry:'/api/skill-library/panel.js'}]}]})}:undefined});
+ await h.settle();await h.click('settings-toggle');await h.click('settings-tab-skills');await h.click('skill-manage');await h.settle();assert.equal(mounts,1);assert.equal(h.$('capability-panel-skill-library').hidden,false);assert.equal(h.calls.some(x=>x.url==='/api/runs'),false);
+});
+
+test('学习技能在列表中标明受管理修订，不冒充外部用户目录',()=>{
+ const {skillRows}=require('./app.js');const rows=skillRows({skills:[{name:'learned',scope:'user',description:'Method',enabled:true,managed:true,revision:'abcdef1234567890'}]});assert.match(rows[0].scopeLabel,/个人技能/);assert.match(rows[0].scopeLabel,/abcdef123456/);
+});

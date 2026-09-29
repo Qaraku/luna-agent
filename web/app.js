@@ -636,7 +636,7 @@ function skillRows(payload) {
       descriptionText: skillDescriptionText(description) || '没有写描述。',
       descriptionMissing: description === '',
       scope: capabilityPanelText(skill.scope),
-      scopeLabel: skillScopeLabel(skill.scope),
+      scopeLabel: skill.managed === true ? '个人技能 · ' + capabilityPanelText(skill.revision).slice(0, 12) : skillScopeLabel(skill.scope),
       reported,
       enabled,
       stateLabel: reported ? (enabled ? '已启用' : '已停用') : '状态未报',
@@ -3147,6 +3147,11 @@ if (typeof document !== 'undefined') {
     else { openComposerSettings('capabilities'); setConversationStatus('请先启用工作预设能力。'); }
   });
   $('composer-project-change').addEventListener('click', () => openComposerSettings('workspace'));
+  $('skill-manage').addEventListener('click', () => {
+    const record = capabilityPanelNodes.get('skill-library');
+    if (record) openDrawer(record.panel);
+    else { openComposerSettings('capabilities'); setConversationStatus('请先启用技能能力。'); }
+  });
 
   $('session-preset').addEventListener('click', () => openControlPicker('preset'));
   $('session-model').addEventListener('click', () => openControlPicker('model'));
